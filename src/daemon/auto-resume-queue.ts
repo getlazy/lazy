@@ -12,7 +12,8 @@
  * show`). Across ALL tasks project-wide, at most one task is retried per
  * `daemon.auto_resume_gap_minutes` — round-robin, oldest attempt first — so one
  * flapping task can never starve every other queued task. `daemon.auto_resume`
- * is the master switch for both lanes.
+ * gates this slow lane only; the fast lane in src/utils/reconcile.ts does not read
+ * it (whether it should is an open decision, raised on docs-diataxis-redesign).
  *
  * Per-task attempt count/timestamp/exhausted flag live in task metadata (same
  * pattern as src/daemon/auto-react-budget.ts's per-task counters). The

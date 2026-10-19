@@ -65,15 +65,9 @@ paired session with no lazy tools is broken, not degraded.
 
 Cursor and Codex tasks pair the same in-container way: the interactive CLI runs
 inside the task's container on the same mounted home (`~/.cursor` / `~/.codex`)
-the supervised turns used, resuming the task's own session. For Cursor this was
-previously a hard refusal, for a security reason
-that in-container pairing removed: a container-written Cursor chat lives in the
-worktree sandbox, a *host* `cursor-agent` reads your real `~/.cursor` and cannot
-see it, and lazy will not close that gap by copying agent-authored history into
-your host home — that turns a task's chat log into a prompt-injection channel
-into a session running as you. Since the session now runs on the same side of
-the boundary as the agent that wrote the history, nothing is copied and there is
-nothing to escalate.
+the supervised turns used, resuming the task's own session. Because the
+session runs on the same side of the boundary as the agent that wrote the
+history, nothing is copied into your host home.
 
 **Honest gap:** conversation capture and the AI end-of-session summary need
 session files lazy can read back, and Cursor's and Codex's are not that — so

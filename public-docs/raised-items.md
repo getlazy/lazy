@@ -11,7 +11,6 @@ flag.
 | --- | --- | --- |
 | What it is | A question or decision about **this task's own scope or diff** | An orthogonal proposal, or an FYI |
 | Gates `lazy accept` | Yes — every open one must be resolved | No |
-| Was previously called | Raised item | Follow-up |
 
 Recording an item is passive either way: it starts no turn, changes no status,
 and notifies nobody.
@@ -29,9 +28,8 @@ Two practical consequences:
 - An agent that files a blocking item is not asked, at the end of its turn,
   where it stands. It already said.
 - An agent that declared the work done and then discovers it needs a decision
-  files the blocking item as usual. The earlier declaration stays in the record —
-  it was true about the head it named — and the open item gates accept on its
-  own, as it always has.
+  files the blocking item as usual. The earlier declaration stays in the record,
+  and the open item gates accept on its own.
 
 ## Raising
 
@@ -63,7 +61,7 @@ Agents should file structured proposals when they can:
 - **proposed_code** — suggested kebab-case task code
 - **proposed_prompt** — what a promoted task should tell its agent
 
-A bare `content` (or the legacy single-field `note`) still works; promotion falls
+A bare `content` also works; promotion falls
 back to a first-sentence goal and a synthesized prompt when no proposal is
 present.
 
@@ -209,25 +207,12 @@ not something an agent does to its own notes.
 
 ## Cross-task listing
 
-`lazy raised` lists **every** raised item in the project:
+The web dashboard lists **every** raised item in the project at `/raised` (open by default; add
+`?all=1` for triaged items):
 
-```bash
-lazy raised                       # open items needing attention (newest first)
-lazy raised --blocking            # only the ones that gate accept
-lazy raised --non-blocking        # only the ones that never gate
-lazy raised --all                 # include resolved items
-lazy raised --status complete-only  # originating task is complete (work landed, item may still be open)
-lazy raised --min-age 7           # at least a week old
-lazy raised -r                    # recurrences only (size ≥ 2)
-lazy raised -q "retry helper"     # substring search on body
-```
+![The dashboard Raised items page. A table lists two open items from one task: an FYI titled "Stock levels are hardcoded in the source" and a Blocking item titled "Unknown SKUs need a decision before this can land", each with age, recurrence, task, status and decision columns.](images/explanation/raised-list.png)
 
-`lazy followups` and `lazy followup` are aliases for one release. They print a
-deprecation line to stderr and otherwise behave identically, so a script that
-pipes stdout keeps parsing exactly what it parsed before.
-
-The web dashboard shows the same listing at `/raised` (open by default; add
-`?all=1` for triaged items). `/followups` redirects there rather than 404ing. It
+The listing
 is sorted by **age, newest first**, stated in a line under the filters, and every
 column header is a link that re-sorts the listing — clicking the column you are
 already sorted by flips the direction. A **Blocking** column and filter buttons
@@ -246,13 +231,30 @@ Each item has a detail page whose main content is one **Decide** control —
 respond, acknowledge, dismiss with a note, or promote (goal and code you can
 edit) — alongside the body, where it came from, a blocking toggle, and its
 promoted task once promoted. The review page's raised-items block offers the same
-control, so a decision looks the same wherever you make it. Near-duplicate
+control, so a decision looks the same wherever you make it.
+
+![An open blocking raised item in the dashboard. It shows the agent's question, the options the agent offered, a Decide section with a dropdown and an Apply button, and a Gate section with a Make this FYI button.](images/explanation/raised-decide.png)
+
+Near-duplicate
 recurrences appear in a summary section and as grouped rows in the table (one row
 per recurrence, all originating tasks linked).
 
 The **Raised** nav entry carries a badge — `2/11` means two open blocking and
 eleven open non-blocking, blocking first; a plain number means non-blocking only.
 See [the nav counts](web-review.md#the-nav-counts).
+
+On the command line, `lazy raised` lists the same items:
+
+```bash
+lazy raised                       # open items needing attention (newest first)
+lazy raised --blocking            # only the ones that gate accept
+lazy raised --non-blocking        # only the ones that never gate
+lazy raised --all                 # include resolved items
+lazy raised --status complete-only  # originating task is complete (work landed, item may still be open)
+lazy raised --min-age 7           # at least a week old
+lazy raised -r                    # recurrences only (size ≥ 2)
+lazy raised -q "retry helper"     # substring search on body
+```
 
 **MCP:** `lazy_raised_items` — the same data for
 builders, read-only, with a blocking filter. Returns every triage state by
@@ -270,14 +272,8 @@ one stored record and one listing row.
 ### Promotion hints
 
 Promoted items show their task code in the listing and leave the default "needs
-attention" view. For older rows promoted before this link existed, the cross-task
-listing still detects prompts that open with `Promoted from a follow-up on
-<originating-task>` and marks `possibly_promoted` on items from that task. Real
-promoted links win over that heuristic.
-
-Promotions without either a stored link or that boilerplate are not detected.
-Folding into scope or deliberately dropping an item also leaves no promote
-record — those stay in the listing until you judge them stale.
+attention" view. Folding into scope or deliberately dropping an item leaves no
+promote record — those stay in the listing until you judge them stale.
 
 ## What to do at review
 
@@ -332,15 +328,11 @@ shows the decider: the item's own panel and the review page say **Decided by
 …**, `lazy show --full` prints a `decided by:` line, and the `/raised` listing
 and `lazy raised` tag the row.
 
-On a single-user install that is the role — `human` — exactly as it has always
-read. When you are signed in as a member of a team, the record also names *you*,
+On a single-user install that is the role — `human`. When you are signed in as a member of a team, the record also names *you*,
 so a team can see which member responded to, acknowledged, dismissed or promoted
 each item rather than an anonymous "human". The same applies to the two other
 decisions on an item: changing whether it gates accept records who changed it,
 and undoing a decision before it reaches the agent records who reopened it.
-
-Nothing is recorded retroactively — items decided before this existed simply
-show the role.
 
 ## How an item is labelled in the web UI
 

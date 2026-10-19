@@ -21,6 +21,8 @@ terminal attaches to it. This is the full experience:
 
 If you want Claude Code working on a Teams project, start here.
 
+![The Builders page, where your builder on the server is listed and opened](images/teams/teams-builders.png)
+
 ## The secondary way: your own Claude Code on your machine
 
 You can also point a Claude Code you run yourself — in your own editor, with

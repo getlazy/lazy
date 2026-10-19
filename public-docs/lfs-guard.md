@@ -24,10 +24,9 @@ on one more key:
 The second row is the whole problem. Nothing errors, nothing warns, and the
 commit looks normal until a push hits the forge's blob-size limit.
 
-For example, a clone with `filter.lfs.process` set but **empty** and
-`required = false` will commit a 335 MB dataset file verbatim where a 134-byte
-pointer belongs. The task branch becomes unpushable, and recovery takes manual
-history surgery.
+A clone with `filter.lfs.process` set but **empty** and `required = false`
+commits a large file verbatim where a pointer belongs, and the task branch
+becomes unpushable.
 
 ## Layer 1: the start-time preflight
 
@@ -46,11 +45,9 @@ file content instead of LFS pointers, producing a branch that cannot be pushed.
 Run `lazy doctor` for details.
 ```
 
-`lazy doctor` carries the full diagnosis and the exact commands — that split is
-deliberate: the point of occurrence gets one generic
-line, doctor is the single place remedies live.
+`lazy doctor` carries the full diagnosis and the exact commands.
 
-**For repositories you manage yourself, lazy does not repair your git config.** Writing to your config as a side effect of `lazy start` is a hidden side effect lazy avoids by design. Lazy detects and refuses; fix it deliberately:
+**For repositories you manage yourself, lazy does not repair your git config.** It detects and refuses; fix it yourself:
 
 ```bash
 git lfs install --local          # writes filter.lfs.process/clean/smudge + required
@@ -104,8 +101,8 @@ lazy accept t1 --approve-file datasets/train.bin
 
 (or `approved_files` over MCP). Each file must be approved individually; the
 accept then proceeds and records a warning naming what was approved, so the audit
-trail shows a human made the call. This reuses the same approval channel as the
-[resurrection guard](resurrection-guard.md) rather than inventing a second one.
+trail shows a human made the call. This is the same approval channel as the
+[resurrection guard](resurrection-guard.md).
 
 Lazy does **not** rewrite bad commits for you. Repairing history on a branch is
 the human's call.
@@ -121,12 +118,10 @@ LFS usage or to find raw blobs. The binary is consulted for exactly one question
 - **Is path X LFS-tracked at a ref?** git's own attribute engine, against a
   throwaway index built from that ref:
   `GIT_INDEX_FILE=<temp> git read-tree <ref>` then `git check-attr --cached -z
-  filter`. `git check-attr --source=<ref>` would be the direct spelling but only
-  landed in git 2.40, and lazy supports older gits. Nothing is written to the
+  filter`. Nothing is written to the
   repository.
 - **Is a blob a pointer?** `git cat-file -s` first; anything over 1 KB cannot be a
-  pointer and is reported without being read (the point is not to pull 335 MB
-  into memory to learn that it is 335 MB). Otherwise the blob must start with
+  pointer and is reported without being read. Otherwise the blob must start with
   `version https://git-lfs.github.com/spec/v1`.
 
 ## Scope and limits

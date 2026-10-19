@@ -53,8 +53,10 @@ Backups taken by earlier lazy versions are a plain copy (a `store/` folder
 instead of `store.tar.gz`). They are listed and restored exactly as before, and
 are never converted or deleted except by the usual keep-the-newest-five rule.
 
-A restore never creates a symlink that points outside the store. If the store
-had one, the restore leaves just that link out and names it.
+A restore never creates a symlink that points outside the store. If the backup
+holds one (an absolute target, or one leading out of the store), the restore
+leaves just that link out and names it. A backup containing a link that passes
+through another link is refused instead (see below).
 
 `lazy doctor` shows the last backup: when it was taken, the store's size and the
 compressed size, and where it is.
@@ -137,17 +139,59 @@ container sharing its store, or the reverse, is refused rather than treated as
 stale; once the other side is stopped, remove the lock file — the error prints
 the exact command.
 
-The restore moves the store's contents to folders next to it, so it refuses a
-store that is a mount point of its own. In that case, stop the daemon and unpack
-the backup into the store by hand (`tar -xzf <backup>/store.tar.gz -C <store>`),
-or, for an older backup, copy its `store/` folder in.
+### A store that is a mount point
+
+The restore moves the store's contents to folders next to it, which cannot
+cross filesystems, so it refuses a store that is a mount point of its own and
+changes nothing. Restore by hand instead, which gives the same result as a normal
+restore: an exact copy of the backup, with the old contents kept. Do not just
+unpack the backup over the store: that only overlays it, and files created after
+the backup stay behind.
+
+Stop the project's daemon first, then run these in the store (the mount point
+itself stays in place; replace `<store>` and `<backup>`):
+
+```bash
+mkdir <store>/before-restore
+find <store> -mindepth 1 -maxdepth 1 ! -name before-restore -exec mv {} <store>/before-restore/ \;
+tar -xzf <backup>/store.tar.gz -C <store>
+find <store> -path <store>/before-restore -prune -o -type l -exec ls -l {} +
+```
+
+The first two commands move everything out of the way into `before-restore`
+inside the mount; nothing is deleted. The third unpacks the backup into the
+now-empty store. The last lists the symbolic links the backup held.
+
+Unlike a normal restore, `tar` creates every link as stored. Look at each link
+listed and `rm` (deleting only the link) any that points outside the store: an
+absolute target, one starting `../` past the store root, or one that goes
+through another listed link. The restore would have left out the first two and
+refused the backup for the third. When the restored store works, move
+`before-restore` somewhere outside the store, or delete it once you no longer need
+the old contents. Lazy does not read or complain about the extra folder, but the
+next backup copies it too, so it makes every backup larger until it is gone.
+
+If `tar` stops partway (disk full, damaged archive), the store holds a partial
+restore, and nothing is lost: the old contents are whole in `before-restore`.
+Stop there. Move the partly unpacked entries into a second new folder inside the
+store (the same `find ... -exec mv` command, with the new folder as the
+destination and both `before-restore` and the new folder excluded with
+`! -name`), move the old entries back out of `before-restore`, and fix the cause
+before trying again.
+
+A backup taken by an earlier lazy is a plain `store/` folder rather than
+`store.tar.gz`: replace the `tar` command with
+`cp -R -p <backup>/store/. <store>/`. Archive backups were introduced in lazy
+0.92; earlier versions made the plain copy. The commands use only options found
+on Linux, macOS and BusyBox alike.
 
 ### A restore refuses a link in the backup
 
-A restore refuses a backup containing a symbolic link that could reach outside
-the store: one with an absolute target, one whose target leads out of the
-store, or one placed under or pointing through another link. The backup is
-still a plain archive. List it first with `tar -tzvf <backup>/store.tar.gz`,
-then extract it by hand into an empty directory with
-`tar -xzf <backup>/store.tar.gz -C <empty-directory>`, and copy what you need
-without following the links the restore refused.
+A restore refuses a backup in which a symbolic link passes through another
+symbolic link: a link whose target goes through one, a link placed under one, or a
+file placed under one. (Links
+with an absolute target or one leading outside the store are not refused; they are
+left out and named, as above.) The backup is still a plain archive. List it with
+`tar -tzvf <backup>/store.tar.gz`, then extract it by hand into an empty
+directory with `tar -xzf <backup>/store.tar.gz -C <empty-directory>`, and copy
+what you need without following the links the restore refused.

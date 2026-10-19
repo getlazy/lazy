@@ -316,7 +316,7 @@ the report says so.
 Options:
   --subtree            Include every descendant task, at every depth, merging
                        the rows by tool name — what a hub (a release task, a
-                       loop) actually spent, rather than its own few turns
+                       cluster) actually spent, rather than its own few turns
   --since <duration>   Read the proxy's recent audit window instead, limited to
                        records within it (e.g. 30m, 2h, 1d)
   --limit <n>          Max audit records to scan, newest first (default 50000);

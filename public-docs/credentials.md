@@ -36,7 +36,6 @@ credential once and the daemon reads it from any shell.
 
 ```bash
 claude setup-token | lazy auth set anthropic
-lazy daemon restart
 ```
 
 That is the whole setup. Nothing needs to be exported in your shell profile, and
@@ -114,8 +113,7 @@ environment. A daemon that started with none loads a newly stored one at the
 next turn that needs it; to replace one it already loaded, run
 `lazy daemon restart`. `lazy auth` says which case you are in after every write.
 
-Replacing a credential the daemon already had when it started is no different:
-it takes effect on the next turn too. A variable *you* export still overrides
+A variable *you* export still overrides
 the store, but the daemon's own copy of a stored
 credential never outranks the store it came from.
 
@@ -256,9 +254,8 @@ the profile it runs on:
   (`OLLAMA_API_KEY` or `lazy auth set ollama`).
 - A profile on an OpenAI-compatible endpoint → the `openai` credential
   (`OPENAI_API_KEY`) — or the `openrouter` credential (`OPENROUTER_API_KEY`)
-  when the endpoint is `openrouter.ai`. The same hostname rule applies to a
-  profile pinned at OpenRouter's Anthropic-compatible endpoint: it bills your
-  OpenRouter key, never your Anthropic one.
+  when the endpoint is `openrouter.ai`, which is the credential the profile names
+  (or the built-in default for a built-in profile).
 - A profile on `api.fireworks.ai` (Fireworks, including its FireRouter models)
   → the `fireworks` credential (`FIREWORKS_API_KEY`, or `lazy auth set fireworks`),
   on either wire. Routing to Opus through FireRouter also needs your Anthropic
@@ -314,18 +311,19 @@ are looking at.
 
 ## Agent API keys
 
-Some harnesses read a key out of their own config rather than being handed one
-by the proxy. For those, `lazy system agent set-key <profile>` stores it per
-project, against the profile's credential slot.
+`lazy system agent set-key <profile>` stores a profile's API key per project. It
+writes the profile's credential slot, the same single saved value
+`lazy auth set <credential>` writes, so the two commands write the same place and
+neither takes precedence over the other (`set-key` is refused for Claude Code, Pi and `credential = "none"` profiles). As with every credential, the container
+only ever holds a placeholder; the proxy swaps in the stored key on each request.
 
-Cursor is one: `lazy system agent set-key cursor` (or any profile whose harness
-is `cursor`). A key stored with `lazy auth set cursor` takes precedence over it,
-and `CURSOR_API_KEY` still outranks both.
+Cursor: `lazy system agent set-key cursor` (or any profile whose harness is
+`cursor`) is the same as `lazy auth set cursor`. `CURSOR_API_KEY`, exported in the
+daemon's environment, overrides the stored value.
 
-Codex works the same way: `lazy system agent set-key codex` stores an OpenAI
-API key. A credential stored with `lazy auth set openai` takes precedence over
-it, and `OPENAI_API_KEY` outranks both. A codex profile that names its own
-credential (`credential = "work-openai"`) stores under that name instead.
+Codex: `lazy system agent set-key codex` is the same as `lazy auth set openai`;
+`OPENAI_API_KEY` overrides it. A codex profile that names its own credential
+(`credential = "work-openai"`) stores under that name instead.
 
 ## Running Codex on a ChatGPT subscription
 
@@ -376,9 +374,11 @@ naming the command that does work.
 **3. Run a task on it.** Nothing to configure:
 
 ```
-lazy create --agent codex-subscription "…"
+lazy create --agent codex-subscription --goal "…"
+lazy start <task>
 ```
 
+`lazy create` leaves the task in the backlog; `lazy start` launches the agent.
 Or make it this project's default:
 
 ```
@@ -458,7 +458,7 @@ Claude Code and Pi have no key of their own: `set-key` is refused for them and
 points you at `lazy auth set <credential>`, because lazy hands those harnesses
 the profile's credential through the proxy — see [pi-agent.md](pi-agent.md). It
 is also refused for a profile whose endpoint authenticates nobody
-(`credential = "none"`, the default for a local model server): there is no key
+(`credential = "none"`, which a profile on a local model server must say explicitly): there is no key
 to store.
 
 ## Services and background processes in a task container
@@ -473,19 +473,8 @@ whoever owns the task's **current turn**. This means:
 - Between turns the placeholder is revoked, so calls from such a process fail
   with a 401 until the next turn starts.
 
-This is how Lazy works today.
-
 ## Human-only, by design
 
 There is no MCP counterpart to `lazy auth`. Writing credentials is a human
 decision; agents must never store, read, or rotate one. See
 [surface asymmetries](surface-asymmetries.md).
-
-### Obsolete agent key files
-
-Lazy no longer reads `agent-credentials.json`. At daemon startup it deletes both
-`~/.lazy/daemon/<project-slug>/agent-credentials.json` and
-`<project>/.lazy/agent-credentials.json`, logging each deleted path. No keys are
-migrated. If your only key was in one of these files, store it again with
-`lazy system agent set-key <profile>`, or export `CURSOR_API_KEY` / `OPENAI_API_KEY`
-in the environment the daemon starts from.

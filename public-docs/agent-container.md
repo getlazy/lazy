@@ -63,7 +63,7 @@ RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends postg
 No configuration is needed: when `[docker] dockerfile` is unset, lazy uses a
 `Dockerfile.lazy` at the project root, once it is committed on the checked-out
 branch. An uncommitted one, staged or not, is ignored (tasks use the default
-image and `lazy doctor` says so), because nobody has reviewed it yet. Lazy
+image and `lazy doctor` says so). Lazy
 builds exactly the committed version: uncommitted edits to the file are not
 used, and it must be a regular file, not a symbolic link.
 
@@ -238,9 +238,7 @@ and stops everything running in Docker, so it asks for confirmation. It then
 holds lazy's automatic Docker recovery off, stops Docker, unmounts everything
 under its storage, removes the storage without crossing a mount point, and
 starts Docker again, telling you each step as it happens (on the page, or in the
-terminal). A plain `rm -rf` of that directory is not a substitute: a Docker that
-was killed leaves its container mounts in place, and removal fails halfway.
-
+terminal).
 **Builds and task starts are cold afterwards**: images are pulled again and
 layers rebuilt, so the first ones take longer. If a step fails, the page says
 which and Docker is started again anyway. Plain members do not see the button.
@@ -259,9 +257,7 @@ Lazy names a custom image after the content of its Dockerfile
 the daemon build the new image the next time a launch asks for it — the launch
 itself waits or runs on the default image, as above.
 
-A Dockerfile's text says nothing about what it *pulls*: the same file builds a
-different image a month later. So lazy also rebuilds an image it BUILT on two
-schedules:
+Lazy also rebuilds an image it BUILT on two schedules:
 
 - **`lazy upgrade` always rebuilds**, from scratch.
 - **After 14 days**, an older image is rebuilt once, without the build cache —
@@ -303,9 +299,7 @@ records its commits for it.
 
 Three small files tell git where a worktree's repository is: the worktree's
 `.git` file, and `commondir` and `gitdir` in the worktree's own git directory.
-A task that could rewrite them could point git at a directory it controls, whose
-configuration runs a program — and the next `git` you or lazy ran in that
-worktree, outside the container, would run it. So:
+Lazy protects them as follows:
 
 - **The container sees read-only copies of those three files.** It cannot
   rewrite, move or delete them.
@@ -313,8 +307,7 @@ worktree, outside the container, would run it. So:
   without running git to do it, and refuses with a message naming the task if
   they differ from what lazy created.
 - **The daemon puts them back** within one reconcile tick if they were changed
-  anyway (for example by an agent on the host-process runner, which has no
-  container), and `lazy doctor` reports any it finds as an error.
+  anyway, and `lazy doctor` reports any it finds as an error.
   `lazy doctor --repair-git-pointers` repairs them on demand.
 
 The same applies to the repositories of the worktree's **submodules**, which
@@ -372,17 +365,11 @@ opens the worktree in an editor that scans for nested repositories. So:
 Until it has been moved aside, do not run git in that subfolder or open the
 worktree in an IDE.
 
-This protection does not rely on git's own "dubious ownership" check, which some
-setups (including container images that trust every directory) turn off.
-
 ### Git hooks do not run on lazy's own git
 
 lazy runs every git command of its own — the agent's commits, `lazy accept`'s
 merge, syncs, worktree setup and pushes — with git hooks turned off
-(`core.hooksPath` pointed at nothing). A task branch can change files in your
-repository, including a hooks folder such as `.husky/` that your git config
-points at; if lazy ran those hooks, a task could run code on your machine
-outside its container just by being accepted.
+(`core.hooksPath` pointed at nothing).
 
 What that means for you:
 

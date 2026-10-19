@@ -28,7 +28,7 @@ export async function commandResumeQueue(args: string[]): Promise<void> {
   console.log(theme.header('Slow-lane auto-resume queue'));
 
   if (!config.daemon.auto_resume) {
-    console.log(`  ${theme.warning('daemon.auto_resume is false')} — auto-resume is disabled entirely.`);
+    console.log(`  ${theme.warning('daemon.auto_resume is false')} — the slow-lane queue is off (immediate resumes still happen).`);
     return;
   }
 
@@ -87,7 +87,7 @@ eligible time, and whether the project-wide gap or the per-task retry
 interval is what's currently holding it back.
 
 Related config (lazy.toml [daemon]):
-  auto_resume                   Master switch for auto-resume (both lanes)
+  auto_resume                   Turns the slow retry queue on or off
   auto_resume_interval_minutes  How often a given task is retried once queued
   auto_resume_gap_minutes       Minimum spacing between ANY two auto-resumes
   auto_resume_max_attempts      Slow-lane attempts before giving up for good

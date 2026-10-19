@@ -14,9 +14,13 @@ On first visit, any page redirects into a four-step wizard:
    and invite people. There is no separate signup page after this. Passwords
    must be at least **12 characters** (length only — no special-character rules).
 
+   ![First-run setup, step 1: creating the administrator account](images/teams-topics/setup-account.png)
+
 2. **Name** — Give the installation a short label (for example your company
    name). Teammates see it in the page header so they know which Lazy Teams
    instance they are on.
+
+   ![First-run setup, step 2: naming the installation](images/teams-topics/setup-installation.png)
 
 3. **Readiness** — The checks run one at a time so you can see progress:
    - **Project data folder** — where Lazy Teams stores project data on disk.
@@ -32,9 +36,13 @@ On first visit, any page redirects into a four-step wizard:
      runtime** and **Project image** — see
      [Task turns](self-hosting-lazy-teams.md#task-turns).
 
+   ![First-run setup, step 3: the readiness checks, each marked Ready, with the email note and the model-credential reminder](images/teams-topics/setup-checks.png)
+
 4. **Your team** — Create your first team and optionally invite someone. The
    finish screen shows the invitation link; with email on, it is also emailed to
    them. They join when they accept.
+
+   ![First-run setup, step 4: naming the first team and optionally inviting someone](images/teams-topics/setup-finish.png)
 
 When you complete step 4, setup is finished and the wizard stops redirecting
 every request.
@@ -77,10 +85,14 @@ On the `local` backend, Lazy Teams and every project it runs use the **same**
 Lazy, from the checkout above. There is no second version to keep in step.
 
 On the default microVM backend, each project runs the image named by
-`LAZY_DAEMON_IMAGE`, and an upgrade does not move existing projects to the
-new version — see
-[What an upgrade does](self-hosting-lazy-teams.md#what-an-upgrade-does). The
-rest of this section describes the `local` backend.
+`LAZY_DAEMON_IMAGE`, and an upgrade moves existing running projects to the new
+version too, automatically and without waiting for them to be idle. A turn that
+is running is interrupted and resumes by itself on the new version; a project
+whose upgrade fails keeps running on the previous version and is retried with
+backoff; after repeated failures Lazy Teams stops retrying and the Installation
+page in god mode names the project. See
+[What an upgrade does](self-hosting-lazy-teams.md#what-an-upgrade-does) for the
+full explanation. The rest of this section describes the `local` backend.
 
 That is kept true automatically. When you upgrade Lazy Teams and restart it, each
 project restarts on the new version within a minute or so. You do not have to ask

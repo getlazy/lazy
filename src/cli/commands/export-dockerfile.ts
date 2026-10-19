@@ -97,7 +97,8 @@ Write the embedded default Dockerfile (used to build agent containers) to disk
 so you can customize it. Output defaults to ${DEFAULT_OUTPUT} in the project root.
 
 This does NOT modify lazy.toml. A ${DEFAULT_OUTPUT} at the project root is used
-automatically when [docker].dockerfile is unset; for any other path, point
+automatically when [docker].dockerfile is unset and the file is COMMITTED on the
+project root's checked-out branch; for any other path, point
 [docker].dockerfile at the file yourself.
 
 Options:

@@ -8,10 +8,7 @@ refusal looks like, and how to override it.
 ## The defect
 
 A branch can reach accept in a state that does not build. A typical way: some
-files the task changed get reverted to their base versions (older versions of
-lazy did this for protected files a human rejected during review; nothing
-reverts a protected file for you any more — approval happens once, at accept),
-and the rest of the branch still depends on the reverted changes.
+files the task changed get reverted to their base versions, and the rest of the branch still depends on the reverted changes.
 
 The agent usually notices at once — its next turn says the tree no longer
 compiles. But nothing on the accept path reads a turn title, so the task can be
@@ -112,7 +109,7 @@ One short-lived container per accept, running the command once, bounded by
 unset. On top of the command itself you pay for starting that container. Paid
 once, at the moment a mistake would otherwise become the branch's problem.
 
-## Half two: reverted protected files (historical records only)
+## Half two: reverted protected files
 
 Independently of the check — and with no configuration at all — accept names
 protected files that were reverted during the task:
@@ -131,11 +128,8 @@ This is a report, not a gate: it never refuses. It exists because absence is not
 visible, and the reviewer needs to know that the tree in front of them is not the
 tree the agent last worked in.
 
-Since protected-file approval moved to accept, **lazy itself never reverts a
-file**, so this notice is empty for any task started after that change. It is
-kept for tasks whose records still carry a revert from the old behaviour, and
-for the one remaining way a protected file leaves the diff: the agent reverting
-it itself, when asked to.
+**lazy itself never reverts a file.** The notice appears when the agent reverted
+a protected file itself, or when a task record carries a revert.
 
 ## Related
 

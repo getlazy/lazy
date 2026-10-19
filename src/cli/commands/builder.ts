@@ -776,7 +776,8 @@ export async function commandBuilder(args: string[]): Promise<void> {
 }
 
 export function builderUsage(): void {
-  console.log(`Usage: lazy builder [list | --resume <id>] [--override-usage-pause]
+  console.log(`Usage: lazy builder [list | stop [<id>] | end [<id>]] [--resume <id> [--import]] [--no-autonomous] [--yes]
+                    [--effort <level>] [--model <id>] [--override-usage-pause]
 
 Launch an interactive Claude Code session with Lazy builder instructions.
 

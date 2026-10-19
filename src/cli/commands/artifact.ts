@@ -333,7 +333,7 @@ Artifacts are inputs and outputs, not a blob store. One name, one artifact —
 re-attaching a name replaces it; there is no versioning.
 
 Agents attach their own outputs with the ${'`'}lazy_artifact_add${'`'} MCP tool. There is
-deliberately no MCP remove — see docs/surface-asymmetries.md.
+deliberately no MCP remove.
 
 Examples:
   lazy artifact add my-task design/button.html design/tokens.json

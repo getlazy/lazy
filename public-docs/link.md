@@ -17,6 +17,8 @@ lazy link origin/feature/auth --parent auth-rewrite --code fix-auth
 `--parent` nests the linked task under another task. `--code` sets the
 human-readable id (otherwise lazy derives one from the branch name).
 
+![The dashboard Tasks list with status filters, the Link… and New task buttons at the top right, and a table of tasks](images/topics/tasks-list.png)
+
 In the web UI, **Link…** on the Tasks list is the same flow: a form for the
 URL or branch, optional parent and code. See [the web review page](web-review.md#linking-a-branch-or-pr).
 

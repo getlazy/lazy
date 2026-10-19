@@ -147,7 +147,7 @@ there, interrupt the command: the review keeps running, and its report lands as
 a `review` turn on the task (`lazy show <task>`, the Reviews tab, the task
 page) with its findings on it.
 
-To end a review you no longer want at all, **`lazy stop <task>`**. That stops
+To end a review you do not want, **`lazy stop <task>`**. That stops
 the reviewer itself, records the stop as the review's ending, keeps anything it
 had already filed, and puts the task back in the status the review found.
 The same goes for a question started with `lazy ask`.
@@ -165,10 +165,12 @@ Raise, and the agent replies to it with `lazy_raised_item_comment` (which does
 not dismiss it — only you do that). MCP callers use `lazy_review` with the same
 ownership gate as the other write verbs (own task or a direct subtask; the
 builder is unrestricted). In the web UI, **Review** on the task page runs this
-same verb; the **Reviews** tab lists every review, failed ones included. See
+same verb; the **Reviews** tab lists every recorded review, failed ones included. See
 [the web review page](web-review.md#agent-review-from-the-task-page).
 
 ### Reviews stay on the task
+
+![The Reviews tab of a task page: one row with the review time, a clean verdict, no raises, and a link to the review turn](images/topics/reviews-tab.png)
 
 **A review is never posted to a pull or merge request.** The report lives on
 the task — `lazy show <task>`, the Reviews tab, the task page — and nowhere
@@ -183,8 +185,5 @@ PR it tracks when you reject or close the task, or when `lazy accept` merged
 the work locally rather than through the forge. It posts no comments, so
 watchers of the pull request are not notified for every review round.
 
-`lazy review --post` is still accepted so older scripts do not fail on an
-unknown flag, but it does nothing and says so.
-
-The former full-screen artifact browser is now `lazy browse` (including `-i`
-for hunk-by-hunk Q&A).
+`lazy browse` is the full-screen artifact browser (including `-i` for
+hunk-by-hunk Q&A).

@@ -190,9 +190,11 @@ Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 Notes:
   - Does not require an active session — works on backlog tasks
   - Worktree is removed but the branch is preserved
+  - An open PR for the task is closed (no comment is posted)
+  - Unfinished subtasks are reparented to this task's parent
   - Task history is preserved
   - Use 'lazy reopen <task_id>' to restore the task later
-  - For closing a task whose work you want to reject (with PR cleanup), use 'lazy reject'
+  - For work you want to reject (the session ends as 'rejected'), use 'lazy reject'
   - By default, uncommitted changes prevent closing (safety check)
   - Use --accept-dirty-worktree to bypass this check when certain
 

@@ -52,9 +52,6 @@ This works behind a sign-in proxy (which accepts the Bearer header and cannot
 read a password) and without one: every login's token carries git access,
 whether you approved it in the browser or with a code.
 
-A machine logged in with an older lazy, whose code-approved token had no git
-access, is left alone; run `lazy login <teams-url>` once more to set git up.
-
 ## Logging in
 
 Inside a clone of the repository, `lazy login` also binds the clone to a project:
@@ -271,10 +268,9 @@ reaching that project under the new name — even after another project takes
 the old name. `lazy login` with no arguments still prints the name you bound
 by; log in again whenever you like to see the new one.
 
-A clone logged in with an older `lazy` only knows the name. It is told the new
-name and asked to log in again (`lazy login --project <team/new-name>`), and if
-another project has taken the old name since it logged in, it is refused rather
-than connected to that other project.
+If another project has taken the old name since a clone logged in, the clone is
+refused rather than connected to that other project; log in again with
+`lazy login --project <team/new-name>`.
 
 ## Seeing where a machine and a clone point
 
@@ -342,6 +338,8 @@ The approval page lives at `/device` on your install and is also reachable from
 **Account settings → Git & CLI tokens** (from your avatar menu). Open it and type the code in — it is case-insensitive
 and the dash is optional. The prefilled link lazy prints underneath works too,
 and is a convenience rather than the mechanism.
+
+![The Log in a machine page asking whether to approve a device, with its code and the Approve and Deny buttons](images/teams-topics/login-device-approval.png)
 
 If you did not just run `lazy login`, **deny it**. Approving would let whoever
 did act as you.

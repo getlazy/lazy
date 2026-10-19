@@ -763,7 +763,7 @@ export async function commandReport(args: string[]): Promise<void> {
 }
 
 export function reportUsage(): void {
-  console.log(`Usage: lazy report [--start <spec>] [--end <spec>]
+  console.log(`Usage: lazy report [--start <spec>] [--end <spec>] [--pdf] [--out <path>]
 
 Print an LLM-summarized markdown digest of recent activity to stdout.
 Covers ALL main-branch activity in the window — both lazy-managed

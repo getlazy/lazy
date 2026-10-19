@@ -176,7 +176,7 @@ Options:
   --role <role>        Only count this role (e.g. agent, builder)
   --task <id>          Only count this task (short-id prefix match)
   --subtree            With --task, also count every descendant at every depth
-                       — what a hub (a release task, a loop) really spent. The
+                       — what a hub (a release task, a cluster) really spent. The
                        By task breakdown then has one row per task in it.
   --json               Emit the full rollup as JSON (ignores --top)
 

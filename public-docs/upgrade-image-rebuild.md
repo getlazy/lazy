@@ -38,8 +38,7 @@ first and runs in the background while the rest of the upgrade proceeds.
 
    The default is yes, because refreshing unpinned contents is what an upgrade
    rebuild is *for* — but whether that is worth several minutes right now
-   depends on why you are upgrading, which only you know. There is no hidden
-   time threshold deciding it for you. Without a TTY (scripts, CI) and with
+   depends on why you are upgrading, which only you know. Without a TTY (scripts, CI) and with
    `--force`, the rebuild happens without asking; `lazy upgrade --images` never
    asks — it is the force-refresh path.
 3. **Foreground flow continues**: the stop/wait/cancel prompt, waiting for
@@ -50,7 +49,7 @@ first and runs in the background while the rest of the upgrade proceeds.
    already finished), then points the canonical tags — `lazy-runner:<major.minor>`
    and, for the base repository, `lazy-runner:latest` — at the staged image and
    drops the staging tag. The agent binary is rebuilt alongside this.
-5. **Stop the daemon**, then purge any pre-v0.20 MCP configs left in the repo and
+5. **Stop the daemon**, then purge legacy MCP configs left in the repo and
    rotate the shared daemon token they leaked — the one window where no
    container and no daemon holds it.
 6. **Restart the daemon**, which reconciles and auto-resumes interrupted tasks.
@@ -125,15 +124,10 @@ from a stale proxy address should clear within a retry or two rather than
 looking like a firewall block. If a task was already stopped by the restart
 reaper, the next auto-resume launches a fresh container with fresh env.
 
-Host-process builders (no container) are not stopped by upgrade; their
-interactive supervisor reconnects the same way `lazy pair` and `lazy chat` do.
-
 ## Builds have no time limit
 
 An image build runs for as long as it needs to. `docker build` has no timeout of
-its own, and lazy does not add one: a build killed on a timer wasted every second
-it ran and produced nothing, which is strictly worse than one that runs long and
-succeeds. A slow build is usually a slow network, not a stuck build.
+its own, and lazy does not add one. A slow build is usually a slow network, not a stuck build.
 
 So that an unbounded build never *looks* stuck, lazy streams the build's step
 headers as they happen and prints a "still building…" line with the elapsed time
@@ -237,8 +231,7 @@ Two `FROM` spellings lazy will not supply for you:
   `FROM lazy-runner`, or build the base yourself with
   `lazy system build lazy-runner`. To pin an exact release, name the published
   image instead: `FROM ghcr.io/getlazy/lazy-runner:v0.91.1402`.
-- an agent-suffixed image, e.g. `FROM lazy-runner-cursor`. Per-agent images are
-  no longer produced, because `lazy-runner` now carries every agent CLI. Change
+- an agent-suffixed image, e.g. `FROM lazy-runner-cursor`. There are no per-agent images: `lazy-runner` carries every agent CLI. Change
   the line to `FROM lazy-runner`.
 
 In both cases lazy names the remedy rather than leaving you with the registry

@@ -44,10 +44,7 @@ reads, `lazy_memory_recall` — works on ANY task in the project for an agent
 caller. This is the **lazy flywheel**: agents learning from the work of the
 agents before them, which was the day-one intent of the system.
 
-Earlier versions gated `lazy_show` / `lazy_diff` / `lazy_wait` by ownership.
-That broke the flywheel in practice — an agent told to read a prior task's
-findings was refused and had to reconstruct them from search excerpts — so read
-gating was removed. **Its absence is not a bug.**
+Reads (`lazy_show` / `lazy_diff` / `lazy_wait`) are not gated by ownership. **Their absence from the gate is not a bug.**
 
 **The one read an agent cannot make is `lazy_scratch`** (and `in:scratch` in
 `lazy_search`, which is refused for an agent caller and filtered out of its
@@ -100,11 +97,7 @@ halves have the same single cause:
 
 #### The journal contract, precisely
 
-The journal used to be described as flatly "prompt-immune". That phrasing was
-load-bearing in the wrong place: it was read as "agents may not see the journal
-at all", which cut agents off from things the human, the builder, and peer agents
-were saying *about their own work*. The contract is narrower and stricter than
-"never touches a prompt", and all four clauses hold:
+The contract is narrower and stricter than "never touches a prompt", and all four clauses hold:
 
 1. **Non-triggering.** Appending an entry never starts, resumes, or auto-reacts a
    turn. `lazy journal` emits no daemon signal; nothing hooks a turn off a
@@ -196,27 +189,19 @@ Additional per-tool caller rules:
 
 The CLI has none of this. A human running `lazy accept` is the review authority.
 
-**Gating is per-handler; the advertised list is a separate, softer decision.**
-Every one of these tools has an unconditional refusal in its handler, keyed on
-the caller identity, and that refusal is the enforcement — not what appears in
-`tools/list`.
+**Refusal is the enforcement; the tool list is only an offer.**
+Every one of these tools refuses a caller of the wrong kind, whatever the caller
+was shown.
 
-On top of that, the two lists above are also *hidden* from the caller who can
-never use them: a builder is not offered the agent-only tools, and a task agent
-is not offered the builder-only ones. A caller pays for the whole `tools/list`
-reply before its first message, so advertising tools that will only ever be
-refused is a context tax plus an invitation to waste a call. The role is known
-where the server is built — builder launches pass no task id, task agents always
-do.
+Tools a caller can never use are also left out of what it is offered: a builder
+is not shown the agent-only tools, and a task agent is not shown the
+builder-only ones. Offering tools that will only ever be refused costs context
+and invites wasted calls.
 
-Hiding is **advertisement only, never enforcement**. A hidden tool stays
-registered with its real handler, so a caller whose context still lists it — a
-stale system prompt, a resumed conversation, a hand-written client — gets that
-handler's actionable refusal rather than the useless "Unknown tool". That is the
-original rule intact: a refusal that explains itself is a better teacher than an
-absent tool. What changed is only that a caller who was never going to get one
-no longer reads the offer. Read-only turns (`lazy ask`) narrow *within* the
-role rather than instead of it.
+Leaving a tool out is never what protects it. A caller that still tries a tool
+it was not offered (a resumed conversation, a hand-written client) gets an
+explanatory refusal rather than "Unknown tool". Read-only turns (`lazy ask`)
+narrow the offer further, within the caller's role.
 
 ## 2. Two-step confirmation codes (MCP-only friction)
 
@@ -258,10 +243,7 @@ For `lazy_redo` the gap does a second job: the replacement is created under the
 SAME parent as the old task, and its branch is cut from that parent's HEAD only
 when it starts. The pause between the two calls is the caller's window to
 re-parent the replacement (`lazy_reparent`, or `lazy_edit` with `parent=""` for
-top-level) before that branch exists. The tool description says so explicitly —
-an earlier version claimed the replacement started "from current main", and a
-caller who believed it lost a task's worth of work to a branch cut from the
-inherited parent's release branch.
+top-level) before that branch exists. The tool description says so explicitly.
 
 ### Pinned clones: only a human or the builder lifts the pin
 
@@ -328,9 +310,7 @@ cannot take children.
   refuses gated merges unconditionally. The approval token must originate
   outside the builder/agent context, or the gate is decoration. The refused
   builder's `reason` is captured on the task as a pending review the human's
-  accept surfaces and attaches. (Pre-v0.22 this was a separate human-only
-  `lazy approve` command; the collapse removed it along with its stored,
-  floating approval token.) See
+  accept surfaces and attaches. See
   [protected-branches.md](protected-branches.md).
 
   **The asymmetry is agents vs. humans, not terminal vs. browser.** The web
@@ -375,12 +355,8 @@ cannot take children.
   an agent running lazy from source can drive too. In a released binary those
   overrides are not merely ignored, they are compiled out entirely.
 
-  Honest about the residual: on a machine where nothing has *ever* been
-  enrolled, first enrollment is reachable by an agent under the **host-process**
-  runner, which shares the user's account. Rotation is not, and the passphrase
-  itself is never recoverable (only a hash is stored). Containerized execution
-  — the default runner — is the real fix; this is documented rather than
-  claimed closed. See
+  Rotation requires the current passphrase, and the passphrase itself is never
+  recoverable (only a hash is stored). See
   [protected-branches.md](protected-branches.md#enrolling-the-passphrase-lazy-system-passphrase).
 - **`lazy protect`** — edits the `[protection]` section of `lazy.toml`. Deciding
   what is protected is the human's call; an agent that could turn protection off
@@ -510,16 +486,12 @@ This is the one entry here that is a *shared* restriction rather than a
 CLI-vs-MCP asymmetry, and it is listed for the same reason as the rest: it looks
 like a gap and keeps getting filed as one.
 
-`lazy start` once had an inline create mode. It was removed deliberately, on
-both surfaces at once.
+`lazy start` has no inline create mode, on either surface.
 
 Rationale: a task created inline is created and started in one irreversible
 step, so any parameter the caller forgot is unfixable by the time anyone
 notices — most damagingly `--parent`, which strands the task on the default
-branch with a running agent already on it. Wrong parenting was the single
-largest source of rework in the project, and agents in particular had a
-documented habit of starting a task first and trying to reparent it after. The
-create-then-start split makes creation cheap, reviewable and correctable:
+branch with a running agent already on it. The create-then-start split makes creation cheap, reviewable and correctable:
 `lazy edit` can still fix a backlog task's goal, prompt, code, type and parent.
 Of those, only the code can still change once the agent is running, as a rename: the
 branch, worktree and any PR/MR keep their old names ([Renaming tasks](renaming-tasks.md)).
@@ -651,8 +623,7 @@ can reconstruct that same shape and read `hidden_descendants` on the right task.
 `lazy_blocked` returns a flat array with no parent field at all — a depth limit
 there would silently drop blocked tasks with nothing in the payload explaining
 which ones or why, which is exactly the truncation the feature is designed not
-to do. Giving `lazy_blocked` a `parent_task_id` first would make `levels` a
-straightforward addition; until then the omission is the honest surface.
+to do.
 
 ## 16. Protected-file approval exists only at accept
 
@@ -664,14 +635,11 @@ decision made in three places rather than three decisions.
 
 **Unblock has no approval channel on any surface** —
 no `--approve-file` on `lazy unblock`, no `approved_files` on `lazy_unblock`,
-and no per-file question in the review page's Unblock dialog. Passing one of the
-retired parameters is an error naming accept, never a silent no-op.
+and no per-file question in the review page's Unblock dialog. Passing an
+approval parameter to unblock is an error naming accept, never a silent no-op.
 
-That is deliberate, not a gap. Unblock is a feedback channel, and a task runs
-for as many turns as the work needs: forcing an approve-or-revert decision on
-every one of them made the reviewer rule on files they had not read yet, and any
-caller that answered "none for now" destroyed the agent's committed work. A
-decision that only matters at merge time is made at merge time.
+That is deliberate, not a gap. Unblock is a feedback channel; a decision that
+only matters at merge time is made at merge time.
 
 What each surface still does:
 
@@ -754,11 +722,7 @@ outstanding, failed to produce a readable verdict, or never ran.
 `lazy accept <task> --allow-review-issues` merges anyway. It has **no MCP
 parameter**: an accept through MCP meets the review gate with no way past it.
 
-**This stays human-only, and the gate narrowed instead.** A cluster driver
-told to accept its children liberally used to hit this wall on nothing worse
-than a style nit, with no override it could reach — which argued for giving
-agents one. The answer was the other way round: a finding at medium or below no
-longer holds a merge at all, and a task in the default `low_high` mode has no
+**This stays human-only, and the gate narrowed instead.** A finding at medium or below does not hold a merge at all, and a task in the default `low_high` mode has no
 reviewer verdict to overrule in the first place. So the driver needs no
 override, because there is nothing left to override in the cases it was getting
 stuck on. What still holds a merge — a critical or high finding, a failed or
@@ -883,11 +847,6 @@ break the case the parameter exists for: splitting work across agents. Note
 that this is about *choosing* an agent, not about *installing* one's
 credentials — storing an API key stays human-only (§4), because an agent that
 can install the key it then authenticates with has minted its own access.
-
-One caveat, and it is about the runner rather than this parameter: the
-host-process runner runs an agent as you, on your machine, with your files. An
-agent there can read anything you can, no subtask required. That runner's full
-name says so, and it is not the default.
 
 ## 21. Signing in to the web dashboard is human-only
 
@@ -1049,9 +1008,7 @@ the work that belongs to the *account* rather than to a task — diagnosing or
 replacing the stored Anthropic credential of the person you are viewing as, and
 the team and membership settings an administrator manages anyway.
 
-Accepting, stopping, rejecting and closing a task were on the permitted side of
-this line until a team install began naming the person for them too. They are on
-the refused side now, and the reason is the record rather than the risk: lazy
+Accepting, stopping, rejecting and closing a task are on the refused side of this line, and the reason is the record rather than the risk: lazy
 records who merged a branch and who ended a task, and neither name available
 while viewing as somebody is true.
 
@@ -1141,11 +1098,10 @@ is holding a connection open on its behalf. The CLI simply does the waiting
 *for you*, because a person typing `lazy review` is a person who wants to sit
 and read the report. An agent is not: blocking its whole turn on someone else's
 turn burns its context window on a wait, makes the pair uninterruptible, and —
-when a review of a large diff ran long — used to end with the reviewer killed
-and the task stuck. `lazy_wait` already exists, already races several tasks at
+when a review of a large diff ran long. `lazy_wait` already exists, already races several tasks at
 once, and already returns the moment any of them settles.
 
-Neither surface has a **time limit** any more. A review of a large diff at high
+Neither surface has a **time limit**. A review of a large diff at high
 effort routinely runs many minutes and is allowed to; the guard against one that
 hangs is the agent watchdog, exactly as for a work turn. If you no longer want
 to wait for one, `lazy stop` / `lazy_stop` ends it — that stops the reviewer or

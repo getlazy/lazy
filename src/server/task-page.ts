@@ -314,11 +314,11 @@ function landingExtraActionsHtml(input: TaskPageInput): string {
   if (!reviewReason) {
     parts.push(actionDialogTemplateHtml('review', `
       <form method="post" action="/tasks/${seg}/actions/review" class="lz-action-form" data-lz-action-form>
-        <p>Run a read-only agent review of this task's work. Security and data integrity first. Issues are filed as Raises. The task stays in its current status afterwards.</p>
+        <p>Run a read-only agent review of this task's work. Security and data integrity first. Issues are recorded as findings on the report. The task stays in its current status afterwards.</p>
         <p class="rv-hint">The report stays on this page — lazy does not post reviews to a pull or merge request.</p>
         <label class="edit-check" for="lz-review-auto-fix">
           <input type="checkbox" id="lz-review-auto-fix" name="auto_fix" value="1">
-          Automatically fix — start a work turn that injects any Raises the review files
+          Automatically fix — if the review finds issues, start a work turn that hands its findings to the agent as fix feedback
         </label>
         <div class="rv-form-actions"><button type="submit" class="btn btn-primary">Review</button></div>
       </form>`));

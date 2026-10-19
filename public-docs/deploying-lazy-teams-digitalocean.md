@@ -212,7 +212,7 @@ bin/kamal setup           # once: Docker network, kamal-proxy, registry login on
 bin/kamal deploy --skip-push --version=<release-tag>   # the release tag you are deploying, e.g. v0.23.1234
 ```
 
-Use `--skip-push` when deploying the **pre-built** image from ghcr without rebuilding on your laptop. Images built from `lazy-teams/deploy/Dockerfile` include a `service=lazy_teams` label so Kamal can prune old images cleanly; older published tags without that label still deploy, but pruning may leave unused images behind.
+Use `--skip-push` when deploying the **pre-built** image from ghcr without rebuilding on your laptop. Images built from `lazy-teams/deploy/Dockerfile` include a `service=lazy_teams` label so Kamal can prune old images cleanly.
 
 **First boot takes a minute or two** while the database is prepared and Rails boots. Watch logs:
 
@@ -251,7 +251,7 @@ bin/kamal deploy --skip-push --version=NEW_TAG
 
 Project data in the two volumes survives container replacement. Your projects restart on the new version automatically, within a minute or so of the app coming up.
 
-If your install predates the image-layout change, update the repository checkout along with the image tag. The storage volume's mount point inside the image moved from `/rails/storage` to `/lazy/lazy-teams/storage` — the `lazy_teams_storage` volume and your data are unchanged — and deploying the new image under the old `deploy.yml` would mount the volume where the app no longer looks, so the app would come up against an empty database. Deploying from an up-to-date checkout is all it takes.
+Update the repository checkout along with the image tag: the storage volume mounts at `/lazy/lazy-teams/storage` inside the image, and the `deploy.yml` in the same checkout carries that mount.
 
 ## Backing up and moving off the box
 
@@ -283,7 +283,7 @@ DigitalOcean **Volumes** (block storage) can hold tarball backups off-droplet; t
 
 ## What this guide cannot verify for you
 
-The steps above were written and validated against the Kamal configuration and production boot requirements in the repository. A full end-to-end deploy needs **your** DigitalOcean account and registry credentials. Run these yourself and treat the output as the source of truth:
+A full end-to-end deploy needs **your** DigitalOcean account and registry credentials. Run these yourself and treat the output as the source of truth:
 
 ```bash
 cd lazy-teams

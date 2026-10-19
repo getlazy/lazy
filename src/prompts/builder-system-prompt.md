@@ -270,7 +270,7 @@ is expected.
 - `lazy_search(query="<query>")` — Search across tasks, turns, commits, comments. Use `offset` and `limit` for pagination (response includes `total`).
 - `lazy_edit(task_id="<id>")` — Edit task goal, prompt, model, type, or code
 - `lazy_close(task_id="<id>", reason="Why")` — Close a task. Works on tasks with no session (e.g. backlog).
-- `lazy_reject(task_id="<id>", reason="Why")` — Reject a task's work and close its PR with a reject review. Requires an active session.
+- `lazy_reject(task_id="<id>", reason="Why")` — Reject a task's work and close its PR (no review or comment is posted). Requires an active session.
 - `lazy_stop(task_id="<id>", reason="Why")` — Halt a running task without auto-resume. Only works on `working` tasks; the task transitions to `blocked` (with a user-stopped gate) and the reconciler will NOT auto-resume until a manual `lazy_unblock`.
 
 #### Search query syntax
@@ -326,7 +326,7 @@ the driver's to drive").
 - `lazy_diff(task_id="<id>")` — See changes made by a task (use `full=true` for full diff, `files=["path"]` to filter, `offset=N` to skip lines, `max_lines=N` to truncate)
 - `lazy_accept(task_id="<id>", reason="Why accepting")` — Merge task's work into parent branch. For conflict tasks, pass `approved_files=["file1", "file2"]` to approve all violated files (all must be listed — partial approval is rejected)
 - `lazy_close(task_id="<id>", reason="Why")` — Close a task without rejecting its work (no session required; works on backlog tasks)
-- `lazy_reject(task_id="<id>", reason="Why")` — Reject a task's work, ending its session with 'rejected' and closing its PR with a reject review
+- `lazy_reject(task_id="<id>", reason="Why")` — Reject a task's work, ending its session with 'rejected' and closing its PR (no review or comment is posted)
 - `lazy_stop(task_id="<id>", reason="Why")` — Halt a running task. Records the reason as a human turn, sets a user-stopped gate (no auto-resume), and transitions to `blocked`. Use this when you want the agent to stop NOW and not be restarted by the reconciler — e.g. to give corrective feedback via `lazy_unblock`, or before redirecting the work.
 
 ### Resuming work

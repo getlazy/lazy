@@ -5,6 +5,8 @@ where the tokens went. The same view appears on the dashboard (the **Token
 budget** box), on a Lazy Teams project's **Usage** page (the "Token usage" link on the project page), and to the builder agent through
 the `lazy_usage_limits` tool, which uses it to plan batches of work.
 
+![The Token budget box at the bottom of the dashboard home page: a note that no usage-limit readings exist yet, then tokens by harness and by day](images/topics/token-budget.png)
+
 ```
 lazy stats budget          # human-readable
 lazy stats budget --json   # machine-readable

@@ -10,7 +10,8 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildDocsSite, DEFAULT_EXCLUDED_DIRS } from '../../src/docs/site';
+import { buildDocsSite, DEFAULT_EXCLUDED_DIRS, withOutline, OUTLINE_MIN_H2 } from '../../src/docs/site';
+import type { DocsNav } from '../../src/docs/nav';
 
 let root: string;
 let docsDir: string;
@@ -252,4 +253,225 @@ describe('docs site generator', () => {
       }
     });
   });
+
+  // INVARIANT: a page title is plain text escaped exactly once. Taking it from
+  // rendered heading HTML kept entities like `&#39;`, which the template then
+  // escaped again — readers saw "Reaching a task&amp;#39;s dev server".
+  test('titles with quotes, ampersands and code are escaped once', async () => {
+    await writeDoc('t.md', "# A task's `lazy.toml` & <b>more</b>\n");
+    const manifest = await buildDocsSite({ docsDir, outDir });
+    expect(manifest.pages[0]!.title).toBe("A task's lazy.toml & more");
+    const html = await readFile(join(outDir, 't', 'index.html'), 'utf-8');
+    expect(html).toContain("<title>A task's lazy.toml &amp; more — lazy docs</title>");
+    expect(html).not.toContain('&amp;#39;');
+  });
+});
+
+describe('navigation manifest', () => {
+  const nav = (redirects: { from: string; to: string }[] = []): DocsNav => ({
+    sections: [
+      { title: 'Start here', intro: 'Begin here.', items: [{ path: '', title: 'Overview' }] },
+      { title: 'Guides', intro: 'Do things.', items: [{ path: 'one' }, { path: 'two', title: 'Second' }] },
+      {
+        title: 'Reference',
+        intro: 'Look things up.',
+        items: [{ dir: 'reference/cli', title: 'CLI' }, { group: 'Config', items: [{ path: 'conf' }] }],
+      },
+    ],
+    redirects,
+  });
+
+  beforeEach(async () => {
+    await writeDoc('one.md', '# One\n\n## Part\n');
+    await writeDoc('two.md', '# Two\n');
+    await writeDoc('conf.md', '# Conf\n');
+    await writeDoc('reference/cli/b.md', '# lazy b\n');
+    await writeDoc('reference/cli/a.md', '# lazy a\n\n[one](../../one.md)\n');
+  });
+
+  test('sidebar marks the current page, breadcrumbs name the section, prev/next follow the manifest', async () => {
+    const manifest = await buildDocsSite({ docsDir, outDir, nav: nav() });
+    expect(manifest.problems).toEqual([]);
+    const two = await readFile(join(outDir, 'two', 'index.html'), 'utf-8');
+    expect(two).toContain('<a href="../two/" aria-current="page">Second</a>');
+    expect(two).toContain('<a href="../#guides">Guides</a> › <span aria-current="page">Second</span>');
+    expect(two).toContain('class="prev" href="../one/"');
+    // `dir` items expand sorted, so reference/cli/a follows two.
+    expect(two).toContain('class="next" href="../reference/cli/a/"');
+
+    const a = await readFile(join(outDir, 'reference', 'cli', 'a', 'index.html'), 'utf-8');
+    expect(a).toContain('href="../../../one/"');
+    expect(a).toContain('Reference</a> › CLI › <span aria-current="page">lazy a</span>');
+    expect(a).toContain('class="next" href="../../../reference/cli/b/"');
+    expect(a).not.toMatch(/href="\/[^/]/);
+  });
+
+  test('the index renders sections with their intros', async () => {
+    await buildDocsSite({ docsDir, outDir, nav: nav() });
+    const index = await readFile(join(outDir, 'index.html'), 'utf-8');
+    expect(index).toContain('<h2 class="group" id="guides">Guides</h2>');
+    expect(index).toContain('<p class="intro">Do things.</p>');
+    expect(index).toContain('href="./reference/cli/b/"');
+    // The version index rewrite inserts before </main>.
+    expect(index).toContain('</main>');
+  });
+
+  // INVARIANT: a `{ dir }` group with an index page leads with that index, and outside the
+  // directory only the index is listed. The generated CLI reference is 100+ pages; listing them
+  // all on every page buried the rest of the navigation, and the overview sat mid-list.
+  test('a dir with an index leads with it and collapses outside the directory', async () => {
+    await writeDoc('reference/cli/index.md', '# CLI reference\n');
+    const manifest = await buildDocsSite({ docsDir, outDir, nav: nav() });
+    expect(manifest.problems).toEqual([]);
+    const two = await readFile(join(outDir, 'two', 'index.html'), 'utf-8');
+    expect(two).toContain('class="next" href="../reference/cli/index/"');
+    expect(two).toContain('href="../reference/cli/index/"');
+    // The sidebar now keeps the group in a collapsed <details> instead of omitting its pages.
+    expect(two).toContain('<details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">');
+    // The page body (not the sidebar's All pages list) shows only the directory's index.
+    const index = (await readFile(join(outDir, 'index.html'), 'utf-8')).split('<nav class="sidebar"')[0]!;
+    expect(index).toContain('href="./reference/cli/index/"');
+    expect(index).not.toContain('href="./reference/cli/b/"');
+    const a = await readFile(join(outDir, 'reference', 'cli', 'a', 'index.html'), 'utf-8');
+    expect(a).toContain('href="../../../reference/cli/b/"');
+    expect(a).toContain('class="prev" href="../../../reference/cli/index/"');
+  });
+
+  test('redirect stubs are relative and links to a redirect source resolve', async () => {
+    await writeDoc('two.md', '# Two\n\n[old](./old.md) [oldfrag](./old.md#x)\n');
+    const manifest = await buildDocsSite({ docsDir, outDir, nav: nav([{ from: 'old', to: 'one#part' }]) });
+    expect(manifest.problems).toEqual([]);
+    const stub = await readFile(join(outDir, 'old', 'index.html'), 'utf-8');
+    expect(stub).toContain('<meta http-equiv="refresh" content="0; url=../one/#part">');
+    expect(stub).toContain('<link rel="canonical" href="../one/#part">');
+    expect(stub).toContain('<a href="../one/#part">One</a>');
+    const two = await readFile(join(outDir, 'two', 'index.html'), 'utf-8');
+    expect(two).toContain('href="../old/"');
+  });
+
+  test('--local writes index.html into every link, including redirect stubs', async () => {
+    await writeDoc('two.md', '# Two\n\n[old](./old.md) [one](./one.md#part)\n');
+    const manifest = await buildDocsSite({ docsDir, outDir, nav: nav([{ from: 'old', to: 'one#part' }]), local: true });
+    expect(manifest.problems).toEqual([]);
+    const stub = await readFile(join(outDir, 'old', 'index.html'), 'utf-8');
+    expect(stub).toContain('content="0; url=../one/index.html#part"');
+    expect(stub).toContain('<link rel="canonical" href="../one/index.html#part">');
+    expect(stub).toContain('<a href="../one/index.html#part">One</a>');
+    const two = await readFile(join(outDir, 'two', 'index.html'), 'utf-8');
+    expect(two).toContain('href="../old/index.html"');
+    expect(two).toContain('href="../one/index.html#part"');
+    expect(two).toContain('<a href="../two/index.html" aria-current="page">Second</a>');
+    expect(two).toContain('<a href="../index.html#guides">Guides</a>');
+    expect(two).toContain('class="prev" href="../one/index.html"');
+    expect(two).toContain('class="next" href="../reference/cli/a/index.html"');
+    const index = await readFile(join(outDir, 'index.html'), 'utf-8');
+    expect(index).toContain('href="./reference/cli/b/index.html"');
+  });
+
+  test('images under images/ are copied and resolve', async () => {
+    await mkdir(join(docsDir, 'images'), { recursive: true });
+    await writeFile(join(docsDir, 'images', 'shot.png'), 'png', 'utf-8');
+    await writeDoc('conf.md', '# Conf\n\n![shot](images/shot.png)\n');
+    const manifest = await buildDocsSite({ docsDir, outDir, nav: nav(), strict: true });
+    expect(manifest.assets).toEqual(['images/shot.png']);
+    expect(await readFile(join(outDir, 'images', 'shot.png'), 'utf-8')).toBe('png');
+    expect(await readFile(join(outDir, 'conf', 'index.html'), 'utf-8')).toContain('src="../images/shot.png"');
+  });
+
+  // INVARIANT: strict lists EVERY problem, not the first, so one build tells a
+  // writer everything to fix.
+  test('strict fails with every problem listed', async () => {
+    await writeDoc('stray.md', '# Stray\n\n[gone](./gone.md) [bad](./one.md#nope) [internal](../docs/x.md) [raw](#anchored)\n\n<a id="anchored"></a>\n');
+    const n = nav([{ from: 'moved', to: 'one#missing' }, { from: 'moved2', to: 'nowhere' }]);
+    n.sections[1]!.items.push({ path: 'ghost' });
+    const error = await buildDocsSite({ docsDir, outDir, nav: n, strict: true }).then(
+      () => null,
+      (err: Error) => err,
+    );
+    expect(error?.message).toContain('stray.md: broken link: ./gone.md');
+    expect(error?.message).toContain('stray.md: broken link: ./one.md#nope');
+    expect(error?.message).toContain('stray.md: link into the internal docs/ tree');
+    expect(error?.message).not.toContain('#anchored');
+    expect(error?.message).toContain('navigation lists ghost, but public-docs/ghost.md does not exist');
+    expect(error?.message).toContain('stray.md is not listed in the navigation');
+    expect(error?.message).toContain('redirect moved -> one#missing: no heading #missing on one');
+    expect(error?.message).toContain('redirect moved2 -> nowhere: no page at nowhere');
+  });
+
+  test('strict reports duplicates, a redirect over a real page, and data-id is no anchor', async () => {
+    await writeDoc('two.md', '# Two\n\n[x](./one.md#fake)\n');
+    await writeDoc('one.md', '# One\n\n<a data-id="fake"></a>\n');
+    const n = nav([{ from: 'conf', to: 'one' }]);
+    n.sections[1]!.items.push({ path: 'one' });
+    const error = await buildDocsSite({ docsDir, outDir, nav: n, strict: true }).then(
+      () => null,
+      (err: Error) => err,
+    );
+    expect(error?.message).toContain('navigation lists one more than once');
+    expect(error?.message).toContain('redirect conf: a page still exists at that path');
+    expect(error?.message).toContain('two.md: broken link: ./one.md#fake');
+    // The real page is never overwritten by the stub.
+    expect(await readFile(join(outDir, 'conf', 'index.html'), 'utf-8')).toContain('<h1 id="conf">');
+  });
+});
+
+describe('collapsible sidebar', () => {
+  const nav: DocsNav = {
+    sections: [
+      { title: 'Guides', intro: 'Do things.', items: [{ path: 'one' }, { path: 'two' }] },
+      {
+        title: 'Reference',
+        intro: 'Look things up.',
+        items: [{ dir: 'reference/cli', title: 'CLI' }, { group: 'Config', items: [{ path: 'conf' }] }],
+      },
+      { title: 'Architecture', intro: 'Parts.', items: [{ dir: 'architecture', title: 'Architecture' }] },
+    ],
+    redirects: [],
+  };
+
+  beforeEach(async () => {
+    await writeDoc('one.md', '# One\n');
+    await writeDoc('two.md', '# Two\n');
+    await writeDoc('conf.md', '# Conf\n');
+    await writeDoc('reference/cli/a.md', '# lazy a\n');
+  });
+
+  // INVARIANT: only the branch holding the current page starts open; every other
+  // section and sub-group is collapsed. The reader sees where they are without
+  // scrolling a tree of every page.
+  test('only the current branch is open', async () => {
+    await buildDocsSite({ docsDir, outDir, nav });
+    const html = await readFile(join(outDir, 'reference', 'cli', 'a', 'index.html'), 'utf-8');
+    const opens = [...html.matchAll(/<details class="branch[^"]*"( open)?><summary>([^<]*)</g)].map((m) => [m[2], !!m[1]]);
+    expect(opens).toEqual([
+      ['Guides', false],
+      ['Reference', true],
+      ['CLI', true],
+      ['Config', false],
+      ['All pages', false],
+    ]);
+  });
+
+  // INVARIANT: "All pages" is the last, always-collapsed branch and the only
+  // place the full page list lives; an empty nav directory breaks nothing.
+  test('All pages is last, collapsed, and lists every page', async () => {
+    const manifest = await buildDocsSite({ docsDir, outDir, nav, strict: true });
+    const html = await readFile(join(outDir, 'one', 'index.html'), 'utf-8');
+    const summaries = [...html.matchAll(/<summary>([^<]*)</g)].map((m) => m[1]);
+    expect(summaries.at(-1)).toBe('All pages');
+    expect(html).toContain('<details class="branch all-pages"><summary>All pages');
+    const list = html.slice(html.indexOf('all-pages'));
+    for (const page of manifest.pages) expect(list).toContain(`href="../${page.path}/"`);
+  });
+});
+
+// INVARIANT: a long page gets a static "On this page" outline built from its
+// existing h2 anchors (no script, no URL change); a short page gets none.
+test('long pages get an On this page outline; short pages do not', () => {
+  const h = (n: number) => Array.from({ length: n }, (_, i) => `<h2 id="s${i}"><a class="anchor" href="#s${i}" aria-hidden="true">#</a>Part ${i}</h2>\n<p>x</p>`).join('\n');
+  const long = withOutline(`<h1 id="t">T</h1>\n${h(OUTLINE_MIN_H2)}`);
+  expect(long).toContain('<nav class="toc"');
+  expect(long).toContain('<a href="#s0">Part 0</a>');
+  expect(long.indexOf('class="toc"')).toBeGreaterThan(long.indexOf('</h1>'));
+  expect(withOutline(`<h1 id="t">T</h1>\n${h(OUTLINE_MIN_H2 - 1)}`)).not.toContain('class="toc"');
 });

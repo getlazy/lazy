@@ -10,15 +10,17 @@ It is the shape you want when you have a pile of related work that should land
 in one branch and be reviewed as one change: everything a review turned up,
 every follow-up from a release, every item on a checklist.
 
+For how a cluster fits into review and accept, see [Review and accept](explanation/review-and-accept.md).
+
 ## Creating one
 
 ```bash
 lazy create --type cluster --goal "Fix everything the API review found"
 ```
 
-The type is available everywhere a type is: `lazy create --type cluster`,
-`lazy edit <task> --type cluster`, the `type` field of the `lazy_create` MCP
-tool, and the type dropdown on the dashboard's create form.
+The type is available everywhere a type is: the type dropdown on the dashboard's
+create form, `lazy create --type cluster`, `lazy edit <task> --type cluster`,
+and the `type` field of the `lazy_create` MCP tool.
 
 Give the cluster a prompt that says what the children are for. You can list the
 work in the prompt and let the cluster create the subtasks itself, or create the
@@ -50,11 +52,7 @@ Every turn a cluster takes, it runs under a contract lazy injects for you:
 - Read what that child came back with — its report and its raised items, not its
   diff. By default a child has already reviewed its own work inside its own
   session before it parked ([the review paradigm](review-paradigm.md)), so the
-  work that reaches the driver has been read once and fixed once. A cluster of a
-  dozen children would run out of context if it read every diff.
-- Accept it, unless something serious is recorded. That is the instruction the
-  driver has: accept is the default, and a round is a full agent turn spent on
-  work nobody has shown is needed. "Serious" means a security or data-integrity
+  work that reaches the driver has been read once and fixed once.- Accept it, unless something serious is recorded. Accept is the default. "Serious" means a security or data-integrity
   problem, a capability lost, a stated goal not met, or a finding at critical or
   high severity — not a nit, and not polish. The driver writes the child's
   verdict in its journal first, so you can read afterwards how many rounds each
@@ -68,8 +66,7 @@ Every turn a cluster takes, it runs under a contract lazy injects for you:
   justify a cold second read — a security or data-integrity change, a migration,
   something it cannot judge from the report. It sets that child's review mode to
   `separate`, and then that child gets a reviewer of its own whose verdict gates
-  the accept. It costs three to four times the wall-clock and the tokens, which
-  is why it is per child and not how a cluster runs by default. A child whose
+  the accept. It is per child, not how a cluster runs by default. A child whose
   separate review stalls — a decision only a person can make, findings the driver
   must weigh, the round cap, or a review that failed or never ran — is handed
   back to the driver with the findings, not parked on you. Whatever it decides,
@@ -78,18 +75,10 @@ Every turn a cluster takes, it runs under a contract lazy injects for you:
 
 ### How many children run at once
 
-That is the driver's call, and lazy does not second-guess it. There is no cap,
-no queue and no setting.
-
-Running children one at a time would avoid ever merging siblings' work, but
-those merges are mostly trivial, and serialisation is slow enough to dominate
-everything else. The judgement about when running children side by side is
-safe lives with the agent that can actually see the work.
+That is the driver's call. There is no cap, no queue and no setting.
 
 ### How many rounds one child may have
 
-A cluster runs unattended, so one child that keeps not-quite-passing review could
-otherwise absorb any number of agent turns with nobody watching the spend.
 `[cluster] max_child_fix_rounds` (default **3**) bounds it: after that many rounds
 on the same child, lazy refuses the driver's next send-back and tells it to
 accept the child, close it, or set it aside with a question for you.
@@ -130,14 +119,9 @@ protected change, and you decide on all of them once, at the cluster's accept.
 ### It keeps its own branch current
 
 A cluster can sync itself: it merges its own branch on origin, then its parent,
-into its branch. This matters on a long run. Work keeps landing on the parent
-while the cluster runs, and without the sync every child would branch from the
-base the parent had when the cluster began, so a fix that landed an hour ago
-would never reach any of them. Children started after the sync branch from the
-cluster's current state.
-
-The driver is told to do this before starting a new wave rather than after every
-accept, because a sync costs a merge for every child currently running.
+into its branch. Children started after the sync branch from the cluster's current
+state. The driver is told to sync before starting a new wave rather than after
+every accept.
 
 The sync merges everything outstanding and stops at the first conflict, which
 the driver resolves itself before carrying on — so a conflict costs one cycle,
@@ -166,15 +150,19 @@ A child created without an agent runs on the driver's own agent profile, and so 
 
 ## Watching it
 
-`lazy show <cluster>` prints the cluster's progress: how many children have been
+On the **dashboard**, the progress line (`Cluster: 0/2 accepted`) is at the top of the cluster's own page, with each child linked:
+
+![A cluster task's page in the dashboard. Under the tab strip, a line reads "Cluster: 0/2 accepted" with "2 subtasks: 2 backlog" beneath it.](images/explanation/cluster-progress.png)
+
+The dashboard's **Clusters** page lists every cluster with its progress and a table of its children, their statuses and goals:
+
+![The dashboard Clusters page: an explanation of cluster tasks, then the cluster demo-cluster with "0/2 accepted" and a table listing its two backlog children.](images/explanation/clusters-page.png)
+
+On the **command line**, `lazy show <cluster>` prints the cluster's progress: how many children have been
 accepted out of how many are still expected to land, which are running, which
-are deferred, and how many were closed. The same line is at the top of the
-cluster's page on the dashboard, with each child linked, and the dashboard's
-**Clusters** page lists every cluster with its progress and its children.
+are deferred, and how many were closed.
 `lazy show <cluster> --json` carries the same numbers, under `cluster_progress`.
-That key was called `loop_progress` before the type was renamed, and there is no
-second spelling: a script that reads the old name finds nothing there, exactly as
-it would for a task that is not a cluster.
+For a task that is not a cluster the key is absent.
 
 In **Lazy Teams** the same line is on the cluster's own page, and the project nav
 has a page listing every cluster with its progress and its children — including
@@ -194,10 +182,8 @@ lazy unblock <cluster>
 ```
 
 With one exception: **if you add a child to a cluster that is parked after its
-own turn, lazy starts it again by itself**, telling it which child arrived. That
-is the only case in lazy where something other than you starts a turn on a local
-event, and it is limited to cluster tasks — adding work to a cluster should not
-need a second step to take effect.
+own turn, lazy starts it again by itself**, telling it which child arrived. This
+applies to cluster tasks only.
 
 Three things to know about it:
 
@@ -220,11 +206,6 @@ meant as a restart. Unblocking it obviously does, but so does **asking it a
 question with `lazy ask`, or running a review on it**: both run the agent, and a
 completed turn clears the stop. From then on the cluster is an ordinary parked
 cluster again, so the next child added to it starts a turn.
-
-This matters if you are relying on a stop. A cluster you stopped, read, and then
-handed more work to is no longer stopped — it will pick that work up. If you
-need it to stay parked, leave it alone, or close the children you are not ready
-for it to run.
 
 ### If a cluster's turn is killed
 

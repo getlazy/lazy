@@ -459,7 +459,7 @@ export async function commandAsk(args: string[]): Promise<void> {
 export function askUsage(): void {
   console.log(`Usage: lazy ask <id> [-m|--message "..."] [--no-wait] [--json] [--override-usage-pause]
 
-Ask a question and print the answer. Read-only either way — an ask never writes.
+Ask a question and print the answer. Read-only either way — an ask never changes code or the task's status.
 
 <id> resolves the same way as 'lazy show': a TASK first, then a stored
 CONVERSATION.
@@ -496,7 +496,8 @@ Options:
                         Ignored on the record route, which answers immediately.
   --json                Print the answer as JSON instead of text.
                         Task:         {type, taskId, fullTaskId, answer,
-                                       sessionId, turnNumber, usage, warnings}
+                                       sessionId, turnNumber, derivedFrom,
+                                       provenance, usage, warnings}
                         Conversation: {type, conversationId, sessionId, answer,
                                        chunks, relevantChunks, usage, warnings}
                         Errors are printed as {"error": "..."} with exit 1.

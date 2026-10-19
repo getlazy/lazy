@@ -12,6 +12,8 @@ When you create a task, the **Agent** field lets you pick which agent runs it.
 The form preselects your project's default (see below). Pick another agent to
 override for that task only.
 
+![The new-task form's Agent field, preselected with the project default, with the When to use each agent list open beneath it](images/teams-topics/agents-new-task-picker.png)
+
 When an agent's configuration says when to use it (its `description`), a
 **When to use each agent** list opens beneath the field — for example "use this
 one whenever a security aspect comes up". It is guidance for your choice; the
@@ -34,8 +36,14 @@ filling in a task form.
 If a project's agents cannot be read just now, the form falls back to the ones
 lazy ships with rather than guessing.
 
-The agent is fixed for a task once work has started. Change it only on tasks
-still in the backlog, before the first turn.
+You can change a task's agent with **Edit** after work has started, as long as
+the task is not finished or closed and no turn is running (wait for it to stop
+or block, or stop it first). The change applies to later turns and persists on
+the task. If the new agent runs a different harness, the next turn starts a
+fresh agent conversation, because one harness's conversation cannot be resumed
+by another; between two agents on the same harness the conversation continues.
+Unless you set a model and effort in the same edit, they are re-picked for the
+new agent.
 
 ### Long prompts
 
@@ -49,6 +57,8 @@ You do not have to shorten feedback because a task has a long history.
 Team **admins** set the default under **Settings → General** on a project page. The control
 shows what the repository's lazy.toml specifies and what this Lazy Teams install
 overrides, so you always see both values and which one wins.
+
+![Settings → General on a project: the Default agent control with the When to use each agent list beside it](images/teams-topics/agents-project-default.png)
 
 Clearing the override returns new tasks to the repository default. Changing the
 default affects tasks that have not started yet; a task already running keeps the

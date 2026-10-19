@@ -701,7 +701,9 @@ Behavior:
   - If no conflicts: merges and cleans up the worktree/branch
   - Allows uncommitted changes in the main repo; merge will fail naturally if conflicts occur
   - Accept reason is stored as a comment on the task
-  - When a GitHub PR exists, the reason is posted as an approving PR review
+  - Lazy writes no review or comment to a PR. The one exception: with [remote]
+    auto_approve = true and a protected target, the reason is the body of the
+    approving review the forge needs before it will merge
   - With --wait: if the merge fails (e.g., required CI checks pending), polls
     check status every 10s for up to 10 minutes, then retries the merge
 
@@ -716,10 +718,10 @@ Protected merges ([protection] in lazy.toml):
     repository: 'lazy system passphrase set'. With nothing enrolled here, a
     protected merge refuses with that instruction rather than prompting.
   - A review recorded by the builder's refused accept is shown before the
-    prompt and attached to the merge (task comment and PR/MR review).
+    prompt and attached to the merge (the [Accepted] task comment).
 
 Raised items (agent questions/decisions that gate accept):
-  - Accept refuses while any raised item is open. Every open item must be
+  - Accept refuses while any BLOCKING raised item is open. Every such item must be
     responded to, promoted (subtask or peer), or dismissed — all-or-nothing.
   - Interactive TTY with no flags: walks each open item (content + options)
     and prompts respond / promote-subtask / promote-peer / dismiss. --yes does
@@ -728,8 +730,8 @@ Raised items (agent questions/decisions that gate accept):
     --respond-raised for each open id.
   - Comments stay pending until accept/unblock writes them; change the
     resolution on the review page before then to undo.
-  - See also: lazy show (lists raised items), lazy followup (triage follow-ups —
-    those do NOT gate accept).
+  - See also: lazy show (lists raised items), lazy raised (triage non-blocking
+    raised items — those do NOT gate accept).
 
 Conflict Resolution:
   Interactive mode (TTY available, no --yes flag):

@@ -56,19 +56,6 @@ Before any accept merges, lazy computes:
 Anything that survives step 4 is a resurrection. Paths the target never had, or
 that it deleted and later re-added itself, are not flagged.
 
-### Why not `git diff --diff-filter=D main...parent`
-
-That command is the intuitive one and it does **not** work. A three-dot diff is
-taken from the merge base, and in this topology the resurrected file has no
-version at the merge base — so it appears in neither side of that diff. Run
-against the topology above it returns nothing at all.
-
-The related idea of checking that `merge-base(parent, main)` is recent enough also
-fails, for a different reason: by accept time the parent has already merged `main`,
-so its merge base *is* `main`'s tip. The staleness signal is gone precisely when
-you would want to read it. The guard therefore asks the direct question — "would
-this merge un-delete anything?" — instead of a proxy for it.
-
 ## When it fires
 
 The accept is refused, nothing is merged, and the message names each file, the
@@ -112,21 +99,14 @@ behind the work that just landed, which is the stale-base condition above. Accep
 says so, and both `lazy accept`'s pre-flight note and the post-accept warning
 point at `lazy sync`.
 
-Lazy does **not** sync those children for you. Merging into somebody else's
-worktree as a side effect of an accept the human asked for on a different task is
-a hidden side effect lazy avoids by design, and a conflict raised there
-would strand a task nobody is watching. Upstream merge is `lazy sync`'s job. The
-resurrection guard is the backstop for when the advice is ignored.
+Lazy does **not** sync those children for you; upstream merge is `lazy sync`'s
+job. The resurrection guard is the backstop if the advice is ignored.
 
 ## Scope and limits
 
-- **The guard is always on** and applies to every accept, not just long-lived parent tasks.
-  The hazard is a property of merge topology, not of release semantics — any
-  squash-accepted parent with a stacked child can produce it. It adds no config.
+- **The guard is always on** and applies to every accept. It adds no config.
 - **File granularity only.** A file that survives on the target but has *hunks*
-  reverted inside it by the same mechanism is not detected. That defect class is
-  real, but hunk-level detection has no clean
-  signal to key off and would fire constantly on ordinary merges.
+  reverted inside it is not detected.
 - **Deletions made only inside a merge commit** are not attributed to a deleting
   commit; `git log --diff-filter=D` does not report them by default. The file-level check itself still catches the
   re-add — only the "deleted by" attribution would be missing.

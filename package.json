@@ -16,6 +16,7 @@
     "test:all": "bun run generate:version && bun run ensure:agent-placeholder && LAZY_SLOW_TESTS=1 bun test --timeout 30000",
     "ensure:agent-placeholder": "test -f lazy-agent || echo placeholder > lazy-agent",
     "prepare": "bun run generate:version && bun run ensure:agent-placeholder",
+    "docs:cli": "bun run generate:version && bun run ensure:agent-placeholder && bun run scripts/gen-cli-reference.ts",
     "typecheck": "bun node_modules/typescript/lib/tsc.js --noEmit"
   },
   "devDependencies": {

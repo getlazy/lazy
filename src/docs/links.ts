@@ -111,6 +111,7 @@ export const DOCS_PAGES = {
     path: 'self-hosting-lazy-teams#task-turns',
     source: 'self-hosting-lazy-teams.md',
   },
+  'store-backups-mount-point': { path: 'store-backups#a-store-that-is-a-mount-point', source: 'store-backups.md' },
   'state-machine': { path: 'state-machine', source: 'state-machine.md' },
   'troubleshooting': { path: 'troubleshooting', source: 'troubleshooting.md' },
   'troubleshooting-daemon': { path: 'troubleshooting#the-daemon-wont-start', source: 'troubleshooting.md' },

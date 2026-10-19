@@ -5,11 +5,10 @@ traffic flows through. A **request plugin** receives the parsed JSON body of eac
 outbound request just before it is forwarded upstream, and may return a
 replacement body.
 
-> **Repository plugins are currently not run.** Lazy never runs code from the
+> **Repository plugins are not run.** Lazy never runs code from the
 > repository inside its own process on the host — on your own machine or on a
 > shared Lazy Teams host. Files in `.lazy/plugins/` are ignored; the daemon log
-> and `lazy doctor` name them. The rest of this page describes how plugins are
-> written and how they would behave, for when a contained way to run them exists.
+> and `lazy doctor` name them. The rest of this page describes the plugin format.
 
 Lazy ships the **seam**, not plugins. There is no built-in plugin and nothing to
 turn off: a project extends the proxy by dropping a module into
@@ -121,7 +120,7 @@ Plugins are loaded from the **main project checkout only**, never from a task
 worktree. A worktree is agent output; a plugin appearing there would let one task
 agent rewrite every other agent's outbound requests.
 
-That is exactly why they are not run today: a plugin is code from the
+That is why they are not run: a plugin is code from the
 repository, which an agent can write and get accepted, and it would run with
 the daemon's full privileges on the host. See
 [Managed mode](managed-config.md#code-from-the-repository) for how lazy treats

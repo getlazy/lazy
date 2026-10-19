@@ -13,8 +13,7 @@ Lazy Teams is a web application your team runs on a server you control. This gui
 
 You do **not** need Ruby, Bun, lazy, or a git checkout on the host — pull the published image and go.
 
-Running on a **Mac** instead? The published image cannot run agent turns there, because Docker Desktop does not pass hardware virtualization into containers. A route that runs Lazy Teams directly on the Mac, without Docker, exists but is not published yet.
-
+Running on a **Mac** instead? The published image cannot run agent turns there, because Docker Desktop does not pass hardware virtualization into containers.
 ## Quick install (pull-and-go)
 
 Copy the deploy bundle from a [lazy release](https://github.com/getlazy/lazy/releases) (the `lazy-teams/deploy/` directory) onto your server, or clone the repository if you prefer.
@@ -499,24 +498,13 @@ docker compose exec app bin/rails lazy:adopt_store \
 ```
 
 The store is always **copied** into the fleet's own layout. Your original
-directory is only read, never written — not even to clear a stale lock. A
-`COPY=1` left over from an older script is ignored, with a note saying so.
+directory is only read, never written — not even to clear a stale lock.
 
 Because it is a copy, do the adoption with the local daemon stopped (step 1).
 A copy of a store that a daemon is still writing can catch a task mid-write, and
 tasks that were `working` in it may be resumed by the new project. The command
 prints a warning about this before it copies, and refuses if the store's lock
 shows something is serving it.
-
-A project adopted by an older version of this command may still be serving your
-original directory in place. It keeps working, and it does not stop you adopting
-the same store again as a copy: the command prints a warning naming that project,
-because its daemon still writes the directory being copied. Pick a different
-`NAME`, or remove the old project first with `bin/native-rails
-lazy:reset_projects` (your original is not deleted). Both commands name the
-environment and database they use before doing anything; run from a checkout's
-own database, `lazy:reset_projects` refuses to delete unless you add
-`ALLOW_DEV_DB=1`.
 
 The adoption then starts the project, and prints each step as it happens —
 creating the machine and pulling its image, restoring or cloning the repository
@@ -531,7 +519,7 @@ The project page shows the same steps.
 | `AS` is not a member of the team, or has no connection for the repository's forge | Name a member of `TEAM`, and have them connect GitHub or GitLab in their settings first. The clone runs as them. |
 | The store's lock is still held | Something is serving that store right now. Stop the daemon on the machine that owns it (step 1); a copy taken now would be a snapshot in the middle of a write. |
 | The store's format is newer than this install understands | Upgrade this install first. Older code reading a newer store drops what it does not understand, silently. |
-| The store still names people by old account numbers | It was written before Lazy named people by email. Back it up, run the attribution rewrite the error prints, then adopt again. |
+| The store still names people by account numbers | Back it up, run the attribution rewrite the error prints, then adopt again. |
 | The store names people this install cannot identify | Its rows were written by a different Lazy Teams install, whose account numbering is not this one's. Adopting would show one person's work under another person's name. Create the matching accounts first, or adopt into the install that wrote it. |
 
 A store from a personal, single-person install names nobody and passes the last
@@ -730,7 +718,7 @@ Git requests are bounded so that git cannot crowd out the rest of the install:
 
 ## Task turns
 
-**With hardware virtualization, each project gets its own microVM,** and its agent turns run inside it. What has been confirmed on real hardware so far: a project provisioned and ran an agent turn in a microVM on an Apple Silicon Mac, and the microVM runtime passed its hardware checks on a Linux server with KVM, both with Lazy Teams running directly on the machine. **Running it from inside the published container, as the compose install does, has not yet been confirmed on real hardware** — [Confirming it on your server](#confirming-it-on-your-server) below is how to check yours before you rely on it.
+**With hardware virtualization, each project gets its own microVM,** and its agent turns run inside it. [Confirming it on your server](#confirming-it-on-your-server) below is how to check that yours supports it.
 
 Each project gets its own microVM, and its agent turns run inside it. A project's repository is cloned inside its VM and never touches your server's filesystem. The server shares only that project's task store with it. The VM carries its own Docker engine, so a task's agent container runs next to the project process that launched it, and no Docker socket is shared with anything.
 
@@ -804,7 +792,7 @@ If a service is not answering yet, **Open** shows a page saying so: whether Run 
 
 #### Example: task services behind ngrok with Google OAuth
 
-This extends [the ngrok example above](#example-ngrok-with-google-oauth) to an install whose Teams answers at `teams.example.com`, with services under `svc.teams.example.com`. It uses a subdomain of Teams' own name, against the advice above, because an ngrok custom domain usually lives under your one domain; the end of this example says what that costs. Lazy Teams keeps listening on `127.0.0.1` only. ngrok is the only way in to Teams and to every service, and nothing else needs to be exposed.
+This extends [the ngrok example above](#behind-an-authenticating-proxy) to an install whose Teams answers at `teams.example.com`, with services under `svc.teams.example.com`. It uses a subdomain of Teams' own name, against the advice above, because an ngrok custom domain usually lives under your one domain; the end of this example says what that costs. Lazy Teams keeps listening on `127.0.0.1` only. ngrok is the only way in to Teams and to every service, and nothing else needs to be exposed.
 
 1. **Reserve a wildcard domain.** On a paid ngrok plan, add `*.svc.teams.example.com` under **Domains** in the ngrok dashboard (see [ngrok's domains documentation](https://ngrok.com/docs/gateway/domains)). Create exactly the DNS records the dashboard lists for it: a `CNAME` for `*.svc.teams.example.com`, and the records ngrok needs to issue the wildcard certificate. ngrok obtains and renews that certificate itself, so there is nothing to install.
 
@@ -936,12 +924,10 @@ Every project's process runs beside the application — in the compose install, 
 
 ### Your Docker socket stays on your host
 
-The application container is **not** given access to your host's Docker. It
-used to be, so that it could start agent containers alongside itself — which,
-as [Task turns](#task-turns) explains, it was never actually able to do. Agent
-turns run in each project's microVM instead, on that VM's own Docker engine. Handing
+The application container is **not** given access to your host's Docker. Agent
+turns run in each project's microVM, on that VM's own Docker engine. Handing
 a container your Docker socket is equivalent to giving root on the machine to
-anything that can run code inside it, so it is no longer mounted.
+anything that can run code inside it, so it is never mounted.
 
 You do not need to do anything about this, and nothing about running the
 product needs it back: no part of the application opens the socket, and on the
@@ -1228,7 +1214,7 @@ docker compose pull
 docker compose up -d
 ```
 
-If your install already has projects that were set up without microVMs, set `LAZY_FLEET_BACKEND=local` in `.env` before upgrading: an install never hands a project to a different backend than the one that set it up, and setup and the Installation page say so until the backend matches. A project set up before Lazy Teams recorded which backend made it, on a microVM backend, is refused too rather than guessed at; the refusal gives the one command that records its backend.
+If your install has projects that were set up without microVMs, set `LAZY_FLEET_BACKEND=local` in `.env`: an install never hands a project to a different backend than the one that set it up, and setup and the Installation page say so until the backend matches.
 
 Before it changes the application database, the upgrade copies it — see [Automatic backup before every upgrade](#automatic-backup-before-every-upgrade). Project data in the two volumes above is preserved. On the `local` backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend each project's microVM is upgraded in place shortly after — see [What an upgrade does](#what-an-upgrade-does).
 

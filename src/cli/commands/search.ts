@@ -341,7 +341,7 @@ export async function commandSearch(args: string[]): Promise<void> {
 export function searchUsage(): void {
   console.log(`Usage: lazy search <query> [options]
 
-Search across tasks, prompts, turns, commits, notes, follow-ups, conversations,
+Search across tasks, prompts, turns, commits, notes, raised items, conversations,
 and shared memory records.
 
 Options:
@@ -355,7 +355,7 @@ Filter by type:
   --turns            Search conversation turns only
   --commits          Search commit messages only
   --notes            Search task notes only
-  --followups        Search task follow-ups only
+  --followups        Older spelling of --raised
   --raised           Search agent-raised questions/decisions only
   --conversations    Search captured builder conversations only
   --memories         Search shared memory records only

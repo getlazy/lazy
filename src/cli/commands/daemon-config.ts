@@ -316,6 +316,10 @@ Subcommands:
   reset [key]            Clear the override, reverting to lazy.toml
                          (usage_pause_threshold --task <task>: drop that task's)
 
+Options:
+  --task <task>          (usage_pause_threshold, set/reset) act on that task's
+                         allowance instead of the daemon-wide override
+
 Keys:
   max_concurrent_builders  (alias: builders) max concurrent builder containers
   usage_pause_threshold    (alias: usage-pause) 'off' lets ONE paused turn start

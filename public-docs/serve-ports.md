@@ -7,6 +7,10 @@ half usable.
 Declare the ports your project serves on, and every task's dev server gets its
 own name in the browser. `lazy url` tells you where.
 
+![The Services tab of a task page. With no Start services command set it offers Configure services](images/topics/services-tab.png)
+
+In the web UI, a **Services** card on both the task detail page and the review page shows each service with its URL as a link, a green/grey liveness dot from the same TCP check `lazy url` uses, and the `lazy url <task> <service>` command ready to copy. When no services are configured, the card offers **Configure services**. The task *list* does not show it. The same mapping is printed by `lazy url` and shown in `lazy show`.
+
 ```toml
 # lazy.toml
 [serve]
@@ -53,13 +57,6 @@ name, `[serve.services]` for the ones worth naming. A bare port from `ports` is
 addressed by its number (`lazy url my-task 5173`); a named service is addressed
 by name or by its container port, case-insensitively. Service names must start
 with a letter, so a name is never mistaken for a port.
-
-The same mapping shows up in `lazy show`, and in the web UI as a **Services**
-card on both the task detail page and the review page: each service with its
-URL as a link, a green/grey liveness dot from the same TCP check `lazy url`
-uses, and the `lazy url <task> <service>` command ready to copy. The task
-*list* does not show it: the live mapping means a runtime call per task, which
-is not a cost a list render should pay for information nobody asked for yet.
 
 ## The URL is a name: `<task>.<service>.lazy.localhost`
 
@@ -268,16 +265,8 @@ lazy url my-task web
 same node, the same installed packages, the same network as the agent sees.
 `lazy shell <task> --host` gives you a shell in the task's worktree on your own
 machine instead, which is the right thing for git and host editors.
-(`--container` is still accepted as a deprecated no-op alias for the default.)
 
 If the task's container is not running, `lazy shell` starts it first and says so
 — which also means the container is created fresh, picking up the current
 `[serve]`.
 
-## Runners without containers
-
-Everything on this page needs a container runner (`docker` or `podman`): task
-servers are reached through the container's published ports. The
-`dangerously-host-process-without-any-isolation` runner has no container and so
-no port mapping — a dev server a task starts there listens directly on your
-machine.

@@ -4,22 +4,21 @@ This page is for anyone reviewing and driving lazy tasks from a browser rather
 than the terminal: it describes the dashboard the daemon serves, how to sign in,
 what each page and tab shows, and where its limits are. The daemon's embedded web server hosts **one page per task**, at `/tasks/:task`
 — the task's code when it has one, its id otherwise, and either works — with
-tabs for everything you used to hunt across a task page and a review page:
+tabs for everything about a task:
 Summary, Verify, Regions, Changes, Turns, Commits, Reviews, Subtasks, Raised,
 Comments, Journal, Artifacts, Stats, Shell, Services, and **Current review**. Review is a tab on that page — the place your
 queued comments, ticks, and Unblock / Ask / Accept live — not a second site.
 Old `/review/:id` links 308 there.
 
-The **review loop** is still the same work: the queue of tasks awaiting you →
+The **review loop**: the queue of tasks awaiting you →
 read what changed → comment, ask, or verify → unblock or accept. It just
 happens on one address.
 
-It is an early implementation: the loop works end to end, but it is **not
-hardened**, and it binds to loopback only for that reason. Read [Known
-limits](#known-limits) before exposing it on anything else.
+Read [Known limits](#known-limits) before exposing it on anything other than
+loopback.
 
 It also requires a **signed-in browser session** — see [Signing
-in](#signing-in). Loopback is no longer the only thing standing between the
+in](#signing-in). Loopback is not the only thing standing between the
 dashboard and everything else that can reach the daemon's port.
 
 ## Signing in
@@ -157,6 +156,8 @@ the same, in this order,
 so muscle memory survives moving from one task to another. Only **Shell** hides,
 and only when the runner has no container to enter.
 
+![The task page for a blocked task: status, action buttons, the tab strip, and the Changes tab showing a unified diff with a Viewed checkbox per file](images/topics/changes-tab.png)
+
 | Tab | What it is |
 |---|---|
 | **Summary** | Status-driven: what this task is, what just happened, the agent's report of what a user would notice. |
@@ -165,7 +166,7 @@ and only when the runner has no container to enter.
 | **Changes** | The diff, presented when the agent declared a walkthrough, raw files one click away. A small card above it says how many regions there are and which one is in force. |
 | **Turns** | The record, reviewed a **chunk** at a time. A chunk is what happened since you last acted — your turn and every agent, nudge and auto-resume turn that followed, until you acted again — and it is one card: headed by the turn that opened it and the first line of what you asked for, with those turns, plus any comments and journal entries from the same window, inside it. Each agent turn lists the commits it made underneath, and each can be collapsed on its own. Ticking a chunk Viewed and the `j` / `k` keys both move a whole chunk. Newest first throughout. |
 | **Commits** | Every commit on the task, newest first — the same rows as under each turn, in one list. |
-| **Reviews** | Successful formal agent reviews — when, verdict, raise count, links to the turn and Raises (including reviews that filed issues). A turn that produced no usable Raises and no **clean** parseable security/data-integrity sweeps does not get a row here — check **Turns** for an unparsed banner or an incomplete recording. |
+| **Reviews** | Every recorded agent review, newest first — when, verdict, raise count, links to the turn and Raises. A review whose report could not be parsed is listed too, so the failure is visible; check **Turns** for the unparsed banner. |
 | **Subtasks** | Direct children, grouped by status, each group listing the most recently updated child first. Click a column header to re-sort a group; the jump bar above the groups opens and scrolls to any group in one click. The **Nested** column counts everything under that child — its own subtasks, theirs, and so on — and links into that child's Subtasks tab; a dash means nothing is nested under it. |
 | **Raised** | Questions and proposals; a row opens the item in a dialog. |
 | **Comments** | Every comment on the task, oldest first, split into the ones the agent has already been shown and the ones still queued for its next turn. Add one here in any status, finished tasks included — it is saved and nothing else, it reaches the agent in the prompt of the next Unblock, and it never starts a turn on its own. On a finished task a comment is an annotation for whoever reads the task later; if the task is reopened or redone, it rides that next turn. The tab's badge reads `queued/total` while any are waiting. If the store cannot be written, the page hands your text back so nothing you typed is lost. |
@@ -287,8 +288,7 @@ never a second writer). The dashboard's base URL is printed by
 | `/raised/:id` | GET | Opens the owning task's Raised tab with that item in a dialog (JS off: the same page, dialog in-flow). The address bar reads `/raised/:id`; Back and ESC close without acting. |
 | `/raised/:id/decide` | POST | Decide that item — respond, acknowledge, dismiss (with an optional note), or promote to a backlog task (form; 303 → the item, or the new task on promote) |
 | `/raised/:id/blocking` | POST | Change whether that item gates accept (form; 303 → the item) |
-| `/followups`, `/followups/:id`, `/api/followups` | GET | The pre-unification paths — 308-redirected to their `/raised` equivalents rather than 404ing, because they are in old task prompts and bookmarks |
-| `/sessions` | GET | **410** — Review with builder was removed |
+| `/followups`, `/followups/:id`, `/api/followups` | GET | Alternate paths — 308-redirected to their `/raised` equivalents |
 | `/builders` | GET | Builders — one per builder conversation (start or `/clear` to the next `/clear`), newest first; `?q=` searches their message bodies (an invalid or too-slow pattern is refused, not a server error) |
 | `/builders/:id` | GET | One Builder's transcript across all its session files, paged 40 messages at a time (`?offset=`); any of its session ids works |
 | `/api/builders` | GET | The Builders listing as JSON — metadata, session ids and run state, never transcripts |
@@ -442,40 +442,34 @@ tabs) linking at once each get their own run — they do not share a queue slot.
 
 **Review** on a paused task's action row is the browser's version of
 [`lazy review`](review.md). It is a read-only agent pass — security and data
-integrity first — that files each issue as a **Raise** on the Raised tab (with
-`blocking` chosen per item). It is not the **Go to Current review** tab (that
+integrity first — recorded on the task and shown on the **Reviews** tab, where you
+land when it finishes. Tick **Automatically fix** to have lazy hand the findings
+to the agent as fix feedback. It is not the **Go to Current review** tab (that
 is where you accept or unblock). The task stays in its current status
 afterwards. The button is offered only while the task is paused (`blocked`,
 `conflict`, `submitted`, or `interrupted`) — the same statuses the daemon
 accepts.
 
-Optionally tick **Automatically fix — start a work turn that injects any Raises
-the review files**. When the review files at least one Raise, lazy starts a
-normal work turn whose notes include every finding (ids and text) and asks the
-agent to reply per item with `lazy_raised_item_comment`. A clean review or a
-turn that produced nothing usable does not start that turn. Agent comments do
-not dismiss Raises — only you do, on the Raised tab.
+Optionally tick **Automatically fix — if the review finds issues, start a work
+turn that hands its findings to the agent as fix feedback**. A clean review does
+not start that turn. A `needs_human` decision is the one thing that arrives as
+a Raise, and an agent's comment on it does not dismiss it — only you do, on the
+Raised tab. See [`lazy review`](review.md) for how findings reach the agent.
 
 The report stays on this page. Lazy does not post reviews to a pull or merge
 request — see [reviews stay on the task](review.md#reviews-stay-on-the-task).
 
-The **Reviews** tab lists every *successful* formal review: when it ran, the
-verdict, how many Raises it filed, and links to the review turn and those
-Raises. A review counts when it filed usable Raises or produced parseable
-**clean** security/data-integrity statements (`none found`). Unparsed leftover
-JSON with no Raises is treated as if the review never happened for the list
-and accept gates (the turn itself may still show a failed-parse banner on the
-Turns tab). A
-review that names issues in those sweeps but somehow records no Raises is
-also treated as failed — not as a clean pass. Accept refuses while a
-successful review that raised issues has not been followed by a work turn
-(dismissing Raises alone is not enough). A Raise you **promote to its own
-task** is the exception: the work is tracked in that task, so it stops
-counting towards the gate, and accept no longer asks you to unblock the agent
-for work nobody owes. Current review's **Before you can accept** list names
-that gate even when the Raises are non-blocking or already dismissed — the
-list would otherwise look clear while Accept still refuses — and it counts
-exactly the Raises that still hold accept back. When a task's work is
+The **Reviews** tab lists every recorded agent review, newest first: when it
+ran, the verdict, how many Raises it filed, and links to the review turn and
+those Raises. A review that failed to produce a usable report is listed too, so
+a failure is visible rather than looking like no review happened.
+
+A review whose report could not be parsed holds accept, and so do its critical
+and high findings; lower-severity findings ride along. Dismissing,
+acknowledging or responding to a Raise does not clear that hold — the agent
+must have had a turn to address it. A Raise you **promote to its own task** is
+the exception: the work is tracked in that task, so it stops counting towards
+the gate. When a task's work is
 declared done, lazy starts a review on it without anyone asking (see
 [the review page](review.md)); by the time you open Accept that review has
 usually already run and its verdict is on the task. **Review** stays its own
@@ -587,8 +581,7 @@ does it per section rather than all at once. A short poll asks the server what
 has moved — the status and progress line, subtasks and their statuses, turns,
 comments, journal entries, raised items, commits, the branch's latest commit —
 and only the parts that actually moved react. A task that stays *working* while
-its subtasks come and go now updates its Subtasks tab; it used to sit there
-stale until you reloaded.
+its subtasks come and go updates its Subtasks tab too.
 
 What happens next depends on which tab you are reading:
 
@@ -960,9 +953,7 @@ Opening a page never starts anything, and two panels opened together share one
 start rather than launching two containers. Starting usually takes seconds, but
 if the image has to be rebuilt it can take minutes, so whatever surface you
 asked from shows what the launch is doing until it finishes or fails. Nothing is
-started for a task that is closed or complete, or for a runner with no
-containers (the `host-process` runner shares your machine's network, so there is
-nothing to start).
+started for a task that is closed or complete.
 
 ### Start services
 
@@ -1672,7 +1663,7 @@ them would make anchors ambiguous.
 ### The view toolbar, and side-by-side
 
 Above every diff sits a toolbar of **view modes**, one group per mode, defined as
-a list. Today that is
+a list:
 **Layout** (Unified / Split) and **Long lines** (Scroll / Wrap), plus **Files**
 (Presented / Source) on any page that has something to present. Each choice is
 one setting for the whole tool, not per file, persisted in `localStorage`
@@ -1866,7 +1857,7 @@ silently attached to the wrong line.
   no accent at all. Source has the exact lines in both cases.
 - Without scripting, **Review** (and Accept, and the other long verbs) POST and
   wait on that one request. The dashboard cuts the page off after about 105
-  seconds — the same deadline Accept hit before action dialogs — so a
+  seconds — so a
   minutes-long review never finishes in the browser. Scripting-on follows the
   run in a dialog instead; or run `lazy review` in a terminal.
 

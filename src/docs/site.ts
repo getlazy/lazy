@@ -30,8 +30,10 @@
 
 import { mkdir, readdir, readFile, writeFile, copyFile, rm } from 'fs/promises';
 import { dirname, join, posix } from 'path';
+import { fileURLToPath } from 'url';
 import { Marked } from 'marked';
 import GithubSlugger from 'github-slugger';
+import type { DocsNav, NavItem } from './nav';
 
 /** One rendered page, as recorded in the manifest. */
 export interface DocsSitePage {
@@ -69,6 +71,14 @@ export interface DocsSiteManifest {
    * here — see {@link buildDocsSite}.
    */
   unresolvedLinks: DocsSiteUnresolvedLink[];
+  /** Redirect stubs written, from the navigation manifest. */
+  redirects: { from: string; to: string }[];
+  /**
+   * Everything `strict` refuses, one human-readable line each: unresolved
+   * links, links into the internal `docs/` tree, pages the navigation does not
+   * list, navigation entries with no page, redirects that do not resolve.
+   */
+  problems: string[];
 }
 
 export interface BuildDocsSiteOptions {
@@ -88,6 +98,24 @@ export interface BuildDocsSiteOptions {
   clean?: boolean;
   /** Emit a `CNAME` file with this hostname (GitHub Pages custom domain). */
   cname?: string;
+  /**
+   * The navigation manifest (`DOCS_NAV` from src/docs/nav.ts for the real
+   * site). Drives the sidebar, breadcrumbs, previous/next, the index page and
+   * redirect stubs. Without one, pages get no sidebar and the index lists every
+   * page grouped by directory.
+   */
+  nav?: DocsNav;
+  /**
+   * Throw, after writing the site, when {@link DocsSiteManifest.problems} is
+   * non-empty. The error lists every problem, not just the first.
+   */
+  strict?: boolean;
+  /**
+   * Preview mode for opening the output from `file://`: every internal link names
+   * its `index.html` explicitly, because a browser shows a folder listing for a
+   * directory link on disk. The default output (directory links) is unchanged.
+   */
+  local?: boolean;
 }
 
 /**
@@ -131,6 +159,7 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
   const { docsDir, outDir } = options;
   const exclude = new Set(options.exclude ?? DEFAULT_EXCLUDED_DIRS);
   const version = options.version ?? null;
+  const local = options.local ?? false;
 
   if (options.clean) {
     await rm(outDir, { recursive: true, force: true });
@@ -146,32 +175,33 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
     );
   }
 
+  const nav = options.nav ?? null;
+  const redirects = nav?.redirects ?? [];
+  const problems: string[] = [];
+
   // Everything the site publishes, so link rewriting can tell "points at a page
-  // we render" from "points at something that will 404".
-  const knownPages = new Set(markdown);
+  // we render" from "points at something that will 404". A redirect source is
+  // publishable too: its stub sends the reader on.
+  const redirectSources = new Set(redirects.map((redirect) => `${redirect.from}.md`));
+  const knownPages = new Set([...markdown, ...redirectSources]);
   const knownAssets = new Set(assets);
 
   const pages: DocsSitePage[] = [];
+  const bodies = new Map<string, string>();
   const unresolvedLinks: DocsSiteUnresolvedLink[] = [];
   const fragmentLinks: (FragmentLink & { source: string })[] = [];
+  const idsBySource = new Map<string, Set<string>>();
 
   for (const source of markdown) {
     const raw = await readFile(join(docsDir, source), 'utf-8');
-    const rendered = renderPage({ source, markdown: raw, knownPages, knownAssets });
+    const rendered = renderPage({ source, markdown: raw, knownPages, knownAssets, local });
     unresolvedLinks.push(...rendered.unresolved.map((href) => ({ source, href })));
     fragmentLinks.push(...rendered.fragmentLinks.map((link) => ({ source, ...link })));
 
     const pagePath = source.replace(/\.md$/, '');
     const file = posix.join(pagePath, 'index.html');
-    const html = pageHtml({
-      title: rendered.title,
-      body: rendered.html,
-      version,
-      // Depth of the page directory, so the header link back to the index is relative.
-      toRoot: relativeToRoot(pagePath),
-    });
-
-    await writeOut(outDir, file, html);
+    bodies.set(pagePath, rendered.html);
+    idsBySource.set(source, new Set([...rendered.anchors, ...htmlIds(rendered.html)]));
     pages.push({ path: pagePath, source, file, title: rendered.title, anchors: rendered.anchors });
   }
 
@@ -179,11 +209,58 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
 
   // A link to a heading that is not on its page lands the reader at the top,
   // silently — as much a dead end as a missing page, so it counts as unresolved.
-  const anchorsBySource = new Map(pages.map((page) => [page.source, new Set(page.anchors)]));
+  // Ids written as raw HTML (`<a id="…">`) count: they are real targets.
+  // A fragment on a redirect source is not checked here: the stub has no
+  // headings, and the redirect's own target is checked below.
   for (const link of fragmentLinks) {
-    if (!anchorsBySource.get(link.target)?.has(link.fragment)) {
+    if (redirectSources.has(link.target)) continue;
+    if (!idsBySource.get(link.target)?.has(link.fragment)) {
       unresolvedLinks.push({ source: link.source, href: link.href });
     }
+  }
+
+  for (const link of unresolvedLinks) {
+    const sourceDir = posix.dirname(link.source) === '.' ? '' : posix.dirname(link.source);
+    const target = posix.normalize(posix.join(sourceDir, link.href.split('#')[0] ?? ''));
+    problems.push(
+      target === '../docs' || target.startsWith('../docs/')
+        ? `${link.source}: link into the internal docs/ tree, which is never published: ${link.href}`
+        : `${link.source}: broken link: ${link.href}`,
+    );
+  }
+
+  const titles = new Map(pages.map((page) => [page.path, page.title]));
+  const resolvedNav = nav ? resolveNav(nav, pages, problems) : null;
+
+  for (const page of pages) {
+    const chrome = resolvedNav ? navChrome(resolvedNav, page.path, local) : null;
+    const html = pageHtml({
+      title: page.title,
+      body: withOutline(bodies.get(page.path) ?? ''),
+      version,
+      // Depth of the page directory, so the header link back to the index is relative.
+      toRoot: relativeToRoot(page.path),
+      chrome,
+      local,
+    });
+    await writeOut(outDir, page.file, html);
+  }
+
+  for (const redirect of redirects) {
+    const [targetPath = '', fragment] = redirect.to.split('#');
+    if (titles.has(redirect.from)) {
+      // Never write the stub over a real page.
+      problems.push(`redirect ${redirect.from}: a page still exists at that path; delete it or drop the redirect`);
+      continue;
+    }
+    const targetIds = idsBySource.get(`${targetPath}.md`);
+    if (!targetIds && targetPath !== '') {
+      problems.push(`redirect ${redirect.from} -> ${redirect.to}: no page at ${targetPath}`);
+    } else if (fragment && !targetIds?.has(fragment)) {
+      problems.push(`redirect ${redirect.from} -> ${redirect.to}: no heading #${fragment} on ${targetPath}`);
+    }
+    const href = siteHref(redirect.from, targetPath, local) + (fragment ? `#${fragment}` : '');
+    await writeOut(outDir, posix.join(redirect.from, 'index.html'), redirectHtml(titles.get(targetPath) ?? redirect.to, href));
   }
 
   for (const asset of assets) {
@@ -192,7 +269,16 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
     await copyFile(join(docsDir, asset), target);
   }
 
-  await writeOut(outDir, 'index.html', indexHtml(pages, version));
+  // Offline search: the index is a .js file setting a global, because a browser
+  // blocks fetch() of a .json from file://.
+  await writeOut(outDir, SEARCH_INDEX_FILE, searchIndexJs(pages, bodies));
+  await copyFile(fileURLToPath(new URL('./search.js', import.meta.url)), join(outDir, SEARCH_SCRIPT_FILE));
+
+  await writeOut(
+    outDir,
+    'index.html',
+    resolvedNav ? navIndexHtml(resolvedNav, version, local) : indexHtml(pages, version, local),
+  );
 
   // GitHub Pages runs Jekyll unless told not to, and Jekyll silently drops any
   // path with a leading underscore. Nothing here has one today; the file costs
@@ -208,10 +294,104 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
     pages,
     assets: [...assets].sort(),
     unresolvedLinks,
+    redirects: redirects.map(({ from, to }) => ({ from, to })),
+    problems,
   };
   await writeOut(outDir, 'manifest.json', JSON.stringify(manifest, null, 2) + '\n');
 
+  if (options.strict && problems.length > 0) {
+    throw new Error(
+      `docs site strict build found ${problems.length} problem(s):\n` +
+      problems.map((problem) => `  - ${problem}`).join('\n'),
+    );
+  }
+
   return manifest;
+}
+
+export const SEARCH_INDEX_FILE = 'search-index.js';
+export const SEARCH_SCRIPT_FILE = 'search.js';
+
+/** Generated CLI reference: the whole help text (usage and flags) is indexed, code blocks included. */
+const FULL_CODE_PREFIXES = ['reference/cli/'];
+
+/** One indexed page: `s` is `[heading, anchor id, plain body text]` per section; the first may have no heading. */
+export interface SearchIndexPage {
+  p: string;
+  t: string;
+  s: [string, string, string][];
+}
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#(\d+);/g, (_m, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_m, code: string) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&amp;/g, '&');
+}
+
+function htmlText(html: string): string {
+  return decodeEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The terms worth finding in an example: flags (`--env-file`), `[section]`
+ * headers and `key =` names. Prose inside a code block is left out, so the
+ * index stays small.
+ */
+export function codeTerms(code: string): string[] {
+  const terms = new Set<string>();
+  for (const flag of code.matchAll(/(?<![\w-])--[a-z][\w-]*/gi)) terms.add(flag[0]);
+  for (const header of code.matchAll(/^\s*\[{1,2}([A-Za-z_][\w.-]*)\]{1,2}\s*$/gm)) terms.add(`[${header[1]}]`);
+  for (const key of code.matchAll(/^\s*([A-Za-z_][\w.-]*)\s*=/gm)) terms.add(key[1]!);
+  return [...terms];
+}
+
+/** A code block's text with its line breaks kept (the term extractor reads lines). */
+function preText(pre: string): string {
+  return decodeEntities(pre.replace(/<[^>]*>/g, ''));
+}
+
+/**
+ * Split a rendered page body into searchable sections at its headings. With
+ * `fullCode` the code blocks are indexed whole (the CLI reference); otherwise
+ * only their flags and config keys are, appended to the section's text.
+ */
+export function searchSections(html: string, fullCode: boolean): [string, string, string][] {
+  const sections: [string, string, string][] = [];
+  let heading = '';
+  let id = '';
+  let last = 0;
+  const flush = (end: number): void => {
+    const chunk = html.slice(last, end);
+    const blocks = [...chunk.matchAll(/<pre[\s\S]*?<\/pre>/g)].map((m) => preText(m[0]));
+    const prose = htmlText(chunk.replace(/<pre[\s\S]*?<\/pre>/g, ' '));
+    const code = fullCode
+      ? blocks.join(' ').replace(/\s+/g, ' ').trim()
+      : codeTerms(blocks.join('\n')).join(' ');
+    const body = [prose, code].filter(Boolean).join(' ');
+    if (heading !== '' || body !== '') sections.push([heading, id, body]);
+  };
+  for (const match of html.matchAll(/<h([1-6]) id="([^"]*)">([\s\S]*?)<\/h\1>/g)) {
+    flush(match.index ?? 0);
+    heading = htmlText((match[3] ?? '').replace(/<a class="anchor"[\s\S]*?<\/a>/, ''));
+    id = decodeEntities(match[2] ?? '');
+    last = (match.index ?? 0) + match[0].length;
+  }
+  flush(html.length);
+  return sections;
+}
+
+function searchIndexJs(pages: DocsSitePage[], bodies: Map<string, string>): string {
+  const index = pages.map((page): SearchIndexPage => ({
+    p: page.path,
+    t: page.title,
+    s: searchSections(bodies.get(page.path) ?? '', FULL_CODE_PREFIXES.some((prefix) => page.path.startsWith(prefix))),
+  }));
+  // `<` is escaped so no page text can close the script it is served as.
+  return `window.LAZY_DOCS_INDEX=${JSON.stringify({ v: 1, pages: index }).replace(/</g, '\\u003c')};\n`;
 }
 
 /** Walk the docs tree, returning `docs/`-relative markdown and asset paths (posix separators). */
@@ -267,6 +447,7 @@ interface RenderPageInput {
   markdown: string;
   knownPages: Set<string>;
   knownAssets: Set<string>;
+  local: boolean;
 }
 
 interface RenderedPage {
@@ -308,7 +489,7 @@ interface FragmentLink {
  * repeated heading and silently break its anchors.
  */
 function renderPage(input: RenderPageInput): RenderedPage {
-  const { source, markdown, knownPages, knownAssets } = input;
+  const { source, markdown, knownPages, knownAssets, local } = input;
   const slugger = new GithubSlugger();
   const anchors: string[] = [];
   const unresolved: string[] = [];
@@ -320,7 +501,7 @@ function renderPage(input: RenderPageInput): RenderedPage {
   const sourceDir = posix.dirname(source) === '.' ? '' : posix.dirname(source);
 
   const rewrite = (href: string): string => {
-    const result = resolveHref({ href, sourceDir, pageDir, knownPages, knownAssets });
+    const result = resolveHref({ href, sourceDir, pageDir, knownPages, knownAssets, local });
     if (result === null) {
       unresolved.push(href);
       return href;
@@ -347,7 +528,10 @@ function renderPage(input: RenderPageInput): RenderedPage {
         const text = this.parser.parseInline(token.tokens);
         const id = slugger.slug(plainText(token.tokens));
         anchors.push(id);
-        if (token.depth === 1 && !title) title = stripTags(text);
+        // Plain text from the TOKENS, escaped once at output. Stripping tags from
+        // the rendered HTML kept its entities (`&#39;`), which the page template
+        // then escaped a second time.
+        if (token.depth === 1 && !title) title = titleText(token.tokens);
         return `<h${token.depth} id="${escapeAttr(id)}">` +
           `<a class="anchor" href="#${escapeAttr(id)}" aria-hidden="true">#</a>${text}` +
           `</h${token.depth}>\n`;
@@ -386,6 +570,7 @@ interface ResolveHrefInput {
   pageDir: string;
   knownPages: Set<string>;
   knownAssets: Set<string>;
+  local: boolean;
 }
 
 /**
@@ -403,7 +588,7 @@ interface ResolveHrefInput {
  * generator never emits one, and a doc that hand-writes one is on its own.
  */
 function resolveHref(input: ResolveHrefInput): string | null {
-  const { href, sourceDir, pageDir, knownPages, knownAssets } = input;
+  const { href, sourceDir, pageDir, knownPages, knownAssets, local } = input;
 
   if (href === '') return href;
   if (href.startsWith('#')) return href;
@@ -424,7 +609,7 @@ function resolveHref(input: ResolveHrefInput): string | null {
   if (target.endsWith('.md')) {
     if (!knownPages.has(target)) return null;
     const targetDir = target.replace(/\.md$/, '');
-    return `${relativeSitePath(pageDir, targetDir)}/${fragment}`;
+    return `${relativeSitePath(pageDir, targetDir)}/${local ? 'index.html' : ''}${fragment}`;
   }
 
   if (knownAssets.has(target)) {
@@ -464,8 +649,27 @@ function plainText(tokens: unknown[]): string {
   return out;
 }
 
-function stripTags(html: string): string {
-  return html.replace(/<[^>]*>/g, '');
+/** Like {@link plainText}, but drops raw inline HTML, which is markup, not words. */
+function titleText(tokens: unknown[]): string {
+  let out = '';
+  for (const token of tokens as Array<{ type?: string; text?: string; tokens?: unknown[] }>) {
+    if (token.type === 'html') continue;
+    if (token.tokens && token.type !== 'codespan') {
+      out += titleText(token.tokens);
+    } else if (typeof token.text === 'string') {
+      out += token.text;
+    }
+  }
+  return out.trim();
+}
+
+/** `id`/`name` attributes written as raw HTML in a page (`<a id="removing-someone">`). */
+function htmlIds(html: string): string[] {
+  const ids: string[] = [];
+  for (const match of html.matchAll(/<a\s(?:[^>]*\s)?(?:id|name)="([^"]+)"/g)) {
+    if (match[1]) ids.push(match[1]);
+  }
+  return ids;
 }
 
 function prettifyName(source: string): string {
@@ -494,7 +698,7 @@ const STYLES = `
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
 .wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
 header.site { border-bottom:1px solid var(--line); }
-header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
 header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
 header.site .version { color:var(--muted); font-size:.85rem; }
 a { color: var(--link); }
@@ -515,10 +719,278 @@ ul.pages { list-style:none; padding:0; }
 ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
 ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
 h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}
 `.trim();
 
-function pageHtml(input: { title: string; body: string; version: string | null; toRoot: string }): string {
+/** One navigation entry after `dir` items are expanded and titles are known. */
+interface NavEntry {
+  path: string;
+  title: string;
+  section: string;
+  /** Sub-group label inside the section, if any. */
+  group: string | null;
+  /**
+   * The directory a `{ dir }` item expanded this entry from, when that directory
+   * has an `index` page. Outside that directory the sidebar and the front page show
+   * only the index, so 100+ generated pages do not swamp the navigation.
+   */
+  collapsedDir?: string;
+}
+
+interface ResolvedNav {
+  sections: { title: string; id: string; intro: string; entries: NavEntry[] }[];
+  /** Every published page, for the collapsed "All pages" list at the bottom of the sidebar. */
+  allPages: NavEntry[];
+  /** Every entry in reading order — what previous/next follows. */
+  order: NavEntry[];
+}
+
+/**
+ * Expand the manifest against the pages that actually exist, recording a
+ * problem for each entry with no page, each page listed twice, and each page the
+ * manifest does not list.
+ */
+function resolveNav(nav: DocsNav, pages: DocsSitePage[], problems: string[]): ResolvedNav {
+  const titles = new Map(pages.map((page) => [page.path, page.title]));
+  const listed = new Set<string>();
+  const slugger = new GithubSlugger();
+  const order: NavEntry[] = [];
+  const sections: ResolvedNav['sections'] = [];
+
+  for (const section of nav.sections) {
+    const entries: NavEntry[] = [];
+    const add = (path: string, title: string | undefined, group: string | null, collapsedDir?: string): void => {
+      if (path !== '' && !titles.has(path)) {
+        problems.push(`navigation lists ${path}, but public-docs/${path}.md does not exist`);
+        return;
+      }
+      if (listed.has(path)) {
+        problems.push(`navigation lists ${path || 'the index'} more than once`);
+        return;
+      }
+      listed.add(path);
+      entries.push({ path, title: title ?? titles.get(path) ?? 'Overview', section: section.title, group, collapsedDir });
+    };
+    const addItem = (item: NavItem, group: string | null): void => {
+      if ('group' in item) {
+        for (const child of item.items) addItem(child, item.group);
+      } else if ('dir' in item) {
+        const prefix = `${item.dir}/`;
+        const index = `${item.dir}/index`;
+        const hasIndex = titles.has(index);
+        // The directory's own index page leads its group; the rest follow in path order.
+        const inDir = pages.map((page) => page.path).filter((path) => path.startsWith(prefix));
+        const ordered = hasIndex ? [index, ...inDir.filter((path) => path !== index)] : inDir;
+        for (const path of ordered) add(path, undefined, group ?? item.title, hasIndex ? item.dir : undefined);
+      } else {
+        add(item.path, item.title, group);
+      }
+    };
+    for (const item of section.items) addItem(item, null);
+    order.push(...entries);
+    sections.push({ title: section.title, id: slugger.slug(section.title), intro: section.intro, entries });
+  }
+
+  for (const page of pages) {
+    if (!listed.has(page.path)) {
+      problems.push(`${page.source} is not listed in the navigation (src/docs/nav.ts)`);
+    }
+  }
+  const allPages = [...pages]
+    .sort((a, b) => a.title.localeCompare(b.title))
+    .map((page): NavEntry => ({ path: page.path, title: page.title, section: ALL_PAGES_TITLE, group: null }));
+  return { sections, order, allPages };
+}
+
+const ALL_PAGES_TITLE = 'All pages';
+
+/** Relative href from the page at `from` to the page at `to` (`''` is the index). */
+function siteHref(from: string, to: string, local: boolean): string {
+  const up = from === '' ? './' : relativeToRoot(from);
+  const leaf = local ? 'index.html' : '';
+  return to === '' ? `${up}${leaf}` : `${up}${to}/${leaf}`;
+}
+
+interface NavChrome {
+  sidebar: string;
+  breadcrumbs: string;
+  pager: string;
+}
+
+/** Whether a nav entry is shown in a listing for the page at `current` (see `collapsedDir`). */
+function shownFor(entry: NavEntry, current: string): boolean {
+  if (!entry.collapsedDir) return true;
+  return entry.path === `${entry.collapsedDir}/index` || current.startsWith(`${entry.collapsedDir}/`);
+}
+
+/** Sidebar, breadcrumbs and previous/next for one page. */
+function navChrome(nav: ResolvedNav, current: string, local: boolean): NavChrome {
+  const link = (entry: NavEntry): string => {
+    const here = entry.path === current;
+    return `<a href="${escapeAttr(siteHref(current, entry.path, local))}"${here ? ' aria-current="page"' : ''}>` +
+      `${escapeHtml(entry.title)}</a>`;
+  };
+
+  // Every branch is a <details> (no JS, works from file://) that starts closed
+  // unless it holds the current page, so the reader sees where they are.
+  const sidebarSections = nav.sections
+    .filter((section) => section.entries.length > 0)
+    .map((section) => {
+      const open = section.entries.some((entry) => entry.path === current);
+      let html = `<details class="branch"${open ? ' open' : ''}><summary>${escapeHtml(section.title)}</summary>\n<ul>`;
+      let group: string | null = null;
+      let groupHtml = '';
+      let groupOpen = false;
+      const flush = (): void => {
+        if (group === null) return;
+        html += `<li class="group"><details class="branch"${groupOpen ? ' open' : ''}>` +
+          `<summary>${escapeHtml(group)}</summary><ul>${groupHtml}</ul></details></li>`;
+        group = null;
+        groupHtml = '';
+        groupOpen = false;
+      };
+      for (const entry of section.entries) {
+        // A generated group named like its section would just repeat the heading.
+        const label = entry.group === section.title ? null : entry.group;
+        if (label !== group) flush();
+        if (label === null) {
+          html += `<li>${link(entry)}</li>`;
+        } else {
+          group = label;
+          groupHtml += `<li>${link(entry)}</li>`;
+          if (entry.path === current) groupOpen = true;
+        }
+      }
+      flush();
+      return `${html}</ul></details>`;
+    });
+  // Collapsed always: it repeats pages the tree above already places, so it must
+  // never open on its own or carry a second current-page marker.
+  const allPages = nav.allPages.length > 0
+    ? `<details class="branch all-pages"><summary>${ALL_PAGES_TITLE}</summary>\n<ul>` +
+      nav.allPages
+        .map((entry) => `<li><a href="${escapeAttr(siteHref(current, entry.path, local))}">${escapeHtml(entry.title)}</a></li>`)
+        .join('') +
+      '</ul></details>'
+    : '';
+  const sidebar = [...sidebarSections, allPages].filter(Boolean).join('\n');
+
+  const at = nav.order.findIndex((entry) => entry.path === current);
+  const entry = at === -1 ? null : nav.order[at]!;
+  const section = entry ? nav.sections.find((candidate) => candidate.title === entry.section) : undefined;
+  const breadcrumbs = entry && section && entry.path !== ''
+    ? `<nav class="crumbs" aria-label="Breadcrumbs"><a href="${escapeAttr(siteHref(current, '', local))}#${escapeAttr(section.id)}">` +
+      `${escapeHtml(section.title)}</a>${entry.group ? ` › ${escapeHtml(entry.group)}` : ''} › ` +
+      `<span aria-current="page">${escapeHtml(entry.title)}</span></nav>`
+    : '';
+
+  const prev = at > 0 ? nav.order[at - 1] : undefined;
+  const next = at !== -1 ? nav.order[at + 1] : undefined;
+  const pager = prev || next
+    ? `<nav class="pager" aria-label="Previous and next">` +
+      (prev ? `<a class="prev" href="${escapeAttr(siteHref(current, prev.path, local))}"><span>Previous</span>${escapeHtml(prev.title)}</a>` : '<span></span>') +
+      (next ? `<a class="next" href="${escapeAttr(siteHref(current, next.path, local))}"><span>Next</span>${escapeHtml(next.title)}</a>` : '<span></span>') +
+      `</nav>`
+    : '';
+
+  return { sidebar, breadcrumbs, pager };
+}
+
+/** A page gets an "On this page" outline from this many h2 headings up. */
+export const OUTLINE_MIN_H2 = 5;
+/** The outline starts open up to this many entries; a longer one opens on click. */
+const OUTLINE_OPEN_MAX = 14;
+
+/**
+ * Insert an "On this page" outline (the page's h2 headings, linked by their
+ * existing anchors) after the title of a long page. Static HTML in a native
+ * `<details>`: it works with no script, in both builds, at any width. Pages
+ * with fewer h2 headings than {@link OUTLINE_MIN_H2} are returned unchanged.
+ */
+export function withOutline(html: string): string {
+  const entries = [...html.matchAll(/<h2 id="([^"]*)">([\s\S]*?)<\/h2>/g)].map((m) => ({
+    id: m[1] ?? '',
+    text: htmlText((m[2] ?? '').replace(/<a class="anchor"[\s\S]*?<\/a>/, '')),
+  }));
+  if (entries.length < OUTLINE_MIN_H2) return html;
+  const outline = `<nav class="toc" aria-label="On this page"><details${entries.length <= OUTLINE_OPEN_MAX ? ' open' : ''}>` +
+    `<summary>On this page</summary><ul>` +
+    entries.map((e) => `<li><a href="#${e.id}">${escapeHtml(e.text)}</a></li>`).join('') +
+    `</ul></details></nav>\n`;
+  const h1 = html.match(/<\/h1>\n?/);
+  if (!h1 || h1.index === undefined) return outline + html;
+  const at = h1.index + h1[0].length;
+  return html.slice(0, at) + outline + html.slice(at);
+}
+
+function pageHtml(input: {
+  title: string;
+  body: string;
+  version: string | null;
+  toRoot: string;
+  chrome?: NavChrome | null;
+  local?: boolean;
+}): string {
   const version = input.version ? `<span class="version">${escapeHtml(input.version)}</span>` : '';
+  const chrome = input.chrome ?? null;
+  // The sidebar comes AFTER the content in the document, so a phone shows the
+  // page first; on a wide screen the grid places it on the left.
+  const main = chrome
+    ? `<div class="layout">
+<main>
+${chrome.breadcrumbs}
+${input.body}
+${chrome.pager}
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+${chrome.sidebar}
+</nav>
+</div>`
+    : `<main class="wrap">
+${input.body}
+</main>`;
+  const contents = chrome ? `<a class="contents" href="#contents">Contents</a>` : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -526,18 +998,74 @@ function pageHtml(input: { title: string; body: string; version: string | null; 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(input.title)} — lazy docs</title>
 <style>${STYLES}</style>
+<script defer src="${input.toRoot || './'}${SEARCH_INDEX_FILE}"></script>
+<script defer src="${input.toRoot || './'}${SEARCH_SCRIPT_FILE}" data-root="${input.toRoot || './'}"${input.local ? ' data-local="1"' : ''}></script>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="${input.toRoot || '.'}">lazy documentation</a>${version}</div></header>
-<main class="wrap">
-${input.body}
-</main>
+<header class="site"><div class="wrap"><a href="${input.local ? `${input.toRoot}index.html` : input.toRoot || '.'}">lazy documentation</a>${version}${contents}</div></header>
+${main}
 </body>
 </html>
 `;
 }
 
-function indexHtml(pages: DocsSitePage[], version: string | null): string {
+/** The index page: the navigation tree with each section's intro. */
+function navIndexHtml(nav: ResolvedNav, version: string | null, local: boolean): string {
+  const sections = nav.sections
+    .filter((section) => section.entries.some((entry) => entry.path !== ''))
+    .map((section) => {
+      let html = `<h2 class="group" id="${escapeAttr(section.id)}">${escapeHtml(section.title)}</h2>\n` +
+        `<p class="intro">${escapeHtml(section.intro)}</p>\n<ul class="pages">`;
+      let group: string | null = null;
+      for (const entry of section.entries) {
+        if (entry.path === '' || !shownFor(entry, '')) continue;
+        if (entry.group !== group && entry.group !== null) {
+          html += `<li class="group">${escapeHtml(entry.group)}</li>`;
+        }
+        group = entry.group;
+        html += `<li${entry.group ? ' class="in-group"' : ''}><a href="./${escapeAttr(entry.path)}/${local ? 'index.html' : ''}">${escapeHtml(entry.title)}</a></li>`;
+      }
+      return `${html}</ul>`;
+    })
+    .join('\n');
+
+  const body = `<h1>lazy documentation</h1>
+<p>lazy runs coding agents on your repository as tasks: each task works on its own branch, in its own
+container, and stops for you to review, send feedback, and accept its work into your branch. The easiest
+way in is the dashboard: open it in your browser with <code>lazy dashboard</code>. The <code>lazy</code>
+command line covers everything too, and its strongest tool is the builder in your terminal. Lazy Teams
+(private alpha) brings the same workflow to a shared team server.</p>
+<p>New here? Begin with <a href="./start-here/${local ? 'index.html' : ''}">Start here</a>. ${escapeHtml(nav.sections[0]?.intro ?? '')} ${
+    version ? `This is <strong>${escapeHtml(version)}</strong>.` : ''
+  }</p>
+${sections}`;
+
+  return pageHtml({ title: 'lazy documentation', body, version, toRoot: '', chrome: navChrome(nav, '', local), local });
+}
+
+/**
+ * A stub for a page that moved: meta refresh, canonical link and a visible
+ * link, all relative, so the same stub works under `/v0.NN/` and at the root.
+ */
+function redirectHtml(title: string, href: string): string {
+  const target = escapeAttr(href);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moved: ${escapeHtml(title)} — lazy docs</title>
+<link rel="canonical" href="${target}">
+<meta http-equiv="refresh" content="0; url=${target}">
+</head>
+<body>
+<p>This page has moved to <a href="${target}">${escapeHtml(title)}</a>.</p>
+</body>
+</html>
+`;
+}
+
+function indexHtml(pages: DocsSitePage[], version: string | null, local: boolean): string {
   const groups = new Map<string, DocsSitePage[]>();
   for (const page of pages) {
     const dir = page.path.includes('/') ? page.path.slice(0, page.path.lastIndexOf('/')) : '';
@@ -552,7 +1080,7 @@ function indexHtml(pages: DocsSitePage[], version: string | null): string {
     const items = (groups.get(dir) ?? [])
       .map(
         (page) =>
-          `<li><a href="./${escapeAttr(page.path)}/">${escapeHtml(page.title)}</a>` +
+          `<li><a href="./${escapeAttr(page.path)}/${local ? 'index.html' : ''}">${escapeHtml(page.title)}</a>` +
           `<span class="path">${escapeHtml(page.path)}</span></li>`,
       )
       .join('\n');
@@ -565,6 +1093,6 @@ function indexHtml(pages: DocsSitePage[], version: string | null): string {
   }</p>
 ${sections.join('\n')}`;
 
-  return pageHtml({ title: 'lazy documentation', body, version, toRoot: '' });
+  return pageHtml({ title: 'lazy documentation', body, version, toRoot: '', local });
 }
 

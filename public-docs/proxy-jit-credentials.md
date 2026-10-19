@@ -12,8 +12,7 @@ leaves the machine.
 
 The property this buys: a task container's environment, its `docker run` argv,
 its process listing, anything it writes to a log or a file, and anything a
-prompt-injected agent can exfiltrate contain a placeholder that is worthless
-anywhere except against this machine's proxy — and only until the task ends.
+prompt-injected agent can exfiltrate contain a placeholder that cannot authenticate to the provider. It is still a live token for this machine's proxy until the task ends, and is pinned to its container only where Docker allows (see below).
 
 This covers every model call lazy makes, including the short-lived ones it makes
 on its own behalf — see [Lifetime](#lifetime).
@@ -75,7 +74,7 @@ someone else's endpoint.
 | Target's configured credential | What the proxy sends |
 |---|---|
 | `credential = "anthropic"` | your real Anthropic credential, in the form that target expects |
-| `credential = "none"` (default) | nothing — the presented credential is *stripped*, not passed along |
+| `credential = "none"` | nothing — the presented credential is *stripped*, not passed along |
 | resolvable but missing/expired | 401 if it is the primary; that hop is skipped if it is a fallback |
 
 The map is keyed by **origin** (scheme + host + port), so two upstreams that
@@ -84,23 +83,16 @@ whose origin collides with an already-credentialed upstream while declaring
 `credential = "none"` would silently inherit that credential, so lazy refuses
 to start rather than run a credential map that does not mean what it says.
 
-A target that needs no credential today (local Ollama) and one that will need
-its own tomorrow (hosted Ollama) differ only in the data, not in the code path —
-the credential is looked up per target, never inferred from the backend type.
-
 **Profile upstreams are targets too.** An [agent
 profile](./lazy-toml.md#agentsname--named-agent-profiles)'s `endpoint` is the
 upstream the proxy forwards that profile's launches to, so it enters the same
-map under the same rules. A profile that does not name a `credential` gets the
-one lazy infers from its endpoint's hostname: a **local** Ollama upstream gets
-**none**; **hosted** Ollama (`https://ollama.com`) gets the Ollama API key you
-store with `lazy auth set ollama`; an Anthropic upstream gets the real Anthropic
-credential; an OpenAI one gets your OpenAI key — or your OpenRouter key when the
-endpoint is `openrouter.ai`, which holds whether the profile speaks OpenAI's
-wire or OpenRouter's Anthropic-compatible one (`https://openrouter.ai/api`). A
-profile that *does* name a credential (`credential = "work-openai"`) gets that
-one instead, so two profiles on the same provider can carry different keys. All
-are sent as the header form that target expects; the placeholder in the
+map under the same rules. A profile or endpoint you define must name
+the credential that pays for it — `credential = "work-openai"`, or
+`credential = "none"` for an unauthenticated local model server. Lazy refuses to
+load a config where it does not. Naming credentials per profile is also how two
+profiles on the same provider carry different keys. Only the built-in profiles,
+which use a fixed endpoint of their own, fall back to a default credential for
+that provider. Credentials are sent as the header form each target expects; the placeholder in the
 container mimics the real key's shape (`sk-proj-lazy-…`, `sk-or-v1-lazy-…`) so
 clients that validate key formats still launch. An origin collision with an
 already-credentialed upstream is refused at startup rather than silently
@@ -144,24 +136,13 @@ the same grant-derived attribution as any other proxied request.
 **The Cursor route is the one exception.** Requests under
 `/_lazy/cursor/<placeholder>/…` ([see below](#cursor)) go to a third upstream,
 Cursor's own API, and are forwarded verbatim — the table above does not apply to
-them. That is deliberate: `cursor-agent` speaks a protocol whose endpoints lazy
-does not model, and unlike a profile endpoint the upstream is a hosted API rather
-than a server you run, so there is no administrative surface next to the
-inference surface to scope away. Those requests are still audited.
+them. Those requests are still audited.
 
-Anthropic-wire profile upstreams are held tighter than the Anthropic one on
-purpose. Such an endpoint is usually a model server *you* run, and its
-administrative surface sits right next to its inference surface: an Ollama server
-answers `/api/pull`, `/api/delete` and `/api/create` on the same port it answers
-inference on. An agent holds a placeholder that routes to that endpoint, so
-without this scoping it could ask your model server to delete your models.
-Inference and the probe are all such an upstream ever needs; model discovery is
-left out because there it is an inventory listing with no inference behind it —
-unlike the OpenAI-wire upstreams above, whose model list is a public catalogue.
-
-The list is part of lazy's source, not a config knob, so growing lazy's
-forwarding surface is a reviewable code change rather than a setting someone
-can widen in passing.
+Anthropic-wire profile upstreams are held tighter than the Anthropic one: only
+inference and the reachability probe are forwarded, so a model server's
+administrative endpoints (for Ollama, `/api/pull`, `/api/delete`, `/api/create`)
+are never reachable through the proxy. The list is fixed in lazy and is not
+configurable.
 
 For failed Cursor requests, Watch and the proxy audit log show a credential-redacted upstream error message when the response is small enough to inspect. Large or streamed error bodies still reach Cursor unchanged; oversized bodies are identified without recording their contents.
 
@@ -215,9 +196,7 @@ lines. A refusal for an unknown placeholder is recorded with no role or task id
 They also show up live: because attribution here is derived from the grant
 rather than a self-reported header, `lazy watch` can stream this proxy's
 traffic per task (`net>` lines) and flag a credential refusal with its actual
-cause — a container presenting a placeholder whose grant is gone. That is what
-makes watch agent-agnostic.
-
+cause — a container presenting a placeholder whose grant is gone.
 The grant carries the task's code (or its short id when it has none), so
 filtering proxy traffic by task accepts either form. A task code must match
 exactly, because codes often share prefixes (`fix-login` vs `fix-login-2`) and
@@ -327,11 +306,8 @@ key, so a container always gets a placeholder; this case only arises on the host
 
 ## OAuth token refresh
 
-Claude Code's OAuth refresh flow targets `console.anthropic.com`, a different
-host from `ANTHROPIC_BASE_URL`, so it never reaches the proxy carrying a
-placeholder — and a token minted by `claude setup-token` carries no refresh
-token to exchange in the first place. The placeholder is swapped per request,
-so a rotated real credential is picked up on the next request with no relaunch.
+The placeholder is swapped per request, so a rotated real credential is picked
+up on the next request with no relaunch.
 
 ## Scope
 

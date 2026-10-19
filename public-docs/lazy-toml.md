@@ -10,7 +10,7 @@ If `LAZY_CONFIG` is set but points to a file that doesn't exist, lazy fails hard
 
 ## If lazy.toml doesn't parse
 
-A missing `lazy.toml` is a normal condition — lazy uses its defaults. A `lazy.toml` that **exists but doesn't parse** is not: lazy fails hard with the offending line and stops, rather than falling back to defaults. Falling back would discard every setting in the file at once and leave lazy running on defaults that look deliberate — a duplicate `[runner]` table would mean agents ran in Docker while the file plainly said host-process.
+A missing `lazy.toml` is a normal condition — lazy uses its defaults. A `lazy.toml` that **exists but doesn't parse** is not: lazy fails hard with the offending line and stops, rather than falling back to defaults. Falling back would discard every setting in the file at once and leave lazy running on defaults that look deliberate — a duplicate `[runner]` table would mean agents ran with the default settings while the file plainly said otherwise.
 
 The most common cause is a **duplicate table**. `lazy init` already writes `[runner]`, `[server]`, `[storage]`, `[remote]`, `[docker]` and others, so appending a second copy of one is a TOML redefinition error. Edit the table that is already there instead of adding another one.
 
@@ -153,7 +153,7 @@ agent = "local-ollama"
 
 A role is only a **default**. A task that names its own profile (`lazy create --agent <profile>`) runs on that profile, whatever the role says — which is the whole point of profiles.
 
-> **The `backend`, `model` and `endpoint` keys were removed from this table.** A lazy.toml that still has them is rejected at load, with the exact `[agents.<name>]` block that replaces them printed. See [Migrating from role backends](#migrating-from-role-backends).
+> **The `backend`, `model` and `endpoint` keys are not accepted in this table.** A lazy.toml that has them is rejected at load, with the exact `[agents.<name>]` block that replaces them printed. See [Migrating from role backends](#rejected-spellings).
 
 ---
 
@@ -248,8 +248,8 @@ credential = "none"
 ```
 
 ```bash
-lazy create "Ship the invoice fix" --agent work-codex
-lazy create "Sweep the changelog"  --agent local-pi
+lazy create --goal "Ship the invoice fix" --agent work-codex
+lazy create --goal "Sweep the changelog"  --agent local-pi
 ```
 
 Each task's traffic reaches its own upstream with its own credential, and the others are untouched.
@@ -290,7 +290,7 @@ description = "On demand only: use when someone asks for it by name — the hard
 agent_id = "claude-normal"    # new tasks start on the normal tier
 ```
 
-`lazy.toml.example` carries the full set for Claude Code, Cursor and Codex. Pick a tier per task with `--agent` (`lazy create "Rework the session store" --agent claude-complex`) or from the Agent profile picker. A tier is a starting point, not a lock: `--model` on a single task still wins.
+`lazy.toml.example` carries the full set for Claude Code, Cursor and Codex. Pick a tier per task with `--agent` (`lazy create --goal "Rework the session store" --agent claude-complex`) or from the Agent profile picker. A tier is a starting point, not a lock: `--model` on a single task still wins.
 
 Model ids differ by harness, and each harness has to know the model. The Claude Code ids above need Claude Code 2.1.284 or newer; `cursor-agent models` and the Codex CLI's model list show what yours offers.
 
@@ -362,17 +362,17 @@ Refusals are kept in the daemon's memory. After a daemon restart, a refused tier
 
 The builder can run on a tiered profile — set `[models.roles.builder] agent` to it. It switches tiers per request exactly as a task does, every tier's credential is checked before it starts, and the [usage pause](#usage_pause) holds it only when **every** tier is full. A lower tier is usually a weaker model, so lazy shows which tier is answering: `lazy builder` prints it at start, the builder's `lazy_status` reports it, and the Builders pages in the dashboard and Lazy Teams show it together with recent switches. Switches a builder made are kept in memory by the daemon and are not shown after it restarts.
 
-### Migrating from role backends
+### Rejected spellings
 
-Three older spellings were removed. Lazy **refuses to load** a `lazy.toml` that still uses one, rather than reinterpreting it — the keys still parse, so a tolerant reader would keep launching against a different upstream than the file says. Each refusal prints the exact replacement block:
+Lazy **refuses to load** a `lazy.toml` that uses one of these spellings. Each refusal prints the exact replacement block:
 
-| Removed | Replaced by |
+| Rejected | Replaced by |
 |---------|-------------|
 | `[models.roles.<role>] backend` / `model` / `endpoint` | An `[agents.<name>]` profile plus `[models.roles.<role>] agent = "<name>"` |
 | The `[ollama]` block | One `[agents.<name>]` profile with that endpoint, plus `[agent] agent_id = "<name>"` |
 | `[proxy] openai_upstream` | The `endpoint` of the codex profile |
 
-There is one carve-out, and it is narrow: a bare `[ollama]` header with **no keys under it** — every line commented out, say — configured nothing before profiles either, so there is nothing to reinterpret. Lazy reports it as removed and carries on rather than refusing; delete the dead header whenever it suits you. Anything else written under that name still refuses, including the array-of-tables spelling `[[ollama]]`, which carries real settings however unusual it looks. `lazy doctor` names the section and prints the replacement in both cases — including for a file that no longer loads, which is exactly when you need it.
+A bare `[ollama]` header with **no keys under it** configures nothing, so lazy warns and carries on; anything else written under that name, including `[[ollama]]`, is refused. `lazy doctor` names the section and prints the replacement, including for a file that no longer loads.
 
 `lazy doctor` reports the same thing, and **`lazy doctor --fix agents` rewrites the file for you** — it shows the diff and asks before writing (`--yes` for scripts), preserves your comments and key order, and refuses to write anything it cannot re-validate. Where the rewrite would have to invent a model name it stops and tells you which key to add instead of guessing one.
 
@@ -475,7 +475,7 @@ project's own `.lazy/` directory: wait intervals (`.lazy/waits/`) and trace span
 (`.lazy/traces/`). They are append-only observability data with no relational
 consumers, and they describe the machine that ran the work rather than the project.
 
-The legacy `"in-repo"`, `"orphan-branch"`, and `"postgres"` backends have been removed; lazy fails hard if it sees them and prints migration guidance.
+The `"in-repo"`, `"orphan-branch"`, and `"postgres"` backends are not supported; lazy fails hard if it sees them and prints migration guidance.
 
 ---
 
@@ -687,8 +687,7 @@ somebody deciding that one particular task deserves more thinking. If it did
 outrank it, `draft_effort` would have no effect on any project that states an
 effort at all.
 
-**Migrating.** The three `[agent] low_high_loop*` keys moved here and are still
-honoured meanwhile, with `lazy doctor` naming each replacement:
+**Migrating.** The three `[agent] low_high_loop*` keys are still honoured, with `lazy doctor` naming each replacement:
 `low_high_loop = true` → `mode = "low_high"`, `low_high_loop = false` →
 `mode = "separate"` (which is what `false` meant: no in-session loop, and the
 daemon dispatching its own reviewer), `low_high_loop_draft_effort` →
@@ -865,11 +864,6 @@ host-process runner fails at load time with an actionable error naming Docker.
 type = "docker"
 ```
 
-Legacy `[runner]` keys for host-process permission posture (`permission_mode`,
-`sandbox_*`, `verify_sandbox_boundary`) remain in the schema and are still
-validated if present, but only container runners are supported — remove unused
-keys from new configs.
-
 ---
 
 ## `[remote]`
@@ -982,7 +976,7 @@ would permanently diverge from your local one.
 
 The driver-specific keys (`github_*`, `gitlab_*`) are always valid at the schema level — lazy won't warn about GitHub keys while you're temporarily using the `local` driver.
 
-The legacy `[remote_github]` section is no longer supported; lazy fails hard if it sees one and tells you to move the keys under `[remote]` with a `github_` prefix.
+The `[remote_github]` section is not supported; lazy fails hard if it sees one and tells you to move the keys under `[remote]` with a `github_` prefix.
 
 ---
 
@@ -1133,7 +1127,7 @@ Environment variables always outrank the store, so adding this section changes n
 
 ## Running on Ollama
 
-There is no `[ollama]` section any more — a lazy.toml that still has one with keys in it is [rejected at load](#migrating-from-role-backends) with the replacement printed. An Ollama server is now just an endpoint a profile points at, which is what lets one project run some tasks on it and others on a hosted model:
+There is no `[ollama]` section — a lazy.toml with one that has keys in it is [rejected at load](#rejected-spellings) with the replacement printed. An Ollama server is just an endpoint a profile points at, which is what lets one project run some tasks on it and others on a hosted model:
 
 ```toml
 [agents.local-ollama]
@@ -1176,17 +1170,17 @@ If a profile is removed, its existing launches receive HTTP 410 (route gone), no
 
 ### There is no off switch
 
-`[proxy] enabled` **was removed.** A lazy.toml that still carries it is never silently ignored — what happens depends on the value. `enabled = false` asks for something lazy no longer does, so it is **rejected at load** with an error naming the removed option; ignoring it would leave you believing traffic was unproxied when it is not. `enabled = true` asks for exactly what lazy already does, so the line is merely dead: you get a **warning** telling you to delete it, and the command carries on.
+`[proxy] enabled` is not a key. A lazy.toml that still carries it is never silently ignored — what happens depends on the value. `enabled = false` is **rejected at load** with an error naming the option. `enabled = true` asks for exactly what lazy already does, so the line is merely dead: you get a **warning** telling you to delete it, and the command carries on.
 
 ```toml
 [proxy]
-enabled = false   # ERROR: `enabled` has been removed — delete this line
+enabled = false   # ERROR: `enabled` is not a key — delete this line
 enabled = true    # WARNING: dead line, the proxy is always on — delete it
 ```
 
-This is what makes just-in-time credential injection possible: containers hold placeholder credentials and only the proxy holds the real one, so a proxy-less launch could not authenticate at all — "proxy off" is not a coherent state. To send a task somewhere else entirely, give its profile an explicit `endpoint` — that changes where the **proxy** forwards it, not whether it is proxied.
+Containers hold placeholder credentials and only the proxy holds the real one, so there is no proxy-off mode. To send a task somewhere else entirely, give its profile an explicit `endpoint` — that changes where the **proxy** forwards it, not whether it is proxied.
 
-**If the proxy cannot start, the daemon fails to start** — it never falls through to a direct connection. A silent fallback would send agent traffic straight to Anthropic while the audit trail recorded nothing, so the trail would lie by omission and the connector deny-rules would silently not apply. The startup error says why the proxy did not bind.
+**If the proxy cannot start, the daemon fails to start** — it never falls through to a direct connection. The startup error says why the proxy did not bind.
 
 **And if a launch cannot reach the running proxy, the launch fails too.** Every launch path (task agents, the builder, `lazy pair`, `lazy chat`) resolves the proxy's live address at launch time — from the daemon directly when it launches the agent itself, over the daemon's RPC port when the launch happens in a CLI client. If that resolution fails — daemon down, RPC blip, proxy not bound yet — lazy **refuses to launch** rather than connect direct:
 
@@ -1218,7 +1212,7 @@ The reasoning is the same as for daemon startup: a transient daemon failure must
 | `audit_retention_mib` | `int` | `128` | Disk the proxy audit log may use in all, in MiB (at least `8`). |
 | `upstream_timeout` | `int` | `1800` | Seconds the proxy waits for an upstream to answer one request before giving up (`0` = wait indefinitely). Raise it for a local model that loads slowly, queues requests behind other sessions, or prefills very large prompts; when the proxy does give up it names the upstream and this ceiling, so a slow model never reads as a network fault. |
 
-`openai_upstream` **was removed.** It was one global OpenAI upstream shared by every caller holding an OpenAI key, so two Codex setups could never differ. An upstream is a property of a [profile](#agentsname--named-agent-profiles) now: give the `codex` profile (or a profile of your own) an `endpoint`. A lazy.toml that still carries the key is reported by `lazy doctor` with that remedy, and `lazy doctor --fix agents` applies it.
+`openai_upstream` is not a key. An upstream is a property of a [profile](#agentsname--named-agent-profiles) now: give the `codex` profile (or a profile of your own) an `endpoint`. A lazy.toml that still carries the key is reported by `lazy doctor` with that remedy, and `lazy doctor --fix agents` applies it.
 
 ```toml
 # The default. No [proxy] section needed at all — the daemon starts the proxy on
@@ -1237,8 +1231,6 @@ upstream = "https://api.anthropic.com"
 Audit records are written to `.lazy/logs/proxy-audit.jsonl` (append-only JSONL, one record per line) in the project-local data dir — **not** into your task store. The audit trail is disposable telemetry, not durable state: it is gitignored, safe to delete at any time, and never travels with the store. Writes are serialised — no interleaving even under concurrent requests — and happen asynchronously so the proxy hot path is never blocked by disk I/O.
 
 The file is **bounded by size and by age**: it rotates into numbered segments (`proxy-audit.jsonl.1`, `.2`, …) of 4 MiB, and keeps **7 days or 128 MiB, whichever comes first** — set with `audit_retention_days` and `audit_retention_mib`. Age is checked per segment, so the oldest entries can outlive the window by up to one segment's worth. That is deep enough to answer "which upstream returned that error last night"; `lazy doctor` shows the oldest entry the log still reaches back to. Every reader in lazy reads newest-first with a limit, so the deeper history costs nothing until someone looks. Anything wanting statistics should tap the stream as it flows rather than mine the file.
-
-> **Upgrading from an earlier version:** the audit stream used to be appended, uncapped, into the task store itself (`<store>/proxy-audit.jsonl`), where it could grow large enough to break a store push. The daemon deletes that leftover file on startup and says so in its log — since it is cleanup of a file an older version wrote and has nothing to do with the proxy's current state. `lazy doctor` reports it if it is still there. If your store is a git repo, the oversized blob is also in its **history**, which lazy will not rewrite for you — use `git filter-repo` in the store repo to purge it.
 
 Each record is **attributed to the role and task that made the request.** The attribution comes from the per-launch placeholder credential the agent presents, which the proxy resolves to the task and role it was minted for — evidence, not a claim the agent could forge. Traffic without a placeholder (for example a host session using its own login) falls back to the `x-lazy-role` / `x-lazy-task-id` hint headers lazy sets at launch; those headers are stripped before forwarding either way, so the upstream never sees them. This is what lets the audit trail (and every `DENY` log line) say *which* agent and task tried a given `tool_use`, not just that one did.
 
@@ -1594,8 +1586,6 @@ see below.) `lazy unblock` has no `--approve-file` /
 `--no-approve-files` flags and `lazy_unblock` has no `approved_files`
 parameter — a conflict task is unblocked exactly like a blocked one, as many
 times as the work needs, and lazy itself never changes the violated files.
-(Passing a retired flag or parameter is an error pointing at accept,
-not a silent no-op.)
 
 **Accept is the one gate:**
 
@@ -1756,7 +1746,7 @@ instructions = "You updated UI — start the app in demo mode and take Playwrigh
 
 When enabled, the configured commands run **mechanically** as a task is being **accepted**, BEFORE the merge — the home for expensive one-time validation (full test suite, build). **No agent runs here.** The commands execute in an ephemeral gate container next to the task's own (same runner, same project image) against the task's worktree, in order, and the first non-zero exit — or a command that exceeds its timeout — **aborts the accept** and returns the task to the status it held before the accept, with the failed command, its exit code and an output tail recorded as a comment. There is never a silent merge: nothing merges until this independent run passes, and nothing "fixes" anything first — if the branch fails the gate, you fix it (or send the task back with `lazy unblock`) and accept again.
 
-Because no agent runs, the gate has no session, no system prompt, no `LAZY.md` and no turn in the task history — the outcome appears in the accept output and on the task as a comment. It also means **maintained-files completeness has moved out of accept time**: the maintained-files nudge (`[[automation.maintain]]`) runs once at the wrap-up that closes a declared-final turn, not here.
+Because no agent runs, the gate has no session, no system prompt, no `LAZY.md` and no turn in the task history — the outcome appears in the accept output and on the task as a comment. The maintained-files nudge (`[[automation.maintain]]`) does not run here; it runs once at the wrap-up that closes a declared-final turn.
 
 | Key        | Type       | Default | Description |
 |------------|------------|---------|-------------|
@@ -1804,7 +1794,7 @@ post_turn_timeout = 300
 
 **On container runners, automation hooks run inside the task container.** Anything a `pre_turn` hook starts there is scoped to that container's lifecycle unless you deliberately run host-side tooling from the hook (unusual and not recommended).
 
-**`post_turn` is not a teardown hook.** It runs on clean turns only. A turn that failed, timed out, or was stopped is hard-killed, and `post_turn` does not run for it. That is accepted behavior today, not an oversight: if you need cleanup that must always happen, do it outside lazy (or make the next `pre_turn` reconcile the state).
+**`post_turn` is not a teardown hook.** It runs on clean turns only. A turn that failed, timed out, or was stopped is hard-killed, and `post_turn` does not run for it. If you need cleanup that must always happen, do it outside lazy (or make the next `pre_turn` reconcile the state).
 
 ### The accept check — `accept_check`
 
@@ -1825,7 +1815,7 @@ accept_check_timeout = 300
 
 Override a refusal knowingly with `lazy accept <task> --allow-broken`. The failure is still reported as a warning; the flag suppresses the refusal, never the fact. There is deliberately no config key that turns the gate into a silent pass, and the flag is CLI-only — over MCP the refusal says so instead of naming it.
 
-**Before enabling this on a container-runner project, read the trust boundary in [The accept check](accept-check.md#where-it-runs-and-what-an-agent-can-influence).** The command comes from your committed config, but it runs on the daemon **host** with the agent-written worktree as its working directory — so what it resolves (`package.json` scripts, `Makefile`, `tsconfig.json`) is authored by the branch under review. Unlike `pre_accept`, it does not go through the runner.
+**Before enabling this on a container-runner project, read the trust boundary in [The accept check](accept-check.md#where-it-runs-and-why).** The command comes from your committed config, but it runs on the daemon **host** with the agent-written worktree as its working directory — so what it resolves (`package.json` scripts, `Makefile`, `tsconfig.json`) is authored by the branch under review. Unlike `pre_accept`, it does not go through the runner.
 
 ---
 
@@ -1833,7 +1823,7 @@ Override a refusal knowingly with `lazy accept <task> --allow-broken`. The failu
 
 **Deprecated — folded into `[automation]`.** `[checks] post_turn` and `[checks] post_turn_timeout` are now `[automation] post_turn` and `[automation] post_turn_timeout`, so every declarative hook lives in one table.
 
-The old spelling still **works**: an existing `[checks]` value is applied to the corresponding `[automation]` key, because silently dropping a configured check would remove a project's only per-turn gate without a word. But it is deprecated —
+The old spelling still **works**: an existing `[checks]` value is applied to the corresponding `[automation]` key. It is deprecated —
 
 - loading a config that uses it prints one generic line pointing at `lazy doctor`;
 - `lazy doctor` reports the exact keys to move and where to move them;
@@ -1886,7 +1876,7 @@ max_turns_without_human = 10
 
 The cap must be a **positive integer** (a cap `< 1` is rejected at load time).
 
-**What counts as a live builder, and who enforces it.** The builder cap counts the live builder containers for this project plus any launch the daemon has admitted but whose container is not up yet (an in-flight reservation, dropped automatically after 60s if the launch never completes). Both the count and the verdict live in the **daemon**, which admits each builder atomically — so the cap holds for *any* launcher, not just `lazy builder`, and two launches racing for the last slot cannot both win. `lazy builder` still prints a friendly "limit reached" message before doing any work, but that check is a convenience: bypassing it (a script, a future web UI, a second copy of the CLI) does not bypass the cap. If the daemon or the container runtime is unreachable, an interactive builder launch is allowed through rather than blocked on infrastructure that is already broken.
+**What counts as a live builder, and who enforces it.** The builder cap counts the live builder containers for this project plus any launch the daemon has admitted but whose container is not up yet (an in-flight reservation, dropped automatically after 60s if the launch never completes). Both the count and the verdict live in the **daemon**, which admits each builder atomically — so the cap holds for *any* launcher, not just `lazy builder`, and two launches racing for the last slot cannot both win. `lazy builder` still prints a friendly "limit reached" message before doing any work, but that check is a convenience: bypassing it (a script, another client, a second copy of the CLI) does not bypass the cap. If the daemon or the container runtime is unreachable, an interactive builder launch is allowed through rather than blocked on infrastructure that is already broken.
 
 **All builders are container-enumerable.** With `type = "docker"` or `"podman"`,
 builder sessions appear as named containers and count toward the cap. There is
@@ -1930,8 +1920,8 @@ yourself is never refused, and doing so starts a fresh budget — as does starti
 the child again, accepting it, or reopening it. The daemon's own recovery turns
 are exempt for the same reason.
 
-This section was called `[loop]` before the task type was renamed. A lazy.toml
-still using the old name is reported by `lazy doctor` with the replacement.
+A lazy.toml still using the section name `[loop]` is reported by `lazy doctor`
+with the replacement.
 
 ## `[usage_pause]`
 
@@ -2145,7 +2135,7 @@ Controls the daemon's auto-react behavior — automatically unblocking tasks in 
 | `auto_react_backoff`      | `string` | `"exponential"` | Backoff strategy between repeated auto-unblocks of the same trigger: `"none"`, `"linear"`, or `"exponential"`. |
 | `auto_react_daily_budget` | `number` | `50`            | Max auto-triggered turns per day across all tasks in the project. Resets at **local midnight** (machine timezone). |
 | `max_auto_turns`          | `number` | `3`             | Max *consecutive* auto-triggered turns per task before the task is paused for human review. The counter resets whenever a human manually unblocks the task or the task reaches a terminal state. |
-| `auto_resume`                      | `bool`   | `true`  | Master switch for auto-resuming interrupted tasks (both the fast lane and the slow lane below). `false` disables both — a crashed task then waits for a manual `lazy resume`. |
+| `auto_resume`                      | `bool`   | `true`  | Turns the slow lane below on or off. With `false`, a task whose fast-lane retries are spent waits for a manual `lazy resume`; the fast lane's immediate resumes still happen. |
 | `auto_resume_interval_minutes`     | `number` | `30`    | Once a task's fast-lane retries are spent (its circuit breaker tripped), how often it is retried on the slow lane. |
 | `auto_resume_gap_minutes`          | `number` | `5`     | Minimum spacing between ANY two auto-resumes project-wide, fast lane or slow lane — a fairness floor so a burst of simultaneous crashes can't relaunch every task at once. |
 | `auto_resume_max_attempts`         | `number` | `24`    | Slow-lane attempts before a task gives up for good (default: 24 × 30 min ≈ 12 hours). If a task hasn't recovered by then it needs a human — resume it manually with `lazy resume`. |

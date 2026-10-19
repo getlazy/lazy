@@ -111,11 +111,8 @@ place a Start button appears next to a terminal.
 
 ## When a shell cannot be opened
 
-Two things a start cannot fix, which the page says instead of failing silently:
-
-- **The task hasn't started**, so it has no session yet.
-- **The task runs without a container** — for example on the host-process
-  runner, where there is nothing to enter.
+A start cannot fix a task that hasn't started, so it has no session yet; the
+page says so instead of failing silently.
 
 ## What a shell can reach
 

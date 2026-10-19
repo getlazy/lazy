@@ -205,8 +205,8 @@ Options:
   --json       Emit the winning task plus every waited-on task as JSON
 
 Exit Codes:
-  0            Task became blocked (normal completion awaiting review)
-  1            Task was interrupted, errored, or the wait timed out (600s cap)
+  0            Task became blocked, conflict or submitted (awaiting review)
+  1            Task completed, was interrupted, errored, or the wait timed out (600s cap)
 
 Examples:
   lazy wait abc12345                    # Poll until task completes

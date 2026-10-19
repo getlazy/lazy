@@ -435,7 +435,7 @@ async function launchChatClaude(opts: {
 }
 
 export function chatUsage(): void {
-  console.log(`Usage: lazy chat <task> [--override-usage-pause]
+  console.log(`Usage: lazy chat <task> [--effort <level>] [--override-usage-pause]
 
 Interactive, read-only chat with a task's agent — ask it what it did and why.
 

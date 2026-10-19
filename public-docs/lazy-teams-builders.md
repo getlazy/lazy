@@ -3,7 +3,11 @@
 Open **Builders** in your project to start or return to your builder, read
 previous conversations, and find the files builders have left for you.
 
+![The Builders page listing builder conversations, with the live one marked running](images/teams/teams-builders.png)
+
 ## The terminal
+
+![A builder's terminal on its own page, with the Paste and Fill window buttons above it and the keyboard hints below](images/teams-topics/builders-terminal.png)
 
 Choose **Fill window** above the terminal to make it cover the whole window, and
 **Exit full window** (or **Esc**, when the terminal itself is not focused — inside it Esc goes to your program) to return to the page. You can also drag the terminal's bottom-right resize handle to

@@ -178,7 +178,7 @@ export async function commandReject(args: string[]): Promise<void> {
 export function rejectUsage(): void {
   console.log(`Usage: lazy reject <task_id> [--reason "..."] [--yes] [--accept-dirty-worktree]
 
-Reject a task's work and close its PR with a reject review.
+Reject a task's work and close its PR, if it has one (no comment is posted).
 
 Arguments:
   <task_id>    ID of the task to reject
@@ -193,7 +193,7 @@ Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 Notes:
   - Requires an active session. For tasks that haven't been worked on, use 'lazy close'.
   - The task's session ends with outcome 'rejected'
-  - The PR is closed with a reject review
+  - The PR is closed without a review or comment; the reason stays on the task
   - Worktree is removed; branch and task history are preserved
   - Task is marked as 'abandoned'
   - Use 'lazy reopen <task_id>' to restore the task later

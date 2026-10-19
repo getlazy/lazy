@@ -225,8 +225,8 @@ export interface TaskLinkResult {
 
 export interface TaskReviewInput {
   /**
-   * After a successful review that filed Raises, start an auto-fix work turn
-   * that injects those Raises into the agent's NOTES. Web Review dialog checkbox.
+   * After a successful review that found issues, start an auto-fix work turn
+   * that hands the findings to the agent as fix feedback. Web Review dialog checkbox.
    */
   autoFix?: boolean;
 }

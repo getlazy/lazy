@@ -10,6 +10,41 @@ auto-injected into **builder and agent launches**. Bodies are read on demand.
 Once the store grows, `lazy memory compact` replaces that index with a smaller
 *derived* summary — see [Compaction](#compaction).
 
+### In the browser
+
+![Settings → Memories on the dashboard: Live, All, New record and Compact buttons, the injected-context size line, and a table of three records with type and description](images/topics/memory-settings.png)
+
+The daemon's web UI serves the same store under **Settings → Memories** (the
+dashboard's address is printed by `lazy daemon status`):
+
+- **`/settings/memory`** — the live index, one row per record. `?all=1` includes
+  removed records (tombstones; the write history is kept). `/memory` redirects
+  here.
+- **`/memory/new`** and **`/memory/<name>`** — create, read, and edit a
+  record. These are the same writes as `lazy memory save` / `lazy memory rm`:
+  a human surface, so they may write. Task agents stay read-only.
+- **`/memory/compact`** — the current compact (exactly the derived summary
+  injected into launches), its size against `[memory] warn_bytes`, and whether
+  any records have been written or removed since it. **Run compact** uses the
+  same modes as `lazy memory compact` (`auto`, mechanical, llm) and streams progress so a
+  model call is never a silent wait. Clearing the compact is always safe:
+  injection falls back to the full index.
+
+The pages work with JavaScript turned off. Lazy Teams offers the same pages
+under a project's **Settings → Memory** tab — list, read, create, edit, remove, and run or
+clear the compact, with the same size figures and the same list of records the
+compact does not cover — writing to the same store, so it reads the same either
+way. Any team member can write there; people viewing as someone else cannot.
+
+Every write names who made it. The record page and its write history show the
+person — on a laptop, the git identity the daemon runs with; in Lazy Teams, the
+signed-in member — and fall back to the role (`human`) for older records.
+
+In Lazy Teams, an **Auto** or **LLM** compact runs a model on the Claude account
+of the member who pressed **Run compact**, and is refused if they have not
+connected one; **Mechanical** runs no model and needs no account. The page
+shows each step while the compact runs.
+
 ```bash
 lazy memory list                     # the index
 lazy memory show deploy-checklist # one record in full
@@ -147,39 +182,6 @@ catch-up picture — every record written or updated since the watermark (inject
 as its live index line, superseding the summary) and every name removed since.
 When nothing is outstanding it says so explicitly, so "is my newest memory
 actually reaching sessions?" is answerable without launching anything.
-
-### In the browser
-
-The daemon's web UI serves the same store under **Settings → Memories** (the
-dashboard's address is printed by `lazy daemon status`):
-
-- **`/settings/memory`** — the live index, one row per record. `?all=1` includes
-  removed records (tombstones; the write history is kept). `/memory` redirects
-  here.
-- **`/memory/new`** and **`/memory/<name>`** — create, read, and edit a
-  record. These are the same writes as `lazy memory save` / `lazy memory rm`:
-  a human surface, so they may write. Task agents stay read-only.
-- **`/memory/compact`** — the current compact (exactly the derived summary
-  injected into launches), its size against `[memory] warn_bytes`, and whether
-  any records have been written or removed since it. **Run compact** uses the
-  same modes as the CLI (`auto`, mechanical, llm) and streams progress so a
-  model call is never a silent wait. Clearing the compact is always safe:
-  injection falls back to the full index.
-
-The pages work with JavaScript turned off. Lazy Teams offers the same pages
-under a project's **Settings → Memory** tab — list, read, create, edit, remove, and run or
-clear the compact, with the same size figures and the same list of records the
-compact does not cover — writing to the same store, so it reads the same either
-way. Any team member can write there; people viewing as someone else cannot.
-
-Every write names who made it. The record page and its write history show the
-person — on a laptop, the git identity the daemon runs with; in Lazy Teams, the
-signed-in member — and fall back to the role (`human`) for older records.
-
-In Lazy Teams, an **Auto** or **LLM** compact runs a model on the Claude account
-of the member who pressed **Run compact**, and is refused if they have not
-connected one; **Mechanical** runs no model and needs no account. The page
-shows each step while the compact runs.
 
 ## Memory vs journal vs CLAUDE.md / AGENTS.md
 

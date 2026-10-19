@@ -10,6 +10,22 @@ so the same query returns the same results wherever you type it.
 `lazy search --help` is the authoritative reference for flags; this page explains
 the query language and the behavior that isn't obvious from a flag list.
 
+## Searching in a browser
+
+![The dashboard search page for the query status:blocked: the search box, a folded Query syntax panel, and two matching tasks](images/topics/search.png)
+
+The query language on this page is the same one the browser surfaces take, and
+they say so where you type it. The dashboard's search page and the Lazy Teams
+find page both carry a folded **Query syntax** panel beside the search box: every
+field and operator with what it matches, the matching rules that a field list
+cannot show, and worked examples that are links — clicking one runs it.
+
+A query the engine will not read is not a broken search, and these pages do not
+report it as one. The message you get back is the one `lazy search` would give you:
+`code:spike` is told that the field is now `task:`, an unquoted multi-word tag is
+told to quote it. On Lazy Teams the syntax panel opens itself when that happens,
+since the language is what you are now looking at.
+
 ## Three matching modes
 
 | Mode | When it is used | What it matches |
@@ -105,11 +121,10 @@ not require the whole code.
 fixed list; a tag is normalized on write), so a substring match there would
 quietly widen the filter rather than help.
 
-### `task:` replaced `code:`
+### Matching a task code: `task:`
 
-The field that matches a task code is `task:`. Earlier versions called it
-`code:` and matched only a code in full; that spelling is no longer accepted,
-and typing it tells you what to use instead:
+The field that matches a task code is `task:`. The spelling `code:` is not
+accepted, and typing it tells you what to use instead:
 
 ```
 $ lazy search 'code:spike'
@@ -282,24 +297,8 @@ lazy search 'in:memories "credentials"'
 lazy search 'auth' --json                               # structured output
 ```
 
-## Searching in a browser
-
-The query language on this page is the same one the browser surfaces take, and
-they say so where you type it. The dashboard's search page and the Lazy Teams
-find page both carry a folded **Query syntax** panel beside the search box: every
-field and operator with what it matches, the matching rules that a field list
-cannot show, and worked examples that are links — clicking one runs it.
-
-A query the engine will not read is not a broken search, and these pages do not
-report it as one. The message you get back is the one this page would give you:
-`code:spike` is told that the field is now `task:`, an unquoted multi-word tag is
-told to quote it. On Lazy Teams the syntax panel opens itself when that happens,
-since the language is what you are now looking at.
-
 ## Related
 
 - [Reviewing tasks in Lazy Teams](./lazy-teams-task-review.md) — the find page's
   sibling surfaces
 - [Shared memory](./memory.md) — memory records and `in:memories`
-- [lazy-agent design](./lazy-agent-design.md) — how agents reach search
-  over MCP rather than by shelling out

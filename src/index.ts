@@ -458,7 +458,7 @@ const legacyCommands: Record<string, string> = {
   'pending': 'Error: `lazy pending` has been removed. All tasks are started immediately. Use: lazy list',
   'task': 'Error: `lazy task` has been removed. Use: lazy start, lazy edit, lazy list, lazy show',
   'session': 'Error: `lazy session` has been removed. Use: lazy start, lazy unblock, lazy accept, lazy close, lazy reject',
-  'abandon': 'Error: `lazy abandon` has been removed. Use `lazy close` (no session required) or `lazy reject` (closes PR with reject review).',
+  'abandon': 'Error: `lazy abandon` has been removed. Use `lazy close` (no session required) or `lazy reject` (closes its PR).',
 };
 
 // Hidden internal commands: bypass auto-init, reconciliation, and help.

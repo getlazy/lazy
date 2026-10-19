@@ -298,6 +298,8 @@ Clicking one takes you to Changes with `?region=<id>` applied: the diff and the
 file list scope to that group. Past the twelfth region the rest fold into
 **Other regions** rather than disappearing.
 
+![The Changes tab of a task page. This is the empty case: above the diff, the card says the task has no review regions yet because no walkthrough was filed](images/topics/changes-tab.png)
+
 The **Changes** tab itself carries a small card above the diff — how many
 regions the walkthrough declares, the largest few by name, and a way through to
 the tab. When a region is selected the card says which one, and offers the way

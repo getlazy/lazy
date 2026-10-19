@@ -102,12 +102,10 @@ Only text lazy marked as its own when it wrote the turn is folded. Your words
 are never hidden — if you type something that looks like lazy's marker, it is
 shown escaped (its `<` becomes `&lt;`) and nothing is folded.
 
-Turns recorded before this existed are folded only where lazy recognises its
-own template: the cluster contract, matched exactly in its current wording, and
-lazy's own wrap-up checks, recognised by their heading (only checks whose text
-is entirely lazy's — never one that carries a person's or reviewer's words).
-Older cluster turns written with an earlier wording of the contract, and
-anything else, are shown in full.
+Folding applies only where lazy recognises its own template: the cluster
+contract, matched exactly, and lazy's own wrap-up checks, recognised by their
+heading (only checks whose text is entirely lazy's — never one that carries a
+person's or reviewer's words). Anything else is shown in full.
 
 ## Moving through a review with the keyboard
 
@@ -338,6 +336,8 @@ stand behind.
 ## Changes (diff)
 
 The **Changes** section shows what would merge if you accept the task.
+
+![A task's Changes section, presented as groups of files with a unified diff for each](images/teams-topics/review-changes.png)
 
 Every task gets a **file view**: each changed file as a real unified diff,
 grouped by what the file is — Documentation first, then Code, Tests, Generated
@@ -591,6 +591,8 @@ read or written. Unsent words are that person's.
 accept. Everything else the agent raised, and every item already decided, is on
 the project's **Raised** page.
 
+![A task's Current review section: the latest feedback, an open blocking question with its Decision menu, and the Give feedback form](images/teams-topics/review-current.png)
+
 Agents raise two kinds of thing, and every item says which it is:
 
 | Badge | What it means |
@@ -672,8 +674,6 @@ one decided on a task page rides the agent's next turn instead.
 Two things live on the task page rather than here: **Undo** (the queue cannot
 tell a decision the agent has already read from one still queued) and the diff
 the item is about.
-
-`/follow_ups` — the address this page used to have — redirects here.
 
 See [Raised items](raised-items.md) for the full accept-gate rules and what each
 decision means.
@@ -916,6 +916,9 @@ Teams) is approved by pressing **Accept** yourself: the page says the merge is
 protected, and the task records you as the person who approved it. There is no
 passphrase. See [Protected branches](protected-branches.md#in-lazy-teams-pressing-accept-is-the-approval).
 
+![The Accept page for a protected merge: where the task merges, the protected-merge notice, and the open questions to decide before accepting](images/teams-topics/review-accept.png)
+
+
 ## More to do with this task
 
 The **More** tab holds everything else the page can do with a task. None of it is
@@ -1008,9 +1011,9 @@ minutes or twenty seconds. When a chunk matches the agent's structured report,
 the report is shown once at the top of that chunk instead of repeating the
 agent's prose turn.
 
-The grouping comes from lazy itself. On an older project daemon that does not
-send it, the turns are listed one by one instead, oldest first, and the section
-says so — you lose the grouping, never the transcript.
+The grouping comes from lazy itself. When it is not available, the turns are
+listed one by one, oldest first, and the section says so — you lose the
+grouping, never the transcript.
 
 ## Comments
 
@@ -1147,8 +1150,8 @@ would go out of date without anybody noticing.
 **Nothing missing is shown as a zero.** The three cases each say what they are:
 
 - A task lazy never recorded tool statistics for says so, and says it is not a
-  claim that no tools were called — it may have run before lazy kept them, or
-  its traffic may not have gone through lazy.
+  claim that no tools were called — its traffic may not have gone through
+  lazy.
 - A turn whose agent reported no token usage keeps its row and reads "not
   recorded". It was not a free turn; nobody wrote down what it cost.
 - A tool whose results were never sized shows no token count and no per-call

@@ -37,7 +37,7 @@ You have five categories of lazy MCP tools:
 - `lazy_unblock` — Unblock a blocked task with feedback
 - `lazy_accept` — Accept and merge a task's work
 - `lazy_close` — Close a task (no session required)
-- `lazy_reject` — Reject a task's work and close its PR with a reject review
+- `lazy_reject` — Reject a task's work and close its PR (no review or comment is posted)
 - `lazy_resume` — Resume an interrupted task
 - `lazy_clone` — Create a variant (child) of an existing task
 - `lazy_reopen` — Reopen an abandoned or completed task

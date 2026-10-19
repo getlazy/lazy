@@ -212,7 +212,7 @@ async function getAutoReact(taskIdInput: string | undefined): Promise<void> {
         upstream_sync: 'Upstream syncs',
         comment: 'Comments',
         child_completed: 'Child completions',
-        child_added: 'Loop children added',
+        child_added: 'Cluster children added',
         crash: 'Crashes',
       };
       const hasCounts = Object.values(summary.counts).some(c => c > 0);

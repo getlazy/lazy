@@ -50,6 +50,36 @@ you dismiss the message the next occurrence starts a fresh one.
 
 ## Surfaces
 
+**Dashboard inbox.** The daemon's built-in dashboard — `lazy daemon dashboard-url`
+prints its address — serves the same inbox at `/messages`:
+
+![The dashboard Inbox with Inbox and All (incl. dismissed) views, an empty-inbox notice, and a legend explaining unread, read and dismissed](images/topics/inbox.png)
+
+- **`/messages`** — undismissed messages, newest first, with kind, source, date
+  and state. Unread rows are marked with a bold title and an edge marker, not
+  colour alone.
+- **`/messages?all=1`** — everything, including dismissed ones. A dismissed row
+  says when it was dismissed and by whom, and that the record is kept.
+- **`/messages/<id>`** — one message in full, its body rendered as markdown.
+  Opening it marks it read: `read_at` records that you have *seen* the message,
+  and the body being on your screen is the most direct evidence of that. This
+  matches `lazy messages read <id>`.
+- **Dismiss** is a button on both the list and the message itself.
+  **Dismiss all like this** files away every open message with the same source
+  and title, and **Dismiss all** (on the inbox) every open message — both ask
+  first, and nothing is deleted. Lazy Teams' Messages page offers the same
+  buttons. **Mark read**
+  is offered too, on unread rows, for filing something you have decided about
+  from the title alone.
+- The nav carries an unread badge and the dashboard shows an unread panel, so a
+  new alert is visible without going looking for it. Review, Raised and
+  Conversations carry the same badge — see [the nav
+  counts](web-review.md#the-nav-counts).
+
+Both actions are ordinary form submissions — the inbox works with scripting
+turned off. The dashboard is a loopback surface for the person sitting at the
+machine; dismissals from it are recorded as `human`, exactly as the CLI's are.
+
 **Builder launch.** Unread messages are injected compactly into the builder's
 system prompt — the same shape as the memory index: title + attribution per
 message, bodies on demand via `lazy_messages(id="...")`. The builder is
@@ -84,34 +114,6 @@ skips the question (and is required when there is no terminal to ask on).
 - `lazy_message_dismiss(id)` — **human/builder only.** Rejected server-side
   for task agents: the inbox belongs to the human, and an agent must not be
   able to empty it.
-
-**Web inbox.** The daemon's built-in dashboard — `lazy daemon dashboard-url`
-prints its address — serves the same inbox at `/messages`:
-
-- **`/messages`** — undismissed messages, newest first, with kind, source, date
-  and state. Unread rows are marked with a bold title and an edge marker, not
-  colour alone.
-- **`/messages?all=1`** — everything, including dismissed ones. A dismissed row
-  says when it was dismissed and by whom, and that the record is kept.
-- **`/messages/<id>`** — one message in full, its body rendered as markdown.
-  Opening it marks it read: `read_at` records that you have *seen* the message,
-  and the body being on your screen is the most direct evidence of that. This
-  matches `lazy messages read <id>`.
-- **Dismiss** is a button on both the list and the message itself.
-  **Dismiss all like this** files away every open message with the same source
-  and title, and **Dismiss all** (on the inbox) every open message — both ask
-  first, and nothing is deleted. Lazy Teams' Messages page offers the same
-  buttons. **Mark read**
-  is offered too, on unread rows, for filing something you have decided about
-  from the title alone.
-- The nav carries an unread badge and the dashboard shows an unread panel, so a
-  new alert is visible without going looking for it. Review, Raised and
-  Conversations carry the same badge — see [the nav
-  counts](web-review.md#the-nav-counts).
-
-Both actions are ordinary form submissions — the inbox works with scripting
-turned off. The dashboard is a loopback surface for the person sitting at the
-machine; dismissals from it are recorded as `human`, exactly as the CLI's are.
 
 ## Why agents may post but not dismiss
 

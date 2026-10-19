@@ -15,7 +15,7 @@ config, exactly as it does for git, so a repo where you commit as
 `you@work.example` is a repo where lazy attributes your actions to
 `you@work.example` too.
 
-There is no lazy-side setting for this, on purpose. If you want lazy to record a
+There is no lazy-side setting for this. If you want lazy to record a
 different address, change your git config — one identity, one place.
 
 ## When lazy does not know who you are
@@ -88,6 +88,10 @@ An agent never has an identity of its own. Its work belongs to whoever asked for
 the turn: if you unblocked the task, everything the agent writes for the length
 of that turn — its answer, the notes it leaves, the tags it sets — carries your
 name. If somebody else unblocks the next turn, that turn's work carries theirs.
+
+On the dashboard's **Turns** tab, each turn is labelled with how it arrived (`[human]`, `[agent]`, `[supervisor]`):
+
+![The Turns tab of a task in the dashboard. Each turn heading carries a label such as [human], [agent] or [supervisor], and agent turns show the agent, model and effort they ran as.](images/explanation/self-review-turns.png)
 
 Rows still say *how* the work arrived, so "you asked for this" stays readable
 apart from "you typed this": an agent's write is shown as the agent acting, with

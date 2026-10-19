@@ -7,7 +7,7 @@
  * builder supplied is often a real, extensive code review. This module keeps
  * that review on the task so the human's own `lazy accept` can surface it
  * before the passphrase prompt and attach it to the merge — the `[Accepted]`
- * task comment and, on forge drivers, the approving PR/MR review body.
+ * task comment.
  *
  * INVARIANT: pending_accept_review AUTHORIZES NOTHING. It is review TEXT, not
  * a credential — unlike the deleted `edge_gate_approval` record it can never

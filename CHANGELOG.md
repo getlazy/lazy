@@ -1,6 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [0.92.1203] - 2026-10-19 - Documentation
+
+The documentation site is reorganised into tutorials, how-to guides, reference, explanation and architecture, led by the dashboard and checked against the code.
+
+### Added
+
+- **Documentation search** — a search box in the docs header that finds pages, flags and help text offline, including from local `file://` previews; long pages get an "On this page" outline
+
+### Changed
+
+- **Documentation site** — reorganised dashboard-first into tutorials, how-to guides, reference, explanation and architecture, with screenshots and a generated CLI reference
+
+### Fixed
+
+- **`lazy system store-restore` on a mount-point store** — the refusal and docs now give a procedure that restores an exact snapshot and keeps the old contents
 
 ## [0.92.1201] - 2026-10-18 - Failure visibility, backups and Lazy Teams private alpha
 

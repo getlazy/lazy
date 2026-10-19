@@ -535,7 +535,7 @@ Options:
   --yes               Skip interactive prompts (non-interactive mode)
   --follow            Wait for the agent to finish, streaming output in real time
 
-Feedback input priority: --message flag > -f file > piped stdin > $EDITOR (interactive)
+Feedback input priority: -f file > --message flag > piped stdin > $EDITOR (interactive)
 
 Interactive mode (no flags, TTY):
   Shows task summary, recent commits, diff summary, then presents choices:

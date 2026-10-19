@@ -7,6 +7,8 @@ Each entry is either:
 - a **variable** — a name such as `DATABASE_URL` and a value; or
 - a **file** — a path relative to the task's worktree root (for example `.env.local` or `config/master.key`) and its contents.
 
+![Settings → Environment, listing a project's variables, a secret and a file, with each entry's applies and secret flags](images/teams/teams-project-environment.png)
+
 For each entry you choose:
 
 - **Applies** — *Always* (every task in the project) or *Optional* (only tasks it is picked for).
@@ -26,6 +28,8 @@ Teams checks that a variable name uses only letters, digits and underscores and 
 ## What a task gets
 
 A task's page shows an **Environment** section on its Services tab, where you go to troubleshoot its app: every always-applied entry, the optional entries picked for it, and any entries added for that task alone. Secrets, variables and files are listed by name or path only — values are never shown.
+
+![A task's Services tab with its Environment section: always-applied entries, one picked optional secret, one entry for this task only, and the optional entries to tick](images/teams-topics/task-environment.png)
 
 - **Pick optional entries.** Tick an optional entry to give it to this task. Members can tick entries marked *members may select*; an admin can tick any.
 - **Add something for one task.** Any member who can edit the task can add a variable or file just for it, optionally as a secret (stored encrypted, never shown again). It overrides a project entry with the same name.

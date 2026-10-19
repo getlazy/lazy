@@ -13,6 +13,7 @@ import {
   ARCHIVE_FILE,
   StoreBackupError,
   assertNoRestoreInProgress,
+  mountPointRefusal,
   readRestoreInProgress,
   restoreMarkerPathFor,
   type BackupManifest,
@@ -622,5 +623,21 @@ describe('a restore that fails while staging', () => {
     await expect(restoreStoreBackup({ storePath: store, backup: backup.name, now: clock, freeBytes: async () => 1 })).rejects.toThrow(/needs about .* is free/);
     expect(await leftovers()).toEqual([]);
     expect(await readFile(join(store, 'version.json'), 'utf-8')).toContain('schema_version');
+  });
+});
+
+describe('mountPointRefusal', () => {
+  // INVARIANT: the mount-point refusal never recommends extracting straight over the store. That only overlays the backup (files made after it stay behind); the advice is to move the old contents aside first.
+  test('does not recommend overlay extraction', () => {
+    for (const format of ['archive', 'directory']) {
+      const msg = mountPointRefusal('/mnt/store', { path: '/b/one', format });
+      expect(msg).not.toContain('tar -xzf');
+      expect(msg).not.toContain('by hand');
+      expect(msg).toContain('move the store\'s contents into a new folder inside it');
+      expect(msg).toContain('Nothing was changed');
+    }
+    expect(mountPointRefusal('/mnt/store', { path: '/b/one', format: 'archive' })).toContain(`unpack ${join('/b/one', ARCHIVE_FILE)}`);
+    expect(mountPointRefusal('/mnt/store', { path: '/b/one', format: 'directory' })).toContain('copy /b/one/store into');
+    expect(mountPointRefusal('/mnt/store', { path: '/b/one', format: 'archive' })).toContain('store-backups#a-store-that-is-a-mount-point');
   });
 });

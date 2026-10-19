@@ -5762,8 +5762,8 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
               });
               reviewStatus =
                 'Your review has been RECORDED on the task — the human\'s accept will show it ' +
-                'and attach it to the merge (task comment, and the approving PR/MR review on ' +
-                'forge drivers). Calling lazy_accept again with an updated reason replaces it.';
+                'and attach it to the merge (the [Accepted] task comment). ' +
+                'Calling lazy_accept again with an updated reason replaces it.';
             }
             // Lazy Teams has its own route (a member's browser Accept).
             throw new Error(renderGuidance(isManagedMode() ? 'accept-gated-teams' : 'accept-gated', {
@@ -5876,7 +5876,7 @@ export function createAcceptHandler(ctx: McpToolContext): McpToolHandler {
 export const rejectTool: McpTool = {
   name: 'lazy_reject',
   description:
-    'Reject a task\'s work and close its PR with a reject review. The task\'s session ends with outcome \'rejected\', ' +
+    'Reject a task\'s work and close its PR, posting nothing. The task\'s session ends with outcome \'rejected\', ' +
     'the worktree is cleaned up, and the branch is preserved. ' +
     'Requires an active session — for closing a task that hasn\'t been worked on, use lazy_close. ' +
     'Do not reject a subtask whose code you copied into your own branch: a subtask\'s work lands only by lazy_accept. ' +

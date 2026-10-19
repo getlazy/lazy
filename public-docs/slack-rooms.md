@@ -26,12 +26,14 @@ Setup is two steps on the **Integrations** page (avatar menu → **Account setti
    event subscriptions and Socket Mode already switched on — nothing to
    transcribe by hand.
 
+   ![An install's Integrations page before Slack is set up: step 1 shows the app manifest to copy](images/teams-topics/slack-integrations.png)
+
    The manifest asks for these bot scopes, and the page lists them beside it:
 
    - `groups:write` — create, invite to and archive private task channels
    - `groups:read` — check whether anybody is in a channel before closing it
    - `groups:history` — read thread context in those channels
-   - `channels:manage`, `channels:history` — reserved for future public-channel rooms
+   - `channels:manage`, `channels:history` — public-channel rooms
    - `app_mentions:read` — hear @lazy mentions, including outside its own rooms
    - `chat:write` — post status lines and turn summaries
    - `commands` — the `/lazy` slash command
@@ -54,6 +56,8 @@ Setup is two steps on the **Integrations** page (avatar menu → **Account setti
    - **Bot User OAuth Token** (`xoxb-…`) — Lazy posts to Slack with it.
    - **App-Level Token** (`xapp-…`) — Lazy opens the Socket Mode connection
      with it, and everything you type in Slack arrives over that connection.
+
+   ![The Integrations page's Step 2: the Bot User OAuth Token and App-Level Token fields with the Save Slack tokens button](images/teams-topics/slack-tokens.png)
 
    Save them together. Lazy confirms the workspace name from the tokens
    themselves. Both are stored encrypted and shown afterwards as
@@ -141,8 +145,7 @@ change one thing before you paste it: the slash command name, from `lazy` to
 something you can tell apart, such as `lazy-dev`. Slack does not keep slash
 commands apart by app — two apps claiming `/lazy` in one workspace means the one
 installed most recently silently takes it, whichever copy you meant. Everything
-else in the manifest can stay as it is, and the renamed command behaves
-identically.
+else in the manifest can stay as it is.
 
 Lazy watches for the mistake: if it sees another copy connected with the same
 Slack app, the Integrations page says so and tells you what to do about it.
@@ -154,18 +157,17 @@ archived channel still holds its own. So if the other copy already made
 channel either. It makes `lazy-fix-checkout-2` instead and carries on; the
 number is the only difference, and each copy's channels stay its own.
 
-### Upgrading an install that used the older setup
+### Adding the app-level token
 
-An install connected under the previous flow already has a working bot token and
-no app-level token. The Integrations page says so and asks for that one value:
-in the same Slack app, turn Socket Mode on, then generate an app-level token
-under **Settings → Basic Information → App-Level Tokens → Generate Token and
-Scopes** with the `connections:write` scope, and paste it. The Client ID, Client Secret and Signing
-Secret are no longer used and can be removed from your environment.
-
+If the Integrations page asks for an app-level token: in the same Slack app, turn
+Socket Mode on, then generate one under **Settings → Basic Information →
+App-Level Tokens → Generate Token and Scopes** with the `connections:write`
+scope, and paste it.
 ## Members
 
 1. Open **Account settings → Slack** from the avatar menu and generate a link code.
+
+   ![Account settings → Slack: the Slack linking page with a Generate link code button for the team's workspace](images/teams-topics/slack-link.png)
 2. In Slack: `/lazy link <code>`.
 3. Create work with `/lazy create <goal>`. Lazy creates a private channel named
    `lazy-<task-code>` and adds you to it — look for that channel in your Slack
@@ -203,20 +205,8 @@ When a task ends, its channel is archived. If the task is reopened or started
 again, Lazy brings that same channel back rather than making a second one, so
 its history is where you left it.
 
-If two channels with the same name ever appeared for one piece of work — one
-where everything happens and one that stays empty — that was two parts of Lazy
-asking for the channel at the same moment. Only one channel is made now, whoever
-asks first, and the other request joins it. An empty duplicate left behind by an
-older version is archived on its own the first time Lazy runs after the upgrade;
-a duplicate somebody was added to is left alone, since Lazy cannot tell which of
-the two you have been reading.
-
-Earlier versions of Lazy gave every subtask a channel of its own, and those
-channels had nobody in them but Lazy — invisible in every sidebar. If your
-install has some, Lazy tidies them up on its own the first time it runs after
-the upgrade: it archives the empty ones and moves that work into a thread where
-you can see it. A channel somebody was actually added to is left exactly as it
-is.
+Only one channel is made per piece of work, whoever asks first; a simultaneous
+request joins it.
 
 A task Lazy started by itself, with nobody it can add to a channel, gets no
 channel: a private channel with only Lazy in it cannot be found, opened or

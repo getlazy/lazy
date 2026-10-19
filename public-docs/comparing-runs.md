@@ -41,6 +41,8 @@ header), a pinned task reads like
 
 The agent and model are stored on the clone, so every later turn keeps them. Model names are not portable between agents, so switching `--agent` without `--model` never carries the source's model over.
 
+![A task page on the dashboard; the action row includes the Clone button](images/topics/changes-tab.png)
+
 The dashboard's and Lazy Teams' **Clone** / **Make a copy** action offers the
 same choices: agent, model, and a "Same base" checkbox. Over MCP, `lazy_clone`
 takes `same_base`, `base` and `agent`; with `same_base` or `base` it creates the

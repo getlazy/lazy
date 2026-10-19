@@ -5,6 +5,20 @@ the task (a design file, a spec, a screenshot, a data dump) or something the tas
 publishes *back* (a report, a rendered image, an export the human should be able
 to retrieve without digging through a worktree).
 
+### Dashboard
+
+![The Artifacts tab of a task page: one input file with its size, type and a Download link, a Preview fold, and the Add an input file form](images/topics/artifacts-tab.png)
+
+The task page on the local dashboard (`lazy dashboard`) has an **Artifacts**
+tab, labelled with how many artifacts the task carries. Each artifact shows its
+name, size, type, origin (input or output), who added it and when, and a
+**Download** link. Raster images preview inline; text files preview as text and
+Markdown files render. HTML and SVG are shown as source, never rendered. Below
+the list, **Add an input file** attaches a file for the agent, optionally under a
+name of your choosing; it never starts a turn, and a file with an existing name
+replaces it. Downloads go through the same dashboard sign-in as every page, and
+anything that is not a raster image is delivered as a file attachment.
+
 ```bash
 lazy artifact add <task> design/index.html design/app.css   # attach files
 lazy artifact list <task>                                   # what is attached
@@ -139,18 +153,6 @@ tree-wide like every other read. See
 
 `lazy show` lists a task's artifacts (metadata only), and `lazy_show` returns the
 same as `artifacts`.
-
-### Dashboard
-
-The task page on the local dashboard (`lazy dashboard`) has an **Artifacts**
-tab, labelled with how many artifacts the task carries. Each artifact shows its
-name, size, type, origin (input or output), who added it and when, and a
-**Download** link. Raster images preview inline; text files preview as text and
-Markdown files render. HTML and SVG are shown as source, never rendered. Below
-the list, **Add an input file** attaches a file for the agent, optionally under a
-name of your choosing; it never starts a turn, and a file with an existing name
-replaces it. Downloads go through the same dashboard sign-in as every page, and
-anything that is not a raster image is delivered as a file attachment.
 
 ### Lazy Teams
 

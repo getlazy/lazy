@@ -670,7 +670,7 @@ function renderBlockedOutput(
 export function listUsage(): void {
   console.log(`Usage: lazy list [<task_id>] [--all] [--flat] [--tag <tag>] [--levels <n>]
 
-List all non-terminal tasks (working + blocked + interrupted).
+List all non-terminal tasks (every status except complete and abandoned).
 
 Arguments:
   <task_id>   Optional task ID or code to filter - shows only that task and its descendants
@@ -703,7 +703,8 @@ Examples:
 export function activeUsage(): void {
   console.log(`Usage: lazy active [<task_id>] [--flat] [--levels <n>] [--follow | -f]
 
-List all non-terminal tasks (working + blocked + interrupted).
+List unfinished tasks that have been started (working, blocked, submitted,
+interrupted, ...). Backlog tasks are not shown.
 
 Arguments:
   <task_id>   Optional task ID or code - shows only that task's subtree
@@ -734,7 +735,7 @@ Examples:
 export function blockedUsage(): void {
   console.log(`Usage: lazy blocked [--flat] [--tag <tag>] [--levels <n>]
 
-List blocked tasks (waiting for user input).
+List tasks waiting on a person: blocked, conflict or submitted.
 
 Options:
   --flat         Show flat list instead of tree structure

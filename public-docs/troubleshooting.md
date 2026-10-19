@@ -526,8 +526,8 @@ The same applies to a value that parses as TOML but isn't usable — an unknown
 effort level, a port outside 1–65535, a malformed `[docs] url`. Each is
 reported with the section, the key, and the accepted values.
 
-`lazy doctor` also lists **unknown** sections and keys — typos and options left
-over from older versions. Those are warnings, not errors: lazy ignores them.
+`lazy doctor` also lists **unknown** sections and keys — typos and options lazy does not
+recognise. Those are warnings, not errors: lazy ignores them.
 
 The full key-by-key reference is [lazy.toml](./lazy-toml.md).
 
@@ -580,7 +580,7 @@ profile fails at launch, naming the profile and the credential. Doctor reports
 that credential as missing up front, so you learn it before a task does.
 
 If every profile your configuration uses points at an upstream that takes no
-credential — `credential = "none"`, the default for a local model server — no
+credential — `credential = "none"`, written explicitly for a local model server — no
 credential is required at all, the daemon starts without one, and doctor says
 so:
 
@@ -609,21 +609,6 @@ lazy upgrade --images
 `lazy doctor` reports this one directly — look for "Codex code-mode host
 installed" — so you can check before starting a task rather than after losing a
 turn.
-
-## Cursor review says "MCP calls were rejected"
-
-Symptom: a formal `lazy review` (or `lazy ask`) on a Cursor task produces a
-turn that says MCP calls were rejected / Shell is blocked, skips
-`lazy_show` / `lazy_raise`, and dumps findings only in the verdict JSON. Claude
-reviews on the same project keep their lazy tools.
-
-Cause (fixed in current lazy): Cursor's `--mode plan` refused MCP tool calls.
-Read-only Cursor turns now exclude write tools by name and leave lazy MCP
-available, the same way Claude Code excludes `Bash` / `Write` / `Edit`.
-
-If you still see the rejection on an older binary, upgrade lazy and re-run the
-review. Findings from a review that already lost MCP can still land as Raises
-via the turn handoff / verdict recovery path.
 
 ## One Cursor task fails auth while others work
 
@@ -682,9 +667,7 @@ fails loudly. If you are on a `lazy/*` branch whose task this store does not
 have (or cannot pair), `lazy pair --host --no-task` pairs in the current
 directory with no task context. See [Pairing](pairing.md).
 
-Cursor tasks now pair too — the refusal that used to apply to them was about
-host pairing needing to copy container-written chat history onto your host, and
-in-container pairing does not copy anything. Conversation capture and the
+Cursor tasks pair too. Conversation capture and the
 end-of-session AI summary remain Claude Code only, and pairing says so when it
 starts.
 
@@ -708,19 +691,15 @@ Store a credential (`claude setup-token | lazy auth set anthropic`) or restart
 the daemon from a shell that has one exported — either way, `lazy daemon restart`
 and the next `lazy pair` picks it up.
 
-Your shell is deliberately not consulted, even when it does export a token. That
-used to be the fallback, and it was the cause of this symptom rather than a cure:
-a terminal opened after the daemon started — which is what an upgrade leaves you
-with — exports nothing, so pairing handed Claude Code no credential at all and
-Claude Code fell through to your host login or to a `/login` prompt, while task
-agents kept running fine on the daemon's token. Sourcing both from one place
-makes pairing behave like the rest of lazy.
+Your shell is deliberately not consulted, even when it does export a token:
+a terminal opened after the daemon started exports nothing, so pairing would
+hand Claude Code no credential at all. Sourcing both from one place makes
+pairing behave like the rest of lazy.
 
 If you *want* a session on your own login instead of the daemon's, type `/login`
-inside it. That override still works and still persists — it is now the explicit
-way to get the behavior that used to happen invisibly.
+inside it. That override persists.
 
-When no credential can be resolved at all, `lazy pair` and `lazy chat` now fail
+When no credential can be resolved at all, `lazy pair` and `lazy chat` fail
 **before** launching Claude Code, naming what they checked — rather than opening
 a session that looks fine until a `/login` prompt appears minutes later.
 
@@ -764,8 +743,8 @@ remote) instead. See
 
 This works in both directions. A `github.com` remote is pinned to `github.com`
 just as an Enterprise remote is pinned to its own host, so being logged into an
-Enterprise install no longer makes a `github.com` remote read green either. A
-dot-com report is worded exactly as it always has been — no host in the label,
+Enterprise install does not make a `github.com` remote read green either. A
+dot-com report has no host in the label,
 and the terse `Run: gh auth login` — since there is only one host it could
 mean:
 
@@ -788,10 +767,10 @@ can see the holder is gone.
 
 The holder is identified by more than its pid: lazy records the process's start
 time when it takes the lock and compares it before believing anyone still holds
-it. Pids get recycled, and a recycled pid used to read as a live holder forever
-— which is what the message above shows, an unrelated system daemon that
-inherited the dead holder's pid. Lazy now reclaims such a lock automatically,
-and says plainly when a holder cannot be a lazy process.
+it. Pids get recycled, so a recycled pid — an unrelated system daemon that
+inherited a dead holder's pid — is not believed to be a live holder. Lazy
+reclaims such a lock automatically, and says plainly when a holder cannot be a
+lazy process.
 
 If a lock is left that lazy cannot judge on its own, `lazy doctor` reports it
 and offers to clear it — it does this before any of its other checks, so it
@@ -1008,15 +987,8 @@ cause and the remedy — rather than passing git's wording through.
 
 **"Connection closed" is not a network problem.** It is what an MCP client reports
 when the server process is simply gone. The `lazy_status` that followed could not
-reach the daemon, and older versions treated that the way a one-shot `lazy`
-command does — print the error and quit. Quitting is right for a command that was
-about to finish anyway, and wrong for a server in the middle of a session: it took
-the whole tool channel down, so the agent lost every remaining `lazy_*` tool for
-the rest of the turn, including the ones it would have used to report the problem.
-
-An unreachable daemon now comes back as an ordinary tool error and the session
-keeps working, so a single failing tool no longer costs you the rest of them. If
-you see "Connection closed" today, the server really did die: look at the
+reach the daemon. An unreachable daemon comes back as an ordinary tool error and
+the session keeps working. If you see "Connection closed", the server really did die: look at the
 supervisor log for a `[lazy-mcp]` line, which reports the reason.
 
 If a tool ever answers with the missing-worktree message, do what it says — report
@@ -1114,9 +1086,9 @@ zero tools, the server itself came up empty. If the round-trip fails with a
 401/403, the token or task id is stale (checks 1 and 2); if it fails to connect,
 the daemon is down or its target is not routable from the container.
 
-### Turns now catch this by themselves
+### Turns catch this by themselves
 
-Since v0.21 you usually will not have to run any of this. Claude Code reports
+You usually will not have to run any of this. Claude Code reports
 the MCP servers and tools it loaded on the first line of its own stream, and the
 supervisor checks that line: a turn that provably started with **no** lazy tools
 is killed immediately and fails with a message naming what was observed, rather
@@ -1126,7 +1098,7 @@ the same config cannot conjure tools.
 Two deliberate limits on that check:
 
 - It fails only on **positive evidence of zero**. An agent that reports nothing
-  about its tools (an older or future release, a different agent) leaves the
+  about its tools (a different release or agent) leaves the
   turn alone. Absence of evidence is not evidence of absence.
 - It asserts **at least one** lazy tool, not the full set, because read-only
   ask turns legitimately receive fewer.
@@ -1399,15 +1371,10 @@ does that.
 ## A task lists hundreds of commits it never made
 
 A task's Commits tab — in `lazy show`, in the web review, in search — should
-list what its own branch carries. Before v0.23, a task that merged its upstream
-branch also recorded everything that branch brought along, and the error grew
-every turn: long-running tasks ended up listing hundreds of other people's
-commits, going back months. Only the stored list was wrong; the branch, the
-diff and the review were never affected.
-
-Turns started on v0.23 or later record correctly. Lists already stored that way
-do not fix themselves, because nothing else ever deletes a commit record — clean
-them up explicitly:
+list what its own branch carries. A task whose stored list holds hundreds of
+other people's commits has a wrong record only; the branch, the diff and the
+review are unaffected. Nothing else deletes a commit record, so clean the list
+up explicitly:
 
 ```
 lazy system repair-commits --all

@@ -31,7 +31,7 @@ const TRIGGER_LABELS: Record<string, string> = {
   upstream_sync: 'upstream sync',
   comment: 'comment',
   child_completed: 'child completed',
-  child_added: 'loop child added',
+  child_added: 'cluster child added',
   crash: 'crash',
 };
 

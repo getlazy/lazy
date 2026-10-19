@@ -96,7 +96,7 @@ and CPU, memory and disk use. Read-only. Logs are redacted by the daemon.
   --logs        Also print each service's recent log (and dockerd's restart
                 history on a Lazy Teams machine)
   --lines <n>   How many log lines per service (default 20 with --logs)
-  --json        Machine-readable output, logs included
+  --json        Machine-readable output (logs included with --logs)
 
 reset-docker-storage  Empty this machine's Docker storage safely (Lazy Teams
                 microVMs only): holds dockerd recovery off, stops dockerd and

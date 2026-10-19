@@ -1120,7 +1120,7 @@ export function pairUsage(): void {
 
 Open an interactive agent session, context-aware.
 
-Three modes:
+Four modes:
   1. lazy pair <task>           Pair on a specific task
   2. lazy pair                  On a lazy/* branch: detect the task, pair on it
   3. lazy pair --host           On main or a non-task branch: launch the agent

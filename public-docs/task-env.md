@@ -153,13 +153,9 @@ much more confusingly, as an unexplained 401 inside the container.
 
 ## Runner support
 
-Both runners are covered:
-
-- **Docker/Podman** — passed to `docker run` through a `0600` `--env-file` that is
-  deleted once the container has started (a value containing a line break is
-  passed as `-e KEY=VALUE`, since the env-file format cannot hold one).
-- **Host process** (`dangerously-host-process-without-any-isolation`) — merged
-  into the supervisor process's spawn environment.
+Values are passed to `docker run` through a `0600` `--env-file` that is
+deleted once the container has started (a value containing a line break is
+passed as `-e KEY=VALUE`, since the env-file format cannot hold one).
 
 ## Troubleshooting
 

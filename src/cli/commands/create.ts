@@ -434,7 +434,7 @@ async function createFromBoundClone(storage: Storage, input: {
 }
 
 export function createUsage(): void {
-  console.log(`Usage: lazy create [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--agent <profile>] [--effort <level>] [--runner <docker|container|podman>] [--tag <tag>]
+  console.log(`Usage: lazy create [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--agent <profile>] [--effort <level>] [--runner <docker|container|podman>] [--review <mode>] [--review-gate <gate>] [--review-auto-fix <on|off>] [--tag <tag>]
 
 Create a new task. Interactive if no flags provided.
 

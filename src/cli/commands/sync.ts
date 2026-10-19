@@ -126,7 +126,7 @@ steps, each narrated as it happens.
     open PR, so syncing it does not take it out of the review queue
 
 Global remote sync (detecting external changes, fetching comments, pushing
-branches, posting turns) is now handled automatically by the daemon. Start
+branches, refreshing PR descriptions) is now handled automatically by the daemon. Start
 the daemon with: lazy daemon start
 
 Requirements:

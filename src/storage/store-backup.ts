@@ -48,6 +48,7 @@
 import { createHash } from 'crypto';
 import { constants } from 'fs';
 import { lstat, mkdir, open, type FileHandle, readdir, readFile, readlink, realpath, rename, rm, stat, statfs, symlink, writeFile } from 'fs/promises';
+import { docsSuffix } from '../docs/links';
 import { dirname, join, relative, resolve, sep } from 'path';
 import { ArchiveWriter, safeEntryPath, scanArchive, unpackArchive } from './store-archive';
 import { RESTORE_MARKER_FILENAME, StorageLock, STORAGE_LOCK_FILENAME, StoreRestoreInProgressError, UnjudgeableStorageLockError } from '../utils/storage-lock';
@@ -949,6 +950,24 @@ export async function assertNoRestoreInProgress(storePath: string): Promise<void
 export type RestorePhase = 'verifying' | 'staging' | 'swapping';
 
 /**
+ * The refusal for a store that is a mount point. The manual way out has to be an
+ * exact snapshot that keeps the old contents: extracting straight over the
+ * store only overlays the backup (files made after it stay), so the advice is
+ * to move the old contents into a folder INSIDE the mount first.
+ */
+export function mountPointRefusal(storePath: string, backup: { path: string; format: string }): string {
+  const source = backup.format === 'archive' ? join(backup.path, ARCHIVE_FILE) : join(backup.path, DATA_DIR);
+  const bring = backup.format === 'archive' ? `unpack ${source} into` : `copy ${source} into`;
+  return (
+    `refusing to restore: ${storePath} is a mount point, and the restore moves its contents to and from ` +
+    `directories beside it, which cannot cross filesystems. Nothing was changed. ` +
+    `With the daemon stopped, move the store's contents into a new folder inside it (nothing is deleted), ` +
+    `then ${bring} the emptied store and check the links it made.` +
+    docsSuffix('store-backups-mount-point')
+  );
+}
+
+/**
  * Restore a verified backup into `storePath`.
  *
  * The store's only writer must be stopped, and stays excluded for the WHOLE
@@ -1009,13 +1028,7 @@ export async function restoreStoreBackup(options: {
   // fail the first rename with EXDEV — so say so before anything is copied.
   const [storeDev, parentDev] = await Promise.all([stat(storePath), stat(dirname(storePath))]);
   if (storeDev.dev !== parentDev.dev) {
-    throw new StoreBackupError(
-      `refusing to restore: ${storePath} is a mount point, and the restore moves its contents to and from ` +
-        `directories beside it, which cannot cross filesystems. Nothing was changed. ` +
-        (backup.format === 'archive'
-          ? `Unpack ${join(backup.path, ARCHIVE_FILE)} into the store by hand (tar -xzf) with the daemon stopped.`
-          : `Copy ${join(backup.path, DATA_DIR)} into the store by hand with the daemon stopped.`),
-    );
+    throw new StoreBackupError(mountPointRefusal(storePath, backup));
   }
 
   const run = async (): Promise<RestoreResult> => {

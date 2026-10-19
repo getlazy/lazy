@@ -656,7 +656,7 @@ type = "docker"
 # max_auto_turns = 3
 
 # Auto-resume: when a task's turn crashes, lazy resumes it automatically.
-# Master switch for auto-resuming interrupted tasks (fast lane and slow lane).
+# Turns the slow-lane retry queue below on or off. Immediate resumes still happen when it is false.
 # auto_resume = true
 # A fresh crash resumes immediately, up to 3 consecutive interruptions (fixed).
 # Past that, the task enters a slow-lane retry queue instead of giving up.

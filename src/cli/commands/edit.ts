@@ -483,7 +483,7 @@ Options:
   --goal <goal>      New goal
   --prompt <text>    New prompt
   --model <model>    Change model (e.g. opus, sonnet, claude-opus-5-5)
-  --type <type>      Change task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release)
+  --type <type>      Change task type (task, fix, spike, refactor, test, audit, migrate, document, tidy, rework, feature, release, cluster)
                      Warning: changing type after prompt is set may lead to mismatched expectations
   --code <code>      Set or change the task code (pass "" to clear)
   --parent <task_id> Set or change parent task (pass "" to clear)

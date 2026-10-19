@@ -1,9 +1,8 @@
 # The review paradigm — what lazy does by default, and why
 
-Lazy reviews every task before you merge it, without being asked. What changed
-is *how*: the default review is **fast** — one session, self-reviewed, with the
-diff still in context — and the separate reviewer is the **optimization you opt
-into** when quality is worth three to four times the wall-clock and the tokens.
+Lazy reviews every task before you merge it, without being asked. The default
+review is **fast** — one session, self-reviewed, with the diff still in
+context — and the separate reviewer is the **optimization you opt into** when quality is worth the extra wall-clock and tokens.
 
 This page is the reasoning behind that. For the mechanics of a single review —
 the verdicts, what the reviewer may touch, how to stop one — see
@@ -57,8 +56,7 @@ See [the low-high loop](low-high-loop.md) for the phases in detail.
 **`separate` — a reviewer in its own session.** After the task declares done, a
 new agent in a short-lived container of its own reads the branch cold,
 read-only, and files a verdict that **gates your accept**. It is never weaker
-than the writer: it runs on the task's own model and effort. This is what every
-task used to do.
+than the writer: it runs on the task's own model and effort.
 
 **`off` — nothing.** A final triggers no review, and accept is not gated on
 one, because there is none.
@@ -109,7 +107,11 @@ the effective values, so you never have to reconstruct them.
 
 ## Reading the Review line
 
-`lazy show <task>` and the task page both carry one line for this:
+The task page in the dashboard and `lazy show <task>` both carry one line for this. On the dashboard it sits under the task's title, and the task's **Reviews** tab lists each recorded review with its verdict:
+
+![A task page in the dashboard. Under the title, the line "Review: low-high, gate auto, auto-fix off". The Reviews tab is open and lists one review with verdict clean and no raises.](images/explanation/reviews-tab.png)
+
+On the command line the same line reads:
 
 ```
 Review:  low-high, gate auto, auto-fix off
@@ -169,20 +171,11 @@ report. A review that gates refuses instead, which is its own notice.
 
 ## Why the default is the fast one
 
-Because the slow one can stop the work from advancing. With many tasks running
-at once under the separate reviewer, each can take three or more rounds of
-review-then-fix at roughly half an hour each — enough to exhaust an
-organisation's spend limit, at which point everything running stops.
-
-The reasoning that produced the old default was "your time is the scarce
-resource, tokens are not". It was half right. Money is limited the same way
-time and attention are, and when the spend runs out the work does not merely
-get more expensive — it **stops**, and you wait. Performance per token is what
-actually decides how much gets done, and a second agent re-reading a diff that
-is already warm in the writer's own context is the worst deal on that axis.
-
-So: fast first, ponderously slow as an optimization on quality. The escalation
-is per task, because that is where you can see whether the stakes justify it.
+A second agent re-reading a diff that is already warm in the writer's own
+context costs wall-clock and tokens, and with many tasks running at once each
+can take several review-then-fix rounds. So the default is fast, and the
+separate reviewer is a per-task escalation, because that is where you can see
+whether the stakes justify it.
 
 ## What still holds, in every mode
 
@@ -209,20 +202,14 @@ a pass and never as findings. So is a review that passes the work without
 calling a single tool, including the self-review's bare approval in `low_high`
 mode.
 
-**What no longer gates: findings at medium or below.** A finding is a reviewer's
-opinion about work you are about to read anyway. Holding the merge on every
-style nit cost a full agent turn or a person per finding, and left a cluster's
-driver — told to accept liberally — unable to accept anything, since the
-override is CLI-only. Critical and high findings still hold; so do a failed
+**Findings at medium or below do not gate.** Critical and high findings hold; so do a failed
 review, an outstanding blocking raise, and a report whose own security or
 data-integrity sweep names something no finding covers.
 
 **Fixing is its own switch.** `auto_fix` is `false` by default: a
 `separate` review that finds something parks the task with the findings
 attached instead of spending another round on the daemon's own initiative.
-Whether that round is worth half an hour is a judgement made by whoever can see
-the whole board — you, or a cluster's driver. Turn it on to get the old
-behaviour:
+Turn it on to have the daemon start fix rounds itself:
 
 ```toml
 [review]
@@ -244,9 +231,9 @@ the reason, and it holds acceptance exactly as an unclean review does.
 
 ## Migrating from `[agent] low_high_loop`
 
-The low-high loop used to be an experiment under `[agent]`, off by default. Its
-three keys moved into `[review]` and are still honoured meanwhile, with
-`lazy doctor` naming the replacement for each:
+The `[agent] low_high_loop*` keys are the older spelling of the `[review]`
+settings. They are still accepted and map as below; `lazy doctor` names the replacement for
+each:
 
 | old | new |
 | --- | --- |
@@ -255,32 +242,14 @@ three keys moved into `[review]` and are still honoured meanwhile, with
 | `[agent] low_high_loop_draft_effort` | `[review] draft_effort` |
 | `[agent] low_high_loop_review_effort` | `[review] review_effort` |
 
-Note the second row. `false` never meant "no review" — it meant "no in-session
-loop, and the daemon dispatches a reviewer of its own", which is exactly
-`separate`. Reading it as the new default would switch your existing projects
-into a different mode on upgrade, so it does not. Setting both spellings to
-things that disagree is refused at load rather than guessed.
+`false` means `separate`, not "no review". Setting both spellings to things
+that disagree is refused at load. `lazy start --low-high-loop on|off` is not accepted:
+use `--review low-high` or `--review separate`.
 
-Tasks already in flight keep the mode they were running under, for the same
-reason: the mode is written onto a task the first time it launches, so a project
-default you change later moves new tasks and leaves running ones alone.
-
-Their **children** do not. `low_high_loop = false` was recorded on every task
-alive, whether or not anyone had an opinion, so it says what that task was
-doing and nothing about what its subtasks should do: a task created under an
-existing parent task takes the project default. Escalate the ones that deserve it with
-`lazy edit <task> --review separate`.
-
-`lazy start --low-high-loop on|off` is gone. Use `--review low-high` for what
-`on` did, and `--review separate` for what `off` did.
-
-**The effort you chose for a task is not discarded.** `low_high` never
-silently downgrades a task somebody set to `high`: an `--effort` on THIS TASK wins,
-for the draft and the revise pass alike.
-
-A project-wide `[agent] effort` is the fallback the other phases resolve from
-and does not outrank `draft_effort` for the draft — otherwise the setting would
-do nothing on any project that states an effort, which is most of them.
+**The effort you chose for a task is not discarded.** An `--effort` on THIS TASK
+wins for the draft and the revise pass alike. A project-wide `[agent] effort` is
+the fallback the other phases resolve from and does not outrank `draft_effort`
+for the draft.
 
 ## When tokens are still the constraint
 

@@ -11,7 +11,7 @@ agents.
 ```bash
 lazy system agent           # readiness view: profiles, harness, upstream, auth
 lazy system agent set pi    # project default
-lazy create --agent pi "…"  # or per task
+lazy create --agent pi --goal "…"  # or per task; then `lazy start <task>`
 ```
 
 The built-in `pi` profile runs a local Ollama (see below), so this needs Ollama
@@ -31,7 +31,7 @@ decided by its profile's `endpoint`.
 **Out of the box, Pi runs on your own machine.** The built-in `pi` profile
 points at a local Ollama — `http://localhost:11434`, model `qwen3.8:latest` —
 and spends no credential at all. Pi is lazy's local-model agent, so
-`lazy create --agent pi "…"` does not quietly bill a hosted provider. You need
+`lazy create --agent pi --goal "…"` does not quietly bill a hosted provider. You need
 Ollama running with that model pulled:
 
 ```bash
@@ -51,7 +51,7 @@ Everything else is a profile you declare:
   credential = "none"
   ```
 
-  Then `lazy create --agent remote-ollama-pi "…"`, or make it the project
+  Then `lazy create --agent remote-ollama-pi --goal "…"` and `lazy start` it, or make it the project
   default with `lazy system agent set remote-ollama-pi`. Because the upstream
   is a property of the profile, one project can run some Pi tasks on one server
   and others somewhere else at the same time.
@@ -102,7 +102,7 @@ decides which one a profile gets: `api.openai.com` and `openrouter.ai` put Pi
 on the OpenAI wire, any other host on the Anthropic one. So a self-hosted
 gateway, or any host lazy does not know by name, runs Pi's Anthropic-wire
 provider — point such a profile at the upstream's Anthropic-compatible path. A
-gateway that speaks only the OpenAI API is not reachable from Pi today. There
+gateway that speaks only the OpenAI API is not reachable from Pi. There
 is no Pi-specific model syntax: models and upstreams are chosen through lazy's
 normal configuration, never per prompt. On an Anthropic profile a model name
 carrying a Pi provider prefix (`openai/gpt-4o`) is rejected, because it is not
@@ -123,10 +123,9 @@ upstream in the full form that kind of credential requires, so such a Pi task is
 not treated as some other kind of traffic. The default local profile bills
 nothing — a local model server takes no key, and lazy does not send it one.
 
-**If you already had a Pi profile that omitted `endpoint`, it moved with the
-default.** A block like `[agents.my-pi] harness = "pi", model = "claude-opus-5-5"`
-used to mean Anthropic and now means the local Ollama, which does not have that
-model. Lazy warns at startup when a profile pairs a harness default upstream
+**A Pi profile that omits `endpoint` uses the local Ollama.** A block like
+`[agents.my-pi] harness = "pi", model = "claude-opus-5-5"` means Ollama, which
+does not have that model. Lazy warns at startup when a profile pairs a harness default upstream
 with a recognizably Anthropic model, naming the profile and the
 `endpoint = "https://api.anthropic.com"` line that puts it back. It warns rather
 than refuses: only you can say which service you meant.

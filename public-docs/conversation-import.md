@@ -326,8 +326,7 @@ importable — both in bulk and by session-id.
 Not to be confused with `lazy builder --resume <id> --import`, which is a
 different operation entirely: it decides which projects dir a *builder launch*
 mounts (adopting a session that has never run under builder isolation), and
-writes nothing to lazy's store. See [One `/resume` list per project](./lazy-agent-design.md#one-resume-list-per-project-builder-session-isolation) in
-lazy-agent design. Importing a conversation here never affects which
+writes nothing to lazy's store. Importing a conversation here never affects which
 sessions `/resume` lists, and adopting a session there never imports it.
 
 ### Bulk import never writes silently
@@ -385,6 +384,8 @@ works too. For structured search across the whole project,
 reach conversation bodies.
 
 ### In the browser
+
+![The dashboard Builders page with its search box and an empty list of builders](images/topics/builders.png)
 
 The daemon's web UI serves the same Builders under **Builders** in the nav
 (the dashboard's address is printed by `lazy daemon status`; old

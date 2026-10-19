@@ -12,9 +12,7 @@ against one.
 Protection is **opt-in — OFF by default** (except in Lazy Teams, [where it
 is on by default](#in-lazy-teams-pressing-accept-is-the-approval)). A project with no `[protection]`
 section (or with `enabled = false`) has no protection at all: accepts into
-`main` behave exactly as they always have. That is deliberate — a brand-new
-user's first `lazy accept` should merge, not refuse over a gate they have not
-heard of yet.
+`main` are not gated.
 
 One command turns it on:
 
@@ -62,17 +60,20 @@ so — before you try to accept.
 
 | Surface | What you see |
 | --- | --- |
+| Web dashboard | a `[P]` badge on the task list (the marker the CLI lists use too), and a `Protected` row on the task detail page |
 | `lazy show <task>` | a `Protected:` line — `yes (branch gate)`, `yes (task gate)`, or `yes (task gate + branch gate)` — followed by what each gate is, how to accept, and whether a builder review is waiting |
 | `lazy status <task>` | the same `Protected:` line, in the same words |
 | `lazy list` / `lazy active` / `lazy blocked` | a compact `[P]` marker on the goal, plus a one-line legend under the table |
 | `lazy browse <task>` | the gate in the header line (and above the hunks under `-i`), so you learn about it before you press `a` |
 | MCP `lazy_show` | a `protection` object — `gated`, `target_branch`, `task_gate`, `branch_gate`, `pending_review`, `markers`, `summary` |
-| Web dashboard | the same `[P]` badge on the task list, and a `Protected` row on the task detail page |
+
+On the dashboard, with `main` protected, every task that targets it carries the `[P]` badge in front of its goal:
+
+![The dashboard Tasks page in a project that protects main. The goals of the tasks that target main (the working, protected, review, conflict and backlog demo tasks) begin with a [P] marker; the two cluster subtasks at the top, which target the cluster's branch, do not.](images/explanation/protected-badges.png)
 
 Two properties are deliberate:
 
-- **Additive only.** A project that protects nothing sees exactly the output it
-  saw before — no marker, no legend, no `Protected:` line. Markers sit in the
+- **Additive only.** A project that protects nothing shows no marker, no legend and no `Protected:` line. Markers sit in the
   last column so no fixed-width column shifts, and they are ASCII (`[P]`, not a
   shield emoji, whose width varies by terminal) so scripts can grep them.
 - **Read-only.** These surfaces report gates; they never arrange them. There is
@@ -98,8 +99,7 @@ lazy accept <task>           # prompts, verifies, merges
 Approve-then-merge in one step is the point: the approval is inherently bound
 to the exact commits being merged. There is no stored approval token that
 could go stale, be recorded before the agent finished, or let a later,
-different diff through. (Earlier releases had a separate `lazy approve <task>` command recording a
-one-shot approval; that command and its floating credential are gone.)
+different diff through.
 
 - The passphrase lives **nowhere in the repository**. It is enrolled once per
   machine with `lazy system passphrase set`, stored as a `Bun.password` hash
@@ -188,10 +188,7 @@ and the accepted task records who approved it ("Protected merge approved by
 … (Accept in Lazy Teams)").
 
 **Protection is on by default in Lazy Teams.** A Teams project's default
-branch is protected unless its configuration says otherwise. That includes
-projects created before this default existed, unless their configuration
-already sets `[protection] enabled`. Before, nobody could complete a protected
-accept in Teams, so protection there stayed off. Now the protected accept is
+branch is protected unless its configuration says otherwise. The protected accept is
 one button press for a person, and what it stops is the builder and agents
 merging into the default branch on their own. Merges into a parent task's
 branch are not affected. With protection on, only team admins may push the
@@ -265,25 +262,11 @@ Three deliberate restrictions, each load-bearing:
 - **Refuses inside a container.** A task agent's container is not your
   terminal, and the command exists for your terminal.
 
-### Migrating from `.lazy/approve-passphrase`
-
-In earlier releases the passphrase sat in plaintext inside the repo, at
-`.lazy/approve-passphrase` or wherever `[protection].passphrase_file` pointed.
-Both are **gone**: the key is removed from the schema (`lazy doctor` explains
-the migration if it is still in your `lazy.toml`), and the old file is **never
-consulted** — leaving it in place does not satisfy the gate. Run
-`lazy system passphrase set`, which offers to delete the stale file for you;
-`lazy system passphrase status` and `lazy doctor` flag it until it is gone.
-
 ### What this does not close
 
-If nothing has ever been enrolled on a machine, the **first** enrollment is
-reachable by an agent running under the **host-process** runner — it shares
-your user account, so it could run the command's code path itself. Rotation is
-not (it requires the current passphrase), and neither is reading the passphrase
-back (only a hash is stored). This residual is accepted rather than papered
-over: the real fix is running agents in containers, which is the default
-runner and where the command refuses outright.
+Rotation requires the current passphrase, and the passphrase cannot be read
+back (only a hash is stored). The command refuses outright inside a task
+container.
 
 ## Advanced: protecting additional branches
 
@@ -421,16 +404,8 @@ who is allowed to make it — but it shares the enforcement point and the
 ## What this does NOT do
 
 Deliberate non-goals: no threat model against a hostile builder, no
-push-prevention (an agent on a host runner can `git push` around the check —
-accepted), no cryptographic hardening or rate limiting. The feature succeeds
+push-prevention, no cryptographic hardening or rate limiting. The feature succeeds
 if it changes the *default* path from auto-accept to human-approved.
-
-Moving the passphrase out of the repo closed one concrete hole — the
-secret is no longer sitting in plaintext in a tree every agent can read, at a
-path the repo's own config could redirect. It did not turn friction into
-security: see
-[What this does not close](#what-this-does-not-close) for the residual that
-remains under the host-process runner.
 
 ## Submitting a subtask for review
 
