@@ -12,7 +12,7 @@
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
 .wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
 header.site { border-bottom:1px solid var(--line); }
-header.site .wrap { display:flex; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
 header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
 header.site .version { color:var(--muted); font-size:.85rem; }
 a { color: var(--link); }
@@ -32,12 +32,59 @@ hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
 ul.pages { list-style:none; padding:0; }
 ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
 ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
-h2.group { margin-top:2.5rem; }</style>
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../search.js" data-root="../"></script>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span></div></header>
-<main class="wrap">
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.92</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#reference">Reference</a> › <span aria-current="page">Surface asymmetries: CLI vs MCP</span></nav>
 <h1 id="surface-asymmetries-cli-vs-mcp"><a class="anchor" href="#surface-asymmetries-cli-vs-mcp" aria-hidden="true">#</a>Surface asymmetries: CLI vs MCP</h1>
+<nav class="toc" aria-label="On this page"><details><summary>On this page</summary><ul><li><a href="#the-governing-rule-tight-mcp-lax-cli">The governing rule: tight MCP, lax CLI</a></li><li><a href="#1-agent-ownership-gating-writes-only">1. Agent-ownership gating (writes only)</a></li><li><a href="#2-two-step-confirmation-codes-mcp-only-friction">2. Two-step confirmation codes (MCP-only friction)</a></li><li><a href="#3-mcp-never-auto-starts-work">3. MCP never auto-starts work</a></li><li><a href="#4-human-only-commands-with-no-mcp-equivalent">4. Human-only commands with no MCP equivalent</a></li><li><a href="#5-read-only-turns">5. Read-only turns</a></li><li><a href="#6-lazy_internal_git-is-validated-but-never-advertised">6. lazy_internal_git is validated but never advertised</a></li><li><a href="#7-presentation-flags-have-no-mcp-analogue">7. Presentation flags have no MCP analogue</a></li><li><a href="#8-unblock-always-carries-feedback-resume-is-the-no-feedback-path">8. Unblock always carries feedback; resume is the no-feedback path</a></li><li><a href="#9-start-creates-nothing--on-either-surface">9. start creates nothing — on either surface</a></li><li><a href="#10-review-settings-are-on-both-surfaces">10. Review settings are on both surfaces</a></li><li><a href="#11-asking-a-conversation-one-polymorphic-cli-id-a-separate-mcp-tool">11. Asking a conversation: one polymorphic CLI id, a separate MCP tool</a></li><li><a href="#12-artifacts-attach-and-read-over-mcp-remove-only-at-a-terminal">12. Artifacts: attach and read over MCP, remove only at a terminal</a></li><li><a href="#13-machine-one-shots-have-no-mcp-tool-at-all">13. Machine one-shots have no MCP tool at all</a></li><li><a href="#14-the-tasks-agent-mcp-and-cli-listings-both-carry-it">14. The task's agent: MCP and CLI listings both carry it</a></li><li><a href="#15-depth-scoping---levels-on-three-cli-listings-on-two-mcp-tools">15. Depth scoping: --levels on three CLI listings, on two MCP tools</a></li><li><a href="#16-protected-file-approval-exists-only-at-accept">16. Protected-file approval exists only at accept</a></li><li><a href="#17-raised-items-agent-raises-humanbuilder-resolves">17. Raised items: agent raises, human/builder resolves</a></li><li><a href="#17a-declaring-a-task-done-is-agent-only-and-it-is-its-own-tool">17a. Declaring a task done is agent-only, and it is its own tool</a></li><li><a href="#18-turn-reports-and-file-justifications-agent-writes-human-reads">18. Turn reports and file justifications: agent writes, human reads</a></li><li><a href="#19---allow-broken-is-cli-only">19. --allow-broken is CLI-only</a></li><li><a href="#20-choosing-a-subtasks-agent-is-not-gated-by-who-is-asking">20. Choosing a subtask's agent is NOT gated by who is asking</a></li><li><a href="#21-signing-in-to-the-web-dashboard-is-human-only">21. Signing in to the web dashboard is human-only</a></li><li><a href="#22-the-web-shell-is-human-only--no-mcp-surface">22. The web shell is human-only — no MCP surface</a></li><li><a href="#23-dashboard-url-cli-command-mcp-field--no-dedicated-tool">23. Dashboard URL: CLI command, MCP field — no dedicated tool</a></li><li><a href="#24-re-describing-a-linked-task-is-cli-only">24. Re-describing a linked task is CLI-only</a></li><li><a href="#25-review-regions-everyone-reads-them-only-people-annotate-them-and-which-source-answers">25. Review regions: everyone reads them, only people annotate them (and which source answers)</a></li><li><a href="#26-promoting-a-discussion-into-a-task-is-web-only">26. Promoting a discussion into a task is web-only</a></li><li><a href="#27-promoting-a-conversation-into-a-task-has-no-mcp-tool">27. Promoting a conversation into a task has no MCP tool</a></li><li><a href="#28-lazy-ask--lazy-review-block-lazy_ask--lazy_review-return-immediately">28. lazy ask / lazy review block; lazy_ask / lazy_review return immediately</a></li><li><a href="#29-syncing-a-task-that-is-running-only-that-tasks-own-agent">29. Syncing a task that is running: only that task's own agent</a></li><li><a href="#30-on-a-shared-host-an-operator-credential-cannot-take-a-human-action">30. On a shared host, an operator credential cannot take a human action</a></li><li><a href="#31-logging-a-machine-in-to-lazy-teams-is-human-only">31. Logging a machine in to Lazy Teams is human-only</a></li><li><a href="#32-editing-a-comment-is-a-human-surface-agents-post-a-follow-up-instead">32. Editing a comment is a human surface; agents post a follow-up instead</a></li><li><a href="#33-usage-limit-readings-each-caller-sees-only-what-its-own-person-may-see">33. Usage-limit readings: each caller sees only what its own person may see</a></li><li><a href="#34-getting-past-the-usage-pause-a-person-or-the-builder-one-task-at-a-time">34. Getting past the usage pause: a person or the builder, one task at a time</a></li><li><a href="#35-a-pull-request-into-a-parent-tasks-branch-a-person-may-ask-an-agent-may-not">35. A pull request into a parent task's branch: a person may ask, an agent may not</a></li><li><a href="#36-reading-a-prmr-agents-read-through-lazy-with-no-forge-token">36. Reading a PR/MR: agents read through lazy, with no forge token</a></li><li><a href="#37-the-machine-and-its-image-build-watched-by-people-not-agents">37. The machine and its image build: watched by people, not agents</a></li><li><a href="#when-you-find-an-asymmetry-that-is-not-listed-here">When you find an asymmetry that is not listed here</a></li></ul></details></nav>
 <p>Lazy exposes two control surfaces over the same daemon: the <strong>CLI</strong>
 (the <code>lazy</code> commands a person runs) and the <strong>MCP tool surface</strong> (the <code>lazy_*</code>
 tools advertised to the builder and to task agents). They are
@@ -73,10 +120,7 @@ accepted, however the call reaches lazy.</p>
 reads, <code>lazy_memory_recall</code> — works on ANY task in the project for an agent
 caller. This is the <strong>lazy flywheel</strong>: agents learning from the work of the
 agents before them, which was the day-one intent of the system.</p>
-<p>Earlier versions gated <code>lazy_show</code> / <code>lazy_diff</code> / <code>lazy_wait</code> by ownership.
-That broke the flywheel in practice — an agent told to read a prior task&#39;s
-findings was refused and had to reconstruct them from search excerpts — so read
-gating was removed. <strong>Its absence is not a bug.</strong></p>
+<p>Reads (<code>lazy_show</code> / <code>lazy_diff</code> / <code>lazy_wait</code>) are not gated by ownership. <strong>Their absence from the gate is not a bug.</strong></p>
 <p><strong>The one read an agent cannot make is <code>lazy_scratch</code></strong> (and <code>in:scratch</code> in
 <code>lazy_search</code>, which is refused for an agent caller and filtered out of its
 results). That is not task-ownership gating — no task owns the scratch sandbox.
@@ -144,11 +188,7 @@ That makes peer journaling safe, and useful — it is how one agent leaves a
 durable finding on work it does not own. Ungated.</li>
 </ul>
 <h4 id="the-journal-contract-precisely"><a class="anchor" href="#the-journal-contract-precisely" aria-hidden="true">#</a>The journal contract, precisely</h4>
-<p>The journal used to be described as flatly &quot;prompt-immune&quot;. That phrasing was
-load-bearing in the wrong place: it was read as &quot;agents may not see the journal
-at all&quot;, which cut agents off from things the human, the builder, and peer agents
-were saying <em>about their own work</em>. The contract is narrower and stricter than
-&quot;never touches a prompt&quot;, and all four clauses hold:</p>
+<p>The contract is narrower and stricter than &quot;never touches a prompt&quot;, and all four clauses hold:</p>
 <ol>
 <li><strong>Non-triggering.</strong> Appending an entry never starts, resumes, or auto-reacts a
 turn. <code>lazy journal</code> emits no daemon signal; nothing hooks a turn off a
@@ -233,25 +273,17 @@ to themselves is not a thing, and the human side of the channel is the reading
 side (<code>lazy list</code>, <code>lazy status</code>, <code>lazy show</code>, <code>lazy watch</code>).</li>
 </ul>
 <p>The CLI has none of this. A human running <code>lazy accept</code> is the review authority.</p>
-<p><strong>Gating is per-handler; the advertised list is a separate, softer decision.</strong>
-Every one of these tools has an unconditional refusal in its handler, keyed on
-the caller identity, and that refusal is the enforcement — not what appears in
-<code>tools/list</code>.</p>
-<p>On top of that, the two lists above are also <em>hidden</em> from the caller who can
-never use them: a builder is not offered the agent-only tools, and a task agent
-is not offered the builder-only ones. A caller pays for the whole <code>tools/list</code>
-reply before its first message, so advertising tools that will only ever be
-refused is a context tax plus an invitation to waste a call. The role is known
-where the server is built — builder launches pass no task id, task agents always
-do.</p>
-<p>Hiding is <strong>advertisement only, never enforcement</strong>. A hidden tool stays
-registered with its real handler, so a caller whose context still lists it — a
-stale system prompt, a resumed conversation, a hand-written client — gets that
-handler&#39;s actionable refusal rather than the useless &quot;Unknown tool&quot;. That is the
-original rule intact: a refusal that explains itself is a better teacher than an
-absent tool. What changed is only that a caller who was never going to get one
-no longer reads the offer. Read-only turns (<code>lazy ask</code>) narrow <em>within</em> the
-role rather than instead of it.</p>
+<p><strong>Refusal is the enforcement; the tool list is only an offer.</strong>
+Every one of these tools refuses a caller of the wrong kind, whatever the caller
+was shown.</p>
+<p>Tools a caller can never use are also left out of what it is offered: a builder
+is not shown the agent-only tools, and a task agent is not shown the
+builder-only ones. Offering tools that will only ever be refused costs context
+and invites wasted calls.</p>
+<p>Leaving a tool out is never what protects it. A caller that still tries a tool
+it was not offered (a resumed conversation, a hand-written client) gets an
+explanatory refusal rather than &quot;Unknown tool&quot;. Read-only turns (<code>lazy ask</code>)
+narrow the offer further, within the caller&#39;s role.</p>
 <h2 id="2-two-step-confirmation-codes-mcp-only-friction"><a class="anchor" href="#2-two-step-confirmation-codes-mcp-only-friction" aria-hidden="true">#</a>2. Two-step confirmation codes (MCP-only friction)</h2>
 <p><code>lazy_accept</code>, <code>lazy_reject</code>, <code>lazy_close</code>, <code>lazy_reopen</code>, <code>lazy_redo</code>,
 <code>lazy_submit</code> and <code>lazy_create</code> (when creating under <code>main</code> while an active
@@ -284,10 +316,7 @@ Two calls is the right amount of friction.</p>
 SAME parent as the old task, and its branch is cut from that parent&#39;s HEAD only
 when it starts. The pause between the two calls is the caller&#39;s window to
 re-parent the replacement (<code>lazy_reparent</code>, or <code>lazy_edit</code> with <code>parent=&quot;&quot;</code> for
-top-level) before that branch exists. The tool description says so explicitly —
-an earlier version claimed the replacement started &quot;from current main&quot;, and a
-caller who believed it lost a task&#39;s worth of work to a branch cut from the
-inherited parent&#39;s release branch.</p>
+top-level) before that branch exists. The tool description says so explicitly.</p>
 <h3 id="pinned-clones-only-a-human-or-the-builder-lifts-the-pin"><a class="anchor" href="#pinned-clones-only-a-human-or-the-builder-lifts-the-pin" aria-hidden="true">#</a>Pinned clones: only a human or the builder lifts the pin</h3>
 <p>A clone made with <code>lazy clone --same-base</code> (or <code>--base</code>) is pinned to its base
 commit so a re-run can be compared like for like (see
@@ -355,9 +384,7 @@ prompt is TTY-only: no flag, no env var, no stdin route (stdin is the accept
 refuses gated merges unconditionally. The approval token must originate
 outside the builder/agent context, or the gate is decoration. The refused
 builder&#39;s <code>reason</code> is captured on the task as a pending review the human&#39;s
-accept surfaces and attaches. (Pre-v0.22 this was a separate human-only
-<code>lazy approve</code> command; the collapse removed it along with its stored,
-floating approval token.) See
+accept surfaces and attaches. See
 <a href="../protected-branches/">protected-branches.md</a>.</p>
 <p><strong>The asymmetry is agents vs. humans, not terminal vs. browser.</strong> The web
 review page (<code>/review/&lt;task&gt;</code>) asks the reviewer for the same passphrase and
@@ -398,12 +425,8 @@ prompt testing override is set at all</strong>. Consequence, accepted: enrolling
 passphrase cannot be driven from a test — because anything a test can drive,
 an agent running lazy from source can drive too. In a released binary those
 overrides are not merely ignored, they are compiled out entirely.</p>
-<p>Honest about the residual: on a machine where nothing has <em>ever</em> been
-enrolled, first enrollment is reachable by an agent under the <strong>host-process</strong>
-runner, which shares the user&#39;s account. Rotation is not, and the passphrase
-itself is never recoverable (only a hash is stored). Containerized execution
-— the default runner — is the real fix; this is documented rather than
-claimed closed. See
+<p>Rotation requires the current passphrase, and the passphrase itself is never
+recoverable (only a hash is stored). See
 <a href="../protected-branches/#enrolling-the-passphrase-lazy-system-passphrase">protected-branches.md</a>.</p>
 </li>
 <li><p><strong><code>lazy protect</code></strong> — edits the <code>[protection]</code> section of <code>lazy.toml</code>. Deciding
@@ -527,15 +550,11 @@ to make a task is <code>lazy create</code> / <code>lazy_create</code>, then star
 <p>This is the one entry here that is a <em>shared</em> restriction rather than a
 CLI-vs-MCP asymmetry, and it is listed for the same reason as the rest: it looks
 like a gap and keeps getting filed as one.</p>
-<p><code>lazy start</code> once had an inline create mode. It was removed deliberately, on
-both surfaces at once.</p>
+<p><code>lazy start</code> has no inline create mode, on either surface.</p>
 <p>Rationale: a task created inline is created and started in one irreversible
 step, so any parameter the caller forgot is unfixable by the time anyone
 notices — most damagingly <code>--parent</code>, which strands the task on the default
-branch with a running agent already on it. Wrong parenting was the single
-largest source of rework in the project, and agents in particular had a
-documented habit of starting a task first and trying to reparent it after. The
-create-then-start split makes creation cheap, reviewable and correctable:
+branch with a running agent already on it. The create-then-start split makes creation cheap, reviewable and correctable:
 <code>lazy edit</code> can still fix a backlog task&#39;s goal, prompt, code, type and parent.
 Of those, only the code can still change once the agent is running, as a rename: the
 branch, worktree and any PR/MR keep their old names (<a href="../renaming-tasks/">Renaming tasks</a>).</p>
@@ -643,8 +662,7 @@ can reconstruct that same shape and read <code>hidden_descendants</code> on the 
 <code>lazy_blocked</code> returns a flat array with no parent field at all — a depth limit
 there would silently drop blocked tasks with nothing in the payload explaining
 which ones or why, which is exactly the truncation the feature is designed not
-to do. Giving <code>lazy_blocked</code> a <code>parent_task_id</code> first would make <code>levels</code> a
-straightforward addition; until then the omission is the honest surface.</p>
+to do.</p>
 <h2 id="16-protected-file-approval-exists-only-at-accept"><a class="anchor" href="#16-protected-file-approval-exists-only-at-accept" aria-hidden="true">#</a>16. Protected-file approval exists only at accept</h2>
 <p>A protected file the agent changed is approved at merge time, and nowhere else.
 Three surfaces offer it: the <code>--approve-file</code> flag of <code>lazy accept</code>, the
@@ -653,13 +671,10 @@ the web review page — whose decisions the other two read, so they are one
 decision made in three places rather than three decisions.</p>
 <p><strong>Unblock has no approval channel on any surface</strong> —
 no <code>--approve-file</code> on <code>lazy unblock</code>, no <code>approved_files</code> on <code>lazy_unblock</code>,
-and no per-file question in the review page&#39;s Unblock dialog. Passing one of the
-retired parameters is an error naming accept, never a silent no-op.</p>
-<p>That is deliberate, not a gap. Unblock is a feedback channel, and a task runs
-for as many turns as the work needs: forcing an approve-or-revert decision on
-every one of them made the reviewer rule on files they had not read yet, and any
-caller that answered &quot;none for now&quot; destroyed the agent&#39;s committed work. A
-decision that only matters at merge time is made at merge time.</p>
+and no per-file question in the review page&#39;s Unblock dialog. Passing an
+approval parameter to unblock is an error naming accept, never a silent no-op.</p>
+<p>That is deliberate, not a gap. Unblock is a feedback channel; a decision that
+only matters at merge time is made at merge time.</p>
 <p>What each surface still does:</p>
 <ul>
 <li><strong>Every turn</strong>, the agent is asked to revert each violated file itself or
@@ -731,11 +746,7 @@ is to deliver them (<code>lazy_unblock</code>), not to decide on that person&#39
 outstanding, failed to produce a readable verdict, or never ran.
 <code>lazy accept &lt;task&gt; --allow-review-issues</code> merges anyway. It has <strong>no MCP
 parameter</strong>: an accept through MCP meets the review gate with no way past it.</p>
-<p><strong>This stays human-only, and the gate narrowed instead.</strong> A cluster driver
-told to accept its children liberally used to hit this wall on nothing worse
-than a style nit, with no override it could reach — which argued for giving
-agents one. The answer was the other way round: a finding at medium or below no
-longer holds a merge at all, and a task in the default <code>low_high</code> mode has no
+<p><strong>This stays human-only, and the gate narrowed instead.</strong> A finding at medium or below does not hold a merge at all, and a task in the default <code>low_high</code> mode has no
 reviewer verdict to overrule in the first place. So the driver needs no
 override, because there is nothing left to override in the cases it was getting
 stuck on. What still holds a merge — a critical or high finding, a failed or
@@ -841,10 +852,6 @@ break the case the parameter exists for: splitting work across agents. Note
 that this is about <em>choosing</em> an agent, not about <em>installing</em> one&#39;s
 credentials — storing an API key stays human-only (§4), because an agent that
 can install the key it then authenticates with has minted its own access.</p>
-<p>One caveat, and it is about the runner rather than this parameter: the
-host-process runner runs an agent as you, on your machine, with your files. An
-agent there can read anything you can, no subtask required. That runner&#39;s full
-name says so, and it is not the default.</p>
 <h2 id="21-signing-in-to-the-web-dashboard-is-human-only"><a class="anchor" href="#21-signing-in-to-the-web-dashboard-is-human-only" aria-hidden="true">#</a>21. Signing in to the web dashboard is human-only</h2>
 <p>The dashboard requires a browser session, and the only way to get one is
 <code>lazy dashboard</code> from a terminal in the project: it asks the daemon for a
@@ -979,9 +986,7 @@ looked at, which is the point of viewing as somebody in the first place. So is
 the work that belongs to the <em>account</em> rather than to a task — diagnosing or
 replacing the stored Anthropic credential of the person you are viewing as, and
 the team and membership settings an administrator manages anyway.</p>
-<p>Accepting, stopping, rejecting and closing a task were on the permitted side of
-this line until a team install began naming the person for them too. They are on
-the refused side now, and the reason is the record rather than the risk: lazy
+<p>Accepting, stopping, rejecting and closing a task are on the refused side of this line, and the reason is the record rather than the risk: lazy
 records who merged a branch and who ended a task, and neither name available
 while viewing as somebody is true.</p>
 <p><strong>Anyone may withdraw anyone&#39;s sign-off, and never silently.</strong> A unit holds one
@@ -1055,10 +1060,9 @@ is holding a connection open on its behalf. The CLI simply does the waiting
 <em>for you</em>, because a person typing <code>lazy review</code> is a person who wants to sit
 and read the report. An agent is not: blocking its whole turn on someone else&#39;s
 turn burns its context window on a wait, makes the pair uninterruptible, and —
-when a review of a large diff ran long — used to end with the reviewer killed
-and the task stuck. <code>lazy_wait</code> already exists, already races several tasks at
+when a review of a large diff ran long. <code>lazy_wait</code> already exists, already races several tasks at
 once, and already returns the moment any of them settles.</p>
-<p>Neither surface has a <strong>time limit</strong> any more. A review of a large diff at high
+<p>Neither surface has a <strong>time limit</strong>. A review of a large diff at high
 effort routinely runs many minutes and is allowed to; the guard against one that
 hangs is the agent watchdog, exactly as for a work turn. If you no longer want
 to wait for one, <code>lazy stop</code> / <code>lazy_stop</code> ends it — that stops the reviewer or
@@ -1275,6 +1279,24 @@ and the restart refuse a member&#39;s own credential outright.</p>
 ones. Treat an unlisted difference as a gap and report it. Adding a deliberate
 asymmetry means adding it to this file in the same change.</p>
 
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../mcp-tools/"><span>Previous</span>MCP tools for agents and builders</a><a class="next" href="../search/"><span>Next</span>Searching tasks</a></nav>
 </main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch"><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<details class="branch" open><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/" aria-current="page">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch"><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
 </body>
 </html>
