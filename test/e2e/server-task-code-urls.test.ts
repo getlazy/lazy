@@ -108,44 +108,48 @@ describe('task URLs by code', () => {
   }, 60_000);
 
   test('a duplicated code falls back to the id on every link that knows the dup set', async () => {
-    // `lazy create` refuses a duplicate code, but `lazy edit --code` does not —
-    // the store can legitimately end up with two tasks sharing one code. The
+    // `lazy create` and `lazy edit --code` both refuse a code a LIVE task holds,
+    // but the store can still end up with two tasks sharing one — a terminal
+    // task keeps its code, and stores written before the edit guard carry
+    // them — so A is closed before B takes its code. The
     // code is then ambiguous: no link built from it may be emitted, or it
     // resolves to whichever task the resolver names the winner (or refuses as
     // an ambiguity error) — either way the engineer lands on the wrong task.
     const a = await createTask(ctx, 'Dup A', 'x');
     const b = await createTask(ctx, 'Dup B', 'x');
-    const aFull = (readTaskJson(ctx.root, a) as { id: string }).id;
+    const bFull = (readTaskJson(ctx.root, b) as { id: string }).id;
     const recoded = await ctx.lazy(['edit', a, '--code', 'dup-code-urls']);
     expect(recoded.exitCode).toBe(0);
+    const closed = await ctx.lazy(['close', a, '--reason', 'superseded', '--yes']);
+    expect(closed.exitCode).toBe(0);
     const recodedB = await ctx.lazy(['edit', b, '--code', 'dup-code-urls']);
     expect(recodedB.exitCode).toBe(0);
 
     // The listing knows both tasks: its rows fall back to the ids.
     const list = await (await fetch(`${base}/tasks`)).text();
     expect(list).not.toContain('href="/tasks/dup-code-urls"');
-    expect(list).toContain(`href="/tasks/${aFull}">dup-code-urls</a>`);
+    expect(list).toContain(`href="/tasks/${bFull}">dup-code-urls</a>`);
 
     // A task page knows both codes too (it loads the same tables for its own
     // links): its edit/review links fall back to the id.
-    const page = await (await fetch(`${base}/tasks/${aFull}`)).text();
+    const page = await (await fetch(`${base}/tasks/${bFull}`)).text();
     expect(page).not.toContain('href="/tasks/dup-code-urls');
-    expect(page).toContain(`/tasks/${aFull}/review`);
-    expect(page).toContain(`/tasks/${aFull}/turns`);
+    expect(page).toContain(`/tasks/${bFull}/review`);
+    expect(page).toContain(`/tasks/${bFull}/turns`);
 
     // The dashboard knows the set too: its recently-created rows (fresh tasks
     // land there even when they are backlog) link by id.
     const dash = await (await fetch(`${base}/`)).text();
     expect(dash).toContain('Recently Created');
     expect(dash).not.toContain('href="/tasks/dup-code-urls"');
-    expect(dash).toContain(`href="/tasks/${aFull}">dup-code-urls</a>`);
+    expect(dash).toContain(`href="/tasks/${bFull}">dup-code-urls</a>`);
 
     // The edit page's form action falls back to the id as well — a code-URL
     // POST that resolved to a random one of the two tasks would edit the
     // wrong one.
-    const edit = await (await fetch(`${base}/tasks/${aFull}/edit`)).text();
+    const edit = await (await fetch(`${base}/tasks/${bFull}/edit`)).text();
     expect(edit).not.toContain('/tasks/dup-code-urls');
-    expect(edit).toContain(`action="/tasks/${aFull}/edit"`);
+    expect(edit).toContain(`action="/tasks/${bFull}/edit"`);
   }, 60_000);
 
   // INVARIANT: escaping a segment on generation and decoding it on resolution

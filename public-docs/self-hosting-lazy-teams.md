@@ -774,13 +774,18 @@ Giving the application your host's Docker would not change that — the problem 
 
 A task that declares services to run (see [Reaching a task's dev server](serve-ports.md)) is opened from the **Open** link on its task page's Services card. Lazy Teams proxies the request to the task, so it works from any browser signed in to Teams as a member of the project — WebSockets included. Signing out, or leaving the team, ends access on the next request.
 
-Each service gets its own host name, one label under `SERVICES_HOST`:
+Each service gets its own host name, one label under `SERVICES_HOST`, that reads as the task, the port, the project and the team, ending in a 12-character id:
 
 ```
-https://<task>--<service>--p<project>.<SERVICES_HOST>
+https://<task>-<port>-<project>-<team>-<id>.<SERVICES_HOST>
+https://fix-login-3000-web-acme-k3x73f9a1c2e.svc.example.com
 ```
 
-The link follows where you are browsing. On the Teams machine itself (`localhost`, `127.0.0.1`) it is `http://<task>--<service>--p<project>.localhost:<port>`, on the port you reached Teams on, which works with nothing configured — unless Teams is behind a sign-in proxy (`TRUSTED_IDENTITY_HEADER`), where every service request must come through that proxy, so the link is the `SERVICES_HOST` one there too. Anywhere else it is `https://` under `SERVICES_HOST` (`http://` for a `*.localhost` services name, or when the install sets `APP_PROTOCOL=http`).
+Long names are shortened to fit one DNS label (at most 63 characters), so every service gets a link. The id at the end is what finds the service: four characters that name the project without revealing anything about it, then the start of the task's id. Renaming the task, project or team changes the readable part of new links, and an older link still reaches the same service. The project part of the id is derived from the install's secret key (`SECRET_KEY_BASE`), so it stays the same for as long as that key does; replacing the key changes every service link.
+
+A link can be shared. Someone who opens it without having opened the service before is sent to sign in to Lazy Teams, and then on to the page the link pointed at, if they are a member of the project. In the rare case where the id matches more than one of their tasks, Teams asks which one they meant. Links in the older form (`<task>--<service>--p<number>`) keep working.
+
+The link follows where you are browsing. On the Teams machine itself (`localhost`, `127.0.0.1`) it is `http://<name>.localhost:<port>`, on the port you reached Teams on, which works with nothing configured — unless Teams is behind a sign-in proxy (`TRUSTED_IDENTITY_HEADER`), where every service request must come through that proxy, so the link is the `SERVICES_HOST` one there too. Anywhere else it is `https://` under `SERVICES_HOST` (`http://` for a `*.localhost` services name, or when the install sets `APP_PROTOCOL=http`).
 
 If a service is not answering yet, **Open** shows a page saying so: whether Run services is still bringing it up (and its current step), or the app is still starting by itself (including after a start command that launched it in the background and finished), and how long it has waited. It checks again every few seconds and opens the service as soon as its port answers. If nothing is starting it, it says so and offers Run services. On the Services card each such service reads **starting — waiting for port N to answer** with the time it has waited.
 
@@ -986,7 +991,7 @@ workaround — it removes the boundary the rest of this page depends on.
 | `ALLOWED_HOSTS` | no | Extra hostnames the install answers to, comma-separated |
 | `CLI_JWT_PRIVATE_KEY_FILE` (or `CLI_JWT_PRIVATE_KEY`), `CLI_JWT_ISSUER` | no | Behind an authenticating proxy: the key Teams signs command-line tokens with, and the token issuer (defaults to `<APP_PROTOCOL>://<APP_HOST>`, without a port). `lazy login` refuses a token whose issuer is not exactly the address people type, port included, so set `CLI_JWT_ISSUER` when that differs; see "Behind an authenticating proxy" |
 | `TRUSTED_IDENTITY_HEADER`, `TRUSTED_PROXY_SECRET` | no | Sign people in from your reverse proxy's login; both must be set (see "Signing in through your proxy's login") |
-| `SERVICES_HOST` | no | Host name task services open under (`<task>--<service>--p<project>.<SERVICES_HOST>`); needs a wildcard DNS name and certificate; not needed on a `localhost` install (see "Reaching a task's running services") |
+| `SERVICES_HOST` | no | Host name task services open under (`<task>-<port>-<project>-<team>-<id>.<SERVICES_HOST>`); at most 189 characters (Teams refuses to start with a longer one); needs a wildcard DNS name and certificate; not needed on a `localhost` install (see "Reaching a task's running services") |
 | `SMTP_*`, `MAILER_FROM` | no | Outgoing email |
 | `ACME_EMAIL` | no | Let's Encrypt contact when using the `tls` profile |
 | `LAZY_FLEET_BACKEND` | no | Where projects run: `smolvm`, one microVM per project (default), or `local`, the escape hatch for a host without hardware virtualization (no agent turns in the compose install) |
@@ -1042,7 +1047,7 @@ On a microVM, the container runtime stores images and builds them in a way that 
 **In god mode**, a site administrator can also:
 
 - restart the container runtime or the forwarder from the machine page. Restarting the container runtime stops every task and builder running on that machine. It also restarts a container runtime that lazy stopped restarting because it kept stopping.
-- restart the project's daemon (and its task proxy with it) from the project's god-mode page, which the machine page links to;
+- restart the project from its god-mode page, which the machine page links to. **Restart** stops a running project (on the microVM backend, its machine) and starts it again with its secrets resolved afresh as the person who clicked; running tasks and builders are interrupted and resume;
 - open the machine's **Shell** from the machine page;
 - change the machine's size (CPUs, memory, disk) from the machine page, with the same form as on the project's god-mode page. Saving a different size stops the machine and starts it again; the machine is not replaced, so its files stay, and disk can only grow.
 
@@ -1217,6 +1222,8 @@ docker compose up -d
 If your install has projects that were set up without microVMs, set `LAZY_FLEET_BACKEND=local` in `.env`: an install never hands a project to a different backend than the one that set it up, and setup and the Installation page say so until the backend matches.
 
 Before it changes the application database, the upgrade copies it — see [Automatic backup before every upgrade](#automatic-backup-before-every-upgrade). Project data in the two volumes above is preserved. On the `local` backend your projects restart on the new version automatically, within a minute or so of the app coming up; on the microVM backend each project's microVM is upgraded in place shortly after — see [What an upgrade does](#what-an-upgrade-does).
+
+While a project daemon is being restarted for a version upgrade, project, task and builder pages display an upgrade notice rather than a generic connection error. The notice shows the current step. If a task or conversation cannot load during the restart, its page returns when the daemon is available again.
 
 Your existing `.env` is never rewritten, so two of the defaults above change under an install that predates them:
 

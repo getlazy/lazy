@@ -122,12 +122,36 @@ export const MEMBER_BRIDGE_INTERFACE = 'lzmember0';
  * is what separates members from the task containers on docker0.
  */
 export function memberNetworkCreateArgs(binary: string): string[] {
+  return isolatedNetworkCreateArgs(binary, MEMBER_NETWORK_SPEC);
+}
+
+/**
+ * A bridge network lazy creates for one kind of container and vouches for:
+ * its own bridge interface, inter-container traffic off, lazy's label.
+ */
+export interface IsolatedNetworkSpec {
+  name: string;
+  bridge: string;
+  /** Label key set to `1` on the network. */
+  label: string;
+  /** What joins it, for messages ("terminals"). */
+  purpose: string;
+}
+
+export const MEMBER_NETWORK_SPEC: IsolatedNetworkSpec = {
+  name: MEMBER_NETWORK,
+  bridge: MEMBER_BRIDGE_INTERFACE,
+  label: 'lazy.member-network',
+  purpose: 'terminals',
+};
+
+export function isolatedNetworkCreateArgs(binary: string, spec: IsolatedNetworkSpec): string[] {
   return [
     binary, 'network', 'create', '--driver', 'bridge',
-    '--opt', `com.docker.network.bridge.name=${MEMBER_BRIDGE_INTERFACE}`,
+    '--opt', `com.docker.network.bridge.name=${spec.bridge}`,
     '--opt', 'com.docker.network.bridge.enable_icc=false',
-    '--label', 'lazy.member-network=1',
-    MEMBER_NETWORK,
+    '--label', `${spec.label}=1`,
+    spec.name,
   ];
 }
 
@@ -144,17 +168,20 @@ async function runCaptured(argv: string[]): Promise<{ exitCode: number; stdout: 
 }
 
 /**
- * What a network must be to serve as {@link MEMBER_NETWORK}: exactly what
- * {@link memberNetworkCreateArgs} creates. The NAME proves nothing — anyone
- * with the runtime can create a `lazy-members` network first, with
- * inter-container traffic on, and member containers would join it.
+ * What a network must be to serve as {@link MEMBER_NETWORK} (or another
+ * isolated network): exactly what {@link isolatedNetworkCreateArgs} creates.
+ * The NAME proves nothing — anyone with the runtime can create a
+ * `lazy-members` network first, with inter-container traffic on, and member
+ * containers would join it.
  */
-const MEMBER_NETWORK_REQUIRED: ReadonlyArray<{ what: string; read: (n: InspectedNetwork) => unknown; want: string }> = [
-  { what: 'driver', read: (n) => n.Driver, want: 'bridge' },
-  { what: 'option com.docker.network.bridge.enable_icc', read: (n) => n.Options?.['com.docker.network.bridge.enable_icc'], want: 'false' },
-  { what: 'option com.docker.network.bridge.name', read: (n) => n.Options?.['com.docker.network.bridge.name'], want: MEMBER_BRIDGE_INTERFACE },
-  { what: 'label lazy.member-network', read: (n) => n.Labels?.['lazy.member-network'], want: '1' },
-];
+function isolatedNetworkRequired(spec: IsolatedNetworkSpec): ReadonlyArray<{ what: string; read: (n: InspectedNetwork) => unknown; want: string }> {
+  return [
+    { what: 'driver', read: (n) => n.Driver, want: 'bridge' },
+    { what: 'option com.docker.network.bridge.enable_icc', read: (n) => n.Options?.['com.docker.network.bridge.enable_icc'], want: 'false' },
+    { what: 'option com.docker.network.bridge.name', read: (n) => n.Options?.['com.docker.network.bridge.name'], want: spec.bridge },
+    { what: `label ${spec.label}`, read: (n) => n.Labels?.[spec.label], want: '1' },
+  ];
+}
 interface InspectedNetwork {
   Driver?: string;
   Options?: Record<string, string> | null;
@@ -162,14 +189,14 @@ interface InspectedNetwork {
 }
 
 /** Why an existing network is not the member network lazy creates, or null. */
-function memberNetworkMismatch(inspectStdout: string): string | null {
+function networkMismatch(inspectStdout: string, spec: IsolatedNetworkSpec): string | null {
   let net: InspectedNetwork;
   try {
     net = JSON.parse(inspectStdout) as InspectedNetwork;
   } catch (err) {
     return `its description could not be read (${err instanceof Error ? err.message : String(err)})`;
   }
-  const wrong = MEMBER_NETWORK_REQUIRED
+  const wrong = isolatedNetworkRequired(spec)
     .map((r) => ({ ...r, got: r.read(net) }))
     .filter((r) => r.got !== r.want)
     .map((r) => `${r.what} is ${r.got === undefined || r.got === null ? 'not set' : JSON.stringify(r.got)}, not "${r.want}"`);
@@ -187,14 +214,19 @@ function memberNetworkMismatch(inspectStdout: string): string | null {
  * member terminals are refused there (see launchMemberContainer).
  */
 export async function ensureMemberNetwork(binary: string, deps: NetworkDeps = {}): Promise<void> {
+  return ensureIsolatedNetwork(binary, MEMBER_NETWORK_SPEC, deps);
+}
+
+/** {@link ensureMemberNetwork} for any {@link IsolatedNetworkSpec}. */
+export async function ensureIsolatedNetwork(binary: string, spec: IsolatedNetworkSpec, deps: NetworkDeps = {}): Promise<void> {
   const run = deps.run ?? runCaptured;
-  const inspect = () => run([binary, 'network', 'inspect', '--format', '{{json .}}', MEMBER_NETWORK]);
+  const inspect = () => run([binary, 'network', 'inspect', '--format', '{{json .}}', spec.name]);
   const verify = (stdout: string) => {
-    const mismatch = memberNetworkMismatch(stdout.trim());
+    const mismatch = networkMismatch(stdout.trim(), spec);
     if (mismatch) {
       throw new Error(
-        `a network named ${MEMBER_NETWORK} already exists on this host but is not the one lazy creates for terminals (${mismatch}). ` +
-        `Remove it (${binary} network rm ${MEMBER_NETWORK}) so lazy can create its own.`,
+        `a network named ${spec.name} already exists on this host but is not the one lazy creates for ${spec.purpose} (${mismatch}). ` +
+        `Remove it (${binary} network rm ${spec.name}) so lazy can create its own.`,
       );
     }
   };
@@ -203,16 +235,16 @@ export async function ensureMemberNetwork(binary: string, deps: NetworkDeps = {}
     verify(existing.stdout);
     return;
   }
-  const created = await run(memberNetworkCreateArgs(binary));
+  const created = await run(isolatedNetworkCreateArgs(binary, spec));
   if (created.exitCode === 0) return;
   if (!/already exists/i.test(created.stderr)) {
-    throw new Error(`could not create the ${MEMBER_NETWORK} network: ${created.stderr.trim() || `exit ${created.exitCode}`}`);
+    throw new Error(`could not create the ${spec.name} network: ${created.stderr.trim() || `exit ${created.exitCode}`}`);
   }
   // Created concurrently (another project's daemon on this host) — or by
   // somebody else: held to the same check as one found up front.
   const raced = await inspect();
   if (raced.exitCode !== 0) {
-    throw new Error(`could not inspect the ${MEMBER_NETWORK} network: ${raced.stderr.trim() || `exit ${raced.exitCode}`}`);
+    throw new Error(`could not inspect the ${spec.name} network: ${raced.stderr.trim() || `exit ${raced.exitCode}`}`);
   }
   verify(raced.stdout);
 }
@@ -1032,6 +1064,40 @@ export function memberAdoptScript(adoptPaths: string[], readOnlyPaths: string[])
   );
 }
 
+/**
+ * The project's `[[mounts]]` and `[docker] run_args` as they apply to a
+ * container that must not share writable storage with turns: a member's
+ * terminal, and a commit run's container (./commit-run-container.ts).
+ *
+ * Everything turns can WRITE is collected first, so that no mount here reaches
+ * the same storage read-only while turns write it through another door:
+ * read-write [[mounts]] and run_args mounts, and lazy's own read-write mounts —
+ * every task's worktree (all under the worktrees directory), the object store
+ * and the worktrees' gitdirs (../capture/git-mounts.ts). A shared mount is kept
+ * only when no turn can write it; network, name-resolution and port flags are
+ * dropped from run_args ({@link memberRunArgs}).
+ */
+export async function memberMountPlan(
+  projectRoot: string,
+  worktreePath: string,
+  config: { mounts: MountConfigEntry[]; docker: { run_args: string[] } },
+): Promise<{ runArgs: string[]; droppedRunArgs: string[]; customMountArgs: string[]; omittedMounts: string[] }> {
+  const mountPaths = { worktreePath, repoRoot: projectRoot };
+  const runArgShared = runArgMounts(config.docker.run_args);
+  const isTurnWritable = await turnWritableIndex([
+    ...turnWritableMountStorage(config.mounts, mountPaths),
+    ...runArgShared.filter((m) => !m.readOnly).map((m) => m.storage),
+    { kind: 'path', path: dirname(worktreePath) },
+    { kind: 'path', path: join(projectRoot, '.git', 'objects') },
+    { kind: 'path', path: join(projectRoot, '.git', 'worktrees') },
+  ]);
+  const writableElsewhere = new Set<string>();
+  for (const m of runArgShared) if (m.readOnly && (await isTurnWritable(m.storage))) writableElsewhere.add(m.spec);
+  const { args: runArgs, dropped: droppedRunArgs, droppedMounts: droppedRunArgMounts } = memberRunArgs(config.docker.run_args, writableElsewhere);
+  const memberMounts = await buildMemberMountArgs(config.mounts, mountPaths, isTurnWritable);
+  return { runArgs, droppedRunArgs, customMountArgs: memberMounts.args, omittedMounts: [...memberMounts.omitted, ...droppedRunArgMounts] };
+}
+
 export interface LaunchMemberContainerDeps {
   planCredential?: typeof planMemberContainerCredential;
   ensureImage?: (binary: string, opts: { agentId?: string; pinnedImage?: string }) => Promise<string>;
@@ -1078,31 +1144,13 @@ export async function launchMemberContainer(opts: {
     [...knownRuntimeSocketPaths(), ...(await (deps.activeSockets ?? activeRuntimeSockets)(binary))],
   );
   if (refusal) return { ok: false, status: 409, message: refusal };
-  // Everything turns can WRITE, so that no member mount reaches the same
-  // storage read-only while turns write it through another door: read-write
-  // [[mounts]] and run_args mounts, and lazy's own read-write mounts — every
-  // task's worktree (all under the worktrees directory), the object store and
-  // the worktrees' gitdirs (../capture/git-mounts.ts).
-  const mountPaths = { worktreePath, repoRoot: projectRoot };
-  const runArgShared = runArgMounts(config.docker.run_args);
-  const isTurnWritable = await turnWritableIndex([
-    ...turnWritableMountStorage(config.mounts, mountPaths),
-    ...runArgShared.filter((m) => !m.readOnly).map((m) => m.storage),
-    { kind: 'path', path: dirname(worktreePath) },
-    { kind: 'path', path: join(projectRoot, '.git', 'objects') },
-    { kind: 'path', path: join(projectRoot, '.git', 'worktrees') },
-  ]);
-  const writableElsewhere = new Set<string>();
-  for (const m of runArgShared) if (m.readOnly && (await isTurnWritable(m.storage))) writableElsewhere.add(m.spec);
-  const { args: runArgs, dropped: droppedRunArgs, droppedMounts: droppedRunArgMounts } = memberRunArgs(config.docker.run_args, writableElsewhere);
+  const { runArgs, droppedRunArgs, customMountArgs, omittedMounts } = await memberMountPlan(projectRoot, worktreePath, config);
   if (droppedRunArgs.length > 0) {
     logger.info(
       `[${task.id.substring(0, 8)}] Not applying these [docker] run_args to ${memberEmail}'s terminal environment, ` +
       `which is on its own network only: ${droppedRunArgs.join(', ')}.`,
     );
   }
-  const memberMounts = await buildMemberMountArgs(config.mounts, mountPaths, isTurnWritable);
-  const omittedMounts = [...memberMounts.omitted, ...droppedRunArgMounts];
   if (omittedMounts.length > 0) {
     logger.info(
       `[${task.id.substring(0, 8)}] Not mounting these into ${memberEmail}'s terminal environment, because other tasks' agents ` +
@@ -1174,7 +1222,7 @@ export async function launchMemberContainer(opts: {
       gitMountArgs,
       adoptPaths,
       readOnlyPaths,
-      customMountArgs: memberMounts.args,
+      customMountArgs,
       runArgs,
       credentialEnv: credential.env,
     });

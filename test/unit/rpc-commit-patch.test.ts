@@ -53,7 +53,7 @@ describe('commitPatch RPC and commit identity on show', () => {
     git(root, 'add', 'a.txt');
     git(root, 'commit', '-q', '-m', 'first');
     await writeFile(join(root, 'a.txt'), 'one\ntwo\n');
-    git(root, 'commit', '-q', '-am', 'second');
+    git(root, 'commit', '-q', '-am', 'second', '-m', 'The complete commit body.');
     recordedSha = git(root, 'rev-parse', 'HEAD');
     otherSha = git(root, 'rev-parse', 'HEAD~1');
 
@@ -93,6 +93,8 @@ describe('commitPatch RPC and commit identity on show', () => {
     for (const id of [commitId, recordedSha.slice(0, 8)]) {
       const r = await handleCommitPatch(root, { taskId, commitId: id });
       expect(r.commit.sha).toBe(recordedSha);
+      // INVARIANT: commit detail reads the complete git message; stored commit records carry only the subject.
+      expect(r.commit.message).toBe('second\n\nThe complete commit body.');
       expect(r.commit.author_name).toBe('Ada Author');
       expect(r.patchAvailable).toBe(true);
       expect(r.patch).toContain('diff --git a/a.txt b/a.txt');

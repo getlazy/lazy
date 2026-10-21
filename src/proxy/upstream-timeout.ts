@@ -40,14 +40,25 @@ export function isUpstreamTimeout(err: unknown): boolean {
  * provider-host backstop. The 3xx goes back to the client as-is, and the client
  * holds only its placeholder.
  */
-export function upstreamFetchOptions(timeoutSeconds: number): Record<string, unknown> {
+export function upstreamFetchOptions(
+  timeoutSeconds: number,
+  clientSignal?: AbortSignal,
+): Record<string, unknown> {
   // `timeout` is a Bun-only fetch extension and is not in the published types.
   const options: Record<string, unknown> = { timeout: false, redirect: 'manual' };
-  if (timeoutSeconds > 0) {
-    options.signal = AbortSignal.timeout(timeoutSeconds * 1000);
-  }
+  const signals: AbortSignal[] = [];
+  if (timeoutSeconds > 0) signals.push(AbortSignal.timeout(timeoutSeconds * 1000));
+  // The client going away aborts the upstream too: nobody reads its answer, and
+  // a live upstream holds a concurrency slot and bills tokens.
+  if (clientSignal) signals.push(clientSignal);
+  if (signals.length === 1) options.signal = signals[0];
+  else if (signals.length > 1) options.signal = AbortSignal.any(signals);
   return options;
 }
+
+/** Audit text for a request that ended because the client disconnected. */
+export const CLIENT_ABORT_MESSAGE =
+  'client disconnected before the upstream answered; the upstream request was aborted';
 
 /**
  * The error text a failed upstream request is audited and reported with.

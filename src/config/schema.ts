@@ -61,7 +61,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
   // profile key nobody classified is a key a shared host would honour from an
   // untrusted repository, and `endpoint` is where the real model credential
   // goes.
-  agents: ['harness', 'model', 'endpoint', 'credential', 'description', 'named_endpoint', 'tiers'],
+  agents: ['harness', 'model', 'endpoint', 'credential', 'description', 'named_endpoint', 'reasoning', 'tiers'],
   // `[endpoints.<name>]` — named upstreams, freeform like `agents`; inner keys
   // are validated by resolveNamedEndpoints at config load.
   endpoints: ['url', 'credential', 'description'],

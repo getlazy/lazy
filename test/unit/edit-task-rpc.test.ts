@@ -88,6 +88,28 @@ describe('editTask RPC', () => {
     expect(updated?.metadata?.effort).toBe('low');
   });
 
+  // INVARIANT: Teams edits review settings on a started task through the
+  // daemon, including the source markers children use for inheritance.
+  test('persists explicit review settings on a started task', async () => {
+    const storage = await getOrCreateStorage();
+    const task = await storage.createTask('Review this', undefined, undefined, 'review-task');
+    const session = await storage.createSession(task.id, 'claude-code', 'lazy/review-task', 'abc');
+    await storage.createTurn({ sessionId: session.id, sequence: 1, role: 'agent', content: 'did work' });
+
+    const result = await handleEditTask(root, {
+      taskId: task.id, review: 'separate', reviewGate: 'always', reviewAutoFix: 'on',
+    });
+    expect(result.reviewSettingsApplied).toBe(true);
+    expect((await storage.getTask(task.id))?.metadata).toMatchObject({
+      review_mode: 'separate', review_mode_source: 'task',
+      review_gate: 'always', review_gate_source: 'task',
+      review_auto_fix: 'on', review_auto_fix_source: 'task',
+    });
+    expect((await storage.getTaskJournal(task.id)).at(-1)?.content).toContain(
+      'review mode → separate, review gate → always, review auto-fix → on',
+    );
+  });
+
   test('refuses terminal tasks outright', async () => {
     const storage = await getOrCreateStorage();
     const task = await storage.createTask('Done', undefined, undefined, 'done');

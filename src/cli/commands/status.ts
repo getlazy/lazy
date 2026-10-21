@@ -177,7 +177,9 @@ export async function commandStatus(args: string[]): Promise<void> {
           console.log(`\n  Latest backup snapshot:`);
           console.log(`    Turn: ${snapshot.turn_sequence}`);
           console.log(`    Time: ${formatDate(snapshot.timestamp)}`);
-          console.log(`    (Uncommitted changes have been backed up)`);
+          console.log(snapshot.retired_at !== undefined
+            ? `    (${snapshot.retired_reason === 'consumed' ? 'Already restored' : 'Superseded by a later clean turn'} — will not be restored again)`
+            : `    (Uncommitted changes have been backed up)`);
         }
       }
     }

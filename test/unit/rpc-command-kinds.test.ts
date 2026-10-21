@@ -287,7 +287,11 @@ describe('rpc command kinds', () => {
     const lines = source.split('\n');
     // Class members sit at exactly two-space indentation.
     const MEMBER = /^ {2}(?:(private|protected)\s+)?(?:static\s+)?(?:async\s+)?\*?([A-Za-z_]\w*)\s*[(<]/;
-    const PERSON = /\b(?:actorFields|actorEmail|actorName)\s*\(/;
+    // `createPromotedTask(this, …)` (src/raised/promote-task.ts) hands its
+    // ActorInput to `createTask`, which writes the person on the creation entry
+    // — a person write through a module helper the `this.<helper>` scan below
+    // cannot follow, so it is recognised by name.
+    const PERSON = /\b(?:actorFields|actorEmail|actorName)\s*\(|\bcreatePromotedTask\s*\(\s*this\b/;
 
     const members: Array<{ name: string; hidden: boolean; body: string[] }> = [];
     let current: { name: string; hidden: boolean; body: string[] } | null = null;

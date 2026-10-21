@@ -21,8 +21,7 @@ import { currentTraceparent } from '../tracing';
 import { readToken, getDaemonTcpTarget } from './lifecycle';
 import { findLazyRoot } from '../project-paths';
 import type { ProgressEmitter } from './progress';
-import { resolveTeamsLogin } from '../teams/login';
-import { CredentialIndexParseError } from '../credentials/store';
+import { resolveTeamsLogin, corruptIndexMeansLocal, forgetLocalDaemonTarget } from '../teams/login';
 import { resolveTargetAddresses, describeTargetResolution } from '../utils/target-resolution';
 
 /** Optional observers for a long RPC's mid-flight envelope lines. */
@@ -49,10 +48,18 @@ export class RpcApplicationError extends Error {
      * re-deriving next steps from the message prose.
      */
     public readonly remedy?: AcceptRemedy,
+    /** Structured refusal details the daemon sent (`{ error, code, details }`), e.g. a run's dirty files. */
+    public readonly details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = 'RpcApplicationError';
   }
+}
+
+/** A reply body's `details` object, when it carries one. */
+function detailsOf(body: unknown): Record<string, unknown> | undefined {
+  const details = (body as { details?: unknown } | null)?.details;
+  return details && typeof details === 'object' && !Array.isArray(details) ? details as Record<string, unknown> : undefined;
 }
 
 /** `{ traceparent }` when this process has an active span, `{}` otherwise. */
@@ -185,10 +192,13 @@ export class DaemonClient {
       // clone never has a local daemon, so a recorded local target answers it.
       // Without this, one bad line of JSON cut every command off the daemon,
       // including `lazy doctor`, the surface that reports the broken file.
-      if (!(err instanceof CredentialIndexParseError) || !getDaemonTcpTarget(projectRoot)) throw err;
+      if (!corruptIndexMeansLocal(projectRoot, err)) throw err;
       bound = null;
     }
     if (bound) {
+      // A clone bound before `lazy login` cleared it may still carry a local
+      // target; drop it now, while the index still reads.
+      await forgetLocalDaemonTarget(projectRoot);
       // The path segment IS `/api/projects/<slug>/rpc` already, so the base
       // handed to `buildDaemonRpcRequest` must stop one segment short of
       // `rpc` — that function appends `/${routePrefix}/${command}` itself.
@@ -296,6 +306,7 @@ export class DaemonClient {
           status,
           `RPC ${command} failed: ${status} ${detail}`,
           parseAcceptRemedy((body as { remedy?: unknown })?.remedy),
+          detailsOf(body),
         );
       }
       return body;
@@ -316,8 +327,11 @@ export class DaemonClient {
       // a truncated stream) is not an error worth surfacing here, so it simply
       // yields no remedy and the text still reaches the message.
       let remedy: AcceptRemedy | undefined;
+      let details: Record<string, unknown> | undefined;
       try {
-        remedy = parseAcceptRemedy((JSON.parse(body) as { remedy?: unknown })?.remedy);
+        const parsed = JSON.parse(body) as { remedy?: unknown };
+        remedy = parseAcceptRemedy(parsed?.remedy);
+        details = detailsOf(parsed);
       } catch {
         remedy = undefined;
       }
@@ -325,6 +339,7 @@ export class DaemonClient {
         response.status,
         `RPC ${command} failed: ${response.status} ${body}`,
         remedy,
+        details,
       );
     }
 

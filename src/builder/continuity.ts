@@ -124,8 +124,18 @@ export async function runBuilderWithContinuity(
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      // Prove the MCP binary before every launch — upgrade may be rewriting the mount.
-      await preflightAgentBinaryWithRetry('lazy-agent', { log });
+      // Prove the MCP binary before every RElaunch — upgrade may be rewriting the
+      // mount. The first launch skips it: the builder supervisor (the only
+      // caller) proved the same binary a moment ago, and the repeat was dead
+      // time between "Start your builder" and a usable terminal.
+      if (restarts > 0) await preflightAgentBinaryWithRetry('lazy-agent', { log });
+
+      // The daemon-status baseline does not depend on the launch env, so it is
+      // asked for at the same time instead of after it. Awaited below; the
+      // handler only keeps an early return (the env refused) from leaving its
+      // rejection unhandled — that return already reports the real failure.
+      const baselineRead = readStatus(projectRoot);
+      baselineRead.catch(() => undefined);
 
       let launchEnv: BuilderLaunchEnv;
       try {
@@ -148,7 +158,7 @@ export async function runBuilderWithContinuity(
         return { exitCode: 1, restarts };
       }
 
-      const baseline = await readStatus(projectRoot);
+      const baseline = await baselineRead;
       const claudeArgs = buildClaudeArgs(resumeId, launchEnv.directive);
       const env = overlayLaunchEnv(baseEnv, launchEnv);
 

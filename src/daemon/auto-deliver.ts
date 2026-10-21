@@ -26,7 +26,7 @@ import { resolveTurnLaunchIdentity } from './launch-identity';
 import { resolveAndPersistLowHighLoop } from './effort';
 import type { EffortLevel } from '../config/types';
 import { createRunner } from '../runner';
-import { harnessForTask, setRunnerAgentForTask } from './task-harness';
+import { harnessForTask, setRunnerAgentForTask, agentTargetForTask } from './task-harness';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { mustRecreateForTaskEnv } from './task-env';
 import { deliverTaskFilesForLaunch } from './task-files';
@@ -51,7 +51,7 @@ import { runGit } from '../utils/git';
 import { emitSignal, readSignals, consumeSignals, consumeSignalsById } from './signals';
 import { writeDaemonMcpConfig } from './task-launcher';
 import { resolveWrapUpCommandFields } from './wrap-up-plan';
-import { planTurnCredential, mustRecreateForCredentialPlan, systemTurnBlock } from './turn-credentials';
+import { planTurnCredential, mustRecreateForCredentialPlan, systemTurnBlock, sessionCredentialCommandField } from './turn-credentials';
 import { takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import { hasDaemonContext } from './context';
 import { restartClusterForAddedChildren } from './cluster-restart';
@@ -388,7 +388,7 @@ export async function autoUnblockTask(
     await recordRecreationIfRunning(
       storage,
       task.id,
-      recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv),
+      recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)),
       runner, containerName,
     );
     const envNotice = await environmentReplacedPrefix(storage, task.id);
@@ -432,6 +432,7 @@ export async function autoUnblockTask(
         worktreePath,
         config,
       })),
+      ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
       ...commonCommandFields(config),
     };
     // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).

@@ -264,7 +264,7 @@ export function createRpcReviewActions(client: DaemonClient, projectRoot: string
 
     async promoteConversation(
       sessionId: string,
-      options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string },
+      options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string; actor?: ActorInput },
     ): Promise<PromoteConversationResult> {
       return (await call('conversationPromote', {
         sessionId,
@@ -274,6 +274,7 @@ export function createRpcReviewActions(client: DaemonClient, projectRoot: string
         ...(options.prompt != null ? { prompt: options.prompt } : {}),
         ...(options.code != null ? { code: options.code } : {}),
         ...(options.parent != null ? { parent: options.parent } : {}),
+        ...(options.actor !== undefined ? { actor: options.actor } : {}),
       })) as PromoteConversationResult;
     },
 

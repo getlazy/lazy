@@ -59,6 +59,7 @@ const CONTAINER_EXPANSIONS: Record<string, string[]> = {
   'agents.endpoint': ['agents.*.endpoint'],
   'agents.credential': ['agents.*.credential'],
   'agents.named_endpoint': ['agents.*.named_endpoint'],
+  'agents.reasoning': ['agents.*.reasoning'],
   'agents.tiers': ['agents.*.tiers[].endpoint', 'agents.*.tiers[].model', 'agents.*.tiers[].threshold_percent'],
   // [endpoints.<name>] is collapsed to `*` the same way.
   'endpoints.url': ['endpoints.*.url'],

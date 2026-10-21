@@ -70,8 +70,16 @@ export function getContainerStart(taskId: string): ContainerStartState | null {
  *
  * Idempotent while in flight: a double-clicked button, or a reload that
  * re-POSTs, must not launch a second `docker run` for the same task.
+ *
+ * `taskId` is the registry KEY. A commit run's page (./runs-page.ts) records
+ * its start under `run:<id>` (./run-urls.ts) and passes the run's own id as
+ * `subjectId`, which is what `ensureContainer` is called with.
  */
-export function beginContainerStart(taskId: string, actions: TaskActions): ContainerStartState {
+export function beginContainerStart(
+  taskId: string,
+  actions: Pick<TaskActions, 'ensureContainer'>,
+  subjectId: string = taskId,
+): ContainerStartState {
   const existing = getContainerStart(taskId);
   if (existing && existing.phase === 'starting') return existing;
 
@@ -83,7 +91,7 @@ export function beginContainerStart(taskId: string, actions: TaskActions): Conta
   starts.set(taskId, state);
 
   void actions
-    .ensureContainer(taskId, (detail) => {
+    .ensureContainer(subjectId, (detail) => {
       // Narration from the launch itself: which image, why a rebuild, the
       // build's own output. Latest line wins — this is a status, not a log.
       if (detail.trim()) state.detail = detail.trim();

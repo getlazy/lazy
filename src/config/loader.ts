@@ -5,7 +5,7 @@ import { BACKEND_SELECTIONS, isBackendSelection } from '../credentials/backends'
 import { VALID_TASK_TYPES, LEGACY_CLUSTER_TASK_TYPE } from '../types';
 import { DEFAULT_WEB_PORT, DEFAULT_SERVER_BIND, DEFAULT_PROXY_BIND, DEFAULT_MEMORY_WARN_BYTES } from './constants';
 import { pathExists, readFile } from '../utils/fs';
-import { expandTilde } from '../utils/home';
+import { expandTilde, getHome } from '../utils/home';
 import { validateMounts } from '../capture/mounts';
 import { DEFAULT_OPENAI_UPSTREAM } from '../utils/openai-compat';
 import { resolveMainService, resolveServicePorts, resolveStartServicesCmd, type ServeConfigInput } from '../serve/ports';
@@ -1110,6 +1110,7 @@ export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = 
     if (fallback) return fallback;
     throw err;
   }
+  await resolveStorePathOnto(lazyRoot, config);
   rememberGoodConfig(configPath, config);
   // Which bytes (and which control-plane version) this config came from, so an
   // error raised later from inside a lookup can name them (./config-provenance).
@@ -1146,6 +1147,25 @@ export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = 
     noteConfigLoaded(null);
   }
   return config;
+}
+
+/**
+ * Resolve the effective store dir once, with the project root in hand, so
+ * consumers that must agree on it — the host sandbox deny list, built by both
+ * the runner and the supervisor command — read one answer. Here rather than in
+ * resolveConfigText because the default needs an async git lookup. The
+ * empty-path default costs a git subprocess on a hot path and its only reader
+ * is the host-process runner's sandbox, so it is derived for that alone.
+ */
+async function resolveStorePathOnto(lazyRoot: string, config: ResolvedConfig): Promise<void> {
+  if (config.storage.backend !== 'external') return;
+  if (config.storage.external_path) {
+    config.storage.resolved_path = resolve(lazyRoot, expandTilde(config.storage.external_path));
+  } else if (isHostRunnerType(config.runner.type)) {
+    // Dynamic import: storage/index imports this module.
+    const { getProjectName } = await import('../storage/index');
+    config.storage.resolved_path = join(getHome(), '.lazy', await getProjectName(lazyRoot, config.remote.git_remote));
+  }
 }
 
 async function loadConfigAt(

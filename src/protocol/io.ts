@@ -19,7 +19,7 @@ import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
-import { PROTOCOL_VERSION, normalizeResponse, normalizeSupervisorStatus, type CommandId } from './types';
+import { PROTOCOL_VERSION, normalizeResponse, normalizeSupervisorStatus, responseCommandId, type CommandId } from './types';
 import { PROGRESS_FILE } from './progress';
 import { mintNotesSecret } from './notes-secret';
 import { FINAL_MARKER_FILE } from './final-marker';
@@ -236,7 +236,46 @@ function safeReadJson<T>(filePath: string): T | null {
 export function writeCommand(dir: string, command: Command): void {
   ensureProtocolDir(dir);
   // Clear previous response so supervisor knows this is a fresh command.
-  //
+  supersedeResponse(dir);
+  // The record of which command was dispatched is cleared FIRST and written
+  // again only once the command is on disk: a record naming a command the
+  // supervisor was never handed would set aside the answer to the one it WAS
+  // handed. With no record, every response reads as the current turn's answer,
+  // which is how the reconciler behaved before the record existed.
+  clearDispatchedCommand(dir);
+  // INVARIANT: a command starts a turn, and a turn starts with no progress.
+  // The agent's self-reported progress line (progress.json) is per-TURN
+  // ephemera, so clearing it here — the one place every turn passes through —
+  // is what makes "a stale message from a finished turn never lingers" a
+  // structural guarantee rather than eight call sites that must remember.
+  const pPath = join(dir, PROGRESS_FILE);
+  if (existsSync(pPath)) {
+    try { unlinkSync(pPath); } catch { /* best effort */ }
+  }
+  // Same argument for the pencils-down marker, and it is a correctness one
+  // rather than a cosmetic one: a `final.json` left by the previous turn would
+  // make this turn's first agent invocation look declared-done before the agent
+  // had written a line. The supervisor ALSO clears it before every agent
+  // invocation (a command runs several), which is the load-bearing clear; this
+  // one closes the gap for a turn whose supervisor never reaches that code.
+  const fPath = join(dir, FINAL_MARKER_FILE);
+  if (existsSync(fPath)) {
+    try { unlinkSync(fPath); } catch { /* best effort */ }
+  }
+  // The supervisor's own credential for comment hand-offs — see ./notes-secret.
+  const { command_id: cid } = command as { command_id?: string };
+  const withSecret = (cid && command.task_id)
+    ? { ...command, notes_secret: mintNotesSecret(command.task_id, cid) }
+    : command;
+  atomicWrite(commandPath(dir), JSON.stringify(withSecret, null, 2));
+  if (cid) recordDispatchedCommand(dir, cid);
+}
+
+/**
+ * Move an unread `response.json` aside as a superseded response, for
+ * `sweepSupersededResponses` to record. Returns true when there was one.
+ */
+export function supersedeResponse(dir: string): boolean {
   // INVARIANT: an unconsumed response is NEVER destroyed here. It is the only
   // record of a turn the agent actually finished, and this used to `unlink` it.
   // Any command landing between the supervisor writing its response and the
@@ -277,32 +316,84 @@ export function writeCommand(dir: string, command: Command): void {
         );
       }
     }
+    return true;
   }
-  // INVARIANT: a command starts a turn, and a turn starts with no progress.
-  // The agent's self-reported progress line (progress.json) is per-TURN
-  // ephemera, so clearing it here — the one place every turn passes through —
-  // is what makes "a stale message from a finished turn never lingers" a
-  // structural guarantee rather than eight call sites that must remember.
-  const pPath = join(dir, PROGRESS_FILE);
-  if (existsSync(pPath)) {
-    try { unlinkSync(pPath); } catch { /* best effort */ }
+  return false;
+}
+
+/**
+ * The daemon-side record of the command most recently handed to a mailbox's
+ * supervisor. A sibling of the mailbox, never inside it: the mailbox is
+ * bind-mounted read-write into the task container, and nothing there may
+ * rewrite which command the daemon thinks is running.
+ */
+function dispatchedCommandPath(dir: string): string {
+  return `${dir}.dispatched-command`;
+}
+
+function recordDispatchedCommand(dir: string, commandId: CommandId): void {
+  try {
+    atomicWrite(dispatchedCommandPath(dir), commandId);
+  } catch (err) {
+    // Without the record the reconciler reads any response as the answer,
+    // which is its behaviour before the record existed, so the command still
+    // goes out. Said loudly: a queued command can then be parked under.
+    logger.warn(
+      `Protocol ${dir}: could not record which command was dispatched ` +
+      `(${err instanceof Error ? err.message : String(err)}); a response to an earlier command ` +
+      `will be read as this one's answer.`,
+    );
   }
-  // Same argument for the pencils-down marker, and it is a correctness one
-  // rather than a cosmetic one: a `final.json` left by the previous turn would
-  // make this turn's first agent invocation look declared-done before the agent
-  // had written a line. The supervisor ALSO clears it before every agent
-  // invocation (a command runs several), which is the load-bearing clear; this
-  // one closes the gap for a turn whose supervisor never reaches that code.
-  const fPath = join(dir, FINAL_MARKER_FILE);
-  if (existsSync(fPath)) {
-    try { unlinkSync(fPath); } catch { /* best effort */ }
+}
+
+function clearDispatchedCommand(dir: string): void {
+  const p = dispatchedCommandPath(dir);
+  try {
+    if (existsSync(p)) unlinkSync(p);
+  } catch (err) {
+    logger.warn(
+      `Protocol ${dir}: could not clear the dispatched-command record ` +
+      `(${err instanceof Error ? err.message : String(err)}).`,
+    );
   }
-  // The supervisor's own credential for comment hand-offs — see ./notes-secret.
-  const { command_id: cid } = command as { command_id?: string };
-  const withSecret = (cid && command.task_id)
-    ? { ...command, notes_secret: mintNotesSecret(command.task_id, cid) }
-    : command;
-  atomicWrite(commandPath(dir), JSON.stringify(withSecret, null, 2));
+}
+
+/** The id of the command most recently written to this mailbox, or null when none is recorded. */
+export function readDispatchedCommandId(dir: string): CommandId | null {
+  const p = dispatchedCommandPath(dir);
+  try {
+    if (!existsSync(p)) return null;
+    return readFileSync(p, 'utf-8').trim() || null;
+  } catch (err) {
+    logger.warn(
+      `Protocol ${dir}: could not read the dispatched-command record ` +
+      `(${err instanceof Error ? err.message : String(err)}); reading the response as the current turn's.`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Does `response` answer the command most recently dispatched to this mailbox?
+ *
+ * A supervisor runs one command at a time, and a launch that finds the task's
+ * container running leaves its command for that supervisor to pick up NEXT. So
+ * when a task was parked while its supervisor was still busy, the next launch's
+ * command queues behind the old one, and the OLD command's response is the next
+ * thing in the mailbox. Read as the new turn's answer, it parked the task while
+ * the queued command then ran under a paused status — and every write that
+ * turn's agent made was refused for want of a live turn (an agent resolving a
+ * sync conflict could not commit the merge).
+ *
+ * False only on positive evidence: both ids known and different. A response
+ * with no id (a supervisor predating correlation, `lazy stop`'s own) or a
+ * mailbox with no record is read as the answer, as it always was.
+ */
+export function answersLatestCommand(dir: string, response: Response): boolean {
+  const responseId = responseCommandId(response);
+  if (!responseId) return true;
+  const dispatched = readDispatchedCommandId(dir);
+  return !dispatched || dispatched === responseId;
 }
 
 /**
@@ -535,6 +626,8 @@ export function cleanProtocol(dir: string): void {
     const p = join(dir, file);
     try { if (existsSync(p)) unlinkSync(p); } catch { /* best effort */ }
   }
+  // The command it named is gone with command.json above.
+  clearDispatchedCommand(dir);
 }
 
 /**

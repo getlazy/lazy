@@ -112,11 +112,11 @@ import { isSyncDispatchable } from '../task/sync-dispatch';
 import { resolveAndPersistLowHighLoop } from './effort';
 import { switchTaskAgent, formatAgentSwitchAnnouncement } from './agent-switch';
 import { resolveProjectModel } from './project-settings';
-import { setRunnerAgentForTask } from './task-harness';
+import { setRunnerAgentForTask, agentTargetForTask } from './task-harness';
 import { assertKnownAgentProfile } from './agent-profile-check';
 import { readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
 import { refuseTamperedWorktreeGit } from '../git/worktree-pointers';
-import { hasUncommittedChanges, listUncommittedPaths, applyPatch, patchIsAlreadyApplied, snapshotFiles, patchPaths, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getAcceptTagCommit, getNewCommits, getMergeBase } from '../git/operations';
+import { hasUncommittedChanges, listUncommittedPaths, hasUpstreamChanges, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch, createAcceptTag, getAcceptTagCommit, getNewCommits, getMergeBase } from '../git/operations';
 import { recordReopenAfterAccept } from '../task/reopen-after-accept';
 import { DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from '../supervisor/accept-gate';
 import type { DestinationRestoreConflict } from '../git/operations';
@@ -129,7 +129,7 @@ import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystem
 import { typeConstraintsSection } from '../task/type-constraints';
 import { lazyFold, neutralizeLazyMarkers } from '../task/wrapper-fold';
 import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
-import { snapshotIsRestorable } from '../task/worktree-snapshot';
+import { restoreWorktreeSnapshot } from '../task/worktree-snapshot-restore';
 import { runSyncWithRemote } from '../task/sync-remote';
 import { cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../task/cleanup';
 import { buildAgentSwitchHandoffContext } from '../agent/switch-handoff';
@@ -201,13 +201,14 @@ import {
 } from './submit-target';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
-import { prepareTurnLaunch, assertNoMemberInside, assertTurnCredentialAvailable, releaseTurnCredential, turnCredentialProblem } from './turn-credentials';
+import { prepareTurnLaunch, assertNoMemberInside, assertTurnCredentialAvailable, releaseTurnCredential, turnCredentialProblem, sessionCredentialCommandField } from './turn-credentials';
 import { assertBesideLaunchAllowed, assertBesideUsagePauseOverrideAllowed, assertTurnStartAllowed, takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import { USAGE_PAUSE_PENDING_FIX_KEY } from '../usage-pause/hold';
 import { createAgentTurn, createRecoveredAgentTurn, pendingTurnOwnerPerson, turnOwnerOfClaim } from './turn-owner';
 import { revokeTaskMcpTokens } from './mcp-tokens';
 import { clearTaskEnv } from './task-env';
 import { assertNoDeliveredSecretsToPush, deliverTaskFilesForLaunch, deliveredGuardFor, forgetTaskFiles } from './task-files';
+import { forgetContainerCredentialLaunches } from './container-credential-launch';
 import { deliveredFilesRefusal, findDeliveredFilesAtRef, findDeliveredFilesInRange } from '../git/delivered-files';
 import { revokeTaskCredentialGrants } from '../proxy/credential-broker';
 import { setupSandbox } from '../utils/sandbox';
@@ -379,6 +380,16 @@ async function revokeTaskTokens(projectRoot: string, task: Task): Promise<void> 
   } catch (err) {
     logger.warn(
       `Failed to clear per-task env for task ${shortId(taskId)}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // What its containers were launched with (./container-credential-launch.ts).
+  try {
+    await forgetContainerCredentialLaunches(projectRoot, taskId);
+  } catch (err) {
+    logger.warn(
+      `Failed to clear the container credential-launch record for task ${shortId(taskId)}: ` +
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
@@ -1261,84 +1272,11 @@ async function launchUnblockTaskRun(
   const sandbox = await setupSandbox(worktreePath, { storage, taskId: task.id });
 
   try {
-    // Restore snapshot if exists
-    const snapshot = await storage.getLatestWorktreeSnapshot(sess.id);
-    if (snapshot && !await hasUncommittedChanges(worktreePath)) {
-      // ONLY THE LAST AGENT TURN'S SNAPSHOT. Nothing ever consumes or
-      // supersedes one — `getLatestWorktreeSnapshot` returns the newest ever
-      // taken in the session, and one is written only when a turn ends DIRTY.
-      // So once a task has had a single dirty turn, that patch stayed the
-      // candidate for every later unblock, forever.
-      //
-      // That was harmless only because the stored patch was unappliable (the
-      // trim, fixed in this task). Now that a restore can actually write files,
-      // an unbounded candidate is a way to RESURRECT work: a human reads an
-      // edit at turn 3, decides against it, reverts the file — and at turn 9 an
-      // unblock finds a clean worktree, the old patch still applies, and the
-      // discarded edit is back, on its way into the next commit.
-      //
-      // A snapshot is restorable only while it describes the turn the worktree
-      // is still sitting at the end of — the rule lives in
-      // `snapshotIsRestorable` (src/task/worktree-snapshot.ts) with the full
-      // reasoning. The remaining lifecycle (consume on apply, supersede on a
-      // clean turn) is raised separately; this is the bound that must not ship
-      // missing now that a restore can actually write files.
-      const turns = await storage.getSessionTurns(sess.id);
-      const isStale = !snapshotIsRestorable(snapshot.turn_sequence, turns);
-
-      let patch = snapshot.uncommitted_diff;
-      patch = patch.replace(/^--- STAGED CHANGES ---\n/gm, '');
-      patch = patch.replace(/^--- UNSTAGED CHANGES ---\n/gm, '');
-      patch = patch.replace(/^--- UNTRACKED FILES ---\n/gm, '');
-
-      if (isStale) {
-        logger.debug(
-          `Task ${displayId(task)}: worktree snapshot is from turn ${snapshot.turn_sequence}, which ` +
-          'a later agent turn has moved past — not restoring it over a worktree that went on without it.',
-        );
-      } else if (await applyPatch(patch, worktreePath)) {
-        warnings.push('Restored uncommitted changes from backup.');
-      } else if (await patchIsAlreadyApplied(patch, worktreePath)) {
-        // THE COMMON CASE, AND IT IS NOT A FAILURE. The snapshot is from the
-        // turn the worktree is still at (the gate above), the agent has since
-        // been sent back and committed exactly those edits, and the unblock
-        // after that finds a clean worktree and replays a patch whose content
-        // is already in HEAD. Git refuses it, correctly.
-        //
-        // Reported as a loss, that warning sent a whole investigation after the
-        // backup mechanism — it appeared on exactly the turns adjacent to work
-        // that had gone missing, because it is the echo of that work being
-        // COMMITTED. It says nothing now.
-        logger.debug(
-          `Task ${displayId(task)}: worktree snapshot from turn ${snapshot.turn_sequence} is ` +
-          'already in the branch — nothing to restore.',
-        );
-      } else {
-        // A genuine failure: the patch is neither appliable nor already in the
-        // branch. Name the files, or the human is told something was lost
-        // without being told what — but name them HONESTLY. The status capture
-        // lists everything the worktree held; the patch skips an untracked file
-        // that was binary or over the capture ceiling, and pointing somebody at
-        // a snapshot for content it does not contain is worse than telling them
-        // nothing.
-        const named = snapshotFiles(snapshot.git_status);
-        const stored = new Set(patchPaths(patch));
-        const recoverable = named.filter(f => stored.has(f));
-        const nameOnly = named.filter(f => !stored.has(f));
-
-        let warning = 'Could not restore uncommitted changes from backup. Continuing without them';
-        if (recoverable.length > 0) {
-          warning += ` (${recoverable.join(', ')}). They are still in the task's snapshot for turn ${snapshot.turn_sequence}.`;
-        } else {
-          warning += '.';
-        }
-        if (nameOnly.length > 0) {
-          warning += ` The snapshot records ${nameOnly.join(', ')} by name only — its content was not captured` +
-            ' (binary, or over the capture ceiling), so it cannot be restored from the store.';
-        }
-        warnings.push(warning);
-      }
-    }
+    // Restore the latest worktree snapshot when the worktree is clean and the
+    // snapshot is live and restorable — the rules live in
+    // src/task/worktree-snapshot-restore.ts.
+    const restored = await restoreWorktreeSnapshot(storage, sess.id, worktreePath, displayId(task));
+    if (restored.warning) warnings.push(restored.warning);
 
     phases.end();
 
@@ -1704,7 +1642,7 @@ async function launchUnblockTaskRun(
       // a supervisor that outlived its daemon acts on the command the moment it
       // lands, and must never start a turn on a revoked binding. See
       // prepareTurnLaunch in src/daemon/turn-credentials.ts.
-      const { mustRecreateContainer } = await prepareTurnLaunch(projectRoot, {
+      const { mustRecreateContainer, plan: credentialPlan } = await prepareTurnLaunch(projectRoot, {
         taskId: task.id,
         sessionId: sess.id,
         storage,
@@ -1717,7 +1655,7 @@ async function launchUnblockTaskRun(
       await recordRecreationIfRunning(
         storage,
         task.id,
-        recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv),
+        recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv, mustRecreateForRunnerImage(task)),
         runner, containerName,
       );
       const envNotice = await environmentReplacedPrefix(storage, task.id);
@@ -1801,6 +1739,7 @@ async function launchUnblockTaskRun(
           worktreePath,
           config,
         })),
+        ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(unblockConfig, task)),
         ...commonCommandFields(config, { command_id: turnCommandId }),
       };
       // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
@@ -2782,7 +2721,7 @@ async function launchAskTaskRun(
       });
 
       // Credential first — see the note in unblockTask.
-      const { mustRecreateContainer } = await prepareTurnLaunch(projectRoot, {
+      const { mustRecreateContainer, plan: credentialPlan } = await prepareTurnLaunch(projectRoot, {
         taskId: task.id,
         sessionId: sess.id,
         storage,
@@ -2807,6 +2746,7 @@ async function launchAskTaskRun(
         model_id: modelName,
         effort: effortValue,
         agent_session_id: agentSessionId,
+        ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
         ...commonCommandFields(config, { command_id: askClaim.commandId }),
       };
       writeCommand(protoDir, askCommand);
@@ -2834,7 +2774,7 @@ async function launchAskTaskRun(
     if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
       // Not a work turn: a replacement here is only RECORDED, and told to the
       // next work turn (src/task/environment-replaced.ts).
-      await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv), runner, containerName);
+      await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)), runner, containerName);
       if (mustRecreateForAgent) {
         phases.note(
           `recreating container: agent changed ` +
@@ -9309,7 +9249,7 @@ async function syncTaskRun(
       // merge completes. Without this, the supervisor runs but the response
       // sits in protocol/ forever and the task stays in its prior status.
       // Credential first — see the note in unblockTask.
-      const { mustRecreateContainer } = await prepareTurnLaunch(projectRoot, {
+      const { mustRecreateContainer, plan: credentialPlan } = await prepareTurnLaunch(projectRoot, {
         taskId: task.id,
         sessionId: sess.id,
         storage,
@@ -9348,6 +9288,7 @@ async function syncTaskRun(
         // hardcoded `claude` failed instantly on every retry.
         agent_id: task.agent_id,
         harness,
+        ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
         ...(config.agent.watchdog_output_timeout_ms !== 0 && {
           watchdog_output_timeout_ms: config.agent.watchdog_output_timeout_ms,
         }),
@@ -9417,7 +9358,7 @@ async function syncTaskRun(
     if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
     // Not a work turn: a replacement here is only RECORDED, and told to the
     // next work turn (src/task/environment-replaced.ts).
-    await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv), runner, containerName);
+    await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)), runner, containerName);
     if (mustRecreateForAgent) {
       phases.note(
         `recreating container: agent changed ` +
@@ -10409,7 +10350,7 @@ async function resumeTaskRun(
     // refuses BEFORE writing anything, or the entry sees this task `working`
     // and is refused — never a member working in the worktree while a turn
     // runs on it, and never a notice turn for a resume that did not happen.
-    const { mustRecreateContainer } = await withTaskLifecycleLock(task.id, async () => {
+    const { mustRecreateContainer, plan: credentialPlan } = await withTaskLifecycleLock(task.id, async () => {
       assertNoMemberInside(task.id);
       // A turn with no credential for its profile is refused here: this launch carries
       // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
@@ -10450,7 +10391,7 @@ async function resumeTaskRun(
     await recordRecreationIfRunning(
       storage,
       task.id,
-      recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv),
+      recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv, mustRecreateForRunnerImage(task)),
       runner, containerName,
     );
     const envNotice = await environmentReplacedPrefix(storage, task.id);
@@ -10480,6 +10421,7 @@ async function resumeTaskRun(
         worktreePath,
         config,
       })),
+      ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(resumeTurnBudgetConfig, task)),
       ...commonCommandFields(config),
     };
     // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).

@@ -17,6 +17,10 @@
  *     {@link runWithGitAuthor} around the request;
  *   - an agent's tool call — the turn owner recorded on the session, via the
  *     same scope around the MCP call;
+ *   - a builder session's tool call on a managed host — the member the session
+ *     belongs to, through the authenticated token label;
+ *   - an accept the daemon resumes after a crash — the actor saved with the
+ *     accept intent;
  *   - everything else — the daemon's registered fallback
  *     ({@link setGitAuthorFallback}), which answers with the configured system
  *     identity (the service credential's owner in Teams, git config on a

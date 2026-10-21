@@ -9,7 +9,7 @@
  */
 
 import { join, dirname } from 'path';
-import { mkdir, copyFile, writeFile, rm, appendFile } from 'fs/promises';
+import { mkdir, readFile, writeFile, rm } from 'fs/promises';
 import { getHome } from './home';
 import { pathExists, dirExists } from './fs';
 import { runGit } from './git';
@@ -100,8 +100,8 @@ async function safeDirectoryStanza(worktreePath: string): Promise<string> {
 /**
  * Create the sandbox directory layout for a worktree and return its config.
  *
- * Idempotent — safe to call repeatedly. Always rewrites `.gitconfig` to keep
- * it in sync with the host's, and removes any stale directory Docker may have
+ * Idempotent — safe to call repeatedly. Keeps `.gitconfig` in sync with the
+ * host's (writing it only when that changed), and removes any stale directory Docker may have
  * created at that path on a previous run.
  */
 export async function setupSandbox(
@@ -130,21 +130,30 @@ export async function setupSandbox(
     await rm(sandboxGitconfig, { recursive: true });
   }
 
-  if (await pathExists(hostGitconfig)) {
-    await copyFile(hostGitconfig, sandboxGitconfig);
-  } else {
-    await writeFile(sandboxGitconfig, DEFAULT_GITCONFIG);
-  }
-  // Belt and braces for the split .git mount: the container sees the shared git
-  // dir read-only, so an auto-gc triggered in there could only fail (it wants to
-  // repack objects and rewrite packed-refs). Disabling it keeps that failure from
-  // ever surfacing as a confusing error on an unrelated git command.
-  await appendFile(sandboxGitconfig, GC_OFF);
-  // Trust for lazy's own worktree and git dirs. Must be in this file (a GLOBAL
-  // config from the container's point of view): git deliberately ignores
-  // `safe.directory` from repository-local config and from `-c` on the command
-  // line, so there is no other place it can be set.
-  await appendFile(sandboxGitconfig, await safeDirectoryStanza(worktreePath));
+  const base = (await pathExists(hostGitconfig)) ? await readFile(hostGitconfig, 'utf-8') : DEFAULT_GITCONFIG;
+  const gitconfig =
+    base +
+    // Belt and braces for the split .git mount: the container sees the shared git
+    // dir read-only, so an auto-gc triggered in there could only fail (it wants to
+    // repack objects and rewrite packed-refs). Disabling it keeps that failure from
+    // ever surfacing as a confusing error on an unrelated git command.
+    GC_OFF +
+    // Trust for lazy's own worktree and git dirs. Must be in this file (a GLOBAL
+    // config from the container's point of view): git deliberately ignores
+    // `safe.directory` from repository-local config and from `-c` on the command
+    // line, so there is no other place it can be set.
+    (await safeDirectoryStanza(worktreePath));
+  // Written only when it changed. This runs before EVERY launch, and the file is
+  // bind-mounted into a container that may be running the task's services: a
+  // rewrite truncates it in place, so a `git` run by those services at that
+  // moment read a config with no safe.directory. Unchanged, it is not touched.
+  // In place (never by rename), so the running container's file mount — which
+  // follows the inode — keeps seeing it.
+  const current = await readFile(sandboxGitconfig, 'utf-8').catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  });
+  if (current !== gitconfig) await writeFile(sandboxGitconfig, gitconfig);
 
   if (artifacts) {
     await materializeArtifacts(worktreePath, artifacts.storage, artifacts.taskId);

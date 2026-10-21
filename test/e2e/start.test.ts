@@ -5,6 +5,7 @@ import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
 import { createTask, fullTaskId, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTaskJson, readSessionJson } from '../helpers/storage';
 
 /**
  * Resolve the tasks directory for a test project. Test projects use external
@@ -249,6 +250,21 @@ describe('lazy start', () => {
     expectSuccess(result);
     expectOutput(result, 'Started task');
     expectOutput(result, `lazy/${taskId}`);
+  });
+
+  // INVARIANT: a top-level start records its branch point on the TASK, not
+  // only on the (local-only) session. The backlog-recovery sweep reads the
+  // task's base; without it a top-level task's work could only be found by
+  // the slower merge-base fallback.
+  test('top-level start records branched_from_sha equal to the session start SHA', async () => {
+    const taskId = await createTask(ctx, 'Base test', 'Do the work');
+
+    expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
+
+    const task = readTaskJson(ctx.root, taskId);
+    const session = readSessionJson(ctx.root, taskId);
+    expect(task.branched_from_sha).toBeTruthy();
+    expect(task.branched_from_sha).toBe(session?.git_start_sha);
   });
 
   test('task transitions to blocked after start (supervisor completes immediately)', async () => {

@@ -8,9 +8,10 @@ import { loadConfig } from '../config/loader';
 import { readAuditRecords } from '../proxy/audit-log';
 import { aggregateUsage, type TokenGroup, type TokenReport } from '../proxy/aggregate';
 import {
-  buildToolStats, mergeToolStats, partitionAuditRecordsByTask, toolStatsFromRecord,
+  buildToolStats, mergeToolStats, toolStatsFromRecord,
   type TaskToolStats,
 } from '../task/stats';
+import { taskAuditForms } from '../task/identity';
 import { collectDescendantTasks, loadToolStatsRecords } from '../task/stats-data';
 
 export type TokenStatsGroup = 'task' | 'model' | 'role' | 'endpoint';
@@ -45,7 +46,42 @@ export interface TaskPlanningRow {
   feedbackRounds: number;
   turnWallClockMs: number | null;
   tokens: number;
+  /** Where `tokens` / `modelTokens` came from: durable per-turn usage wins over the bounded proxy trail. */
+  tokenSource?: 'turn-usage' | 'proxy-audit' | 'none';
+  /** Tokens the bounded proxy trail still holds for this task (0 once it rotated away). */
+  auditTokens?: number;
+  /** Agent turns that reported usage / all agent turns; a partial sum is not a complete one. */
+  turnsWithUsage?: number;
+  agentTurns?: number;
   modelTokens: Record<string, number | null>;
+}
+
+/**
+ * Durable usage from the turns themselves. The proxy trail is bounded and
+ * rotates, so it forgets old tasks; `Turn.usage` is stored with the turn and
+ * does not. null = no turn of this task reported usage (never coerced to zero).
+ */
+export function durableTurnUsage(
+  turns: Turn[],
+  sinceMs?: number,
+): { total: number; byModel: Record<string, number>; turnsWithUsage: number; agentTurns: number } | null {
+  let agentTurns = 0;
+  let total = 0;
+  let turnsWithUsage = 0;
+  const byModel: Record<string, number> = {};
+  for (const turn of turns) {
+    if (turn.role !== 'agent' || (sinceMs !== undefined && turn.timestamp < sinceMs)) continue;
+    agentTurns++;
+    if (!turn.usage) continue;
+    const u = turn.usage;
+    const n = (u.inputTokens ?? 0) + (u.outputTokens ?? 0) +
+      (u.cacheCreationTokens ?? 0) + (u.cacheReadTokens ?? 0);
+    total += n;
+    turnsWithUsage++;
+    const model = turn.model_id ?? turn.model ?? '(unattributed)';
+    byModel[model] = (byModel[model] ?? 0) + n;
+  }
+  return turnsWithUsage ? { total, byModel, turnsWithUsage, agentTurns } : null;
 }
 
 export function summarizeModels(rows: TaskPlanningRow[], minTasks: number) {
@@ -151,29 +187,25 @@ function tokenCount(record: ProxyAuditRecord): number {
 }
 
 /**
- * One pass over the trail, keyed by the attributed task id. Records whose id is
- * a full task id are found by exact lookup; only the (rare) short-prefix ids
- * need the prefix comparison, and those are few distinct keys, not records.
+ * One pass over the trail, keyed by the attributed task id. Each record is
+ * filed by exact lookup of its taskId among the forms its task answers to
+ * (`taskAuditForms`: full id, short id, code, ref) — no prefix comparison.
  */
 export function indexAuditByTask(
   records: ProxyAuditRecord[],
-  taskIds: string[],
+  tasks: Task[],
 ): (taskId: string) => ProxyAuditRecord[] {
-  const byKey = new Map<string, ProxyAuditRecord[]>();
+  const owner = new Map<string, string>();
+  for (const task of tasks) for (const form of taskAuditForms(task)) owner.set(form, task.id);
+  const byTask = new Map<string, ProxyAuditRecord[]>();
   for (const record of records) {
-    if (!record.taskId) continue;
-    const list = byKey.get(record.taskId) ?? [];
+    const id = record.taskId ? owner.get(record.taskId) : undefined;
+    if (!id) continue;
+    const list = byTask.get(id) ?? [];
     list.push(record);
-    byKey.set(record.taskId, list);
+    byTask.set(id, list);
   }
-  const full = new Set(taskIds);
-  const partialKeys = [...byKey.keys()].filter(key => !full.has(key));
-  return (taskId) => [
-    ...(byKey.get(taskId) ?? []),
-    ...partialKeys
-      .filter(key => taskId.startsWith(key) || key.startsWith(taskId))
-      .flatMap(key => byKey.get(key)!),
-  ];
+  return (taskId) => byTask.get(taskId) ?? [];
 }
 
 function modelTokensForTask(records: ProxyAuditRecord[]): Record<string, number> {
@@ -203,16 +235,17 @@ function within(root: Task, task: Task, descendants: Task[]): boolean {
 async function loadTools(
   projectRoot: string,
   storage: Storage,
-  ids: string[],
+  tasks: Task[],
   options: TokenStatsOptions,
 ): Promise<TaskToolStats | null> {
+  const ids = tasks.map(t => t.id);
   if (options.sinceMs !== undefined || options.windowedTools) {
     const all = await loadAudit(projectRoot, options.limit);
     const records = options.sinceMs === undefined
       ? all
       : all.filter(record => record.ts >= options.sinceMs!);
-    const byTask = partitionAuditRecordsByTask(records, ids);
-    return mergeToolStats(ids.map(id => buildToolStats(byTask.get(id) ?? [], id)));
+    const recordsFor = indexAuditByTask(records, tasks);
+    return mergeToolStats(tasks.map(t => buildToolStats(recordsFor(t.id), t.id, taskAuditForms(t))));
   }
   const byTask = await loadToolStatsRecords(storage, ids);
   const present = ids.map(id => byTask.get(id) ?? null).filter(r => r !== null);
@@ -242,8 +275,7 @@ export async function describeTokenStats(
       throw new Error("scope 'tools' does not accept group_by, task_type, or min_tasks");
     }
     const descendants = options.subtree ? await collectDescendantTasks(storage, selectedRoot.id) : [];
-    const ids = [selectedRoot.id, ...descendants.map(task => task.id)];
-    const tools = await loadTools(projectRoot, storage, ids, options);
+    const tools = await loadTools(projectRoot, storage, [selectedRoot, ...descendants], options);
     return {
       scope,
       taskId: selectedRoot.id,
@@ -269,7 +301,7 @@ export async function describeTokenStats(
   const rawAudit = await loadAudit(projectRoot, options.limit);
   const report = aggregateUsage(rawAudit, {
     sinceMs: options.sinceMs,
-    taskIds: selectedRoot || options.taskType ? tasks.map(t => t.id) : undefined,
+    taskIds: selectedRoot || options.taskType ? tasks.flatMap(taskAuditForms) : undefined,
     role: options.role,
     taskId: options.taskIdPrefix,
   });
@@ -278,7 +310,7 @@ export async function describeTokenStats(
   const audit = rawAudit.filter(
     record => options.sinceMs === undefined || record.ts >= options.sinceMs,
   );
-  const recordsFor = indexAuditByTask(audit, planningTasks.map(task => task.id));
+  const recordsFor = indexAuditByTask(audit, planningTasks);
   const allRows: TaskPlanningRow[] = [];
   for (const task of planningTasks) {
     const session = await storage.getSessionByTaskId(task.id);
@@ -287,7 +319,11 @@ export async function describeTokenStats(
     if (options.sinceMs !== undefined && lastActivity < options.sinceMs) continue;
     const models = servedModels(turns);
     const taskRecords = recordsFor(task.id);
-    const modelTokens = attributedModelTokens(taskRecords, models);
+    const auditTokens = taskRecords.reduce((sum, record) => sum + tokenCount(record), 0);
+    const durable = durableTurnUsage(turns, options.sinceMs);
+    const modelTokens: Record<string, number | null> = durable
+      ? { ...Object.fromEntries(models.map(m => [m, null])), ...durable.byModel }
+      : attributedModelTokens(taskRecords, models);
     allRows.push({
       taskId: task.id,
       code: task.code,
@@ -299,7 +335,11 @@ export async function describeTokenStats(
       harnesses: labels(turns.filter(t => t.role === 'agent'), 'agent'),
       feedbackRounds: feedbackRounds(turns),
       turnWallClockMs: turnWallClock(turns),
-      tokens: taskRecords.reduce((sum, record) => sum + tokenCount(record), 0),
+      tokens: durable ? durable.total : auditTokens,
+      tokenSource: durable ? 'turn-usage' : auditTokens > 0 ? 'proxy-audit' : 'none',
+      auditTokens,
+      turnsWithUsage: durable?.turnsWithUsage ?? 0,
+      agentTurns: turns.filter(t => t.role === 'agent').length,
       modelTokens,
     });
   }
@@ -313,11 +353,35 @@ export async function describeTokenStats(
   const detailRows = allRows
     .filter(row => detailIds.has(row.taskId))
     .sort((a, b) => b.tokens - a.tokens || a.taskId.localeCompare(b.taskId));
+  // A zero from the bounded trail must never read as "used nothing": say so
+  // when the trail holds nothing for a task that demonstrably ran turns.
+  const warnings: string[] = [];
+  const oldestAudit = rawAudit.length ? rawAudit.reduce((min, r) => Math.min(min, r.ts), Infinity) : null;
+  const trailNote = oldestAudit === null
+    ? 'the proxy audit trail is empty'
+    : `the proxy audit trail starts ${new Date(oldestAudit).toISOString()}`;
+  for (const row of detailRows) {
+    const name = row.code ?? row.taskId;
+    if (row.tokenSource === 'none' && row.models.length) {
+      warnings.push(`${name}: ran agent turns but no token usage is recorded on its turns or in the trail (${trailNote}); 0 means unknown, not unused.`);
+    } else if (row.tokenSource === 'turn-usage' && (row.turnsWithUsage ?? 0) < (row.agentTurns ?? 0)) {
+      warnings.push(`${name}: only ${row.turnsWithUsage} of ${row.agentTurns} agent turns reported usage, so its tokens are a lower bound.`);
+    } else if (row.tokenSource === 'turn-usage' && row.auditTokens === 0) {
+      warnings.push(`${name}: tokens come from durable per-turn usage; the bounded proxy trail holds none for it (${trailNote}), so the trail totals and byTask undercount it.`);
+    }
+  }
+  const durableRows = detailRows.filter(r => r.tokenSource === 'turn-usage');
   return {
     scope,
     source: {
-      tokens: 'bounded proxy audit trail; requests without usage count as requests',
+      tokens: `bounded proxy audit trail, ${oldestAudit === null ? 'empty' : `oldest record ${new Date(oldestAudit).toISOString()}`} (totals, byTask, byRole, byModelTokens); requests without usage count as requests`,
+      taskTokens: "per-task tokens/modelTokens prefer durable per-turn usage, falling back to the proxy trail (see each row's tokenSource)",
       planning: 'durable task, session, and turn storage',
+    },
+    ...(warnings.length ? { warnings } : {}),
+    durableTotals: {
+      tokens: durableRows.reduce((n, r) => n + r.tokens, 0),
+      tasksWithTurnUsage: durableRows.length,
     },
     totals: report.totals,
     firstTs: report.firstTs,

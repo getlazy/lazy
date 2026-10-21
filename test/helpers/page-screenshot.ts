@@ -39,7 +39,8 @@
  *    way, so those badges come out blank. Neither affects page layout.
  */
 
-import { writeFile, rm, stat } from 'fs/promises';
+import { readFile, writeFile, rm, stat } from 'fs/promises';
+import { inflateSync } from 'zlib';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawn } from '../../src/utils/spawn';
@@ -92,6 +93,67 @@ export function inlineStylesheet(html: string, css: string): string {
   // page — an unstyled screenshot looks exactly like a CSS regression.
   if (html.includes('</head>')) return html.replace('</head>', `${inlined}\n</head>`);
   return `${inlined}\n${html}`;
+}
+
+/** Reject a frame whose decoded pixels are effectively one background color. */
+export async function assertPaintedScreenshot(out: string): Promise<void> {
+  const png = await readFile(out);
+  const signature = '89504e470d0a1a0a';
+  if (png.subarray(0, 8).toString('hex') !== signature) {
+    throw new Error(`Screenshot ${out} is not a PNG; check the browser's screenshot output`);
+  }
+  const width = png.readUInt32BE(16);
+  const height = png.readUInt32BE(20);
+  const depth = png[24];
+  const color = png[25];
+  const channels = color === 2 ? 3 : color === 6 ? 4 : 0;
+  if (!width || !height || depth !== 8 || !channels || png[28] !== 0 || width * height > 100_000_000) {
+    throw new Error(`Screenshot ${out} has an unsupported PNG format; check the browser's screenshot output`);
+  }
+  const parts: Buffer[] = [];
+  for (let offset = 8; offset + 12 <= png.length;) {
+    const size = png.readUInt32BE(offset);
+    if (offset + size + 12 > png.length) throw new Error(`Screenshot ${out} is a truncated PNG`);
+    if (png.toString('ascii', offset + 4, offset + 8) === 'IDAT') parts.push(png.subarray(offset + 8, offset + 8 + size));
+    offset += 12 + size;
+  }
+  const pixels = inflateSync(Buffer.concat(parts));
+  const stride = width * channels;
+  if (pixels.length !== (stride + 1) * height) throw new Error(`Screenshot ${out} has incomplete pixel data`);
+  const previous = Buffer.alloc(stride);
+  const row = Buffer.alloc(stride);
+  let reference: number[] | undefined;
+  let contrasting = 0;
+  for (let y = 0; y < height; y++) {
+    const start = y * (stride + 1);
+    const filter = pixels[start];
+    if (filter > 4) throw new Error(`Screenshot ${out} uses an invalid PNG filter`);
+    for (let index = 0; index < stride; index++) {
+      const left = index >= channels ? row[index - channels]! : 0;
+      const above = previous[index]!;
+      const upperLeft = index >= channels ? previous[index - channels]! : 0;
+      let predictor = 0;
+      if (filter === 1) predictor = left;
+      if (filter === 2) predictor = above;
+      if (filter === 3) predictor = (left + above) >> 1;
+      if (filter === 4) {
+        const estimate = left + above - upperLeft;
+        const leftError = Math.abs(estimate - left);
+        const aboveError = Math.abs(estimate - above);
+        const cornerError = Math.abs(estimate - upperLeft);
+        predictor = leftError <= aboveError && leftError <= cornerError ? left : aboveError <= cornerError ? above : upperLeft;
+      }
+      row[index] = (pixels[start + 1 + index]! + predictor) & 255;
+    }
+    if (!reference) reference = [row[0]!, row[1]!, row[2]!];
+    for (let index = 0; index < stride; index += channels * 4) {
+      if (Math.max(...reference.map((value, channel) => Math.abs(value - row[index + channel]!))) > 20) contrasting++;
+    }
+    row.copy(previous);
+  }
+  if (contrasting < Math.max(8, width * height / 4000)) {
+    throw new Error(`Screenshot ${out} is blank or nearly blank despite Chromium exiting successfully; check the browser's rasterisation and try another Chromium binary (CHROME_BIN)`);
+  }
 }
 
 /**
@@ -160,6 +222,7 @@ export async function screenshotDashboardPage(options: PageScreenshotOptions): P
         stderr.trim().split('\n').slice(-5).join('\n'),
       );
     }
+    await assertPaintedScreenshot(out);
   } finally {
     await rm(tmpHtml, { force: true });
   }
@@ -244,6 +307,7 @@ export async function screenshotDashboardLive(options: LivePageScreenshotOptions
         stderr.trim().split('\n').slice(-5).join('\n'),
       );
     }
+    await assertPaintedScreenshot(out);
   } finally {
     await rm(profile, { recursive: true, force: true });
   }

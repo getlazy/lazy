@@ -29,7 +29,7 @@ import type { AgentFailureClass } from '../agent/failure-taxonomy';
  *
  * Integer only. Protocols either match or they don't; no semver, no ranges.
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /**
  * Correlation id carried on every supervisor-bound command and echoed on its
@@ -76,6 +76,14 @@ export interface StartCommand {
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
   harness?: string;
+  /**
+   * The turn's session placeholder and the env var(s) it belongs in, for the
+   * supervisor to install in its own env before the agent starts (see
+   * src/supervisor/turn-credential-env.ts). Team mode, claude-code / pi only;
+   * absent otherwise. Lets a RUNNING container serve a turn whose credential
+   * kind differs from the one it was created with, instead of being recreated.
+   */
+  session_credential_env?: Array<{ key: string; value: string }>;
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
   effort?: string;             // reasoning effort level — passed as --effort (Claude Code only)
@@ -123,6 +131,14 @@ export interface UnblockCommand {
   agent_id?: string;           // which agent to use (e.g., 'claude-code', 'cursor') — defaults to 'claude-code'
   /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
   harness?: string;
+  /**
+   * The turn's session placeholder and the env var(s) it belongs in, for the
+   * supervisor to install in its own env before the agent starts (see
+   * src/supervisor/turn-credential-env.ts). Team mode, claude-code / pi only;
+   * absent otherwise. Lets a RUNNING container serve a turn whose credential
+   * kind differs from the one it was created with, instead of being recreated.
+   */
+  session_credential_env?: Array<{ key: string; value: string }>;
   system_prompt?: string;      // static system instructions (tool usage, commit guidelines) — passed as --append-system-prompt
   model_id?: string;
   effort?: string;             // reasoning effort level — passed as --effort (Claude Code only)
@@ -280,6 +296,14 @@ export interface AskCommand {
   agent_id?: string;
   /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
   harness?: string;
+  /**
+   * The turn's session placeholder and the env var(s) it belongs in, for the
+   * supervisor to install in its own env before the agent starts (see
+   * src/supervisor/turn-credential-env.ts). Team mode, claude-code / pi only;
+   * absent otherwise. Lets a RUNNING container serve a turn whose credential
+   * kind differs from the one it was created with, instead of being recreated.
+   */
+  session_credential_env?: Array<{ key: string; value: string }>;
   system_prompt?: string;
   model_id?: string;
   effort?: string;
@@ -362,6 +386,14 @@ export interface SyncCommand {
   agent_id?: string;
   /** Harness (agent binary) the profile in `agent_id` runs. See the note above CommandType. */
   harness?: string;
+  /**
+   * The turn's session placeholder and the env var(s) it belongs in, for the
+   * supervisor to install in its own env before the agent starts (see
+   * src/supervisor/turn-credential-env.ts). Team mode, claude-code / pi only;
+   * absent otherwise. Lets a RUNNING container serve a turn whose credential
+   * kind differs from the one it was created with, instead of being recreated.
+   */
+  session_credential_env?: Array<{ key: string; value: string }>;
   /**
    * Guard timeouts for the conflict-resolution agent turn. A sync that hits
    * conflicts runs a real agent turn, so it gets the same two guards as work:

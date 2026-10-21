@@ -32,6 +32,13 @@ import { launchImagePin } from '../docker/worktree-image';
 import type { PhaseNotify } from './progress';
 import { logger } from '../utils/logger';
 import { mustRecreateForTaskEnv } from './task-env';
+import {
+  recordRecreation,
+  REASON_CHECKOUT_MISSING,
+  REASON_GIT_POINTERS_BROKEN,
+  REASON_RESTART_REQUESTED,
+  REASON_TASK_ENV_CHANGED,
+} from '../task/environment-replaced';
 import type { Storage } from '../storage';
 import type { Task } from '../types';
 
@@ -156,6 +163,10 @@ async function ensureTaskContainerClaimed(
     if (!await runner.stopRun(containerName) || await runner.isRunning(containerName)) {
       throw new RpcError(503, `Cannot stop the outdated environment for ${displayId(task)}. Task files left untouched.`);
     }
+    // Told on the task, for the person and the agent's next work turn: whatever
+    // ran or was built in the container went with it (src/task/environment-replaced.ts).
+    // Only once the stop succeeded — a refused stop replaced nothing.
+    await recordRecreation(storage, task.id, REASON_CHECKOUT_MISSING);
     containerRunning = false;
   }
 
@@ -190,7 +201,14 @@ async function ensureTaskContainerClaimed(
       );
     }
     if (pointers.kind === 'broken') params.notify?.('Recreating container: mounted git pointers or checkout do not match the validated host environment.');
-    await runner.stopRun(containerName);
+    const reasons = [
+      ...(params.restart ? [REASON_RESTART_REQUESTED] : []),
+      ...(recreateForEnv ? [REASON_TASK_ENV_CHANGED] : []),
+      ...(pointers.kind === 'broken' ? [REASON_GIT_POINTERS_BROKEN] : []),
+    ];
+    const stopped = await runner.stopRun(containerName);
+    // Recorded only for a stop that happened (as above).
+    if (stopped && reasons.length > 0) await recordRecreation(storage, task.id, reasons.join('; '));
   }
 
   params.onLaunching?.();

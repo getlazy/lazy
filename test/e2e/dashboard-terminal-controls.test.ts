@@ -29,6 +29,9 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
   let server: ReturnType<typeof Bun.serve>;
   let browser: Browser;
   const resizes: Resize[] = [];
+  // What the browser typed into the shell session, and its socket.
+  let typed = '';
+  let shellSocket: { send(data: string | Uint8Array): void } | null = null;
 
   beforeAll(async () => {
     server = Bun.serve({
@@ -36,7 +39,7 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
       fetch(req, srv) {
         const url = new URL(req.url);
         if (url.pathname.endsWith('/ws')) {
-          return srv.upgrade(req, { data: {} }) ? undefined : new Response('upgrade failed', { status: 400 });
+          return srv.upgrade(req, { data: { shell: url.pathname.endsWith('/shell/ws') } }) ? undefined : new Response('upgrade failed', { status: 400 });
         }
         const text = (body: string, type: string) => new Response(body, { headers: { 'content-type': type } });
         switch (url.pathname) {
@@ -56,12 +59,16 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
       },
       websocket: {
         open(ws) {
+          if ((ws.data as { shell?: boolean }).shell) shellSocket = ws;
           ws.send(JSON.stringify({ type: 'ready' }));
           // Enough output to scroll back through.
           ws.send(new TextEncoder().encode(Array.from({ length: 150 }, (_, i) => `line ${i}\r\n`).join('')));
         },
-        message(_ws, message) {
-          if (typeof message !== 'string') return;
+        message(ws, message) {
+          if (typeof message !== 'string') {
+            if ((ws.data as { shell?: boolean }).shell) typed += new TextDecoder().decode(message as Uint8Array);
+            return;
+          }
           const frame = JSON.parse(message) as { type?: string; cols?: number; rows?: number };
           if (frame.type === 'resize') resizes.push({ cols: frame.cols!, rows: frame.rows! });
         },
@@ -167,6 +174,57 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
   test('PageUp scrolls back in Watch and in the shell', async () => {
     await pageUpScrolls('.lz-watch-panel');
     await pageUpScrolls('.lz-shell-session');
+  }, 60_000);
+
+  // A readable clipboard holding PASTE-ME (so a second paste path would show),
+  // recording writes in window.__copied.
+  const stubClipboard = () => browser.evaluate(`(() => { window.__copied = null; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText: () => Promise.resolve('PASTE-ME'), writeText: (t) => { window.__copied = t; return Promise.resolve(); } } }); })()`);
+
+  // INVARIANT: Ctrl/Cmd+V pastes exactly ONCE. The keydown is kept from the
+  // program (no ^V), and the browser's own paste event that follows it is the
+  // one paste; pasting from the keydown as well delivered the text twice.
+  test('Ctrl+V pastes once into the shell', async () => {
+    const ta = `document.querySelector('.lz-shell-session .xterm-helper-textarea')`;
+    await stubClipboard();
+    typed = '';
+    await browser.evaluate(`(() => { const t = ${ta}; t.focus();
+      t.dispatchEvent(new KeyboardEvent('keydown', { key: 'v', code: 'KeyV', ctrlKey: true, bubbles: true, cancelable: true }));
+      const dt = new DataTransfer(); dt.setData('text/plain', 'PASTE-ME');
+      t.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })); })()`);
+    await until(async () => typed, (t) => t.includes('PASTE-ME'), 'the paste to arrive');
+    await Bun.sleep(500);
+    expect(typed.split('PASTE-ME').length - 1).toBe(1);
+    expect(typed).not.toContain('\x16');
+  }, 60_000);
+
+  // INVARIANT: on a program's full screen (the alternate buffer — Claude Code's
+  // fullscreen view) PageUp/PageDown go to the program, which scrolls itself;
+  // that buffer has no scrollback for the terminal to scroll.
+  test('PageUp reaches a full-screen program', async () => {
+    shellSocket!.send(new TextEncoder().encode('\x1b[?1049h'));
+    await Bun.sleep(300);
+    typed = '';
+    await browser.evaluate(`document.querySelector('.lz-shell-session .xterm-helper-textarea').dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', code: 'PageUp', keyCode: 33, bubbles: true, cancelable: true }))`);
+    await until(async () => typed, (t) => t.includes('\x1b[5~'), 'PageUp to reach the program');
+    shellSocket!.send(new TextEncoder().encode('\x1b[?1049l'));
+  }, 60_000);
+
+  // INVARIANT: a program setting the clipboard with OSC 52 (how Claude Code
+  // copies its own selection) lands on the clipboard. xterm ignores OSC 52
+  // unless the page handles it, which is why "N characters copied" copied nothing.
+  // Only right after the person acted, though: output alone never writes it.
+  test('OSC 52 from the program sets the clipboard', async () => {
+    await stubClipboard();
+    // No user activation in this page for a while: refused.
+    await Bun.sleep(5_500);
+    shellSocket!.send(new TextEncoder().encode(`\x1b]52;c;${Buffer.from('unasked').toString('base64')}\x07`));
+    await Bun.sleep(500);
+    expect(await browser.evaluate<string | null>(`window.__copied`)).toBeNull();
+    // The person just clicked: the program's copy lands.
+    await browser.evaluate(`document.querySelector('.lz-shell-session .xterm-helper-textarea').focus()`, { userGesture: true });
+    shellSocket!.send(new TextEncoder().encode(`\x1b]52;c;${Buffer.from('copied ✓').toString('base64')}\x07`));
+    await until(() => browser.evaluate<string | null>(`window.__copied || null`), (v) => v === 'copied ✓', 'the clipboard write');
+    await shot('shell-osc52-copied');
   }, 60_000);
 
   // INVARIANT: closing a filled shell session releases the page's scroll lock

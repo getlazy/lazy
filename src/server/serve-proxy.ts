@@ -34,10 +34,11 @@
 
 import type { Server, ServerWebSocket } from 'bun';
 import type { Storage } from '../storage/interface';
-import { getTaskServeState } from '../serve/discovery';
+import { getTaskServeState, getRunServeState } from '../serve/discovery';
+import { runPagePath } from '../run/identity';
 import { findService, type ResolvedService } from '../serve/ports';
 import { parseServeHost } from '../serve/subdomain';
-import { serveNoticePath, type ServeNoticeReason } from './serve-notice';
+import { serveNoticePath, serveNoticeQuery, type ServeNoticeReason } from './serve-notice';
 import { taskPathSegment, duplicateTaskCodes } from './task-urls';
 import { DASHBOARD_COOKIE_NAME } from '../daemon/dashboard-auth';
 import type { UpgradeOutcome, WebSocketUpgrader } from './ws';
@@ -106,10 +107,12 @@ export interface ServeProxyDeps {
 /** A resolved upstream, or the reason there is not one. `seg` is the task's
  *  URL segment (code when unique, id otherwise, already escaped) for the
  *  serve-notice redirect — present on both outcomes because a successful
- *  resolution can still fail to CONNECT, and that redirect carries it too. */
+ *  resolution can still fail to CONNECT, and that redirect carries it too.
+ *  A COMMIT RUN's target carries `page` instead — the run's own page path
+ *  (src/run/identity.ts) — and `taskId` is then the run's id. */
 type ProxyTarget =
-  | { ok: true; taskId: string; seg: string; hostAddress: string; hostPort: number }
-  | { ok: false; taskId: string | null; seg?: string; reason: ServeNoticeReason | 'unknown-task' };
+  | { ok: true; taskId: string; seg: string; page?: string; hostAddress: string; hostPort: number }
+  | { ok: false; taskId: string | null; seg?: string; page?: string; reason: ServeNoticeReason | 'unknown-task' };
 
 // ---------------------------------------------------------------------------
 // Resolution
@@ -191,6 +194,21 @@ async function resolveTargetUncached(
   serviceLabel: string,
 ): Promise<ProxyTarget> {
   const storage = await deps.getStorage();
+  // A COMMIT RUN first (src/daemon/commit-run.ts), by its exact slug. Runs
+  // come first because a task label also resolves by id PREFIX (a run of
+  // branch `cafe` would otherwise lose to any task whose id starts so), and
+  // the store refuses a run whose slug is a live task's label, and a task
+  // code that is a run's slug, so neither can shadow the other.
+  const run = await storage.getCommitRunBySlug(taskLabel);
+  if (run) {
+    const page = runPagePath(run.id);
+    const state = await getRunServeState(deps.root, run);
+    if (state.unavailable) return { ok: false, taskId: run.id, seg: '', page, reason: state.unavailable };
+    const service = findService(state.services, serviceLabel);
+    if (!service) return { ok: false, taskId: run.id, seg: '', page, reason: 'unknown-service' };
+    if (!service.binding) return { ok: false, taskId: run.id, seg: '', page, reason: 'not-published' };
+    return { ok: true, taskId: run.id, seg: '', page, hostAddress: service.binding.hostAddress, hostPort: service.binding.hostPort };
+  }
   const resolved = await storage.resolveTask(taskLabel);
   const task = resolved.task;
   // An ambiguous prefix is "no task" here on purpose: the proxy cannot ask
@@ -377,7 +395,7 @@ export function isNavigationRequest(req: Request): boolean {
 function downText(reason: ServeNoticeReason | 'unknown-task', service: string, task: string): string {
   switch (reason) {
     case 'unknown-task':
-      return `lazy: no task matches '${task}'.`;
+      return `lazy: no task matches '${task}', and no run answers there.`;
     case 'unknown-service':
       return `lazy: task '${task}' declares no service '${service}'.`;
     case 'not-running':
@@ -413,7 +431,9 @@ function downResponse(
     return new Response(null, {
       status: 302,
       headers: {
-        Location: `${dashboardOrigin}${serveNoticePath(target.seg ?? encodeURIComponent(target.taskId), service, target.reason)}`,
+        Location: `${dashboardOrigin}${target.page
+          ? `${target.page}?${serveNoticeQuery(service, target.reason)}`
+          : serveNoticePath(target.seg ?? encodeURIComponent(target.taskId), service, target.reason)}`,
         // The state that produced this redirect changes without warning; a
         // cached 302 would outlive it.
         'Cache-Control': 'no-store',
@@ -527,6 +547,7 @@ export function createServeProxy(deps: ServeProxyDeps) {
         ok: false,
         taskId: target.taskId,
         seg: target.seg,
+        page: target.page,
         reason: 'not-listening',
       });
     } finally {

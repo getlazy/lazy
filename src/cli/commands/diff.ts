@@ -3,6 +3,7 @@ import { displayId, getWorktreePath, getBranchNameFromId } from '../../task/iden
 import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit, parseLineRange, sliceLines } from '../helpers';
 import { getCurrentBranch, getRemoteDefaultBranch, recoverMissingWorktreeWithFetch } from '../../git/operations';
 import { getTurnDiff } from '../../utils/diff';
+import { latestWorkAgentTurn } from '../../utils/turns';
 import { loadConfig } from '../../config/loader';
 import { queryDiff } from '../../daemon/rpc-fallback';
 import { parentTaskIdOf } from '../../task-target';
@@ -110,7 +111,9 @@ async function handleTurnDiff(
 
   let targetTurn;
   if (turnValue === 'latest') {
-    targetTurn = agentTurns[agentTurns.length - 1];
+    // The newest WORK turn: wrap-up turns (presentation, push-back) are
+    // recorded after it as 'nudge' turns and change no code.
+    targetTurn = latestWorkAgentTurn(turns) ?? agentTurns[agentTurns.length - 1];
   } else {
     const turnSeq = parseInt(turnValue, 10);
     if (isNaN(turnSeq)) {
@@ -200,7 +203,7 @@ Examples:
   lazy diff abc123                    # Summary of all changes vs upstream
   lazy diff abc123 --full             # Full diff vs upstream
   lazy diff abc123 --region task:fix-x --full   # Just that region's files
-  lazy diff abc123 --turn latest      # Diff for the most recent turn
+  lazy diff abc123 --turn latest      # Diff for the most recent work turn
   lazy diff abc123 --turn 1           # Diff for turn 1
   lazy diff abc123 --lines 10..50     # Show only lines 10-50 of diff output
   lazy diff abc123 --full --lines 1..100  # First 100 lines of full diff`);

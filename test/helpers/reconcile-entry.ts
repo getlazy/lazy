@@ -16,7 +16,7 @@
  *
  * argv[2] = project root.
  */
-import { reconcileTasks } from '../../src/utils/reconcile';
+import { reconcileTasks, settleAutoResumes } from '../../src/utils/reconcile';
 import { settleAcceptResumes } from '../../src/daemon/stranded-merge';
 import { initDaemonStorage, getOrCreateStorage } from '../../src/daemon/rpc-handlers';
 
@@ -37,6 +37,8 @@ try {
   // daemon tick must not stall); this one-shot pass exits right after, so let
   // them finish first.
   await settleAcceptResumes();
+  // Auto-resume launches are dispatched off the sweep for the same reason.
+  await settleAutoResumes();
 } finally {
   await storage.close();
 }

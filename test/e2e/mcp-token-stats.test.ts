@@ -45,7 +45,9 @@ describe('lazy_token_stats over MCP', () => {
     const child = await ctx.lazy(['create', '--goal', 'Token child', '--parent', parent]);
     expect(child.exitCode).toBe(0);
     const childShort = extractTaskId(child.stdout);
-    const other = await createTask(ctx, 'Other member task');
+    const otherCreated = await ctx.lazy(['create', '--goal', 'Other member task', '--code', 'other-member-task']);
+    expect(otherCreated.exitCode).toBe(0);
+    const other = extractTaskId(otherCreated.stdout);
     parentId = findFullTaskId(ctx.root, parent);
     childId = findFullTaskId(ctx.root, childShort);
     otherId = findFullTaskId(ctx.root, other);
@@ -119,6 +121,29 @@ describe('lazy_token_stats over MCP', () => {
     expect(tools.tools.totalRows).toBe(2);
     expect(tools.tools.rows).toHaveLength(1);
     expect(tools.tools.source).toBe('window');
+
+    // INVARIANT: the proxy attributes traffic by task CODE, so lazy_token_stats must count code-attributed records.
+    // (Kept in the first test on purpose: observed in this suite, the in-process daemon opens a LATER test's storage on the
+    // PREVIOUS test's external store, so a separate test cannot resolve its own fixture task. Cause not found; see the raised item.)
+    const { readFile } = await import('fs/promises');
+    const { taskFilePath } = await import('../helpers/storage');
+    const code = JSON.parse(await readFile(taskFilePath(ctx.root, otherId, 'task.json'), 'utf-8')).code as string | undefined;
+    if (!code || code === otherId) throw new Error('fixture task has no code');
+    const path = auditLogPath(join(ctx.root, '.lazy'));
+    const rec = JSON.stringify({
+      id: 'rc1', seq: 99, ts: Date.now(), role: 'agent', taskId: code, backend: 'proxy',
+      upstream: 'https://api.anthropic.com', method: 'POST', path: '/v1/messages', endpoint: 'messages',
+      model: 'opus', tier: null, stream: false, requestShape: null, toolUses: [], toolResults: [], status: 200,
+      usage: { inputTokens: 500, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      stopReason: 'end_turn', error: null, durationMs: 1, reroute: null,
+    });
+    await writeFile(path, (await readFile(path, 'utf-8')) + rec + '\n');
+    const codeStats = await call(builderToken, { scope: 'tokens', task: otherId, top: 20 });
+    expect(codeStats.totals.totalTokens).toBe(100 + 1 + 505);
+    expect(codeStats.tasks[0].auditTokens).toBe(606);
+    // The windowed tools view (built from the same records) must see the code-attributed request too.
+    const codeTools = await call(builderToken, { scope: 'tools', task: otherId, since: '1h' });
+    expect(codeTools.tools.proxyTotals.total).toBe(606);
   });
 
   test('a stale task token fails closed instead of receiving project details', async () => {

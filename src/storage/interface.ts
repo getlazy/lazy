@@ -37,6 +37,7 @@ import type {
   InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
+  WorktreeSnapshotRetiredReason,
   TaskTreeNode,
   ListTasksOptions,
   TaskCodeEntry,
@@ -47,6 +48,8 @@ import type {
   BuilderResumeIntent,
   BuilderSession,
   BuilderSessionUpdate,
+  CommitRun,
+  CommitRunUpdate,
   ProjectSettings,
   StatusChange,
   Actor,
@@ -827,6 +830,18 @@ export interface Storage {
    */
   getWorktreeSnapshotForTurn(sessionId: string, turnSequence: number): Promise<WorktreeSnapshot | null>;
 
+  /**
+   * Retire snapshots so no later unblock restores them: the one named by
+   * `snapshotId`, or — when omitted — every still-live snapshot in the
+   * session. Already-retired snapshots keep their original reason. Content is
+   * kept. Returns how many were retired by this call.
+   */
+  retireWorktreeSnapshots(
+    sessionId: string,
+    reason: WorktreeSnapshotRetiredReason,
+    snapshotId?: string
+  ): Promise<number>;
+
   // --- Task Tree Operations ---
 
   /**
@@ -1067,7 +1082,7 @@ export interface Storage {
       code?: string;
       /** Task id/code to parent the new task under; absent = top level. */
       parent?: string;
-      actor: Actor;
+      actor: ActorInput;
     },
   ): Promise<import('../types').PromoteConversationResult>;
 
@@ -1578,6 +1593,35 @@ export interface Storage {
     expectedState?: BuilderSession['state'],
     expectedBuilderId?: string,
   ): Promise<BuilderSession>;
+
+  // --- Commit runs (the product at one commit, without a task) ---
+  //
+  // Daemon-written rows (src/daemon/commit-run.ts). Never tasks: no list or
+  // count of tasks includes them. Whether a run's container and services are
+  // up is probed, never stored.
+
+  /**
+   * Register a run. Refuses (throws) when a run with the same `slug` already
+   * exists, or when a NON-TERMINAL task's code equals the slug — both checked
+   * inside the storage lock, so a racing create or task creation cannot slip a
+   * duplicate host label in between.
+   */
+  createCommitRun(run: CommitRun): Promise<CommitRun>;
+
+  /** A run by id, or null. */
+  getCommitRun(id: string): Promise<CommitRun | null>;
+
+  /** A run by its slug (exact), or null. */
+  getCommitRunBySlug(slug: string): Promise<CommitRun | null>;
+
+  /** Every run, oldest first. */
+  listCommitRuns(): Promise<CommitRun[]>;
+
+  /** Patch a run's mutable fields; stamps `updated_at`. Throws when the run does not exist. */
+  updateCommitRun(id: string, patch: CommitRunUpdate): Promise<CommitRun>;
+
+  /** Remove a run's row. False when there was none. */
+  deleteCommitRun(id: string): Promise<boolean>;
 
   // --- Tags ---
   //

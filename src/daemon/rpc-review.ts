@@ -589,6 +589,7 @@ export async function handleConversationPromote(
   const prompt = optionalString(params, 'prompt');
   const code = optionalString(params, 'code');
   const parent = optionalString(params, 'parent');
+  const actor = optionalActorInput(params);
   return await createReviewActions(projectRoot).promoteConversation(sessionId, {
     ...(from != null ? { from } : {}),
     ...(to != null ? { to } : {}),
@@ -596,6 +597,7 @@ export async function handleConversationPromote(
     ...(prompt != null ? { prompt } : {}),
     ...(code != null ? { code } : {}),
     ...(parent != null ? { parent } : {}),
+    ...(actor !== undefined ? { actor } : {}),
   });
 }
 

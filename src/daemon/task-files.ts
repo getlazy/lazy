@@ -30,6 +30,16 @@
  * resume, auto-resume, auto-deliver, sync — so a merge or an agent edit that
  * touched a path is repaired on the next turn.
  *
+ * A path that ALREADY holds exactly what would be written (same bytes, no
+ * looser mode, and — for a root daemon — already owned by the worktree's
+ * owner) is left untouched: no write, no rename, no new inode or mtime. The
+ * exclude list and the manifest are treated the same way. A task's services
+ * keep running in its container while its agent works, and a dev server that
+ * watches `.env` restarts on every replace, so a launch that rewrote unchanged
+ * secrets restarted the person's app every turn. A changed file is still
+ * written exactly as before, and a root daemon hands it to the worktree's owner
+ * BEFORE it is renamed into place, so it is never briefly unreadable to them.
+ *
  * A path the task's branch TRACKS is never overwritten: delivering there would
  * either ship the secret as a modification or silently replace the project's
  * own file. Nor is an UNTRACKED file lazy did not put there (a
@@ -57,11 +67,11 @@
  * (../git/delivered-files.ts), from the registry alone (`deliveredGuardFor`).
  */
 
-import { lstat, mkdir, readFile, writeFile } from 'fs/promises';
+import { lstat, mkdir, readFile, stat, writeFile } from 'fs/promises';
 import { basename, dirname, join, posix } from 'path';
 import { homedir } from 'os';
 import { getTaskFilesPath } from './paths';
-import { LinkRefusedError, readRegularFileUnder, writeRegularFileUnder } from './link-safe-files';
+import { LinkRefusedError, readRegularFileUnder, regularFileHolds, writeRegularFileUnder } from './link-safe-files';
 import { assertRegistrableSecretValues, MAX_REGISTERED_VALUES_PER_SOURCE, registeredSecretSources, setRegisteredSecretValues } from '../utils/redact';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
@@ -618,6 +628,7 @@ export async function deliverTaskFiles(
     }
   }
   const everDelivered = Object.keys(history.paths).sort();
+  const owner = await worktreeOwnerForRootDaemon(worktreePath);
   if (everDelivered.length > 0) {
     try {
       const globals = await globalExcludesText();
@@ -625,10 +636,10 @@ export async function deliverTaskFiles(
         (globals ? `${globals.replace(/\n?$/, '\n')}` : '') +
         `# Per-task secret files delivered by lazy — never commit these.\n` +
         everDelivered.map(p => `${excludeLineFor(p)}\n`).join('');
-      await writeRegularFileUnder(worktreePath, DELIVERED_FILES_EXCLUDE_REL, exclude, 0o644);
+      await writeUnlessHeld(worktreePath, DELIVERED_FILES_EXCLUDE_REL, exclude, 0o644, owner);
       // Convenience copy only — agent-writable, read by no guard.
-      await writeRegularFileUnder(worktreePath, DELIVERED_FILES_MANIFEST_REL,
-        JSON.stringify({ files: everDelivered.flatMap(path => history.paths[path].map(blob => ({ path, blob }))) }), 0o600);
+      await writeUnlessHeld(worktreePath, DELIVERED_FILES_MANIFEST_REL,
+        JSON.stringify({ files: everDelivered.flatMap(path => history.paths[path].map(blob => ({ path, blob }))) }), 0o600, owner);
     } catch (err) {
       const reason = `could not write the git exclude list that keeps it out of commits: ${(err as Error).message}`;
       for (const d of planned) result.refused.push({ path: d.path, reason });
@@ -636,10 +647,11 @@ export async function deliverTaskFiles(
     }
   }
 
-  // 3. The files themselves.
+  // 3. The files themselves — only those whose content changed (see the
+  // header: an unchanged file is never replaced under a running service).
   for (const d of planned) {
     try {
-      await writeRegularFileUnder(worktreePath, d.path, d.content, 0o600);
+      await writeUnlessHeld(worktreePath, d.path, d.content, 0o600, owner);
       result.written.push(d.path);
     } catch (err) {
       result.refused.push({ path: d.path, reason: (err as Error).message });
@@ -651,6 +663,35 @@ export async function deliverTaskFiles(
   result.refused.sort((x, y) => x.path.localeCompare(y.path));
   for (const r of result.refused) logger.warn(`Task ${taskId}: secret file ${r.path} not delivered — ${r.reason}`);
   return result;
+}
+
+/**
+ * Write `data` at `rel` through the link-safe writer, unless the path already
+ * holds exactly that (regularFileHolds) — then nothing is touched at all.
+ * Returns whether it wrote.
+ */
+async function writeUnlessHeld(
+  worktreePath: string,
+  rel: string,
+  data: string | Buffer,
+  mode: number,
+  owner: { uid: number; gid: number } | undefined,
+): Promise<boolean> {
+  if (await regularFileHolds(worktreePath, rel, data, mode, owner)) return false;
+  await writeRegularFileUnder(worktreePath, rel, data, mode, false, owner);
+  return true;
+}
+
+/**
+ * Who a ROOT daemon's writes into this worktree must belong to: its owner,
+ * once the container user adopted it (../utils/worktree-ownership.ts). Undefined
+ * for a daemon that is not root, or a worktree root still owns — nothing to hand
+ * over, exactly as realignAfterDaemonWrite decides.
+ */
+async function worktreeOwnerForRootDaemon(worktreePath: string): Promise<{ uid: number; gid: number } | undefined> {
+  if (process.getuid?.() !== 0) return undefined;
+  const st = await stat(worktreePath);
+  return st.uid === 0 ? undefined : { uid: st.uid, gid: st.gid };
 }
 
 async function presentRetired(worktreePath: string, everDelivered: string[], files: Record<string, string>): Promise<string[]> {

@@ -20,13 +20,13 @@ import {
   piHttpIdleTimeoutMsFromEnv,
   LAZY_PI_UPSTREAM_TIMEOUT_MS_ENV,
 } from '../../src/agent/pi-turn-config';
-import { LAZY_PI_PROVIDER_ENV } from '../../src/agent/pi';
+import { LAZY_PI_PROVIDER_ENV, LAZY_PI_REASONING_ENV } from '../../src/agent/pi';
 import { wireForProfile } from '../../src/config/agent-profiles';
 
 let home: string;
 const savedEnv: Record<string, string | undefined> = {};
 const ENV_KEYS = [
-  'HOME', 'ANTHROPIC_BASE_URL', LAZY_PI_PROVIDER_ENV, LAZY_PI_UPSTREAM_TIMEOUT_MS_ENV,
+  'HOME', 'ANTHROPIC_BASE_URL', LAZY_PI_PROVIDER_ENV, LAZY_PI_UPSTREAM_TIMEOUT_MS_ENV, LAZY_PI_REASONING_ENV,
 ];
 
 beforeEach(() => {
@@ -36,6 +36,7 @@ beforeEach(() => {
   delete process.env.ANTHROPIC_BASE_URL;
   delete process.env[LAZY_PI_PROVIDER_ENV];
   delete process.env[LAZY_PI_UPSTREAM_TIMEOUT_MS_ENV];
+  delete process.env[LAZY_PI_REASONING_ENV];
 });
 
 afterEach(() => {
@@ -221,6 +222,24 @@ describe('writePiModelsConfig', () => {
     // pi's default ceiling (16384) equals its own `high` budget, so a
     // high-effort turn would be left the 1024-token answer floor.
     expect(model.maxTokens).toBe(32768);
+  });
+
+  // INVARIANT: reasoning is declared unless the profile opted out. The opt-out
+  // (LAZY_PI_REASONING=off, from `reasoning = false`) is the only way a model
+  // that rejects reasoning_effort (gpt-4o) can run; the default must stay ON.
+  test('LAZY_PI_REASONING=off declares the model non-reasoning, on both providers', async () => {
+    process.env.ANTHROPIC_BASE_URL = 'http://proxy:1';
+    for (const provider of ['ollama', 'openai']) {
+      process.env[LAZY_PI_PROVIDER_ENV] = provider;
+      process.env[LAZY_PI_REASONING_ENV] = 'off';
+      await writePiModelsConfig({ turnModel: 'gpt-4o' });
+      let config = JSON.parse(readFileSync(piModelsConfigPath(), 'utf-8'));
+      expect(Object.values<any>(config.providers).flatMap((p) => p.models ?? [])[0].reasoning).toBe(false);
+      delete process.env[LAZY_PI_REASONING_ENV];
+      await writePiModelsConfig({ turnModel: 'gpt-4o' });
+      config = JSON.parse(readFileSync(piModelsConfigPath(), 'utf-8'));
+      expect(Object.values<any>(config.providers).flatMap((p) => p.models ?? [])[0].reasoning).toBe(true);
+    }
   });
 
   // INVARIANT: a custom-provider turn with no model REFUSES — it never falls

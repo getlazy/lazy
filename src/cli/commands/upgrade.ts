@@ -56,7 +56,6 @@ import {
   describeInteractiveSession,
   type InteractiveSessionEntry,
 } from '../../daemon/interactive-registry';
-import { spawnSyncUnsupervised } from '../../utils/spawn';
 import {
   printFullUpgradeCompletionSummary,
   printImageRefreshCompletionSummary,
@@ -72,8 +71,6 @@ import { backupStoreForUpgrade, SKIP_STORE_BACKUP_ENV } from '../../daemon/upgra
 import { backupSizeText } from '../../storage/store-backup';
 import { backupProgressPrinter } from '../../daemon/upgrade-store-backup';
 import { missingCredentialNotice } from '../../daemon/credential-gate';
-
-const DOCKER_TIMEOUT_MS = 10_000;
 
 interface ContainerInfo {
   name: string;
@@ -209,26 +206,16 @@ async function printImageSource(root: string): Promise<void> {
 }
 
 /**
- * Force-rebuild the container image by removing the existing one first.
+ * Force-rebuild the container image in place (`rebuild` + `--no-cache`). The
+ * current image is never removed, so a failed build leaves it untouched.
  */
 async function forceRebuildImage(root: string, binary: string = 'docker', timeoutMs: number = 0): Promise<string> {
-  const imageName = await resolveImageName(root);
-
-  // Remove existing image to force rebuild
-  try {
-    // A sync spawn is acceptable: `lazy upgrade` is a one-shot CLI command
-    // that runs to completion; there is no daemon event loop to block here.
-    spawnSyncUnsupervised(
-      [binary, 'rmi', '-f', imageName],
-      { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS },
-    );
-  } catch {
-    // Container runtime not available — ensureImage will handle this
-  }
-
-  // ensureImage will detect the missing image and rebuild — with --no-cache
-  // so Docker doesn't serve stale layers (e.g. cached curl install of Claude Code)
-  return ensureImage(binary, { noCache: true, timeoutMs });
+  // `rebuild` makes ensureImage build even when the Dockerfile hash matches,
+  // and docker moves the tag only when a build succeeds — so a failed refresh
+  // leaves the current image in place. (Removing the image first, as this once
+  // did, turned a failed build into NO image at all.) --no-cache so Docker
+  // doesn't serve stale layers (e.g. cached curl install of Claude Code).
+  return ensureImage(binary, { noCache: true, timeoutMs, rebuild: true });
 }
 
 /**
@@ -780,10 +767,25 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       await waitForWorkingTasks(storage, workingContainers);
     }
 
+    // A build still in flight must settle BEFORE anything is stopped: failing
+    // after the stops would leave tasks interrupted by an upgrade that cannot
+    // finish.
+    if (imageBuild && imageBuild.status() === 'building') {
+      console.log(`\nWaiting for the background image rebuild before stopping anything (${imageBuild.elapsedSeconds()}s elapsed so far)...`);
+      const ticker = setInterval(() => {
+        console.log(`  still building the container image... (${imageBuild?.elapsedSeconds()}s elapsed)`);
+      }, BUILD_PROGRESS_INTERVAL_MS);
+      try {
+        await imageBuild.awaitSettled();
+      } finally {
+        clearInterval(ticker);
+      }
+    }
+
     // The human has committed to the upgrade — but nothing has been stopped
     // yet. If the background rebuild has ALREADY failed, say so now and abort
     // while every container is still running and the current image is intact.
-    // (A build still in flight is collected after the stops, below.)
+    // (A build still in flight was settled just above.)
     if (imageBuild && imageBuild.status() === 'failed') {
       console.error('');
       console.error(theme.error('Upgrade aborted: the background container image rebuild failed.'));
@@ -984,7 +986,7 @@ Non-disruptive image refresh (--images):
       (a blocked task reuses its live supervisor on unblock, so it does NOT
       switch on the next turn)
   For an immediate, disruptive switch of everything, run a full \`lazy upgrade\`.
-  Only applies to docker/podman runners (host-process has no image).
+  Only applies to docker/podman runners.
 
 What happens:
   1. The Docker image rebuild starts immediately, in the BACKGROUND, under a

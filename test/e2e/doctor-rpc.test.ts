@@ -117,6 +117,21 @@ describe('doctor RPC', () => {
     }
   }
 
+  // INVARIANT: Teams assigns the project store and its members use their own
+  // terminals; the managed Doctor report must not diagnose the daemon's shell.
+  test('managed doctor omits terminal checks and repository storage notices', async () => {
+    const store = /external_path = "([^"]+)"/.exec(await readFile(join(ctx.root, 'lazy.toml'), 'utf8'))?.[1];
+    expect(store).toBeTruthy();
+    const report = await doctorRunWithEnv({
+      LAZY_TEST_FORCE_MANAGED: '1', LAZY_MANAGED_STORAGE_PATH: store!, SHELL: '',
+    });
+    const titles = report.checks.map((check: any) => check.title);
+    expect(titles.some((title: string) => title.startsWith('Shell detected'))).toBe(false);
+    expect(titles.some((title: string) => title.startsWith('Completions installed'))).toBe(false);
+    expect(titles.some((title: string) => title.startsWith('tmux'))).toBe(false);
+    expect(titles.some((title: string) => title.startsWith("lazy.toml 'storage."))).toBe(false);
+  });
+
   // INVARIANT: a managed (Teams) daemon measures its repository host through git
   // and the credential helper, not a forge CLI login. The microVM daemon image has
   // no gh; failing on it told members a project whose git worked was unreachable.
@@ -318,6 +333,6 @@ describe('doctor RPC — storage lock inside the daemon', () => {
       expect(c.status).toBe('ok');
     }
     expect(lock.some(c => c.title.includes('as designed'))).toBe(true);
-    expect(body.checks.some(c => c.title.includes('(skipped —'))).toBe(false);
+    expect(lock.some(c => c.title.includes('(skipped —'))).toBe(false);
   }, 60_000);
 });

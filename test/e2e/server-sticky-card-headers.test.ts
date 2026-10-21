@@ -27,8 +27,8 @@
 import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
-import { dumpDomOfHtml, inlineStylesheet, browserSuiteSkipped } from '../helpers/page-screenshot';
+import { mintDashboardLoginUrl, signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
+import { dumpDomOfHtml, inlineStylesheet, browserSuiteSkipped, screenshotDashboardPage, screenshotDashboardLive } from '../helpers/page-screenshot';
 import { bundledStylesheet } from '../../src/server/styles';
 
 /** Three files, each long enough that one card alone outruns the viewport. */
@@ -124,6 +124,46 @@ describe.skipIf(skipped)('the Changes tab keeps a file card header on screen', (
   afterEach(async () => {
     await ctx.cleanup();
   });
+
+  test('rejects a blank screenshot even when Chromium writes a PNG', async () => {
+    const out = `/tmp/lazy-blank-shot-${process.pid}.png`;
+    try {
+      await expect(screenshotDashboardPage({
+        fetch: async () => new Response('<html><body style="background:#eee"></body></html>'),
+        base, path: '/blank', out,
+      })).rejects.toThrow(/blank or nearly blank/);
+    } finally {
+      await Bun.file(out).exists() && await (await import('fs/promises')).rm(out);
+    }
+  });
+
+  test('captures painted multi-file Changes pages from saved HTML and a live browser', async () => {
+    const taskId = await createTask(ctx, 'Screenshot probe', 'Do work');
+    await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
+    const path = `/tasks/${taskId}/changes`;
+    let html = '';
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      html = await (await fetch(`${base}${path}`)).text();
+      if ((html.match(/class="rv-file-head"/g) ?? []).length === 3) break;
+      await Bun.sleep(400);
+    }
+    // INVARIANT: screenshots exercise the multi-file Changes page where blank captures were reported.
+    expect((html.match(/class="rv-file-head"/g) ?? []).length).toBe(3);
+    const savedOut = `/tmp/lazy-changes-saved-${process.pid}.png`;
+    const liveOut = `/tmp/lazy-changes-live-${process.pid}.png`;
+    try {
+      await screenshotDashboardPage({ fetch, base, path, out: savedOut });
+      const { loginUrl } = await mintDashboardLoginUrl(ctx);
+      await screenshotDashboardLive({ loginUrl, url: `${base}${path}`, out: liveOut, settleMs: 2000 });
+      expect((await Bun.file(savedOut).arrayBuffer()).byteLength).toBeGreaterThan(1000);
+      expect((await Bun.file(liveOut).arrayBuffer()).byteLength).toBeGreaterThan(1000);
+      if (process.env.LAZY_SCREENSHOT_OUTPUT) await Bun.write(process.env.LAZY_SCREENSHOT_OUTPUT, Bun.file(savedOut));
+    } finally {
+      const { rm } = await import('fs/promises');
+      await Promise.all([rm(savedOut, { force: true }), rm(liveOut, { force: true })]);
+    }
+  }, 120_000);
 
   // INVARIANT: while any part of a file is on screen, that file's header is
   // VISIBLE — not merely `position: sticky`. Sticky under opaque chrome parked

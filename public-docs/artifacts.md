@@ -27,6 +27,11 @@ lazy artifact get <task> shot.png -o /tmp/shot.png          # write one out
 lazy artifact rm <task> design/app.css                      # remove one
 ```
 
+The task's **Artifacts** tab in the dashboard and Lazy Teams also lets you
+view, download, attach, and remove files. Lazy Teams can attach files while
+creating a task, making them available on its first turn. Removing a file takes
+effect on the next agent turn.
+
 Every artifact of a task is materialized into its worktree at turn launch, so
 the agent reads them with ordinary file tools:
 
@@ -76,9 +81,18 @@ editing the mirror.
 If the artifacts cannot be materialized, the launch **fails loudly**. An agent
 that silently lost its inputs would produce confidently wrong work.
 
-Reading over MCP (`lazy_artifact_get`) is the secondary path — the only path for
-the builder, which has no worktree, and the way to read another task's published
-output.
+Reading over MCP (`lazy_artifact_get`) is the secondary path — the way for the
+builder, which has no worktree, and for reading another task's published output.
+The reply depends on the artifact:
+
+- **Small text** (up to 64 KiB) comes back inline as `content`.
+- **Binary or larger** artifacts are never inlined as base64. The bytes are
+  written to a file and the reply carries its `path`: your own task's
+  `.lazy-task-sandbox/artifacts/<name>`; otherwise a copy under `.artifacts/`
+  in the builder's `$LAZY_SCRATCH_DIR` (not captured as a scratch file) or under
+  `.lazy-task-sandbox/fetched/` for a task agent.
+- **tar / tgz / zip** artifacts also return `members` (name and size). Pass
+  `member` to read one text member inline without extracting the archive.
 
 ## Publishing back
 
@@ -149,7 +163,7 @@ handed the task, deleting is the one artifact operation that destroys something
 the caller did not create, and it takes two seconds at a terminal. Attach is
 ownership-gated for agents (own task or a direct subtask); list and read are open
 tree-wide like every other read. See
-[surface-asymmetries.md](surface-asymmetries.md#12-artifacts-attach-and-read-over-mcp-remove-only-at-a-terminal).
+[surface-asymmetries.md](surface-asymmetries.md#12-artifacts-attach-and-read-over-mcp-remove-on-human-surfaces).
 
 `lazy show` lists a task's artifacts (metadata only), and `lazy_show` returns the
 same as `artifacts`.

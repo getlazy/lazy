@@ -81,6 +81,7 @@ export const DOCS_NAV: DocsNav = {
         { path: 'how-to/upgrade' },
         { path: 'how-to/back-up-and-restore' },
         { path: 'serve-ports' },
+        { path: 'running-a-commit' },
         { path: 'task-env' },
         { path: 'lazy-teams-environment' },
         { path: 'upgrade-image-rebuild' },

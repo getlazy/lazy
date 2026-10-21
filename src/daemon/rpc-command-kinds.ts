@@ -83,7 +83,18 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'awaitClaimedTurn',
   'watchProxyActivity',
   'servePorts',
+  // Which task or run a Lazy Teams service host label names (src/serve/teams-host.ts).
+  'resolveServiceHost',
   'serve.getStartServicesCmd',
+  // Commit runs (src/daemon/commit-run.ts): the remote's branches, a sha
+  // checked against the remote, and the runs themselves. `listBranches
+  // { refresh }` and `resolveCommit` FETCH from the remote — remote-tracking
+  // refs, the environment — and write no row, so they are reads here: a
+  // person choosing what to look at is never refused for want of an identity.
+  'listBranches',
+  'resolveCommit',
+  'runs.list',
+  'runs.show',
   'taskProgress',
   'taskStats',
   'tokenStats',
@@ -276,6 +287,15 @@ export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // but it brings the task's environment up and runs work in it.
   'serve.run',
   'serve.stop',
+  // Commit runs (src/daemon/commit-run.ts): the run's row names who created
+  // and who last pulled it; removing one deletes a checkout and a container.
+  'runs.create',
+  'runs.pull',
+  'runs.remove',
+  'runs.setImageChoice',
+  // Removes a run's container (its services with it): no row, container
+  // plumbing like serve.stop.
+  'runs.stopContainer',
   'submitTask',
   'createTask',
   'cloneTask',
@@ -288,6 +308,9 @@ export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'setProjectSettings',
   'builderSlot',
   'getDaemonMcpConfig',
+  // Hands a host pairing session its task's MCP token (src/daemon/task-mcp-config.ts):
+  // no row, but it puts an agent in front of the store, like getDaemonMcpConfig.
+  'getTaskMcpConfig',
   'revokeDaemonMcpToken',
   'mintDashboardTicket',
   // A builder session is registered under the ATTACHING MEMBER's own email
@@ -295,6 +318,8 @@ export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // getDaemonMcpConfig above, whose rows name nobody, this row's memberEmail
   // really is the person who asked, so attributing it to them is not a lie.
   'startBuilderSession',
+  'resumeBuilder',
+  'continueBuilderFromSummary',
   'stopBuilderSession',
   'endBuilderSession',
   'reviewPostComment',
@@ -379,9 +404,20 @@ export const HUMAN_INITIATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'syncTaskFromRemote',
   'reparentTask',
   'linkTask',
+  // A commit run's record names who created it and who last pulled it, and
+  // any member may pull or remove a run somebody else made — each of those is
+  // a person's act on something shared, and its row says who.
+  'runs.create',
+  'runs.pull',
+  'runs.remove',
+  // Running a run on lazy's default image is a person's call, like
+  // useCustomRunnerImage for a task.
+  'runs.setImageChoice',
   // A builder session names the attaching member — see the comment beside
   // these in STORE_WRITING_RPC_COMMANDS above.
   'startBuilderSession',
+  'resumeBuilder',
+  'continueBuilderFromSummary',
   'stopBuilderSession',
   'endBuilderSession',
   // A region's owner and sign-off: an approval, and the row a reviewer most
@@ -433,6 +469,7 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'ensureTaskContainer',
   'ensureTaskWorktree',
   'getDaemonMcpConfig',
+  'getTaskMcpConfig',
   'builderSlot',
   // Turn plumbing: a running turn's host-process supervisor taking the comments
   // queued during the turn (src/daemon/turn-comments.ts).
@@ -452,8 +489,10 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'serve.clearStopServicesCmd',
   // Start services in a task's container: container plumbing exactly like
   // ensureTaskContainer — it spends no credential and writes no task row.
+  // The same for a commit run's (`runId`), and for removing its container.
   'serve.run',
   'serve.stop',
+  'runs.stopContainer',
   // A throwaway container; writes no task row. A member's token reaches it too
   // (Teams relays `lazy report` / `lazy ask <conversation>` from a bound clone),
   // and is billed to that member through `runAsOneshotPayer`, never the control plane.
@@ -613,6 +652,9 @@ export const READ_ONLY_STORAGE_METHODS: ReadonlySet<string> = new Set([
   'getBuilderSession',
   'getActiveBuilderSessionForMember',
   'listBuilderSessions',
+  'getCommitRun',
+  'getCommitRunBySlug',
+  'listCommitRuns',
   'getTagHistory',
   'getScratchFile',
   'listScratchFiles',
@@ -670,7 +712,7 @@ export const TELEMETRY_STORAGE_METHODS: ReadonlySet<string> = new Set([
  *
  * WHY AN ALLOWLIST AND NOT "every writer": most of Storage takes a bare `Actor`
  * role (`createTaskArtifact`, `saveScratchFile`,
- * `dismissSystemMessage`, `promoteConversation` …) and the rows they write have
+ * `dismissSystemMessage` …) and the rows they write have
  * no person columns at all. Handing one of those an `{ role, email }` object
  * does not attribute it — the object lands in the row's `actor` field verbatim,
  * which is a corrupt record that renders as an object where a role should be.
@@ -716,6 +758,9 @@ export const PERSON_ATTRIBUTED_STORAGE_ACTORS: ReadonlyMap<string, readonly stri
   ['removeTaskTag', ['actor']],
   ['createTurn', ['options', 'actor']],
   ['promoteRaisedItem', ['options', 'actor']],
+  // `lazy conversations promote` reaches this through the proxy; the person
+  // lands on the new task's creation entry, as for a raised-item promotion.
+  ['promoteConversation', ['options', 'actor']],
   // A raised-item DECISION: the one that gates an accept, and the one a
   // reviewer most needs a name on. Its `resolution` bag reaches
   // `FileStorage.resolveRaisedItem`, which writes `resolved_by_email` /

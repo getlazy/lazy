@@ -231,7 +231,18 @@ export interface WorktreeSnapshot {
   uncommitted_diff: string;
   git_status: string;
   timestamp: number;
+  /**
+   * When the snapshot stopped being a restore candidate (epoch ms), and why:
+   * `consumed` — an unblock applied it (or found it already in the branch);
+   * `superseded` — a later turn of the same session ended with a clean
+   * worktree. Absent while it is still live. A retired snapshot keeps its
+   * content: it is never restored again, but stays readable for recovery.
+   */
+  retired_at?: number;
+  retired_reason?: WorktreeSnapshotRetiredReason;
 }
+
+export type WorktreeSnapshotRetiredReason = 'consumed' | 'superseded';
 
 /**
  * Task tree node for hierarchical display
@@ -617,6 +628,10 @@ export interface BuilderSummary {
    * is the badge: the run is starting or running.
    */
   run: { id: string; state: BuilderSession['state']; live: boolean } | null;
+  /** The Builder this one was continued from, as its run recorded it. */
+  continuedFrom?: BuilderContinuedFrom | null;
+  /** Builders continued from this one (their ids and who had them). */
+  continuedAs?: Array<{ builderId: string; memberEmail: string | null }>;
 }
 
 export interface StoredMessage {
@@ -1287,6 +1302,44 @@ export interface BuilderSession {
    * the project's image once that is ready (src/daemon/runner-image.ts).
    */
   runnerImage?: BuilderRunnerImage | null;
+  /**
+   * The Builder this run was started to continue, from a summary of its
+   * readable transcript (src/builder/continue-from-summary.ts); null or absent
+   * for an ordinary run. Cleared when the run is re-pointed at another
+   * conversation (a resume picked from the Builders page).
+   */
+  continuedFrom?: BuilderContinuedFrom | null;
+  /**
+   * What the continued run's builder carries in its system prompt: the source
+   * named, then the summary. Kept so a stop and restart of the same run keeps
+   * it; cleared with `continuedFrom`.
+   */
+  continuationSeed?: string | null;
+  /**
+   * Continuations this run carried for conversations it has since been
+   * re-pointed away from — kept so the conversation keeps its "continued from"
+   * link and its seed when it is listed or resumed later.
+   */
+  pastContinuations?: BuilderPastContinuation[] | null;
+}
+
+/** A continuation a run carried for one conversation (BuilderSession.pastContinuations). */
+export interface BuilderPastContinuation {
+  agentSessionId: string;
+  continuedFrom: BuilderContinuedFrom;
+  continuationSeed: string | null;
+}
+
+/** Where a continued builder came from (BuilderSession.continuedFrom). */
+export interface BuilderContinuedFrom {
+  /** The source Builder's id. */
+  builderId: string;
+  /** Its title, as listed. */
+  title: string;
+  /** Who had the source conversation, as recorded. */
+  memberEmail: string | null;
+  /** How the summary was made: a model run, or an excerpt (offline mode). */
+  method: 'llm' | 'excerpt';
 }
 
 /** Which image a builder run's container was launched from. */
@@ -1321,4 +1374,60 @@ export interface BuilderSessionUpdate {
   lastExit?: string | null;
   startTimeline?: BuilderStartEvent[] | null;
   runnerImage?: BuilderRunnerImage | null;
+  continuedFrom?: BuilderContinuedFrom | null;
+  continuationSeed?: string | null;
+  pastContinuations?: BuilderPastContinuation[] | null;
+}
+
+// --- Commit runs ---
+
+/**
+ * What a commit run serves. `branch` FOLLOWS the branch: it starts at the
+ * branch's remote HEAD and Pull latest moves it to the newest one. `sha` is
+ * pinned to one commit and never moves.
+ */
+export type CommitRunTarget =
+  | { kind: 'branch'; branch: string }
+  | { kind: 'sha'; sha: string };
+
+/** The person who did something to a run, as the caller's identity named them. */
+export interface CommitRunPerson {
+  email: string | null;
+  name: string | null;
+}
+
+/**
+ * The product running at one commit WITHOUT a task (src/daemon/commit-run.ts):
+ * a detached checkout lazy owns, and a container with no agent credential in
+ * it. Not a task — no session, turns, review, accept or PR — and never listed
+ * or counted among tasks.
+ *
+ * The checkout's path and the container's name are DERIVED from `slug`
+ * (src/run/identity.ts), never stored: a row is not trusted to name a
+ * directory lazy removes or a container it stops. Whether the container and
+ * its services are up is probed, never stored.
+ */
+export interface CommitRun {
+  /** Stable id (a UUID). */
+  id: string;
+  /** The host label the run's services answer on — `<slug>.<service>.<suffix>`. Unique per project. */
+  slug: string;
+  target: CommitRunTarget;
+  /** The exact commit checked out (40 hex). Moves only on Pull latest. */
+  head_sha: string;
+  /** `default` when a person chose lazy's default image while the project's was not ready; null otherwise. */
+  image_choice: 'default' | null;
+  created_at: string;
+  created_by: CommitRunPerson | null;
+  updated_at: string;
+  last_pulled_at: string | null;
+  last_pulled_by: CommitRunPerson | null;
+}
+
+/** Patch accepted by {@link Storage.updateCommitRun}. */
+export interface CommitRunUpdate {
+  head_sha?: string;
+  image_choice?: 'default' | null;
+  last_pulled_at?: string | null;
+  last_pulled_by?: CommitRunPerson | null;
 }

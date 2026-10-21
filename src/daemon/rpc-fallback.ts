@@ -84,6 +84,7 @@ import type { IdentityAnswer } from '../identity';
 import type { CommitRepairResult, ConfirmedRepair } from './repair-commits';
 import type { BuilderSession } from '../storage/types';
 import type { AttachSessionInfo } from './session-attach';
+import type { TaskMcpConfigResult } from './task-mcp-config';
 
 
 /**
@@ -443,12 +444,6 @@ export interface WaitResult {
   display_id?: string;
   status: string;
   timed_out: boolean;
-  turn_count?: number;
-  latest_turn?: {
-    sequence: number;
-    role: string;
-    timestamp: number;
-  };
   /** Every task waited on, with its status at return time. */
   tasks?: WaitTaskSnapshot[];
   /** Tasks still working at return time (excludes the winner). */
@@ -797,6 +792,24 @@ export async function queryDaemonMcpConfig(params: {
   // Test/daemon-self mode: execute directly
   const root = resolveLazyRoot();
   return await handleGetDaemonMcpConfig(root, params) as DaemonMcpConfigResult;
+}
+
+// --- Get Task MCP Config (host pairing) ---
+
+/**
+ * The task's own MCP token, for a host pairing session that holds the task in
+ * `pairing` — see src/daemon/task-mcp-config.ts.
+ *
+ * No in-process fallback: the token registry and the routes that honour it are
+ * the daemon's, so a session with no daemon has no tools to be given.
+ */
+export async function queryTaskMcpConfig(params: { taskId: string }): Promise<TaskMcpConfigResult> {
+  const rpc = await tryRpc<TaskMcpConfigResult>('getTaskMcpConfig', { taskId: params.taskId });
+  if (rpc) return rpc;
+  throw new Error(
+    'Cannot give the paired agent its lazy tools: no lazy daemon answered (the task\'s MCP token ' +
+    'and the routes that honour it live in the daemon). Check `lazy daemon status`.',
+  );
 }
 
 // --- Revoke Daemon MCP Token ---

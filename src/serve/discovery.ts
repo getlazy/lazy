@@ -14,6 +14,10 @@ import { resolveServices, type ResolvedService, type ServicePort } from './ports
 import { withPublicUrls } from './subdomain';
 import type { Session, Task } from '../types';
 import { taskRef } from '../task/identity';
+import type { Runner } from '../runner';
+import type { RunnerType } from '../config/types';
+import type { CommitRun } from '../storage/types';
+import { runContainerName } from '../run/identity';
 
 /** Why a task's services could not be resolved, when they could not. */
 export type ServeUnavailableReason =
@@ -56,6 +60,44 @@ export async function getTaskServeState(
   session: Session | null,
   opts: { alwaysProbe?: boolean } = {},
 ): Promise<TaskServeState> {
+  return serveStateFor(root, {
+    host: task,
+    runnerType: session?.runner_type ?? task.runner_type ?? undefined,
+    containerName: (runner) => session?.container_name ?? runner.runNameForTask(taskRef(task)),
+  }, opts);
+}
+
+/**
+ * The same state for a COMMIT RUN (src/daemon/commit-run.ts): its container,
+ * on the project's runner, addressed by its slug.
+ */
+export async function getRunServeState(
+  root: string,
+  run: CommitRun,
+  opts: { alwaysProbe?: boolean } = {},
+): Promise<TaskServeState> {
+  return serveStateFor(root, {
+    host: { id: run.id, code: run.slug },
+    runnerType: undefined,
+    containerName: () => runContainerName(root, run.slug),
+  }, opts);
+}
+
+/**
+ * What a service host — a task, or a commit run — publishes right now. The
+ * ONE resolution both share: the root config's declared services, the
+ * container's live bindings, the public URL named by the host's label.
+ */
+async function serveStateFor(
+  root: string,
+  subject: {
+    /** Named in hostnames by {@link withPublicUrls}' label rule (code, else short id). */
+    host: { id: string; code?: string | null };
+    runnerType: RunnerType | undefined;
+    containerName: (runner: Runner) => string;
+  },
+  opts: { alwaysProbe?: boolean },
+): Promise<TaskServeState> {
   const config = await loadConfig(root);
   const declared = config.serve.services;
 
@@ -68,8 +110,8 @@ export async function getTaskServeState(
     return { declared, services: [], unavailable: null, containerName: '', runnerType: '', containerRunning: false };
   }
 
-  const runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
-  const containerName = session?.container_name ?? runner.runNameForTask(taskRef(task));
+  const runner = await createRunner(root, subject.runnerType);
+  const containerName = subject.containerName(runner);
 
   const base = { declared, containerName, runnerType: runner.type };
 
@@ -84,7 +126,7 @@ export async function getTaskServeState(
   }
 
   const bindings = (await runner.getRunPortBindings(containerName)) ?? [];
-  const services = withPublicUrls(task, resolveServices(declared, bindings));
+  const services = withPublicUrls(subject.host, resolveServices(declared, bindings));
   return { ...base, services, unavailable: null, containerRunning: true };
 }
 

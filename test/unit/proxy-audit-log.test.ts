@@ -385,6 +385,19 @@ describe('audit log retention — edges', () => {
     expect((await readdir(auditLogDir(dir))).sort()).toEqual([`${AUDIT_LOG_FILENAME}.1`, `${AUDIT_LOG_FILENAME}.2`]);
   });
 
+  // INVARIANT: rotation costs what exists, not the retention depth. A large
+  // budget over small segments allows millions of slots, and probing each one
+  // made a single append take tens of seconds.
+  test('rotation under a huge retention depth touches only existing segments', async () => {
+    const lineBytes = JSON.stringify(makeRecord(1)).length + 1;
+    const log = new ProxyAuditLog(dir, { maxBytes: lineBytes, retainedSegments: 10_000_000 });
+    for (let i = 1; i <= 3; i++) await log.append(makeRecord(i));
+    expect((await readdir(auditLogDir(dir))).sort()).toEqual(
+      [`${AUDIT_LOG_FILENAME}.1`, `${AUDIT_LOG_FILENAME}.2`, `${AUDIT_LOG_FILENAME}.3`],
+    );
+    expect((await log.list()).map((r) => r.seq)).toEqual([1, 2, 3]);
+  });
+
   // INVARIANT: the credential-verdict writer honours the CONFIGURED retention —
   // a default-built writer age-pruned at 7 days on every Teams credential check.
   test('the credential-verdict writer keeps what a 30-day retention keeps', async () => {

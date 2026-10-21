@@ -154,7 +154,7 @@ await mockModule(resolve(import.meta.dir, '../../src/daemon/wrap-up-plan.ts'), (
 }));
 
 await mockModule(resolve(import.meta.dir, '../../src/daemon/turn-credentials.ts'), () => ({
-  prepareTurnLaunch: async () => ({ mustRecreateContainer: recreateForCredential }),
+  prepareTurnLaunch: async () => ({ mustRecreateContainer: recreateForCredential, plan: { mode: 'daemon-env' } }),
   releaseTurnCredential: async () => {},
 }));
 

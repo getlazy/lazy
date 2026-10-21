@@ -32,7 +32,9 @@ honest. Everything else is a client that asks it to do things:
 
 - **The CLI** parses what you type and prints the result.
 - **The dashboard** is served by the daemon itself, on the port and interface
-  set in the `[server]` section of [`lazy.toml`](../lazy-toml.md).
+  set in the `[server]` section of [`lazy.toml`](../lazy-toml.md). On a project
+  machine run by Lazy Teams the daemon serves no dashboard of its own, and
+  `lazy daemon status` shows `Web: off (Lazy Teams serves the UI)`.
 - **The agent's tools** (see [MCP tools](../mcp-tools.md)) go through the daemon.
 - **The supervisor** is the small process lazy starts next to an agent to run
   it, watch it and report back to the daemon.

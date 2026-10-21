@@ -2,7 +2,7 @@
 
 System messages: reports and notices lazy files for you (**Inbox** at the right of the navigation bar, address `/messages`). The badge counts unread messages. For what a message is and who posts one, see [System messages](../../system-messages.md).
 
-![The Inbox page with no messages, and the legend of message states](../../images/dashboard/inbox.png)
+![The Inbox page listing three messages (a report that has been read, a notice and an alert that are unread) with Mark read, Dismiss and Dismiss all like this buttons, and the legend of message states underneath](../../images/dashboard/inbox.png)
 
 ## Regions
 

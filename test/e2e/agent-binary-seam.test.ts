@@ -26,6 +26,8 @@ import {
   goSilentScenario,
   heartbeatOnlyScenario,
   crashScenario,
+  sessionStartEvent,
+  resultEvent,
 } from '../helpers/fake-claude';
 import { setGuards, agentTurns, sessionInterrupt, largePrompt, createTaskWithPipedPrompt } from '../helpers/agent-seam';
 import { sandboxSuiteSkipped } from '../helpers/sandbox-deps';
@@ -264,6 +266,37 @@ describe('agent binary seam (real supervisor, fake claude)', () => {
     expect(String(turns[turns.length - 1].content)).toContain('Still done — the summary stands.');
   }, 120_000);
 
+
+  // INVARIANT (src/agent/claude-code.ts): a result line with `is_error: true`
+  // is a FAILED turn even when it is the only result the wind-down guard
+  // captured. Claude Code reports a provider error as `subtype: "success"`
+  // (test/fixtures/claude-code/api-error-400.jsonl), so before is_error was
+  // read, a CLI that emitted that line and then failed to exit was salvaged as
+  // a successful turn whose summary was the error text.
+  test('an API-error result followed by a refusal to exit is a failed turn, not a summary', async () => {
+    await setGuards(ctx, { windDownMs: 2_000 });
+
+    const taskId = await createTask(ctx, 'Wind-down API error', 'Do the work');
+    const sessionId = 'fake-sess-apierror';
+    await ctx.setClaudeScenario({ sequence: [{ steps: [
+      { kind: 'emit', event: sessionStartEvent(sessionId) },
+      { kind: 'emit', event: {
+        ...resultEvent({ result: 'API Error: 400 upstream said no', sessionId }),
+        is_error: true,
+        api_error_status: 400,
+      } },
+      { kind: 'sleep', ms: 120_000 },
+    ] }] });
+
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    const wait = await ctx.lazy(['wait', taskId]);
+    expect(wait.exitCode).not.toBe(0);
+
+    const turns = await agentTurns(ctx.root, taskId);
+    expect(turns.some(t => String(t.content).startsWith('API Error: 400'))).toBe(false);
+    const interrupt = await sessionInterrupt(ctx.root, taskId);
+    expect(JSON.stringify(interrupt)).toContain('Claude Code turn ended in error (HTTP 400): API Error: 400 upstream said no');
+  }, 120_000);
   // INVARIANT (src/supervisor/watchdog.ts): the wind-down guard never kills an
   // agent whose background work is still running, the LAST result is the
   // turn's summary, and the end-of-turn steps run only after that work is

@@ -26,6 +26,7 @@ import type { ParsedConversation } from './claude-code-logs';
 import { getAgent } from '../agent/registry';
 import type { Storage } from '../storage';
 import { tryRemoteStorage } from '../preconditions';
+import { writeConversationRecoveryFile, conversationRecoveryDir } from './conversation-recovery';
 import { logger } from '../utils/logger';
 import { join } from 'path';
 import { SANDBOX_DIR } from '../utils/sandbox';
@@ -156,12 +157,10 @@ export async function captureConversation(
   // Never create FileStorage directly — only the daemon owns the storage lock.
   const storage = existingStorage ?? await tryRemoteStorage(lazyRoot);
   if (!storage) {
-    // Daemon unavailable IS a capture failure — surface it loudly. The session
-    // already exited so there's nothing to abort, but the user must know their
-    // conversation was not saved (it remains in ~/.claude/projects and can be
-    // imported later with `lazy import-conversation`).
-    logger.error(`Failed to capture ${label} conversation: daemon is not running — conversation was NOT saved.`);
-    return null;
+    // Only the daemon owns storage. Rather than drop the conversation, hand it
+    // to the daemon through the recovery directory; it is saved on the
+    // daemon's next reconcile tick (src/import/conversation-recovery.ts).
+    return captureToRecoveryDir(lazyRoot, beforeSnapshot, label);
   }
 
   let result: CaptureResult;
@@ -181,6 +180,46 @@ export async function captureConversation(
   }
 
   return result.newestSessionId;
+}
+
+/**
+ * Daemon-down capture: parse every owned session file and write it to the
+ * recovery directory for the daemon to store later. Returns the resume target
+ * exactly as the storage path does.
+ */
+async function captureToRecoveryDir(
+  lazyRoot: string,
+  before: SessionSnapshot,
+  label: string,
+): Promise<string | null> {
+  const files = await excludeMachineOneshots(await discoverProjectSessionFiles(lazyRoot));
+  const owned = files.filter(f => isNewOrModified(f, before));
+  let newest: SessionFileInfo | null = null;
+  const saved: string[] = [];
+  for (const file of owned) {
+    if (!newest || file.mtimeMs > newest.mtimeMs) newest = file;
+    let step = 'could not be parsed';
+    try {
+      const conversation = await parseConversation(file.projectPath, file.sessionId);
+      if (conversation.messages.length === 0) continue;
+      const stored = toStoredConversation(conversation, extractSummary(conversation), conversationStats(conversation));
+      step = 'could not be written to the recovery directory';
+      saved.push(await writeConversationRecoveryFile(lazyRoot, stored, label));
+    } catch (err) {
+      logger.error(
+        `Failed to capture ${label} conversation ${file.sessionId.substring(0, 8)}: the daemon is not running and the ` +
+        `conversation ${step} (${err instanceof Error ? err.message : String(err)}) — it was NOT saved. ` +
+        'It remains in ~/.claude/projects and can be imported later with `lazy import-conversation`.',
+      );
+    }
+  }
+  if (saved.length > 0) {
+    logger.warn(
+      `Daemon unavailable: ${label} conversation saved to the recovery directory ` +
+      `(${saved.length} file(s) in ${await conversationRecoveryDir(lazyRoot)}); the daemon stores it once it is running.`,
+    );
+  }
+  return newest?.sessionId ?? null;
 }
 
 // --- Pi task sessions ---

@@ -90,6 +90,21 @@ describe('web task page: Artifacts tab', () => {
     expect(replacedTab).toContain('Replaced shots/home.png');
   });
 
+  // INVARIANT: a human removing an artifact through the dashboard removes the
+  // stored file, so it cannot reappear on the next agent turn.
+  test('removing an artifact from the page removes it from the task', async () => {
+    const id = await createTask(ctx, 'Artifacts remove', 'Do work');
+    expect((await upload(id, new File(['brief'], 'brief.txt'))).status).toBe(303);
+    const tab = await (await fetch(`${base}/tasks/${id}/artifacts`)).text();
+    expect(tab).toContain('/artifacts/remove');
+    const form = new FormData();
+    form.set('name', 'brief.txt');
+    const removed = await fetch(`${base}/tasks/${id}/artifacts/remove`, { method: 'POST', body: form, redirect: 'manual' });
+    expect(removed.status).toBe(303);
+    expect(removed.headers.get('location')).toContain('removed=brief.txt');
+    expect((await ctx.lazy(['artifact', 'list', id])).stdout).not.toContain('brief.txt');
+  });
+
   // INVARIANT: artifact bytes never run on the dashboard's origin. HTML and SVG
   // are agent-writable documents that could script against the reviewer's
   // session, so anything that is not a raster image is served as an attachment

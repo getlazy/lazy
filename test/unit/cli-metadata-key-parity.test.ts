@@ -51,6 +51,9 @@ const KNOWN_DYNAMIC_SITES = new Set([
   'src/cli/commands/create.ts',
   'src/cli/commands/edit.ts',
   'src/daemon/effort.ts',
+  // editTask writes review_mode, review_gate, review_auto_fix and their
+  // *_source markers through reviewOverrideMetadata().
+  'src/daemon/edit-task.ts',
 ]);
 
 /**
@@ -58,11 +61,11 @@ const KNOWN_DYNAMIC_SITES = new Set([
  * member meets in a bound clone, classified here instead of by accident.
  */
 const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
-  review_mode: 'lazy create/edit --review: no browser page sets a task\'s review mode.',
+  review_mode: 'The bound clone writes raw metadata; Teams sets review mode through editTask.',
   review_mode_source: 'provenance marker written beside review_mode.',
-  review_auto_fix: 'lazy create/edit --review-auto-fix: no browser page sets it.',
+  review_auto_fix: 'The bound clone writes raw metadata; Teams sets auto-fix through editTask.',
   review_auto_fix_source: 'provenance marker written beside review_auto_fix.',
-  review_gate: 'lazy create/edit --review-gate: no browser page sets it.',
+  review_gate: 'The bound clone writes raw metadata; Teams sets the gate through editTask.',
   review_gate_source: 'provenance marker written beside review_gate.',
   custom_image: 'a pinned container image is local TTY consent; the browser cannot pin one.',
   custom_image_hash: 'written beside custom_image.',

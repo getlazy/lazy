@@ -393,6 +393,8 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
   // each only SELECTS endpoints, and the endpoints' own `url`/`credential` are
   // classified below, so a selection is exactly as safe as what it selects.
   'agents.*.named_endpoint': { disposition: 'respected' },
+  // Only changes the capability declaration written into pi's models.json: no routing or credential effect.
+  'agents.*.reasoning': { disposition: 'respected' },
   'agents.*.tiers[].endpoint': { disposition: 'respected' },
   'agents.*.tiers[].model': { disposition: 'respected' },
   'agents.*.tiers[].threshold_percent': { disposition: 'respected' },

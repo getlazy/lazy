@@ -51,8 +51,11 @@ export interface Browser {
   click(selector: string): Promise<PageState>;
   /** The tab's current state. */
   state(): Promise<PageState>;
-  /** Evaluate an expression in the page and return its JSON-serialisable value (promises are awaited). */
-  evaluate<T>(expression: string): Promise<T>;
+  /**
+   * Evaluate an expression in the page and return its JSON-serialisable value (promises are awaited).
+   * `userGesture` runs the expression as a user gesture, so clipboard writes gated on user activation are allowed.
+   */
+  evaluate<T>(expression: string, opts?: { userGesture?: boolean }): Promise<T>;
   /** Emulate a viewport size (CSS pixels) for layouts gated on width. */
   setViewport(width: number, height: number): Promise<void>;
   /** PNG of the current viewport. */
@@ -195,11 +198,12 @@ export async function launchBrowser(hostMap: string[]): Promise<Browser> {
     async setViewport(width: number, height: number) {
       await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
     },
-    async evaluate<T>(expression: string): Promise<T> {
+    async evaluate<T>(expression: string, opts: { userGesture?: boolean } = {}): Promise<T> {
       const res = await send('Runtime.evaluate', {
         expression,
         returnByValue: true,
         awaitPromise: true,
+        ...(opts.userGesture ? { userGesture: true } : {}),
       }) as { result: { value: T }; exceptionDetails?: { text: string } };
       if (res.exceptionDetails) throw new Error(`evaluate failed: ${res.exceptionDetails.text}`);
       return res.result.value;

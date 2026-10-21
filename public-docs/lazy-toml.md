@@ -171,6 +171,7 @@ A **profile** is the whole answer to "how does this task's agent run": which age
 | `description` | `string` | built-in's own, else none | When to choose this profile, in plain text (at most 500 characters). Shown next to every agent picker — the web New-task and Edit forms, Lazy Teams' task form and project settings, `lazy system agent`, the builder, and the `agent_profiles` list `lazy_status` returns to agents — so a person or the builder can propose the right profile. It never selects a profile on its own. A block that overrides a built-in keeps the built-in's text unless it writes its own `description`, runs a different `harness`, or sets its own `endpoint`. |
 | `credential` | `string` | **required with `endpoint`**; the built-in's own otherwise | Name of a stored credential (`lazy auth set <name>`) that pays for this upstream, or `"none"` for an upstream that authenticates nobody. |
 | `named_endpoint` | `string` | none | Use an [`[endpoints.<name>]`](#endpointsname--named-endpoints) block's URL and credential instead of an inline `endpoint`. |
+| `reasoning` | `bool` | `true` | `pi` only. Set `false` for a model with no reasoning support at all (e.g. `gpt-4o`), which rejects the effort setting; the task's effort is then not sent. Leave it unset otherwise. |
 | `tiers` | array | none | Makes this a [tiered profile](#tiered-profiles--use-a-tier-until-it-says-no): an ordered list of `{ endpoint, model, threshold_percent }` (`threshold_percent` optional). |
 
 A name containing a dot must be quoted in the header, because a bare dot splits the name: write `[agents."claude-glm-5.3"]`, not `[agents.claude-glm-5.3]` (the same goes for `[endpoints."…"]`). Lazy refuses the unquoted form and tells you the quoted spelling.
@@ -1250,6 +1251,8 @@ What the trail cannot know, so totals can undercount:
 - **A stream that is cancelled or breaks mid-way** is recorded, but only with the tokens seen before it stopped — usually the input counts, sometimes nothing, since output tokens arrive at the end.
 - **An OpenAI-compatible stream** reports usage only when the client asked for it (`stream_options.include_usage`); without it the record has no usage.
 - **Cursor requests** are recorded and attributed, but without a model or token usage — Cursor's wire is not read for either.
+
+The audit trail is **bounded** and rotates, so it eventually forgets old tasks. Records are attributed to a task by its **code**, and `--task` accepts a code, a short id or a full id. When you ask about one task, `lazy stats tokens` also prints the usage recorded durably on that task's turns, which does not rotate, and warns when the trail holds less than the turns recorded or nothing at all — a zero there means *unknown*, not *used nothing*. `lazy_token_stats` likewise prefers per-turn usage for its per-task figures and lists `warnings`.
 
 Read the trail with `lazy stats tokens`. It lives under `lazy stats`, the multiplexer for read-only analytics over what lazy recorded (alongside `lazy stats timings`, the request-trace readout) — top-level verbs are reserved for task-lifecycle operations:
 

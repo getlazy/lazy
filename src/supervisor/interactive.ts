@@ -106,6 +106,8 @@ import { getAgent } from '../agent/registry';
 import { resolveBuilderModel } from '../agent/agent-model';
 import { loadConfig } from '../config/loader';
 import { spawn } from '../utils/spawn';
+import { createHostSessionMcp, type HostSessionMcp } from './host-session-mcp';
+import type { McpToolset } from '../mcp/tool-access';
 
 /**
  * How long the child gets to exit after SIGTERM before the supervisor stops
@@ -165,6 +167,8 @@ export interface InteractiveLauncher {
   /** Human-facing name of the launch surface, for messages ('host', 'container'). */
   readonly surface: string;
   plan(opts: { resumeSessionId: string | null; autonomous: boolean }): Promise<InteractiveLaunchPlan>;
+  /** Release whatever the launcher set up for the session (e.g. private config files). Never throws. */
+  dispose?(): Promise<void>;
 }
 
 export interface InteractiveSupervisorConfig {
@@ -191,6 +195,12 @@ export interface InteractiveSupervisorConfig {
    * which resolves the builder role's model instead.
    */
   model?: string;
+  /**
+   * Give a HOST session its task's lazy MCP tools (src/supervisor/host-session-mcp.ts):
+   * `lazy pair <task> --host`. Ignored when a `launcher` is passed — the
+   * container launcher wires its own tools inside the container.
+   */
+  taskMcp?: { taskId: string; worktreePath: string; toolset: McpToolset };
   /**
    * Where the session runs. Defaults to the host launcher (Claude Code as a
    * child of this process) — `lazy pair <task>` passes the container launcher.
@@ -292,24 +302,32 @@ export function hostInteractiveLauncher(opts: {
   extraEnv?: Record<string, string>;
   /** A task session's model; wins over the builder resolution. */
   model?: string;
+  /** The task's lazy MCP tools for this session, when it belongs to a task. */
+  mcp?: HostSessionMcp;
 }): InteractiveLauncher {
   return {
     surface: 'host',
     async plan({ resumeSessionId, autonomous }) {
       const { target, envVars } = await resolveInteractiveLaunch(opts.root, opts.command);
+      const mcp = opts.mcp ? await opts.mcp.prepare() : null;
       return {
         argv: interactiveClaudeArgs({
           resumeSessionId,
           autonomous,
-          extraArgs: opts.extraArgs ?? [],
+          extraArgs: [...(mcp?.args ?? []), ...(opts.extraArgs ?? [])],
           model: resolveBuilderModel(
             await loadConfig(opts.root), { harness: 'claude-code', model: target.model }, opts.model,
           ),
         }),
         cwd: opts.cwd,
-        env: { ...process.env, ...launchEnvOverlay(envVars), ...(opts.extraEnv ?? {}) } as Record<string, string>,
+        env: {
+          ...process.env, ...launchEnvOverlay(envVars), ...(opts.extraEnv ?? {}), ...(mcp?.env ?? {}),
+        } as Record<string, string>,
         sessionHomeDir: getHome(),
       };
+    },
+    async dispose() {
+      await opts.mcp?.dispose();
     },
   };
 }
@@ -370,7 +388,11 @@ export async function runInteractiveSupervisor(
 
   const command = commandName(kind);
   const launcher = config.launcher
-    ?? hostInteractiveLauncher({ root, command, cwd, extraArgs, extraEnv, ...(model ? { model } : {}) });
+    ?? hostInteractiveLauncher({
+      root, command, cwd, extraArgs, extraEnv,
+      ...(model ? { model } : {}),
+      ...(config.taskMcp ? { mcp: createHostSessionMcp({ root, ...config.taskMcp }) } : {}),
+    });
   await registerInteractiveSession(root, { kind, cwd, ...(taskId ? { taskId } : {}) });
 
   // Signals. Installed for the supervisor's whole lifetime, not per launch, so
@@ -523,6 +545,7 @@ export async function runInteractiveSupervisor(
   } finally {
     process.off('SIGINT', onSigint);
     process.off('SIGTERM', onSigterm);
+    await launcher.dispose?.();
     await unregisterInteractiveSession(root);
   }
 }

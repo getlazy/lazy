@@ -53,7 +53,7 @@ you dismiss the message the next occurrence starts a fresh one.
 **Dashboard inbox.** The daemon's built-in dashboard — `lazy daemon dashboard-url`
 prints its address — serves the same inbox at `/messages`:
 
-![The dashboard Inbox with Inbox and All (incl. dismissed) views, an empty-inbox notice, and a legend explaining unread, read and dismissed](images/topics/inbox.png)
+![The dashboard Inbox listing three messages, one read and two unread (bold title, edge marker), with the Inbox and All (incl. dismissed) views, Dismiss all, and a legend explaining unread, read and dismissed](images/topics/inbox.png)
 
 - **`/messages`** — undismissed messages, newest first, with kind, source, date
   and state. Unread rows are marked with a bold title and an edge marker, not

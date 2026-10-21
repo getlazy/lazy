@@ -18,6 +18,9 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTurns } from '../helpers/storage';
+import { latestAgentWorkTurn } from '../../src/task/turn-context';
+import type { Turn } from '../../src/types';
 import { checkDaemonHealth } from '../../src/daemon';
 import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
 
@@ -62,8 +65,6 @@ describe('web turn deep link', () => {
     id: string;
     /** The sequences this task actually has, ascending. */
     sequences: number[];
-    /** The sequence the Summary's report header names. */
-    lastAgent: number;
   }
 
   /**
@@ -85,7 +86,7 @@ describe('web turn deep link', () => {
       const agents = turns.filter((t) => t.role === 'agent');
       const sequences = [...new Set(turns.map((t) => t.sequence))].sort((a, b) => a - b);
       if (agents.length >= 2 && sequences.length >= 2) {
-        return { id, sequences, lastAgent: agents[agents.length - 1].sequence };
+        return { id, sequences };
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -146,12 +147,38 @@ describe('web turn deep link', () => {
   // the redirect is doing real work: resolving the turn, 404ing an unknown
   // sequence, and landing the reader on the right tab.
   test('Summary links to a turn with the absolute URL, and says where it goes', async () => {
-    const { id, lastAgent } = await workedTwice('Turn inbound links');
+    const { id } = await workedTwice('Turn inbound links');
+    // workedTwice returns at the second agent turn, while the closing steps may
+    // still be running — and a WORKING task's landing shows its latest turn, not
+    // the agent's report. Wait for the park before reading the report card.
+    const deadline = Date.now() + 60_000;
+    let status = '';
+    let reportSeq: number | undefined;
+    while (Date.now() < deadline) {
+      const shown = JSON.parse((await ctx.lazy(['show', id, '--json'])).stdout);
+      status = shown.status;
+      reportSeq = shown.turnReport?.turn_sequence ?? shown.turn_report?.turn_sequence;
+      if (status === 'blocked') break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    expect(status).toBe('blocked');
 
+    // The report names the turn it came from (the last WORK turn, not a later
+    // closing-step reply), and that name is an absolute link saying where it goes.
     const landing = await (await fetch(`${base}/tasks/${id}`)).text();
-    expect(landing).toContain(
-      `<a href="/tasks/${id}/turns/${lastAgent}" title="Open turn #${lastAgent} in its chunk">Turn #${lastAgent}</a>`,
-    );
+    const reportCard = landing.slice(landing.indexOf('Agent report'));
+    const link = reportCard.match(/<a href="\/tasks\/([^/"]+)\/turns\/(\d+)" title="Open turn #(\d+) in its chunk">Turn #(\d+)<\/a>/);
+    expect(link).not.toBeNull();
+    const [, linkedId, seq, titleSeq, textSeq] = link!;
+    expect(linkedId).toBe(id);
+    expect(titleSeq).toBe(seq);
+    expect(textSeq).toBe(seq);
+    // The turn the card names: the structured report's own turn when the agent
+    // filed one, else the last WORK turn whose prose stands in for it.
+    const expected = reportSeq
+      ?? latestAgentWorkTurn(readTurns(ctx.root, id) as unknown as Turn[])?.sequence;
+    expect(expected).toBeDefined();
+    expect(Number(seq)).toBe(expected!);
   }, 180_000);
 
   // The navigation island still ships on the Turns tab — j/k move between the

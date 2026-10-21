@@ -690,7 +690,7 @@ export interface ReviewActions {
    */
   promoteConversation(
     sessionId: string,
-    options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string },
+    options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string; actor?: ActorInput },
   ): Promise<PromoteConversationResult>;
 }
 

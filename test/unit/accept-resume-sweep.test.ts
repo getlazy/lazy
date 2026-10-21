@@ -99,6 +99,33 @@ describe('resumeDeadAccept', () => {
   });
 });
 
+describe('resumeDeadAccept git author', () => {
+  // INVARIANT: a resumed accept's squash is authored by the person the accept
+  // intent saved, not the daemon's system identity. The commit is the
+  // accepter's work; the daemon only finished it after their process died.
+  test('the squash is authored as the saved actor', async () => {
+    const { resolveGitAuthorForArgs } = await import('../../src/identity/git-author');
+    task.metadata.accept_intent = JSON.stringify({
+      reason: 'ship it', actor: { role: 'human', email: 'alice@example.com', name: 'Alice' }, recordedAt: 'x',
+    });
+    let seen: unknown = null;
+    acceptImpl = async () => { seen = await resolveGitAuthorForArgs(['merge', '--squash', 'x']); return {}; };
+    await resumeDeadAccept(storage, '/tmp/x', task);
+    expect(seen).toEqual({ env: {
+      GIT_AUTHOR_NAME: 'Alice', GIT_AUTHOR_EMAIL: 'alice@example.com',
+      GIT_COMMITTER_NAME: 'Alice', GIT_COMMITTER_EMAIL: 'alice@example.com',
+    } });
+  });
+
+  test('a role-only saved actor leaves the author to the fallback', async () => {
+    const { resolveGitAuthorForArgs } = await import('../../src/identity/git-author');
+    let seen: unknown = 'unset';
+    acceptImpl = async () => { seen = await resolveGitAuthorForArgs(['commit', '-m', 'x']); return {}; };
+    await resumeDeadAccept(storage, '/tmp/x', task);
+    expect(seen).toBeNull();
+  });
+});
+
 describe('retryFollowThrough', () => {
   // INVARIANT: a persistent follow-through failure files ONE system message.
   test('files one system message once attempts reach the threshold', async () => {

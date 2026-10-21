@@ -11,6 +11,7 @@
  */
 
 import { shouldLogImageHold, runnerImageHold } from '../daemon/runner-image-choice';
+import { SUPERVISED_HEADINGS } from '../task/supervised-headings';
 import { announceUncommittedLeftBehind } from '../task/uncommitted-left-behind';
 import { RESTORE_COMMIT_EMAIL, restoredViolationRecords } from '../protection/rejected-restore';
 import { join } from 'path';
@@ -18,7 +19,8 @@ import { existsSync, readdirSync, statSync, readFileSync } from 'fs';
 import type { Storage } from '../storage';
 import { TERMINAL_STATUSES, isClusterTask } from '../types';
 import { isBlockedStatus } from '../task-state-machine';
-import type { TokenUsage, AgentTokenUsage, Task, Session, InFlightTurn, TurnOwner, FinalClaim, Turn } from '../types';
+import type { TokenUsage, AgentTokenUsage, Task, Session, InFlightTurn, TurnOwner, TurnAttribution, FinalClaim, Turn } from '../types';
+import { SYSTEM_ACTOR } from '../constants';
 import type { RunnerType } from '../config/types';
 import { toTurnUsage, rollUpSessionUsage } from './usage-recording';
 import { createRunner } from '../runner';
@@ -28,8 +30,9 @@ import {
   removeProtocolDir, listSupersededResponses, consumeSupersededResponse,
 } from '../protocol';
 import type { CommandId, CompletedResponse, ErrorResponse, WorktreeRecovery, AgentHandoffEntry, SupervisedKind, FinalDeclaration } from '../protocol';
-import { completedResponses, responseCommandId } from '../protocol';
-import { hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit } from '../git/operations';
+import { completedResponses, responseCommandId, answersLatestCommand, readDispatchedCommandId, supersedeResponse } from '../protocol';
+import { hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit, resolveRemoteDefaultBranch } from '../git/operations';
+import { parentTaskIdOf } from '../task-target';
 import { recordSessionCommits, scanSessionCommits } from '../task/session-commits';
 import { launchSettingsFromResponse } from './turns';
 import { parkTaskPaused } from './paused-status';
@@ -37,23 +40,22 @@ import { consumeSyncRestoreStatus } from '../task/sync-restore-status';
 import { clearReadOnlyTurnFor, isReadOnlyWorkTurn } from '../task/read-only-turn';
 import { isWorkTurnCommand } from '../task/services-restart-record';
 import { checkLock, readLock, removeLock } from './lock';
-import { launchInFlight } from '../runner/launch-in-flight';
+import { beginTaskLaunch, launchInFlight } from '../runner/launch-in-flight';
 import { resolveWorkRun } from './working-run';
 import { checkPairingLock, removePairingLock } from './pairing-lock';
 import { logger } from './logger';
-import { REVIEW_REASK_HEADING } from '../review/verdict';
 import {
   formatReviewReport,
   parseReviewReport,
   reviewReportIsUnparsed,
 } from '../review/parse-report';
 import { shortId as shortIdHelper, taskRef, taskRefFromId, getWorktreePathForRef } from '../task/identity';
-import { taskBranchFor, DEFAULT_BRANCH_PREFIX } from '../git/branch-prefix';
+import { taskBranchFor, DEFAULT_BRANCH_PREFIX, looksLikeTaskBranch } from '../git/branch-prefix';
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
 import { isUserStopped } from '../task/user-stop';
 import { releaseTurnCredential } from '../daemon/turn-credentials';
-import { createAgentTurn, createRecoveredAgentTurn, sessionTurnOwner, turnChannelActor } from '../daemon/turn-owner';
+import { createAgentTurn, createRecoveredAgentTurn, personForCurrentTurn, turnChannelActor } from '../daemon/turn-owner';
 import { systemActor } from '../identity/system-identity';
 import { turnFailureRemedy } from '../task/turn-failure';
 import { fileTurnFailureAlert } from '../daemon/turn-failure-alert';
@@ -96,6 +98,7 @@ import { collectRunDiagnostics } from '../daemon/supervisor-wait';
 import { loadConfig } from '../config/loader';
 import { usagePauseHold } from '../daemon/usage-pause';
 import { runGit } from './git';
+import { captureTurnEndWorktree } from '../task/worktree-snapshot-restore';
 import { reparentChildren, formatReparentWarning } from '../task/orphan';
 import { readAgentReportFromSessionLog } from '../import/recover-agent-report';
 import { ACTIVE_HARNESS_PHASES } from './working-substate';
@@ -355,6 +358,20 @@ export async function reconcileTasks(
     // or a legitimately forge-pending one.
     await sweep('stranded-merging', () => sweepStrandedMerging(storage, lazyRoot), (err) => {
       logger.warn(`Recover stranded merging tasks failed: ${describe(err)}`);
+    });
+
+    // Sweep 9a: save conversations a CLI captured while the daemon was down
+    // (src/import/conversation-recovery.ts). Every tick, so the first tick after
+    // startup drains what accumulated during the outage.
+    // Skipped in managed mode (Lazy Teams): no host CLI shares the daemon's
+    // filesystem there, so the directory could only be written by containers.
+    await sweep('conversation-recovery', async () => {
+      const { isManagedMode } = await import('../config/managed-mode');
+      if (isManagedMode()) return;
+      const { drainConversationRecovery } = await import('../import/conversation-recovery');
+      await drainConversationRecovery(storage, lazyRoot);
+    }, (err) => {
+      logger.warn(`Conversation recovery sweep failed: ${describe(err)}`);
     });
 
     // Sweep 9b: retry post-accept follow-through (fast-forward, parent push,
@@ -802,7 +819,25 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
       await handleErrorResponse(storage, taskId, session, response, protoDir, lazyRoot);
     }
   };
+  // INVARIANT: a response only ends the turn it answers. One answering an
+  // EARLIER command — a supervisor that was still busy when a later launch
+  // queued its command behind it — is set aside and recorded as a superseded
+  // turn, and the task stays `working` for the queued command. Parking on it
+  // left that command running under a paused status, where every write its
+  // agent made was refused as "no turn running" (src/protocol/io.ts,
+  // answersLatestCommand).
+  const setAsideIfEarlier = (r: NonNullable<ReturnType<typeof readResponse>>): boolean => {
+    if (answersLatestCommand(protoDir, r)) return false;
+    logger.warn(
+      `Task ${taskShortId}: response answers an earlier command (${responseCommandId(r)}), not the one ` +
+      `dispatched since (${readDispatchedCommandId(protoDir)}) — recording it as a superseded turn and ` +
+      `leaving the task working for the queued command`,
+    );
+    supersedeResponse(protoDir);
+    return true;
+  };
   if (response) {
+    if (setAsideIfEarlier(response)) return;
     await routeResponse(response);
     return;
   }
@@ -840,6 +875,7 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
   // "recovered" as finished and a fatal failure is auto-resumed as interrupted.
   const lateResponse = readResponse(protoDir);
   if (lateResponse) {
+    if (setAsideIfEarlier(lateResponse)) return;
     await routeResponse(lateResponse);
     return;
   }
@@ -1052,6 +1088,12 @@ async function maybeAutoResume(
 ): Promise<void> {
   const taskShortId = shortId(taskId);
 
+  // Single-flight: a resume this process dispatched earlier is still launching.
+  if (pendingAutoResumes.has(taskId)) {
+    logger.debug(`Task ${taskShortId}: auto-resume already launching, skipping`);
+    return;
+  }
+
   // Re-read session to get updated consecutive_interruptions from recordInterrupt
   const session = await storage.getSessionByTaskId(taskId);
   if (!session) return;
@@ -1144,28 +1186,76 @@ async function maybeAutoResume(
     logger.debug(`Task ${taskShortId}: auto-react budget check failed: ${err instanceof Error ? err.message : err}`);
   }
 
+  // Reserve the single-flight slot and the launch registration SYNCHRONOUSLY
+  // (no await between the re-check and the reservation), so even an
+  // overlapping tick — the loop force-starts one after 5 minutes — cannot
+  // dispatch this task twice.
+  if (pendingAutoResumes.has(taskId)) {
+    logger.debug(`Task ${taskShortId}: auto-resume already launching, skipping`);
+    return;
+  }
+  let settle!: () => void;
+  pendingAutoResumes.set(taskId, new Promise<void>(resolve => { settle = resolve; }));
+  const release = beginTaskLaunch(taskId);
+
+  // Record the project-wide gap timestamp AT DISPATCH, inline, regardless of
+  // outcome — a failed attempt still launched a container and cost the shared
+  // resource the gap is protecting, and recording it before the launch
+  // completes is what keeps a second crash later in this same sweep inside the
+  // gap.
   try {
-    const success = await autoResumeTask(storage, task, session, lazyRoot);
-    // Record the project-wide gap timestamp regardless of outcome — a failed
-    // attempt still launched a container and cost the shared resource the gap
-    // is protecting.
-    try {
-      await recordProjectAutoResume(dataDir, Date.now());
-    } catch (err) {
-      logger.debug(`Task ${taskShortId}: failed to record project-wide auto-resume timestamp: ${err instanceof Error ? err.message : err}`);
-    }
-    if (success) {
-      // Record the auto-react consumption (counter + daily budget)
-      try {
-        await recordAutoReact(storage, taskId, trigger, dataDir);
-      } catch (err) {
-        logger.debug(`Task ${taskShortId}: failed to record auto-react: ${err instanceof Error ? err.message : err}`);
-      }
-    } else {
-      logger.debug(`Task ${taskShortId}: auto-resume failed, task remains interrupted`);
-    }
+    await recordProjectAutoResume(dataDir, Date.now());
   } catch (err) {
-    logger.debug(`Task ${taskShortId}: auto-resume error: ${err instanceof Error ? err.message : err}`);
+    logger.debug(`Task ${taskShortId}: failed to record project-wide auto-resume timestamp: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // The launch runs OFF the sweep. Sandbox setup, upstream-ref resolution
+  // (which may fetch with retries), image resolution or build (no timeout, by
+  // design) and the container start can take minutes; awaited inline, every
+  // other working task waited behind it and a dead run elsewhere sat at
+  // working(not-alive) for the whole launch. The crash and the interrupted
+  // status were already recorded inline by the caller; only the relaunch is
+  // dispatched. Registered with launchInFlight for its whole duration because
+  // autoResumeTask flips the task to working BEFORE the fetch and image build:
+  // the reconciler must leave it alone and it renders working(launching).
+  void (async () => {
+    try {
+      const success = await autoResumeTask(storage, task, session, lazyRoot);
+      if (success) {
+        // Record the auto-react consumption (counter + daily budget)
+        try {
+          await recordAutoReact(storage, taskId, trigger, dataDir);
+        } catch (err) {
+          logger.debug(`Task ${taskShortId}: failed to record auto-react: ${err instanceof Error ? err.message : err}`);
+        }
+      } else {
+        logger.debug(`Task ${taskShortId}: auto-resume failed, task remains interrupted`);
+      }
+    } catch (err) {
+      logger.debug(`Task ${taskShortId}: auto-resume error: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      release();
+      pendingAutoResumes.delete(taskId);
+      settle();
+    }
+  })();
+}
+
+/**
+ * Auto-resume launches this process dispatched and has not seen settle, keyed
+ * by task id. Process-local for the same reason launchInFlight is: a daemon
+ * that dies mid-launch has nothing in flight any more.
+ */
+const pendingAutoResumes = new Map<string, Promise<void>>();
+
+/**
+ * Wait for every auto-resume launch the reconciler dispatched in this process.
+ * For one-shot reconcile passes (tests, tooling) that close storage or exit
+ * right after the pass — the daemon never needs it, since it outlives them.
+ */
+export async function settleAutoResumes(): Promise<void> {
+  while (pendingAutoResumes.size > 0) {
+    await Promise.all([...pendingAutoResumes.values()]);
   }
 }
 
@@ -1515,33 +1605,10 @@ async function recoverStrandedCompletion(
  */
 /** Supervisor-turn heading per follow-up kind, so `lazy show` labels it clearly. */
 function supervisedHeading(kind: SupervisedKind): string {
-  switch (kind) {
-    case 'permission_pushback':
-      return '## Permission Violation Review';
-    case 'maintain':
-      return '## Maintained Files Review';
-    case 'react':
-      return '## Reactive Automation';
-    case 'commit_leftovers':
-      return '## Uncommitted Work';
-    case 'commit_nudge':
-      return '## Uncommitted Changes Check';
-    case 'background_nudge':
-      return '## Stopped Background Work Check';
-    case 'pending_notes':
-      return '## New Comments During the Turn';
-    case 'present':
-      return '## Presentation Walkthrough';
-    case 'low_high_review':
-      return '## Low-High Loop Self-Review';
-    case 'low_high_revise':
-      return '## Low-High Loop Revision';
-    // The re-ask is carried on the review RESPONSE (`review_reask`), not as a
-    // supervised turn of its own, so this arm exists only for completeness of
-    // the union. See src/supervisor/review-reask.ts.
-    case 'review_reask':
-      return REVIEW_REASK_HEADING;
-  }
+  // The table lives in src/task/supervised-headings.ts so the conversation view
+  // reads back exactly what is written here.
+  const heading = (SUPERVISED_HEADINGS as Partial<Record<string, string>>)[kind];
+  if (heading) return heading;
   // A kind THIS build has no arm for. Reachable across an upgrade: a response
   // written by the previous supervisor can still be sitting in the mailbox
   // when the new daemon reads it, and `final_nudge` — retired when the turn
@@ -1584,10 +1651,16 @@ export async function recordSupervisedTurns(
    * Who owns the turn these follow-ups belong to. Passed in rather than read
    * off the session, because this runs on BOTH the live path (where the session
    * is right) and the superseded sweep (where it names a newer turn's owner) —
-   * see createRecoveredAgentTurn.
+   * see createRecoveredAgentTurn. On the live path it carries `system: true`
+   * for a turn nobody asked for: its replies are then the SYSTEM's, like the
+   * work turn beside them (AGENTS.md, "Work nobody asked for").
    */
-  owner: TurnOwner | null,
+  attribution: TurnOwner | TurnAttribution | null,
 ): Promise<Turn[]> {
+  const system = !!attribution && 'system' in attribution && attribution.system;
+  const owner: TurnOwner | null = attribution
+    ? { email: attribution.email, ...(attribution.name ? { name: attribution.name } : {}) }
+    : null;
   const recorded: Turn[] = [];
   for (const resp of supervised) {
     if (!resp.supervised) continue; // defensive: a supervised follow-up must carry its block
@@ -1612,6 +1685,7 @@ export async function recordSupervisedTurns(
       sessionId,
       sequence: replySeq,
       role: 'agent',
+      ...(system ? { actor: SYSTEM_ACTOR } : {}),
       content: enrichResponseWithPlanContent(resp.result, worktreePath),
       usage: toTurnUsage(resp.usage),
       ...launchSettingsFromResponse(resp),
@@ -2320,7 +2394,7 @@ export async function handleCompletedResponses(
     const recordedSupervised = supervised.length > 0
       ? await recordSupervisedTurns(
           storage, session.id, supervised, worktreePath,
-          await sessionTurnOwner(storage, session.id),
+          await personForCurrentTurn(storage, session.id, lazyRoot),
         )
       : [];
 
@@ -2398,15 +2472,19 @@ export async function handleCompletedResponses(
   }
 
   // Capture uncommitted changes — once, on the pass that recorded them before
-  // the services restart, not again on the pass that parks after it.
+  // the services restart, not again on the pass that parks after it. A turn
+  // that ends CLEAN supersedes every earlier snapshot of the session: the
+  // worktree moved on without those edits, so no later unblock may put them
+  // back (see snapshot restore in runUnblock).
   try {
-    if (!resumingAfterRestart && await hasUncommittedChanges(worktreePath)) {
-      const uncommittedDiff = await getUncommittedDiff(worktreePath);
-      const gitStatus = (await runGit(['status', '--porcelain', '--', ':!.lazy-task-sandbox'], { cwd: worktreePath })).stdout;
-      await storage.createWorktreeSnapshot(session.id, agentTurnSeq, uncommittedDiff, gitStatus);
+    if (!resumingAfterRestart) {
+      await captureTurnEndWorktree(storage, session.id, agentTurnSeq, worktreePath);
     }
-  } catch {
-    logger.debug(`Task ${taskShortId}: could not capture uncommitted changes`);
+  } catch (err) {
+    logger.warn(
+      `Task ${taskShortId}: could not capture uncommitted changes or supersede earlier worktree snapshots: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   // Transition to blocked (or conflict if file permission violations REMAIN).
@@ -3761,14 +3839,23 @@ async function sweepStalePairing(storage: Storage, lazyRoot: string): Promise<vo
 export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: string): Promise<void> {
   try {
     const backlogTasks = await storage.listTasksWithOptions({ backlogOnly: true });
+    // Resolved at most once per sweep, and only if a task needs the fallback.
+    const integration = backlogIntegrationResolver(lazyRoot);
 
     for (const task of backlogTasks) {
       try {
         const taskShortId = shortId(task.id);
 
-        // We need a base SHA to ask "are there commits beyond it?". Without
-        // branched_from_sha (very old tasks), skip — we can't make a safe call.
-        if (!task.branched_from_sha) continue;
+        // We need a base SHA to ask "are there commits beyond it?". A child
+        // task records it at launch. A top-level task without one (launched
+        // before the launcher recorded it, or moved between machines, where
+        // the local session's git_start_sha does not travel either) falls back
+        // to the merge-base with the integration branch it merges back into.
+        // A child without one stays skipped — we can't make a safe call.
+        const integrationRefs = task.branched_from_sha || parentTaskIdOf(task)
+          ? null
+          : await integration(task);
+        if (!task.branched_from_sha && !integrationRefs?.length) continue;
 
         const tRef = await taskRefFromId(task.id, storage);
         // The configured namespace first, then the built-in one for branches
@@ -3782,16 +3869,26 @@ export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: stri
         // both for efficiency and because some tests globally mock that helper.)
         let branch = '';
         let ahead = 0;
+        let base = '';
         for (const candidate of candidates) {
+          // Without a recorded base, probe against the integration ref itself:
+          // `<ref>..<branch>` counts what a merge-base would, and fails fast
+          // when the branch does not exist. The merge-base is only worked out
+          // once there is something to look at.
+          const probeBase = task.branched_from_sha || integrationRefs![0]!;
           const result = await runGit(
-            ['rev-list', '--count', `${task.branched_from_sha}..${candidate}`],
+            ['rev-list', '--count', `${probeBase}..${candidate}`],
             { cwd: lazyRoot },
           );
           if (result.exitCode !== 0) continue;
           const count = parseInt(result.stdout.trim(), 10) || 0;
           if (count === 0) continue;
+          const candidateBase = task.branched_from_sha
+            || await newestMergeBase(candidate, integrationRefs!, lazyRoot);
+          if (!candidateBase) continue;
           branch = candidate;
           ahead = count;
+          base = candidateBase;
           break;
         }
         if (!branch) continue;
@@ -3801,7 +3898,7 @@ export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: stri
         // normal state of every task mid-launch. `git diff --quiet` exits 1 when
         // the trees differ (real content worth reviewing) and 0 when identical.
         const diff = await runGit(
-          ['diff', '--quiet', task.branched_from_sha, branch],
+          ['diff', '--quiet', base, branch],
           { cwd: lazyRoot },
         );
         if (diff.exitCode === 0) continue;
@@ -3821,6 +3918,68 @@ export async function recoverBacklogWithCommits(storage: Storage, lazyRoot: stri
   } catch (err) {
     logger.debug(`Failed to list backlog tasks for recovery: ${err instanceof Error ? err.message : err}`);
   }
+}
+
+/**
+ * Per-sweep resolver for the refs a top-level task's branch merges back into:
+ * its stored branch target, else the repo's integration (remote default)
+ * branch — remote-tracking and local, whichever exist. Mirrors the launcher's
+ * top-level resolution, without fetching and without the launcher's "falling
+ * back to main" warning on every tick. Config, default branch and ref
+ * existence are each looked up once per sweep, so the many never-started
+ * backlog tasks cost nothing extra.
+ */
+function backlogIntegrationResolver(lazyRoot: string): (task: Task) => Promise<string[]> {
+  let defaults: Promise<{ remote: string; branch: string }> | null = null;
+  const refsByBranch = new Map<string, Promise<string[]>>();
+  const loadDefaults = async () => {
+    let remote = 'origin';
+    try {
+      remote = (await loadConfig(lazyRoot)).remote.git_remote || 'origin';
+    } catch (err) {
+      logger.debug(`backlog recovery: config unreadable, assuming remote "origin": ${err instanceof Error ? err.message : err}`);
+    }
+    return { remote, branch: (await resolveRemoteDefaultBranch(lazyRoot, remote)) ?? 'main' };
+  };
+  const existingRefs = async (remote: string, branch: string): Promise<string[]> => {
+    const refs: string[] = [];
+    for (const ref of [`${remote}/${branch}`, branch]) {
+      const ok = await runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: lazyRoot });
+      if (ok.exitCode === 0) refs.push(ref);
+    }
+    return refs;
+  };
+  return async (task) => {
+    defaults ??= loadDefaults();
+    const { remote, branch: defaultBranch } = await defaults;
+    const stored = task.target.kind === 'branch' ? task.target.branch : '';
+    const branch = stored && !looksLikeTaskBranch(stored) ? stored : defaultBranch;
+    let refs = refsByBranch.get(branch);
+    if (!refs) {
+      refs = existingRefs(remote, branch);
+      refsByBranch.set(branch, refs);
+    }
+    return refs;
+  };
+}
+
+/**
+ * The NEWEST merge-base of `branch` with any of `refs`: when local and
+ * remote integration refs disagree, the branch was cut from the one closest to
+ * it, and an older base would count the integration branch's own commits as
+ * the task's work.
+ */
+async function newestMergeBase(branch: string, refs: string[], lazyRoot: string): Promise<string | null> {
+  let best: string | null = null;
+  for (const ref of refs) {
+    const result = await runGit(['merge-base', ref, branch], { cwd: lazyRoot });
+    const mb = result.exitCode === 0 ? result.stdout.trim() : '';
+    if (!mb) continue;
+    if (!best) { best = mb; continue; }
+    const older = await runGit(['merge-base', '--is-ancestor', best, mb], { cwd: lazyRoot });
+    if (older.exitCode === 0) best = mb;
+  }
+  return best;
 }
 
 /**

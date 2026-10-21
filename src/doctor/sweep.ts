@@ -2365,10 +2365,10 @@ function checkManagedConfig(raw: Record<string, unknown> | null, origin: Managed
   // Only the keys the repository actually stated: a project that never asked
   // for a runner does not need to be told which one it got.
   const asked = new Set(flattenConfigAsks(raw ?? {}).keys());
-  const stated = evaluation.overrides.filter((o) => asked.has(o.key));
-  if (stated.length === 0 && withheld.length === 0) {
-    results.push({ ok: true, label: 'No lazy.toml setting is being overridden' });
-  }
+  const stated = evaluation.overrides.filter((o) =>
+    asked.has(o.key) &&
+    !o.key.startsWith('storage.') &&
+    JSON.stringify(o.asked) !== JSON.stringify(o.effective));
   for (const override of stated) {
     results.push({
       ok: true,
@@ -3656,7 +3656,7 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     { id: 'git', label: 'Git and actor identity' },
     { id: 'config', label: 'Configuration and storage locks' },
     { id: 'runner', label: 'Runner and container runtime' },
-    { id: 'auth', label: 'Credentials and shell setup' },
+    { id: 'auth', label: isManagedMode() ? 'Credentials' : 'Credentials and shell setup' },
     { id: 'project', label: 'Project and daemon health', optional: true },
     { id: 'images', label: 'Container images and orphaned containers', optional: true },
     { id: 'tasks', label: 'Task runs, storage and worktrees', optional: true },
@@ -3860,11 +3860,13 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     if (root) results.push(...(await checkStoredCredentialsParse(root, config ?? null)));
   }
 
-  // Shell and completion checks
-  const { result: shellResult, shell } = await checkShellDetected();
-  results.push(shellResult);
-  results.push(checkCompletionsInstalled(shell));
-  results.push(checkTmux());
+  // These describe a person's local CLI terminal, not a Teams project.
+  if (!isManagedMode()) {
+    const { result: shellResult, shell } = await checkShellDetected();
+    results.push(shellResult);
+    results.push(checkCompletionsInstalled(shell));
+    results.push(checkTmux());
+  }
 
   // Container-dependent checks only run if the runner's own diagnostics all passed
   const runnerDiagnosticsOk = runner

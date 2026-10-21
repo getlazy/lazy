@@ -26,6 +26,7 @@ import {
   readCommand,
   consumeCommand,
   writeResponse,
+  supersedeResponse,
   writeStatus,
   clearStatus,
   readStatus,
@@ -69,6 +70,7 @@ import { addAgentUsage, readUsage } from './usage';
 import { getAgent, getAgentPackaging } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
 import { adoptBeforeCommand } from '../utils/worktree-ownership';
+import { applyTurnCredentialEnv } from './turn-credential-env';
 import { prepareTurnMcp } from './mcp-setup';
 import { clearTurnHandoff, handoffField, handoffTurnEnding } from './turn-handoff';
 import { createRunnerFromType } from '../runner';
@@ -93,7 +95,7 @@ import { renderMaintainContext } from './maintain';
 import { renderReactContext } from './react';
 import { runWrapUpSteps, computeBranchPointSha } from './wrap-up';
 import { claimPendingNotes, acknowledgePendingNotes, renderPendingNotesPrompt, type PendingNotesClaim } from './pending-notes';
-import { runCommitNudge, runBackgroundNudge, runSessionNudge, detectUncommittedPaths, MAX_REPORTED_PATHS, type LeftoversFollowupResult } from './leftovers';
+import { runCommitNudge, runBackgroundNudge, runSessionNudge, detectUncommittedPaths, detectTurnEndLeftovers, MAX_REPORTED_PATHS, type LeftoversFollowupResult } from './leftovers';
 import { runReviewVerdictReask } from './review-reask';
 import { parseReviewReport } from '../review/parse-report';
 import { resolveReviewVerdict } from '../review/verdict';
@@ -111,6 +113,12 @@ function writeCorrelatedResponse(
   response: Response,
   command: CorrelatedCommand,
 ): Response {
+  // A response still in the mailbox is an EARLIER command's that the daemon
+  // has not read yet: this command was queued behind it. Overwriting it lost
+  // that turn; it is moved aside for the daemon to record instead.
+  if (supersedeResponse(protocolDir)) {
+    log('[supervisor] Set aside an unread response from an earlier command before answering this one.');
+  }
   writeResponse(protocolDir, attachCommandId(response, commandCorrelationId(command)));
   return response;
 }
@@ -378,6 +386,15 @@ export async function runSupervisor(config: SupervisorConfig): Promise<number> {
     // process's env — must treat them as ignored. Re-read every command, so a
     // reused container picks up files set after it started.
     applyDeliveredFilesGitEnv(await deliveredExcludeFileFor(worktreePath));
+
+    // The turn's credential placeholder, in the env var its kind needs — so a
+    // reused container (and the services running in it) survives a turn whose
+    // owner's credential kind differs from the one it was created with.
+    // See ./turn-credential-env.ts.
+    const credentialCmd = command as { session_credential_env?: Array<{ key: string; value: string }>; harness?: string; agent_id?: string };
+    if (applyTurnCredentialEnv(credentialCmd.session_credential_env, credentialCmd.harness ?? credentialCmd.agent_id)) {
+      log('[supervisor] Installed this turn\'s session credential placeholder.');
+    }
 
     // INVARIANT: Reject commands whose wire protocol doesn't match this supervisor.
     // When the protocol changes between releases, an older supervisor running in a
@@ -1561,7 +1578,7 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     // task and as a system notice (src/task/uncommitted-left-behind.ts).
     // A failed scan (null) writes nothing rather than an empty set — "I could
     // not look" must not reach a reviewer as "there was nothing there".
-    const leftoverPaths = await detectUncommittedPaths(worktreePath);
+    const { paths: leftoverPaths } = await detectTurnEndLeftovers(worktreePath);
     if (leftoverPaths && leftoverPaths.length > 0) {
       logWarn(
         `[supervisor] Turn ending with ${leftoverPaths.length} uncommitted path(s), none of them on the branch: ` +
@@ -1619,12 +1636,13 @@ async function handleTurnCommand(command: Command, config: SupervisorConfig, run
     try {
       const currentSha = await getHeadSha(worktreePath);
       const hasNewCommits = currentSha !== preTurnSha && preTurnSha !== 'unknown' && currentSha !== 'unknown';
-      failedTurnPaths = await detectUncommittedPaths(worktreePath);
+      const failedScan = await detectTurnEndLeftovers(worktreePath);
+      failedTurnPaths = failedScan.paths;
       // `null` is "could not look", which must not read as "clean" in either
       // answer: fall back to the predicate, which is allowed to say false.
       const hasUncommitted = failedTurnPaths !== null
         ? failedTurnPaths.length > 0
-        : await hasUncommittedChanges(worktreePath);
+        : failedScan.midMerge || await hasUncommittedChanges(worktreePath);
       agentHadNoEffect = !hasNewCommits && !hasUncommitted;
       if (agentHadNoEffect) {
         log('[supervisor] Agent had no effect on the branch (no commits, clean worktree).');

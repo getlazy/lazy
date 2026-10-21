@@ -360,6 +360,18 @@ async function runLogin(root: string, urlArg: string, options: LoginOptions): Pr
     process.exit(1);
   }
 
+  // A live local daemon would keep running against the local store, unseen
+  // once bound (`lazy daemon` refuses in a bound clone) and unreachable after
+  // logout. Refused here, before a token is minted, so nothing is orphaned.
+  const { isDaemonRunning } = await import('../../daemon/lifecycle');
+  if (isDaemonRunning(root)) {
+    console.error(
+      'Error: a local lazy daemon is running for this clone, and a clone bound to Lazy Teams has none.\n' +
+      '  Stop it first with `lazy daemon stop`, then run `lazy login` again.',
+    );
+    process.exit(1);
+  }
+
   const existing = await readTeamsLogin(root);
   if (existing) {
     console.log(theme.warning(

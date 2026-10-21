@@ -15,7 +15,7 @@ import type { AgentResponse, TokenUsage } from '../../src/types';
 import { IMAGE_TAG, IMAGE_NAME, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS } from '../../src/capture/image-tag';
 import { AGENT_SELFCHECK_SENTINEL } from '../../src/agent/binary-identity';
 import { getMockResponse } from './mock-response';
-import { listUncommittedPaths } from '../../src/git/operations';
+import { detectTurnEndLeftovers } from '../../src/supervisor/leftovers';
 // Same reasoning as image-tag above: the placeholder SHAPE and the launch env
 // SHAPE are production's to define, so the mock borrows both rather than
 // inventing look-alikes that would drift. None of these modules imports
@@ -460,7 +460,9 @@ async function maybeCommit(worktreePath: string, label: string): Promise<void> {
       writeFileSync(join(worktreePath, filename), `Mock agent output (${label})\n`);
       Bun.spawnSync(['git', 'add', filename], { cwd: worktreePath });
     }
-    Bun.spawnSync(['git', 'commit', '-m', `Mock agent commit (${label})`], { cwd: worktreePath });
+    const commitArgs = ['git', 'commit', '-m', `Mock agent commit (${label})`];
+    if (process.env.LAZY_MOCK_COMMIT_BODY) commitArgs.push('-m', process.env.LAZY_MOCK_COMMIT_BODY);
+    Bun.spawnSync(commitArgs, { cwd: worktreePath });
   }
 }
 
@@ -486,6 +488,29 @@ async function maybeLeaveUncommitted(worktreePath: string): Promise<void> {
     // wrap-up committed the same path still leaves a REAL edit behind.
     writeFileSync(fullPath, `Left uncommitted by the mock agent (${path}) in ${worktreePath}\n`);
   }
+}
+
+/**
+ * Leave the worktree MID-MERGE with an unresolved conflict
+ * (`LAZY_MOCK_LEAVE_MID_MERGE=1`): commit a change to `merge-conflict.txt` here
+ * and on a side branch, then merge the side branch and abandon the conflict.
+ */
+async function maybeLeaveMidMerge(worktreePath: string): Promise<void> {
+  if (!process.env.LAZY_MOCK_LEAVE_MID_MERGE) return;
+  const { writeFileSync } = await import('fs');
+  const { join } = await import('path');
+  const git = (...args: string[]) => Bun.spawnSync(['git', ...args], { cwd: worktreePath });
+  const file = join(worktreePath, 'merge-conflict.txt');
+  const base = git('rev-parse', 'HEAD').stdout.toString().trim();
+  git('checkout', '-q', '-b', 'mock-conflicting-side', base);
+  writeFileSync(file, 'side\n');
+  git('add', 'merge-conflict.txt');
+  git('commit', '-q', '-m', 'side change');
+  git('checkout', '-q', '-');
+  writeFileSync(file, 'mine\n');
+  git('add', 'merge-conflict.txt');
+  git('commit', '-q', '-m', 'mine change');
+  git('merge', '--no-edit', 'mock-conflicting-side');
 }
 
 // --- Synchronous (legacy) API ---
@@ -1321,6 +1346,7 @@ export async function launchSupervisorAsync(
   // In mock mode, simulate the supervisor: make commits, then write response.json
   await maybeCommit(sandbox.worktreePath, 'supervisor');
   await maybeLeaveUncommitted(sandbox.worktreePath);
+  await maybeLeaveMidMerge(sandbox.worktreePath);
 
   // Capture post-work SHA (HEAD after agent's work, before any post-turn sync)
   const postWorkShaResult = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], {
@@ -1583,7 +1609,8 @@ export async function launchSupervisorAsync(
   // supervisor reads it at the same point — after every wrap-up step. Written
   // only when non-empty and never on a failed scan, so the mock cannot report
   // "checked, clean" where production would report nothing at all.
-  const leftovers = await listUncommittedPaths(sandbox.worktreePath);
+  // Mid-merge records nothing, as the supervisor does: the paths are conflicts.
+  const leftovers = (await detectTurnEndLeftovers(sandbox.worktreePath)).paths;
   const workResponse: Record<string, unknown> = {
     status: 'completed',
     result: mockResp.result,

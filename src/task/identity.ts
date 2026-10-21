@@ -92,6 +92,17 @@ export function taskRef(task: Task): string {
 }
 
 /**
+ * Every spelling a task's proxied traffic can be attributed under. The proxy
+ * stamps audit records with the REF the agent launched under — in practice the
+ * task CODE (e.g. `fix-token-stats-empty`), sometimes a short id — never the
+ * full id. Anything matching audit records to a task must match on ALL of these.
+ */
+export function taskAuditForms(task: Task): string[] {
+  return [...new Set([task.id, shortId(task.id), displayId(task), taskRef(task), task.code]
+    .filter((f): f is string => typeof f === 'string' && f.trim().length > 0))];
+}
+
+/**
  * Look up a task's ref by ID. Falls back to shortId if task not found.
  */
 export async function taskRefFromId(taskId: string, storage: Storage): Promise<string> {

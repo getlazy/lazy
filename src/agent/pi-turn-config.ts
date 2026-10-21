@@ -42,7 +42,7 @@ import { mkdir, readFile, writeFile } from 'fs/promises';
 import { getHome } from '../utils/home';
 import type { AgentProfile } from '../config/agent-profiles';
 import { isAnthropicApiEndpoint } from '../config/agent-profiles';
-import { LAZY_PI_PROVIDER_ENV, PI_PROVIDER_KEY, resolvePiProvider, type PiProvider } from './pi';
+import { LAZY_PI_PROVIDER_ENV, LAZY_PI_REASONING_ENV, PI_PROVIDER_KEY, resolvePiProvider, type PiProvider } from './pi';
 
 /**
  * Launch env var carrying the RAW ceiling lazy's proxy enforces on one model
@@ -127,12 +127,13 @@ const PI_ANTHROPIC_WIRE_MAX_TOKENS = 32768;
  * non-reasoning model, which answered normally). On the OpenAI wire a model
  * with no reasoning support at all — a legacy `gpt-4o` — will reject
  * `reasoning_effort`, which is a loud, legible provider error rather than a
- * silent downgrade.
+ * silent downgrade. A profile that writes `reasoning = false` opts such a model out:
+ * it is declared non-reasoning, pi clamps `--thinking` to off and sends no effort.
  */
-function customModelEntry(provider: Exclude<PiProvider, 'anthropic'>, id: string): Record<string, unknown> {
+function customModelEntry(provider: Exclude<PiProvider, 'anthropic'>, id: string, reasoning = true): Record<string, unknown> {
   return {
     id,
-    reasoning: true,
+    reasoning,
     thinkingLevelMap: THINKING_LEVEL_MAP_FOR_PROVIDER[provider],
     ...(provider === 'ollama' ? { maxTokens: PI_ANTHROPIC_WIRE_MAX_TOKENS } : {}),
   };
@@ -220,7 +221,7 @@ export function piProviderForProfile(profile: Pick<AgentProfile, 'endpoint' | 'w
 export function piLaunchEnvVars(opts: {
   harness?: string;
   /** The task's resolved agent profile — what decides provider and model. */
-  profile?: Pick<AgentProfile, 'endpoint' | 'wire'>;
+  profile?: Pick<AgentProfile, 'endpoint' | 'wire' | 'reasoning'>;
   /**
    * The proxy's upstream ceiling for one model request, in ms (0 = none).
    * Required so TypeScript makes every launch path state it — a launch that
@@ -237,6 +238,7 @@ export function piLaunchEnvVars(opts: {
     { key: 'PI_TELEMETRY', value: '0' },
     { key: LAZY_PI_UPSTREAM_TIMEOUT_MS_ENV, value: String(opts.upstreamTimeoutMs) },
   ];
+  if (opts.profile?.reasoning === false) vars.push({ key: LAZY_PI_REASONING_ENV, value: 'off' });
   return vars;
 }
 
@@ -310,7 +312,7 @@ export async function writePiModelsConfig(opts: { turnModel: string | null | und
         'default, resolved on the host). `lazy edit <task> --model <name>` pins one explicitly.',
       );
     }
-    const models = [customModelEntry(provider, turnModel)];
+    const models = [customModelEntry(provider, turnModel, process.env[LAZY_PI_REASONING_ENV]?.trim() !== 'off')];
     // Both custom providers read the SAME env var for their key: the launch
     // places every non-Anthropic credential in ANTHROPIC_AUTH_TOKEN
     // (resolveProfileLaunchCreds), as a per-launch PLACEHOLDER. The proxy

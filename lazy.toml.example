@@ -169,6 +169,7 @@ default = "claude-sonnet-5-5"
 # model = "gpt-6-sol"           # provider, any other endpoint its
 # endpoint = "https://api.openai.com"   # Anthropic-wire one
 # credential = "openai"
+# reasoning = false             # only for a model with NO reasoning support (gpt-4o)
 #
 # [agents.openrouter-pi]        # OpenRouter model ids are used as-is; key from
 # harness = "pi"                # `lazy auth set openrouter`

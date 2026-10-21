@@ -61,6 +61,19 @@ is deliberate: the session is operating on one task, in that task's worktree, so
 it gets that task's tool channel or none. Tool registration fails loudly; a
 paired session with no lazy tools is broken, not degraded.
 
+While you pair, those tools can do what the task's own agent does during a
+turn — including creating, starting, waiting on and accepting the task's
+subtasks, which merges their work into the task you are pairing on.
+
+`lazy pair <task> --host` gets the same tools. lazy writes a private MCP config
+for the session (readable only by you, outside your home directory, removed
+when the session ends) and starts Claude Code with `--strict-mcp-config`, so the
+session has lazy's server and no other: MCP servers from your own
+`~/.claude.json`, or from a `.mcp.json` in the worktree, are not loaded. Nothing
+is written to your `~/.claude` settings; the lazy tools are approved on the
+command line instead. Branchless `--host` sessions have no task, and so no lazy
+tools.
+
 ## Cursor and Codex pairing
 
 Cursor and Codex tasks pair the same in-container way: the interactive CLI runs

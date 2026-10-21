@@ -27,6 +27,7 @@ import { daemonUsageLimits } from '../../src/proxy/usage-limits';
 import { loadConfig } from '../../src/config/loader';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import { pinConfig } from '../helpers/pin-config';
+import { initGitRepo } from '../helpers/git-repo';
 
 enableInProcessTestMode();
 
@@ -43,6 +44,8 @@ describe('the per-task usage-pause allowance', () => {
     resetUsageReadingsForTest();
     resetUsagePauseStateForTest();
     root = await mkdtemp(join(tmpdir(), 'lazy-usage-pause-member-'));
+    // INVARIANT: writing RPC tests pin local identity so the developer's global git config cannot decide the result.
+    await initGitRepo(root);
     await writeFile(
       join(root, 'lazy.toml'),
       `[storage]\nbackend = "external"\nexternal_path = "${join(root, 'store')}"\n\n[usage_pause]\nthreshold_percent = 95\n`,

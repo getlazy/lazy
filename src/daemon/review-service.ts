@@ -743,7 +743,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
 
     async promoteConversation(
       sessionId: string,
-      options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string },
+      options: { from?: number; to?: number; goal?: string; prompt?: string; code?: string; parent?: string; actor?: ActorInput },
     ) {
       const storage = await getOrCreateStorage();
       const code = options.code?.trim() || undefined;
@@ -764,7 +764,7 @@ export function createReviewActions(projectRoot: string): ReviewActions {
         ...(options.prompt?.trim() ? { prompt: options.prompt.trim() } : {}),
         ...(code ? { code } : {}),
         ...(options.parent?.trim() ? { parent: options.parent.trim() } : {}),
-        actor: 'human',
+        actor: options.actor ?? HUMAN_DECIDER,
       });
     },
 

@@ -41,7 +41,7 @@ A strip of tabs sits under the header. Counts appear on a tab when there is some
 | **Regions** | The change carved into units of work, each with its own files and owner. |
 | **Changes** | The diff the task's branch carries, and the conversation about it. |
 | **Verify** | The agent's verification steps for its latest turn, each with a Verified tick. |
-| **Turns** | Everything that happened, grouped by review chunk. |
+| **Turns** | The conversation: each message and the agent's reply, with lazy's own turns folded away; **All turns** shows every review chunk. See [the conversation view](#the-conversation-view). |
 | **Commits** | What the task's branch recorded, newest first. |
 | **Comments** | Notes to the agent, saved now and delivered with the next feedback. |
 | **Journal** | The rationale, decisions and deferred items the agent recorded. |
@@ -55,6 +55,16 @@ A strip of tabs sits under the header. Counts appear on a tab when there is some
 | **More** | The prompt, details, diagnostics and the less common things to do with the task. |
 
 The **?** button at the right end of the strip opens the keyboard shortcut legend.
+
+## The conversation view
+
+**Turns** opens on the conversation, newest exchange first: each message from a person, then the agent's reply to it. The turns lazy adds in between (nudges, self-review, wrap-up, syncs) are folded into one line that you can open, and **Raw turns of this exchange** lists every turn. **All turns** switches to the full list of review chunks. **Current review** shows the agent's reply where you asked.
+
+![The Turns tab as a conversation, with a folded line of mechanical turns](../../images/teams/teams-task-turns.png)
+
+On a phone the same view stacks in one column.
+
+![The conversation view on a phone](../../images/teams/teams-task-turns-phone.png)
 
 ## Action area
 

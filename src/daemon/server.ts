@@ -52,6 +52,7 @@ import { primeTaskEnvSeedRedaction } from './task-env-seed';
 import { initTracing, shutdownTracing } from '../tracing';
 import { daemonRouteTemplate, withRequestSpan } from './request-span';
 import { authorizeMcpCall, handleMcpToolCall, httpStatusForError, parseMcpToolCallBody } from './mcp-routes';
+import { RpcError } from './rpc-error';
 import { resolveRpcActor, rpcAuthErrorMessage, describeActor } from './rpc-auth';
 import type { ActorIdentity } from './actor-tokens';
 import { lookupDaemonTokenLabel } from './actor-tokens';
@@ -64,9 +65,13 @@ import { acceptRemedyOf } from '../types';
  * the message so the client does not have to pattern-match prose to learn what
  * the human should do next. Everything else is unchanged: `{ error }`.
  */
-function errorBody(err: unknown, message: string): { error: string; remedy?: unknown } {
+function errorBody(err: unknown, message: string): { error: string; remedy?: unknown; code?: string; details?: Record<string, unknown> } {
   const remedy = acceptRemedyOf(err);
-  return remedy ? { error: message, remedy } : { error: message };
+  if (remedy) return { error: message, remedy };
+  // A refusal with structured details (a run's dirty checkout) carries them,
+  // and its code, so the client never parses the message for them.
+  if (err instanceof RpcError && err.details) return { error: message, ...(err.code ? { code: err.code } : {}), details: err.details };
+  return { error: message };
 }
 import { clearAllWaits } from './wait-registry';
 import { clearAllProgress } from './progress-registry';
@@ -108,6 +113,7 @@ import { revokeLeftoverMemberTerminalCredentials } from '../server/member-exec-c
 import { sweepLeftoverMemberEnvironments } from './member-leftovers';
 import { createActionRunUpgrader } from '../server/action-ws';
 import { createSessionAttachUpgrader } from '../server/session-attach-ws';
+import { createRunActions } from './run-actions-service';
 import { multiMemberDaemon } from './session-attach';
 import { composeUpgraders } from '../server/ws';
 import { createServeProxy, createServeProxyUpgrader, type ServeProxyDeps } from '../server/serve-proxy';
@@ -765,6 +771,20 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       `Their credentials are still revoked below; run \`lazy doctor\` and restart the daemon.`,
     );
   }
+  // Commit runs' containers (./commit-run-container.ts) left by the previous
+  // daemon: stopped like task containers are at a restart. A run's record and
+  // checkout stay; its next Run services starts a fresh container.
+  try {
+    const runnerType = (await loadConfig(projectRoot)).runner.type;
+    if (runnerType === 'docker' || runnerType === 'podman') {
+      const { removeRunContainers } = await import('./commit-run-container');
+      const swept = await removeRunContainers(projectRoot, runnerType);
+      if (swept.removed > 0) logger.info(`Removed ${swept.removed} run container(s) left by the previous daemon.`);
+      for (const f of swept.failed) logger.warn(`Could not remove run container ${f.name} left by the previous daemon: ${f.error}`);
+    }
+  } catch (err) {
+    logger.warn(`Could not look for run containers left by the previous daemon: ${err instanceof Error ? err.message : String(err)}`);
+  }
   try {
     const leftover = await revokeLeftoverMemberTerminalCredentials(projectRoot);
     if (leftover.bindings + leftover.grants > 0) {
@@ -1162,6 +1182,8 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         bindHost: boundBindHost,
         // string when the dashboard is on; null when managed mode has it off.
         // Callers must not invent a URL from bindHost+webPort when this is null.
+        // Explicit, so a client never has to guess why dashboardUrl is null.
+        managed: isManagedMode(),
         dashboardUrl: isManagedMode()
           ? null
           : (boundWebPort
@@ -2544,6 +2566,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       doctorActions: createDoctorActions(projectRoot),
       taskActions: createTaskEditActions(projectRoot),
       serveActions: createServeActions(projectRoot),
+      runActions: createRunActions(projectRoot),
       usagePauseState: () => describeUsagePauseState(projectRoot, storage, undefined, undefined, undefined, { pausedTasks: true }),
       tokenBudget: async () => (await import('./token-budget')).describeProjectTokenBudget(projectRoot, storage),
     });
@@ -2719,6 +2742,25 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // log and continue — don't block daemon shutdown.
       const msg = err instanceof Error ? err.message : String(err);
       logger.warn(`Could not enumerate supervisors for ${projectRoot}: ${msg}`);
+    }
+
+    // Commit runs' containers (./commit-run-container.ts) go down with the
+    // daemon, as task containers do; found by label, never by the `lazy-`
+    // prefix the loop above stops. Bounded: this is inside the shutdown budget.
+    try {
+      const runnerType = (await loadConfig(projectRoot)).runner.type;
+      if (runnerType === 'docker' || runnerType === 'podman') {
+        const { removeRunContainers } = await import('./commit-run-container');
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const swept = await Promise.race([
+          removeRunContainers(projectRoot, runnerType),
+          new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 10_000); }),
+        ]).finally(() => clearTimeout(timer));
+        if (swept === null) logger.warn('Shutdown: removing run containers did not finish in 10s; the next daemon start removes what is left.');
+        else for (const f of swept.failed) logger.warn(`Shutdown: could not remove run container ${f.name}: ${f.error}`);
+      }
+    } catch (err) {
+      logger.warn(`Shutdown: could not look for run containers: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     stopReconcileLoop();

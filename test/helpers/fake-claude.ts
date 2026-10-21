@@ -89,6 +89,24 @@ export type ClaudeStep =
    * roll to.
    */
   | { kind: 'session-jsonl'; sessionId: string; userText: string; assistantText: string }
+  /**
+   * Act as Claude Code's MCP CLIENT for the server named in the `--mcp-config`
+   * file this invocation was launched with: spawn it exactly as Claude Code
+   * would (its command, args and env over this process's env), initialize, list
+   * its tools and make each call in order. Writes `McpCallRecord` into the
+   * state dir under `recordFile` — the config file and every `--daemon-config`
+   * file its server names, as read DURING the session (with their modes), the
+   * advertised tool names, and each call's result.
+   */
+  | {
+      kind: 'mcp-call';
+      recordFile: string;
+      calls: Array<{ tool: string; arguments?: Record<string, unknown> }>;
+      /** Server key in `mcpServers` (default `lazy`). */
+      server?: string;
+      /** Per-request timeout (default 60s). */
+      timeoutMs?: number;
+    }
   /** Stop ignoring nothing and exit immediately with this code. */
   | { kind: 'exit'; code: number }
   /**
@@ -98,6 +116,18 @@ export type ClaudeStep =
    * enforcement; deliberately scriptable so enforcement-failure suites omit it.
    */
   | { kind: 'declare-presentation' };
+
+/** What an `mcp-call` step writes into the fake's state dir. */
+export interface McpCallRecord {
+  argv: string[];
+  /** Every config file the session was handed, keyed by path: content as read mid-session, and its permission bits. */
+  files: Record<string, { mode: number; content: string }>;
+  /** The `--mcp-config` path. */
+  mcpConfigPath: string;
+  /** Tool names the server advertised in `tools/list`. */
+  tools: string[];
+  results: Array<{ tool: string; isError: boolean; text: string }>;
+}
 
 export interface ClaudeScenario {
   steps: ClaudeStep[];
@@ -635,6 +665,82 @@ function writeSessionJsonl(step) {
   fs.appendFileSync(file, lines.join('\n') + '\n');
 }
 
+// Claude Code's MCP client side, reduced to what a test needs: newline-delimited
+// JSON-RPC over the server's stdio, one request in flight at a time.
+async function runMcpCall(step) {
+  const { spawn } = require('node:child_process');
+  const at = argv.indexOf('--mcp-config');
+  if (at === -1 || at + 1 >= argv.length) throw new Error(FAKE_LABEL + ': mcp-call needs --mcp-config in argv');
+  const mcpConfigPath = argv[at + 1];
+  const files = {};
+  const readTracked = (file) => {
+    const content = fs.readFileSync(file, 'utf-8');
+    files[file] = { mode: fs.statSync(file).mode & 0o777, content };
+    return content;
+  };
+  const config = JSON.parse(readTracked(mcpConfigPath));
+  const server = (config.mcpServers || {})[step.server || 'lazy'];
+  if (!server) throw new Error(FAKE_LABEL + ': no server ' + (step.server || 'lazy') + ' in ' + mcpConfigPath);
+  const serverArgs = server.args || [];
+  const dc = serverArgs.indexOf('--daemon-config');
+  if (dc !== -1 && dc + 1 < serverArgs.length) readTracked(serverArgs[dc + 1]);
+
+  const child = spawn(server.command, serverArgs, {
+    env: { ...process.env, ...(server.env || {}) },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  let buffer = '';
+  const waiting = new Map();
+  child.stdout.on('data', (d) => {
+    buffer += d;
+    let nl;
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch (err) { continue; }
+      const done = waiting.get(msg.id);
+      if (done) { waiting.delete(msg.id); done(msg); }
+    }
+  });
+  let nextId = 0;
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = ++nextId;
+    const timer = setTimeout(
+      () => reject(new Error(FAKE_LABEL + ': MCP ' + method + ' timed out; server stderr:\n' + stderr)),
+      step.timeoutMs || 60000,
+    );
+    waiting.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  });
+  try {
+    await request('initialize', {});
+    const listed = await request('tools/list', {});
+    const tools = ((listed.result && listed.result.tools) || []).map((t) => t.name);
+    const results = [];
+    for (const call of step.calls) {
+      const res = await request('tools/call', { name: call.tool, arguments: call.arguments || {} });
+      results.push(res.error
+        ? { tool: call.tool, isError: true, text: JSON.stringify(res.error) }
+        : {
+            tool: call.tool,
+            isError: !!(res.result && res.result.isError),
+            text: ((res.result && res.result.content) || []).map((c) => c.text).join('\n'),
+          });
+    }
+    fs.writeFileSync(
+      path.join(stateDir, step.recordFile),
+      JSON.stringify({ argv, files, mcpConfigPath, tools, results }, null, 2),
+    );
+  } finally {
+    child.stdin.end();
+    child.kill('SIGTERM');
+  }
+}
+
 // The step kinds only Claude Code understands. Returning false hands an unknown
 // kind back to the shared runtime, which fails loudly.
 async function runAgentStep(step) {
@@ -653,6 +759,9 @@ async function runAgentStep(step) {
       return true;
     case 'session-jsonl':
       writeSessionJsonl(step);
+      return true;
+    case 'mcp-call':
+      await runMcpCall(step);
       return true;
     default:
       return false;

@@ -188,6 +188,8 @@ import { classifyHubChildren } from '../task-diff-base';
 import { MAX_PORT_ATTEMPTS } from '../config/constants';
 import { DAEMON_IDLE_TIMEOUT_S, WEB_REQUEST_DEADLINE_MS } from '../daemon/heartbeat';
 import { RpcError } from '../daemon/rpc-error';
+import { handleRunsRoute } from './runs-routes';
+import type { RunActions } from './run-actions';
 import { stoppableClaimOf } from '../daemon/in-flight-turn';
 import { turnText } from '../utils/turn-content';
 import type { FileViolation } from '../types';
@@ -885,6 +887,10 @@ function artifactNoticeFrom(url: URL): { text: string; error?: boolean } | null 
   if (ok) return { text: `Uploaded ${ok}. The agent will find it in .lazy-task-sandbox/artifacts/ on its next turn.` };
   const err = url.searchParams.get('upload_error');
   if (err) return { text: `Upload failed: ${err}`, error: true };
+  const removed = url.searchParams.get('removed');
+  if (removed) return { text: `Removed ${removed} from this task.` };
+  const removeError = url.searchParams.get('remove_error');
+  if (removeError) return { text: `Removal failed: ${removeError}`, error: true };
   return null;
 }
 
@@ -957,6 +963,25 @@ async function handleArtifactUpload(storage: Storage, req: Request, url: URL, ta
       logger.error(`web: could not attach artifact on task ${task.id.slice(0, 8)}: ${message}`);
     }
     return redirect('upload_error', message);
+  }
+}
+
+async function handleArtifactRemove(storage: Storage, req: Request, url: URL, taskIdParam: string): Promise<Response> {
+  if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
+  const task = (await storage.resolveTask(taskIdParam)).task;
+  if (!task) return html(errorHtml('Not Found', `Task not found: ${taskIdParam}`), 404);
+  const back = await taskPageUrl(storage, url.origin, task, '/artifacts');
+  const redirect = (key: string, value: string) => {
+    const target = new URL(back);
+    target.searchParams.set(key, value);
+    return Response.redirect(target.toString(), 303);
+  };
+  try {
+    const name = normalizeArtifactName(String((await req.formData()).get('name') ?? ''));
+    if (!await storage.deleteTaskArtifact(task.id, name)) return redirect('remove_error', `artifact not found: ${name}`);
+    return redirect('removed', name);
+  } catch (err) {
+    return redirect('remove_error', err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -1455,6 +1480,8 @@ async function handleTaskDetail(
   // Default newest-first; `?chunks=oldest` restores chronological chunk order.
   // Not a setting — just a query-string escape hatch for the old order.
   const chunkOrder = url.searchParams.get('chunks') === 'oldest' ? 'oldest' : 'newest';
+  // The Turns tab reads as a conversation; `?view=chunks` shows the raw chunks.
+  const turnsView = url.searchParams.get('view') === 'chunks' ? 'chunks' : 'conversation';
 
   // Fragment shape, resolved before any of the expensive per-tab loads below.
   // `body=0` is the live island asking for header + strip alone: it wants the
@@ -1766,6 +1793,7 @@ async function handleTaskDetail(
       baseBranch,
       serve,
       chunkOrder,
+      turnsView,
       shell,
       controls,
       activity,
@@ -2823,9 +2851,9 @@ async function handleCommitDetail(storage: Storage, taskId: string, commitId: st
   }
 
   // First-parent patch from git on demand, the same answer as the commitPatch RPC.
-  const { patch: diffText } = await getCommitPatch(commit.sha);
+  const { patch: diffText, message, missing } = await getCommitPatch(commit.sha);
 
-  return html(commitDetailHtml(task, commit, diffText, duplicateTaskCodes(await storage.listTaskCodes())));
+  return html(commitDetailHtml(task, missing ? commit : { ...commit, message }, diffText, duplicateTaskCodes(await storage.listTaskCodes())));
 }
 
 /**
@@ -3132,6 +3160,8 @@ export function createWebRequestHandler(
     taskActions?: TaskActions;
     /** Designate `[serve] start_services_cmd` on the project root's lazy.toml. */
     serveActions?: ServeActions;
+    /** Commit runs — the `/runs` pages (./runs-routes.ts). */
+    runActions?: RunActions;
     /** The daemon's [usage_pause] state, for the dashboard's status line. */
     usagePauseState?: () => Promise<UsagePauseState>;
     /** The daemon's token-budget view, for the dashboard's budget box. */
@@ -3148,6 +3178,7 @@ export function createWebRequestHandler(
   const serveActions = options?.serveActions;
   const usagePauseState = options?.usagePauseState;
   const tokenBudget = options?.tokenBudget;
+  const runActions = options?.runActions;
   return async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -3168,6 +3199,7 @@ export function createWebRequestHandler(
         cssFromDisk,
         usagePauseState,
         tokenBudget,
+        runActions,
       ),
       deadlineMs,
     );
@@ -3238,6 +3270,7 @@ async function routeWebRequest(
   cssFromDisk: boolean,
   usagePauseState?: () => Promise<UsagePauseState>,
   tokenBudget?: () => Promise<TokenBudgetView>,
+  runActions?: RunActions,
 ): Promise<Response> {
   try {
     if (path === STYLESHEET_PATH) {
@@ -3360,6 +3393,12 @@ async function routeWebRequest(
       return await handleTaskList(storage, url);
     }
 
+    // Commit runs — the product at one commit, without a task. Everything
+    // goes through the RunActions port, i.e. the daemon's commit-run code.
+    if (path === '/runs' || path.startsWith('/runs/')) {
+      return await handleRunsRoute(runActions, req, url, path);
+    }
+
     // New-task and Link forms. Must be before /tasks/:id so "new" / "link"
     // are not treated as task ids — which is also why no task may CARRY those
     // codes: the segments are listed once in RESERVED_TASK_PATH_SEGMENTS, which
@@ -3455,6 +3494,8 @@ async function routeWebRequest(
     if (params) {
       return await handleArtifactUpload(storage, req, url, params.id);
     }
+    params = matchRoute(path, '/tasks/:id/artifacts/remove');
+    if (params) return await handleArtifactRemove(storage, req, url, params.id);
 
     // Edit a comment the agent has not seen yet (POST-only), same ordering reason.
     params = matchRoute(path, '/tasks/:id/comments/:commentId/edit');

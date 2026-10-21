@@ -2,7 +2,8 @@ import { describe, test, expect } from 'bun:test';
 import { resolveSessionAttachTarget, taskModeRefusals } from '../../src/daemon/session-attach';
 import { createSessionAttachUpgrader } from '../../src/server/session-attach-ws';
 import { resetMemberTerminalsForTests, markMemberTerminalEntered } from '../../src/server/member-terminals';
-import type { BuilderSession } from '../../src/storage/types';
+import type { BuilderSession, CommitRun } from '../../src/storage/types';
+import { runContainerName } from '../../src/run/identity';
 import type { Session, Task } from '../../src/types';
 import type { Storage } from '../../src/storage';
 import type { Server } from 'bun';
@@ -53,7 +54,12 @@ const TASK_SESSION = { id: 'sess-task-1', task_id: 'task-1', container_name: nul
 
 const STALE_TASK_SESSION = { ...TASK_SESSION, id: 'sess-task-1-old', container_name: 'lazy-run-some-task-old' } as unknown as Session;
 
-function fakeStorage(): Pick<Storage, 'getBuilderSession' | 'getSession' | 'getTask' | 'getSessionByTaskId' | 'getSessionTurns'> {
+const RUN = {
+  id: 'run-1', slug: 'main', target: { kind: 'branch', branch: 'main' }, head_sha: 'a'.repeat(40),
+  image_choice: null, created_at: '', created_by: null, updated_at: '', last_pulled_at: null, last_pulled_by: null,
+} as CommitRun;
+
+function fakeStorage(): Pick<Storage, 'getBuilderSession' | 'getSession' | 'getTask' | 'getSessionByTaskId' | 'getSessionTurns' | 'getCommitRun'> {
   const rows = new Map([ALICE, BOB, TAMPERED, OTHER_PROJECT].map((r) => [r.id, r]));
   return {
     getBuilderSession: async (id: string) => rows.get(id) ?? null,
@@ -62,6 +68,7 @@ function fakeStorage(): Pick<Storage, 'getBuilderSession' | 'getSession' | 'getT
     getSessionByTaskId: async (taskId: string) => (taskId === TASK.id ? TASK_SESSION : null),
     getTask: async (id: string) => (id === TASK.id ? TASK : null),
     getSessionTurns: async (id: string) => (id === TASK_SESSION.id ? [{ sequence: 1 }] : []),
+    getCommitRun: async (id: string) => (id === RUN.id ? RUN : null),
   } as never;
 }
 
@@ -246,6 +253,23 @@ describe('resolveSessionAttachTarget (attach exec target)', () => {
     const r = await resolve('sess-task-1-old', null, false);
     expect(r).toMatchObject({ ok: false, status: 409 });
     if (!r.ok) expect(r.message).toContain('sess-task-1');
+  });
+
+  // INVARIANT: a commit run's terminal reaches exactly the container named from
+  // the run's own record — never one a client names. A run's container holds no
+  // credential, so it is entered directly (shell only) by any caller.
+  test("a run's session reaches the run's own container, for a member or a control token", async () => {
+    for (const caller of ['alice@example.com', null]) {
+      const r = await resolve('run:run-1', caller);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.target.kind).toBe('run');
+        expect(r.target.container).toBe(runContainerName(ROOT, 'main'));
+      }
+    }
+    const missing = await resolve('run:no-such-run', 'alice@example.com');
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.status).toBe(404);
   });
 
   test("locally, a task session resolves to the task's own container, as the web shell derives it", async () => {

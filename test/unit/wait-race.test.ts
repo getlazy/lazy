@@ -24,8 +24,6 @@ interface FakeTaskSpec {
   finishesAtPoll?: number;
   becomes?: string;
   hasSession?: boolean;
-  /** Poll sweep at which an agent turn is appended (without a status change). */
-  agentTurnAtPoll?: number;
 }
 
 /**
@@ -34,12 +32,10 @@ interface FakeTaskSpec {
  */
 function makeStorage(specs: FakeTaskSpec[]) {
   const polls = new Map<string, number>();
-  const turnCounts = new Map<string, number>();
   const byId = new Map<string, FakeTaskSpec>();
   for (const spec of specs) {
     byId.set(spec.id, spec);
     polls.set(spec.id, 0);
-    turnCounts.set(spec.id, 1);
   }
 
   const task = (spec: FakeTaskSpec, status: string): Task =>
@@ -66,9 +62,6 @@ function makeStorage(specs: FakeTaskSpec[]) {
       // Count the sweep BEFORE reading status, so finishesAtPoll: 1 means
       // "already finished by the first poll sweep".
       polls.set(id, (polls.get(id) ?? 0) + 1);
-      if (spec.agentTurnAtPoll !== undefined && polls.get(id)! >= spec.agentTurnAtPoll) {
-        turnCounts.set(id, 2);
-      }
       return task(spec, statusFor(spec));
     },
     async getSessionByTaskId(id: string) {
@@ -76,20 +69,8 @@ function makeStorage(specs: FakeTaskSpec[]) {
       if (!spec || spec.hasSession === false) return null;
       return { id: `sess-${id}` };
     },
-    async getTurnCountByTaskId(id: string) {
-      return turnCounts.get(id) ?? 1;
-    },
     async getStatusHistory(id: string) {
       return [{ timestamp: 1, actor: id.startsWith('agentmade') ? 'agent' : 'human' }];
-    },
-    async getSessionTurns(sessionId: string) {
-      const id = sessionId.replace(/^sess-/, '');
-      const count = turnCounts.get(id) ?? 1;
-      return Array.from({ length: count }, (_, i) => ({
-        sequence: i + 1,
-        role: i === count - 1 && count > 1 ? 'agent' : 'human',
-        timestamp: 1000 + i,
-      }));
     },
   };
 
@@ -156,19 +137,19 @@ describe('raceWait', () => {
     expect(result.pending.map(t => t.display_id)).toEqual(['a']);
   });
 
-  test('a new agent turn wins even while the task stays working', async () => {
+  // INVARIANT: an agent turn on a still-`working` task never settles a wait. The
+  // reconciler records the turn BEFORE it parks the task, so returning on the
+  // turn reported "now working" (exit 1) to a caller that had just started it.
+  test('a task that stays working is not settled until its status changes', async () => {
     const storage = makeStorage([
-      { id: 'aaaa1111', code: 'a', status: 'working', agentTurnAtPoll: 2 },
-      { id: 'bbbb2222', code: 'b', status: 'working' },
+      { id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 5, becomes: 'blocked' },
     ]);
 
-    const result = await raceWait(storage, ['a', 'b'], FAST);
+    const result = await raceWait(storage, ['a'], FAST);
 
-    expect(result.task_id).toBe('aaaa1111');
-    expect(result.status).toBe('working');
-    expect(result.turn_count).toBe(2);
-    expect(result.latest_turn?.role).toBe('agent');
+    expect(result.status).toBe('blocked');
     expect(result.timed_out).toBe(false);
+    expect(storage.getTaskCalls.length).toBeGreaterThanOrEqual(5);
   });
 
   test('duplicate references are deduped to one poll target', async () => {

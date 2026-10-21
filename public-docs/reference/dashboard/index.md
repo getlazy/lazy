@@ -28,6 +28,7 @@ The navigation bar runs across the top of every page. Each of its entries is doc
 |---|---|---|
 | [Dashboard](overview.md) | **Dashboard**, `/` | Counts, activity, usage, and the tasks that need you. |
 | [Tasks](tasks.md) | **Tasks**, `/tasks` | The task list, with the New task and Link forms. |
+| [Runs](../../running-a-commit.md) | **Runs**, `/runs` | Run the product at any commit. |
 | [Task page](task.md) | `/tasks/<code>` | One task: header, actions and tabs. |
 | [Review queue](review-queue.md) | **Review**, `/review` | Tasks waiting for a human decision. |
 | [Raised items](raised.md) | **Raised**, `/raised` | Questions and proposals agents raised, across all tasks. |

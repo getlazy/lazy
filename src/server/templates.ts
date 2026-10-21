@@ -56,7 +56,8 @@ import {
   commandPaletteScript,
   searchResultHref,
 } from './command-palette';
-import { foldRecordIntoChunks, type FoldedItem, type TurnFoldExtras } from './turn-fold';
+import { foldRecordIntoChunks, type FoldedChunk, type FoldedItem, type TurnFoldExtras } from './turn-fold';
+import { buildConversation, type ConversationExchange } from '../task/conversation';
 import { isChunkBoundary, type TurnChunk } from '../utils/turn-chunks';
 import { attributeCommitsToTurns, isAgentWorkTurn } from './turn-commits';
 import { turnText } from '../utils/turn-content';
@@ -369,6 +370,7 @@ export function layoutOpenHtml(title: string, options?: { headExtraHtml?: string
     <a href="/">Dashboard</a>
     <a href="/clusters">Clusters<span class="nav-badge" id="nav-clusters"></span></a>
     <a href="/tasks">Tasks</a>
+    <a href="/runs">Runs</a>
     <a href="/review">Review<span class="nav-badge" id="nav-review"></span></a>
     <a href="/raised">Raised<span class="nav-badge" id="nav-raised"></span></a>
     <a href="/builders">Builders<span class="nav-badge" id="nav-conversations"></span></a>
@@ -696,6 +698,9 @@ export function serveDetailRow(serve?: TaskServeState | null): string {
  * reachable via `?chunks=oldest` — a cheap toggle, not a setting.
  */
 export type TaskChunkOrder = 'newest' | 'oldest';
+
+/** How the Turns tab reads: person -> reply exchanges (default), or raw chunks. */
+export type TaskTurnsView = 'conversation' | 'chunks';
 
 /**
  * The lifecycle action row on /tasks/:id.
@@ -1223,10 +1228,13 @@ export function taskTurnsSectionHtml(
     commits?: Commit[];
     /** Codes shared by more than one task — this tab's task links fall back to the id for those. */
     duplicatedCodes?: ReadonlySet<string>;
+    /** Conversation (person -> reply, mechanical folded) or raw chunks. Default chunks. */
+    view?: TaskTurnsView;
   },
   markdown?: RenderMarkdownOptions,
 ): string {
   const dups = extras?.duplicatedCodes;
+  const view = extras?.view ?? 'chunks';
   const commits = extras?.commits ?? [];
   const folded = foldRecordIntoChunks(turns, {
     comments: extras?.comments,
@@ -1243,7 +1251,13 @@ export function taskTurnsSectionHtml(
   const newest = chunkOrder !== 'oldest';
   const display = newest ? [...folded].reverse() : folded;
   const turnIndex = turnIndexOf(turns);
+  const renderItem = (item: FoldedItem) =>
+    foldedItemHtml(task, session, item, turnIndex, markdown, commitsByTurn, dups);
+  const exchanges = view === 'conversation' ? buildConversation(turns) : [];
+  const exchangeByChunk = new Map(exchanges.map((ex) => [ex.chunk_index, ex]));
   const chunkItems = display.map((group) => {
+    const ex = group.chunk ? exchangeByChunk.get(group.chunk.index) : undefined;
+    if (ex) return exchangeCardHtml(group, ex, renderItem, `${taskPath(task, dups)}/turns?view=chunks#chunk-${chunkNumber(group.chunk!)}`);
     const chunk = group.chunk;
     const items = newest ? [...group.items].reverse() : group.items;
     const body = items
@@ -1302,9 +1316,20 @@ export function taskTurnsSectionHtml(
     });
   }).join('');
 
-  const orderToggle = chunkOrder === 'oldest'
-    ? `<a class="chunk-order-toggle" href="${taskPath(task, dups)}/turns">Newest first</a>`
-    : `<a class="chunk-order-toggle" href="${taskPath(task, dups)}/turns?chunks=oldest">Oldest first</a>`;
+  const viewQs = view === 'chunks' && extras?.view ? 'view=chunks' : '';
+  const qsHtml = (...parts: string[]) => {
+    const kept = parts.filter(Boolean);
+    return kept.length ? `?${kept.join('&')}` : '';
+  };
+  const orderToggleHtml = (chunkOrder === 'oldest'
+    ? `<a class="chunk-order-toggle" href="${taskPath(task, dups)}/turns${qsHtml(viewQs)}">Newest first</a>`
+    : `<a class="chunk-order-toggle" href="${taskPath(task, dups)}/turns${qsHtml(viewQs, 'chunks=oldest')}">Oldest first</a>`) +
+    // Conversation is what you see; the raw chunks are one click away.
+    (extras?.view
+      ? (view === 'conversation'
+        ? ` <a class="turns-view-toggle" id="turns-view-toggle" href="${taskPath(task, dups)}/turns${qsHtml('view=chunks', chunkOrder === 'oldest' ? 'chunks=oldest' : '')}">All turns</a>`
+        : ` <a class="turns-view-toggle" id="turns-view-toggle" href="${taskPath(task, dups)}/turns${qsHtml(chunkOrder === 'oldest' ? 'chunks=oldest' : '')}">Conversation</a>`)
+      : '');
 
   const realChunks = folded.filter((g) => g.chunk !== null).length;
   const heading = turns.length === 0
@@ -1312,7 +1337,9 @@ export function taskTurnsSectionHtml(
     : `<h2>Turns (${turns.length} in ${realChunks} chunk${realChunks === 1 ? '' : 's'})</h2>`;
   // The grouping rule is not visible from the headers ("Chunk 2 · #6 [human]").
   // One line, in the page, so a reader knows why turns are bunched this way.
-  const chunkExplain = turns.length > 0
+  const chunkExplain = turns.length > 0 && view === 'conversation'
+    ? `<p class="turns-chunk-explain">Each message from a person, then the agent's reply to it. Lazy's own turns with the agent in between — nudges, wrap-up, self-review, syncs — are folded into one line you can open.</p>`
+    : turns.length > 0
     ? `<p class="turns-chunk-explain">A chunk is what happened since you last acted — your turn and every agent turn that followed, until you acted again. Review one chunk at a time: the tick, and <kbd>j</kbd>/<kbd>k</kbd>, move by chunk.</p>`
     : '';
 
@@ -1320,7 +1347,7 @@ export function taskTurnsSectionHtml(
       <div class="detail-section">
         <div class="turns-heading">
           ${heading}
-          ${turns.length > 0 ? orderToggle : ''}
+          ${turns.length > 0 ? orderToggleHtml : ''}
         </div>
         ${chunkExplain}
         ${chunkItems}
@@ -2204,7 +2231,7 @@ export function commitDetailHtml(
     <h1>Commit ${escapeHtml(commit.sha.substring(0, 8))}</h1>
     <div class="detail-section">
       <div class="detail-row"><span class="detail-label">SHA</span><span>${escapeHtml(commit.sha)}</span></div>
-      <div class="detail-row"><span class="detail-label">Message</span><span>${escapeHtml(commit.message)}</span></div>
+      <div class="detail-row"><span class="detail-label">Message</span><pre class="commit-message-full">${escapeHtml(commit.message)}</pre></div>
       <div class="detail-row"><span class="detail-label">Status</span><span>${statusBadge(commit.status)}</span></div>
       <div class="detail-row"><span class="detail-label">Time</span><span>${escapeHtml(formatDate(commit.timestamp))}</span></div>
     </div>
@@ -2934,4 +2961,86 @@ export function errorHtml(title: string, message: string): string {
     <p>${escapeHtml(message)}</p>
     <p><a href="/">Back to dashboard</a></p>
   `);
+}
+
+/**
+ * One exchange of the conversation view: the person's message (and any notes
+ * written during it), lazy's mechanical turns folded into one closed drawer
+ * labelled by the daemon's rule, then the agent's reply. Chronological inside,
+ * whatever the chunk order. The card keeps the chunk's id, so chunk links land.
+ */
+function exchangeCardHtml(
+  group: FoldedChunk,
+  ex: ConversationExchange,
+  renderItem: (item: FoldedItem) => string,
+  rawHref: string,
+): string {
+  const chunk = group.chunk!;
+  const n = chunkNumber(chunk);
+  const turnItem = (seq: number | null) =>
+    seq === null ? undefined : group.items.find((i) => i.kind === 'turn' && i.turn.sequence === seq);
+  const prompt = turnItem(ex.prompt_sequence);
+  const reply = turnItem(ex.reply_sequence);
+  const mechanicalSeqs = new Set(ex.mechanical.map((m) => m.sequence));
+  // A comment handed to the running turn and the agent's answer: a person's
+  // message, so it is shown open, in order — never in the mechanical drawer.
+  const itemsHtml = (list: FoldedItem[]): string => list.map(renderItem).join('');
+  const followUps = ex.follow_ups
+    .map((f) => [turnItem(f.prompt_sequence), turnItem(f.reply_sequence)].filter((i): i is FoldedItem => !!i))
+    .map((items) => `<div class="conversation-follow-up" data-follow-up>${itemsHtml(items)}</div>`)
+    .join('');
+  const notes = group.items.filter((i) => i.kind !== 'turn');
+  const mechanical = group.items.filter((i) => i.kind === 'turn' && mechanicalSeqs.has(i.turn.sequence));
+  const intent = chunk.boundary ? chunkIntentLine(chunk.boundary) : '';
+  const body =
+    (prompt ? renderItem(prompt) : '') +
+    notes.map(renderItem).join('') +
+    followUps +
+    (mechanical.length > 0
+      ? `<details class="conversation-mechanical" data-mechanical><summary>${escapeHtml(ex.mechanical_label ?? '')}</summary>${itemsHtml(mechanical)}</details>`
+      : '') +
+    (reply
+      ? `<div class="conversation-reply" data-reply>${itemsHtml([reply])}</div>`
+      : '<p class="rv-hint" data-awaiting-reply>No reply from the agent yet.</p>') +
+    `<p class="rv-hint"><a href="${escapeHtml(rawHref)}">Raw turns of this exchange</a></p>`;
+  const content = group.items
+    .map((item) => (item.kind === 'turn'
+      ? turnText(item.turn)
+      : item.kind === 'comment' ? item.comment.content : item.journal.content))
+    .join('\n---\n');
+  return viewedCardHtml({
+    key: `chunk:${n}`,
+    content,
+    id: `chunk-${n}`,
+    headHtml:
+      `<span class="turn-chunk-header">Chunk ${n} · ${timestampHtml(chunk.turns[0]!.timestamp)}${ex.mechanical_label ? ` · ${escapeHtml(ex.mechanical_label)}` : ''}</span>` +
+      (intent ? `<span class="turn-chunk-intent">${escapeHtml(intent)}</span>` : ''),
+    bodyHtml: body,
+    sectionClass: 'turn-chunk turn-exchange',
+    bodyClass: 'turn-chunk-body',
+  });
+}
+
+/**
+ * Current review's "latest feedback and the reply": the newest exchange a
+ * person opened, rendered like the conversation view. Empty when nobody has
+ * acted yet.
+ */
+export function latestExchangeHtml(
+  task: Task,
+  session: Session | null,
+  turns: Turn[],
+  duplicatedCodes?: ReadonlySet<string>,
+  markdown?: RenderMarkdownOptions,
+): string {
+  const exchanges = buildConversation(turns).filter((ex) => ex.prompt_sequence !== null);
+  const ex = exchanges[exchanges.length - 1];
+  if (!ex) return '';
+  const group = foldRecordIntoChunks(turns).find((g) => g.chunk?.index === ex.chunk_index);
+  if (!group) return '';
+  const turnIndex = turnIndexOf(turns);
+  const card = exchangeCardHtml(group, ex,
+    (item) => foldedItemHtml(task, session, item, turnIndex, markdown, undefined, duplicatedCodes),
+    `${taskPath(task, duplicatedCodes)}/turns?view=chunks#chunk-${chunkNumber(group.chunk!)}`);
+  return `<div class="lz-latest-exchange" id="latest-exchange"><h2>Your latest feedback and the reply</h2>${card}</div>`;
 }

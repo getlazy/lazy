@@ -21,6 +21,7 @@ import { resolveProjectModel } from '../../daemon/project-settings';
 import { switchTaskAgent, formatAgentSwitchAnnouncement } from '../../daemon/agent-switch';
 import { maybeOfferWorktreeImageForTask } from '../../docker/worktree-image';
 import { queryEditTask } from '../../daemon/rpc-fallback';
+import { assertCodeFree } from '../../daemon/edit-task';
 
 /**
  * Check if setting parentId as the parent of taskId would create a cycle.
@@ -130,6 +131,16 @@ export async function commandEdit(args: string[]): Promise<void> {
       console.error(`(--runner and --agent are changeable on a started task too, but only on their own — not combined with a goal/prompt/type/code/parent edit.)`);
       console.error(`Use 'lazy comment ${displayId(t)} --message "..."' to add annotations instead.`);
       process.exit(1);
+    }
+
+    // Collision rule (shared with create), checked before any write below.
+    if (codeValue) {
+      try {
+        await assertCodeFree(storage, t, codeValue);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
     }
 
     // --- Review mode: changeable at ANY time, even after work begins ---
@@ -469,7 +480,7 @@ export function editUsage(): void {
 
 Edit a task's goal, prompt, model, type, code, parent, runner, effort, agent, or review mode. Interactive if no flags provided.
 Once an agent has worked on the task, only --model, --effort, --runner, --agent and the
---review* flags can still be changed; goal/prompt/type/parent edits are rejected. --code can still be
+--review* flags can still be changed; goal/prompt/type/parent edits are rejected. --code (refused when another live task already uses it) can still be
 changed on its own: the rename is cosmetic — the task's branch, worktree, container and any PR/MR keep
 their old names, while lookups, dashboard links and service hostnames use the new code. The --runner, --agent and
 --review overrides take effect on the next turn.

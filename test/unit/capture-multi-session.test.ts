@@ -18,7 +18,8 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'fs';
-import { mkdir, writeFile, utimes } from 'fs/promises';
+import { mkdir, writeFile, utimes, readdir } from 'fs/promises';
+import { conversationRecoveryDir, drainConversationRecovery } from '../../src/import/conversation-recovery';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -263,6 +264,36 @@ describe('multi-segment conversation capture', () => {
     expect(newest).toBe('seg-2');
     // existingStorage was provided → captureConversation must NOT close it.
     expect(isClosed()).toBe(false);
+  });
+
+  // INVARIANT: with no daemon (tryRemoteStorage → null under LAZY_TEST),
+  // captureConversation writes every non-empty owned segment to the recovery
+  // directory and still returns the resume target; the daemon's drain then
+  // stores them all. Before this, a pairing session ending with the daemon down
+  // lost its conversation.
+  test('captureConversation with no daemon writes recovery files the drain stores', async () => {
+    const before = await snapshotSessionFiles(repoRoot);
+    const p1 = await writeSessionFile(projectDir, 'seg-1', repoRoot, 'p1', 'r1');
+    const p2 = await writeSessionFile(projectDir, 'seg-2', repoRoot, 'p2', 'r2');
+    const empty = join(projectDir, 'seg-empty.jsonl');
+    await writeFile(empty, '');
+    await utimes(empty, new Date('2026-06-03T09:00:00Z'), new Date('2026-06-03T09:00:00Z'));
+    await utimes(p1, new Date('2026-06-03T10:00:00Z'), new Date('2026-06-03T10:00:00Z'));
+    await utimes(p2, new Date('2026-06-03T10:05:00Z'), new Date('2026-06-03T10:05:00Z'));
+
+    const newest = await captureConversation(repoRoot, before, 'Pairing');
+    expect(newest).toBe('seg-2');
+    const dir = await conversationRecoveryDir(repoRoot);
+    expect((await readdir(dir)).filter(n => n.endsWith('.json'))).toHaveLength(2);
+
+    const stored = new Map<string, StoredConversation>();
+    const storage = {
+      loadConversation: async (id: string) => stored.get(id) ?? null,
+      saveConversation: async (c: StoredConversation) => { stored.set(c.sessionId, c); },
+    } as unknown as Storage;
+    const result = await drainConversationRecovery(storage, repoRoot);
+    expect(result.recovered.sort()).toEqual(['seg-1', 'seg-2']);
+    expect(await readdir(dir)).toEqual([]);
   });
 
   test('discoverProjectSessionFiles reports stat info for change detection', async () => {

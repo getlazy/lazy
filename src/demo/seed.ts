@@ -18,6 +18,7 @@
 
 import type { DemoScript } from './agent';
 import { DEMO_CONFLICT_FILE, DEMO_PROTECTED_GLOB } from './fixture';
+import { seedPopulatedScreens } from './seed-screens';
 import { lazy, lazyTry, demoStorage, type LazyInvocation } from './runtime';
 
 /** How long the `working` task's agent holds its turn open. */
@@ -299,6 +300,8 @@ export async function seedDemoTasks(ctx: SeedContext): Promise<string[]> {
   await seedReviewConversation(ctx);
 
   await runToBlocked(ctx, 'demo-protected');
+
+  await seedPopulatedScreens(ctx);
 
   // Started, never waited on: the point is that it is still running.
   ctx.report('starting demo-working (left mid-turn on purpose)');

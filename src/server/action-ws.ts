@@ -21,12 +21,13 @@ import type { ProgressEvent } from '../daemon/progress';
 import type { AcceptRemedy } from '../types/accept-remedy';
 import type { WebSocketUpgrader, UpgradeOutcome } from './ws';
 import { decodePathSegment } from './task-urls';
-import { actionRunMatchesPath, getActionRun, subscribeActionRun, type ActionRunState } from './action-run';
+import { actionRunMatchesPath, getActionRun, subscribeActionRun, type ActionConfirm, type ActionRunState } from './action-run';
+import { runActionKey } from './run-urls';
 
 export type ActionRunServerMessage =
   | { type: 'progress'; event: ProgressEvent }
   | { type: 'done'; redirect: string }
-  | { type: 'failed'; error: string; remedy?: AcceptRemedy }
+  | { type: 'failed'; error: string; remedy?: AcceptRemedy; confirm?: ActionConfirm }
   | { type: 'error'; message: string };
 
 export function actionRunServerMessage(message: ActionRunServerMessage): string {
@@ -46,6 +47,8 @@ export interface ActionRunUpgraderDeps {
 }
 
 const ACTION_RUN_WS_PATH_RE = /^\/tasks\/([^/]+)\/action-runs\/([^/]+)\/ws$/;
+/** The same follow for an action on a commit run's page (`/runs/:id`, ./runs-page.ts). */
+const RUN_PAGE_ACTION_WS_PATH_RE = /^\/runs\/([^/]+)\/action-runs\/([^/]+)\/ws$/;
 
 function refusal(status: number, message: string): Response {
   return new Response(message, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
@@ -63,6 +66,7 @@ function framesFor(run: ActionRunState, alreadySent: number): ActionRunServerMes
       type: 'failed',
       error: run.error ?? 'The action failed.',
       ...(run.remedy ? { remedy: run.remedy } : {}),
+      ...(run.confirm ? { confirm: run.confirm } : {}),
     });
   }
   return out;
@@ -115,13 +119,27 @@ export function createActionRunUpgrader(deps: ActionRunUpgraderDeps): WebSocketU
 
     async tryUpgrade(req: Request, server: Server<unknown>): Promise<UpgradeOutcome> {
       const url = new URL(req.url);
-      const match = ACTION_RUN_WS_PATH_RE.exec(url.pathname);
-      if (!match) return null;
+      const runPageMatch = RUN_PAGE_ACTION_WS_PATH_RE.exec(url.pathname);
+      const match = runPageMatch ? null : ACTION_RUN_WS_PATH_RE.exec(url.pathname);
+      if (!match && !runPageMatch) return null;
 
       const denial = await deps.guard(req);
       if (denial) return denial;
 
       if (req.method !== 'GET') return refusal(405, 'Method not allowed');
+
+      // A run page's action is keyed by the run's id alone — there is no task
+      // to resolve, and a key from any other page never matches.
+      if (runPageMatch) {
+        const key = runActionKey(decodePathSegment(runPageMatch[1]!));
+        const actionId = decodePathSegment(runPageMatch[2]!);
+        const action = getActionRun(actionId);
+        if (!action || action.taskId !== key) return refusal(404, 'Action run not found.');
+        const data: ActionRunSocketData = { taskId: key, runId: actionId, stop: null };
+        if (!server.upgrade(req, { data })) return refusal(426, 'Expected a WebSocket upgrade request.');
+        return 'upgraded';
+      }
+      if (!match) return null;
 
       const taskIdParam = decodePathSegment(match[1]!);
       const runId = decodePathSegment(match[2]!);

@@ -110,10 +110,10 @@ export interface AggregateOptions {
   /** Only count records whose taskId starts with this (short-id friendly). */
   taskId?: string;
   /**
-   * Only count records whose taskId starts with ANY of these — the same
-   * prefix rule as `taskId`, widened to a set so a caller can ask for a whole
-   * subtree (a task plus every descendant) in one pass. Applied in addition to
-   * `taskId` when both are given.
+   * Only count records whose taskId EQUALS one of these (exact, not prefix: a
+   * prefix rule filed `fix-a-b` under `fix-a`). Callers pass every form a task
+   * answers to (`taskAuditForms`), for a whole subtree in one pass. Applied in
+   * addition to `taskId` (a prefix match) when both are given.
    */
   taskIds?: string[];
 }
@@ -134,13 +134,16 @@ export function aggregateUsage(
   let firstTs: number | null = null;
   let lastTs: number | null = null;
 
+  const forms = options.taskIds ? new Set(options.taskIds) : null;
   for (const record of records) {
     if (options.sinceMs !== undefined && record.ts < options.sinceMs) continue;
     if (options.role !== undefined && (record.role ?? '') !== options.role) continue;
     if (options.taskId !== undefined && !(record.taskId ?? '').startsWith(options.taskId)) continue;
-    if (options.taskIds !== undefined) {
+    if (forms) {
       const id = record.taskId ?? '';
-      if (!id || !options.taskIds.some((prefix) => id.startsWith(prefix))) continue;
+      // Exact match on the task's attribution forms (id, short id, code) — a
+      // prefix rule would file a record for `fix-a-b` under task `fix-a`.
+      if (!id || !forms.has(id)) continue;
     }
 
     add(totals, record);

@@ -115,6 +115,28 @@ describe('setupSandbox', () => {
     // appended gc.auto=0 and safe.directory stanzas.
     expect(contents).toBe(sentinel + GC_OFF + safeStanza(worktree));
   });
+
+  // INVARIANT: an unchanged sandbox gitconfig is not rewritten. setupSandbox
+  // runs before every turn launch while the task's container — bind-mounting
+  // this file as its ~/.gitconfig — may be running the task's services; a
+  // rewrite truncates it in place under any `git` they run. A change is still
+  // written, in place (same inode, which the running container's mount follows).
+  test('leaves an unchanged .gitconfig untouched and rewrites a changed one in place', async () => {
+    const result = await setupSandbox(worktree);
+    const path = join(result.sandboxPath, '.gitconfig');
+    const before = await stat(path);
+    await Bun.sleep(20);
+
+    await setupSandbox(worktree);
+    const same = await stat(path);
+    expect([same.ino, same.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+
+    await writeFile(join(fakeHome, '.gitconfig'), '[user]\n\tname = Changed\n');
+    await setupSandbox(worktree);
+    const changed = await stat(path);
+    expect(changed.ino).toBe(before.ino);
+    expect(await readFile(path, 'utf-8')).toBe('[user]\n\tname = Changed\n' + GC_OFF + safeStanza(worktree));
+  });
 });
 
 /**

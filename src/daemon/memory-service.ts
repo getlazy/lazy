@@ -26,8 +26,7 @@ import { getOrCreateStorage } from './rpc-handlers';
 import type { MemoryActions, MemorySaveInput } from '../server/memory-actions';
 import type { Storage } from '../storage';
 import type { ActorInput, MemoryRecord } from '../types';
-import { resolveGitIdentity } from '../identity';
-import { isManagedMode } from '../config/managed';
+import { dashboardActor } from './dashboard-actor';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import {
   normalizeMemoryName,
@@ -43,20 +42,6 @@ import {
   type CompactProgressFn,
   type MemoryCompactRunResult,
 } from '../memory/run-compact';
-
-/**
- * The dashboard's actor: `human`, plus the daemon's git identity when it is
- * configured. Resolved per write (cached 60s inside `resolveGitIdentity`), so a
- * config fixed while the daemon runs is picked up without a restart.
- */
-async function dashboardActor(projectRoot: string): Promise<ActorInput> {
-  // Managed mode names people by token only; the environment names nobody.
-  if (isManagedMode()) return 'human';
-  const resolution = await resolveGitIdentity(projectRoot);
-  if (!resolution.configured) return 'human';
-  const { email, name } = resolution.identity;
-  return { role: 'human', email, ...(name ? { name } : {}) };
-}
 
 /**
  * A `MemoryActions` over any Storage, bound to a project root (compact needs

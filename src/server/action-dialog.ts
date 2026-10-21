@@ -123,6 +123,10 @@ export function actionDialogScript(): string {
   var ws = null;
   var lastFormData = null;
   var lastFormAction = '';
+  // A page-level form marked data-lz-action-retry may be submitted again after
+  // its action FAILED (nothing was created, so a second click is safe): its
+  // button is re-enabled when the failure settles.
+  var retrySubmit = null;
 
   function els() {
     dialog = document.getElementById('lz-action-dialog');
@@ -229,6 +233,37 @@ export function actionDialogScript(): string {
     remedyEl.hidden = false;
   }
 
+  // A refusal the human answers by confirming (a run's checkout holds
+  // somebody's files): list what the confirmation is about and offer ONE
+  // button that re-posts the refused form with the confirming fields added —
+  // the same POST the page offers without JS. The route composed it from the
+  // daemon's structured refusal; this only renders it.
+  function renderConfirmRemedy(confirm) {
+    if (!remedyEl) return;
+    var action = confirm.action || lastFormAction || '';
+    var html = '';
+    if (confirm.items && confirm.items.length) {
+      html += '<ul class="lz-action-confirm-items">';
+      for (var i = 0; i < confirm.items.length; i++) html += '<li><code>' + escapeText(confirm.items[i]) + '</code></li>';
+      html += '</ul>';
+    }
+    html += '<form method="post" action="' + escapeText(action) + '" class="lz-action-form lz-action-confirm" data-lz-action-form>';
+    var fields = confirm.fields || {};
+    if (lastFormData && !confirm.action) {
+      lastFormData.forEach(function (value, key) {
+        if (Object.prototype.hasOwnProperty.call(fields, key)) return;
+        html += '<input type="hidden" name="' + escapeText(key) + '" value="' + escapeText(String(value)) + '">';
+      });
+    }
+    Object.keys(fields).forEach(function (key) {
+      html += '<input type="hidden" name="' + escapeText(key) + '" value="' + escapeText(String(fields[key])) + '">';
+    });
+    html += '<div class="rv-form-actions"><button type="submit" class="rv-primary">' + escapeText(confirm.label || 'Confirm') + '</button></div>';
+    html += '</form>';
+    remedyEl.innerHTML = html;
+    remedyEl.hidden = false;
+  }
+
   function describeEvent(e) {
     if (!e || e.kind === 'activity') return '';
     if (e.kind === 'plan') {
@@ -330,6 +365,7 @@ export function actionDialogScript(): string {
       return;
     }
     if (snap.status === 'failed') {
+      if (retrySubmit) { retrySubmit.disabled = false; retrySubmit = null; }
       var remedy = snap.remedy;
       if (remedy && remedy.uiAction === 'passphrase') {
         // The failed step already carries the gate text. Showing it again in
@@ -343,7 +379,12 @@ export function actionDialogScript(): string {
         renderQueuedCommentsRemedy();
         return;
       }
-      showError(snap.error || 'The action failed.');
+      // A confirmable refusal already narrated into a failed step is not
+      // repeated in the Error box (the double refusal the passphrase path
+      // avoids); one with no phases (Remove) still needs the box.
+      var failedStep = (snap.events || []).some(function (e) { return e && e.kind === 'phase' && e.state === 'failed'; });
+      if (!(snap.confirm && failedStep)) showError(snap.error || 'The action failed.');
+      if (snap.confirm) renderConfirmRemedy(snap.confirm);
     }
   }
 
@@ -356,9 +397,12 @@ export function actionDialogScript(): string {
   // (The literal double-escaped spelling is deliberately not written out: this
   // script is embedded in the task page, and task-code-url-escaping.test.ts
   // asserts that signature appears nowhere in the rendered HTML.)
-  function followRun(taskSeg, runId) {
+  // followBase, when the route sends one, is the page the action belongs to
+  // when that page is not a task's (a commit run's /runs/<id>); it is a
+  // path the server composed, used as given.
+  function followRun(taskSeg, runId, followBase) {
     clearFollow();
-    var pollUrl = '/tasks/' + taskSeg + '/action-runs/' + encodeURIComponent(runId);
+    var pollUrl = (followBase || ('/tasks/' + taskSeg)) + '/action-runs/' + encodeURIComponent(runId);
     var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') +
       location.host + pollUrl + '/ws';
 
@@ -399,7 +443,7 @@ export function actionDialogScript(): string {
         return;
       }
       if (msg.type === 'failed') {
-        onSettled({ status: 'failed', error: msg.error, events: events, remedy: msg.remedy });
+        onSettled({ status: 'failed', error: msg.error, events: events, remedy: msg.remedy, confirm: msg.confirm });
         return;
       }
       if (msg.type === 'error') {
@@ -506,6 +550,7 @@ export function actionDialogScript(): string {
     hideError();
     hideRemedy();
     var submit = submitter || form.querySelector('[type=submit]');
+    retrySubmit = form.hasAttribute('data-lz-action-retry') ? submit : null;
     if (submit) submit.disabled = true;
     setRunning(true);
     hideBodyForms();
@@ -550,7 +595,7 @@ export function actionDialogScript(): string {
       // taskId is the stamped segment (already escaped); res.body.taskId is
       // a RAW id from the daemon, so it is escaped once here — followRun takes
       // an escaped segment from either source.
-      followRun(res.body.taskId ? encodeURIComponent(res.body.taskId) : taskId, runId);
+      followRun(res.body.taskId ? encodeURIComponent(res.body.taskId) : taskId, runId, res.body.followBase);
     }).catch(function (err) {
       setRunning(false);
       showBodyForms();

@@ -32,6 +32,7 @@ import { getAuthEnvVars as getDefaultAuthEnvVars, getLaunchAuthEnvVars } from '.
 import { findLazyRoot } from '../project-paths';
 import { getTaskEnv, recordTaskEnvLaunched, taskEnvKeysEnv } from '../daemon/task-env';
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
+import { recordContainerCredentialLaunch } from '../daemon/container-credential-launch';
 import { mintCredentialGrant, pinGrantsToAddresses } from '../proxy/credential-broker';
 import type { LaunchIdentity } from '../proxy/placeholder-env';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
@@ -660,6 +661,8 @@ export class HostProcessRunner implements Runner {
     const sessionCredential = (taskUuid && projectRoot)
       ? await sessionCredentialEnvFor(projectRoot, taskUuid)
       : null;
+    // Same record as a container launch: see mustRecreateForCredentialPlan.
+    if (taskUuid && projectRoot) await recordContainerCredentialLaunch(projectRoot, taskUuid, runName, sessionCredential ? 'session' : 'other');
     const taskEnv = (taskUuid && projectRoot) ? await getTaskEnv(projectRoot, taskUuid) : {};
     // Spawn env is fixed for the supervisor's life, exactly like a container's.
     if (taskUuid && projectRoot) await recordTaskEnvLaunched(projectRoot, taskUuid, runName, taskEnv);

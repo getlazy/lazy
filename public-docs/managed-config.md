@@ -51,8 +51,10 @@ have.
 
 ## Finding out why your config is being ignored
 
-Run `lazy doctor` in the project. On a managed host it prints one line per key
-the fleet is not honouring:
+Run `lazy doctor` in the project. On a managed host it prints one line per
+repository setting that differs from the value in use, except storage settings.
+The fleet always assigns the project's store, so repository storage settings
+do not need a separate warning:
 
 ```
 ⚠ lazy.toml 'runner.type'
@@ -164,7 +166,7 @@ host files that are not this project's.
 Everything else. In full:
 
 `models.default` · `models.roles.*.model` · `models.roles.*.agent` ·
-`agents.*.harness` · `agents.*.model` · `agents.*.description` · `agents.*.named_endpoint` · `agents.*.tiers[].endpoint` · `agents.*.tiers[].model` · `agents.*.tiers[].threshold_percent` · `endpoints.*.description` ·
+`agents.*.harness` · `agents.*.model` · `agents.*.description` · `agents.*.named_endpoint` · `agents.*.reasoning` · `agents.*.tiers[].endpoint` · `agents.*.tiers[].model` · `agents.*.tiers[].threshold_percent` · `endpoints.*.description` ·
 `proxy.retry_after_threshold` · `proxy.tier_retry_interval` · `proxy.upstream_timeout` ·
 `proxy.audit_retention_days` · `proxy.audit_retention_mib` ·
 `proxy.policy.deny_path_globs` (it can only ever

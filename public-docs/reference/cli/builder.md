@@ -50,8 +50,7 @@ Autonomous by default:
 Auto-resume across upgrade (docker/podman only):
   If 'lazy upgrade' stops this builder to rebuild the image, the session is
   automatically relaunched in place — same conversation, same terminal — once
-  the upgrade finishes; no manual --resume needed. (Host-process builders are
-  not stopped by upgrade, so there is nothing to relaunch there.) The wait has
+  the upgrade finishes; no manual --resume needed. The wait has
   no time limit — progress lines print every ~15s, and ctrl-c cancels the wait
   while preserving your session (resume with --resume when ready). Finish typing
   any in-progress message before upgrading: unsent input cannot be recovered.
@@ -61,9 +60,8 @@ Auto-resume across upgrade (docker/podman only):
 Flags:
   --autonomous         Run without permission prompts. This is the DEFAULT — the flag
                        is accepted so existing scripts keep working, but it changes
-                       nothing. Under the host sandbox (default) the OS sandbox still
-                       confines the builder; under permission_mode="bypass" or Docker
-                       this adds --dangerously-skip-permissions.
+                       nothing. The builder runs in a container, which is what
+                       confines it.
   --no-autonomous      Opt out: run with Claude Code's normal permission prompts.
   --yes                Auto-confirm prompts, including the autonomous-posture
                        confirmation (required for autonomous runs in non-TTY mode —

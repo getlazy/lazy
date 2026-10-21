@@ -61,6 +61,7 @@ import { layoutHtml } from '../../src/server/templates';
 import { subtasksSectionHtml } from '../../src/server/subtasks';
 import { copyMarkdownScript } from '../../src/server/copy-markdown';
 import { servicesCardHtml } from '../../src/server/services-card';
+import { runShaChoiceScript } from '../../src/server/runs-page';
 import type { Task } from '../../src/types';
 import { progressiveLoaderScript } from '../../src/server/review-progressive';
 
@@ -154,6 +155,7 @@ const ISLANDS: Record<string, () => string> = {
   relativeTimeScript: () => relativeTimeScript(),
   modifierKeyScript: () => modifierKeyScript(),
   screenshotLightboxScript: () => screenshotLightboxScript(),
+  runShaChoiceScript: () => runShaChoiceScript(),
   // Private islands, reached through what ships them.
   navBadgeScript: () => layoutHtml('t', '<p>body</p>'),
   navProgressScript: () => layoutHtml('t', '<p>body</p>'),

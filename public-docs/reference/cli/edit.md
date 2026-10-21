@@ -7,7 +7,7 @@ Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [
 
 Edit a task's goal, prompt, model, type, code, parent, runner, effort, agent, or review mode. Interactive if no flags provided.
 Once an agent has worked on the task, only --model, --effort, --runner, --agent and the
---review* flags can still be changed; goal/prompt/type/parent edits are rejected. --code can still be
+--review* flags can still be changed; goal/prompt/type/parent edits are rejected. --code (refused when another live task already uses it) can still be
 changed on its own: the rename is cosmetic — the task's branch, worktree, container and any PR/MR keep
 their old names, while lookups, dashboard links and service hostnames use the new code. The --runner, --agent and
 --review overrides take effect on the next turn.

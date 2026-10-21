@@ -270,6 +270,11 @@ that never reached the store, because that means live capture is broken *now*:
 Sessions written in the last few minutes are treated as in flight, not as
 failures — the sweep may simply not have ticked yet.
 
+A builder or `lazy pair` session that ends while the daemon is down is not
+lost: lazy keeps a copy under `.lazy/recovery/conversations/` and tells you so,
+and the daemon stores it automatically the next time it runs. Files there that
+are not valid recovery files are renamed to `*.invalid` and never stored.
+
 ### What a builder session tells you when its capture failed
 
 The first path runs on a 30-second timer inside the builder's container, where
@@ -385,7 +390,7 @@ reach conversation bodies.
 
 ### In the browser
 
-![The dashboard Builders page with its search box and an empty list of builders](images/topics/builders.png)
+![The dashboard Builders page with its search box and one captured builder conversation listed with its id, start and end, turn counts and title](images/topics/builders.png)
 
 The daemon's web UI serves the same Builders under **Builders** in the nav
 (the dashboard's address is printed by `lazy daemon status`; old

@@ -128,12 +128,67 @@ export async function readRegularFileUnder(root: string, rel: string, maxBytes: 
 }
 
 /**
+ * True when `rel` under `root` is ALREADY a regular file holding exactly
+ * `data`, granting no permission bit beyond `mode` — so writing it again would change
+ * nothing but its inode and mtime. Never true for a link, a non-regular file,
+ * a path whose directories are links, or anything unreadable: every such case
+ * answers false and the caller's link-safe write deals with it.
+ *
+ * Exists because a write is not free for whoever watches the file: a dev
+ * server watching `.env` restarts on every replace, and a watcher holding the
+ * old inode loses it.
+ */
+export async function regularFileHolds(
+  root: string,
+  rel: string,
+  data: string | Uint8Array,
+  mode: number,
+  owner?: { uid: number; gid: number },
+): Promise<boolean> {
+  const want = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data);
+  let existing: Buffer | null;
+  try {
+    existing = await readRegularFileUnder(root, rel, want.length);
+  } catch (err) {
+    if (err instanceof LinkRefusedError) return false;
+    throw err;
+  }
+  if (existing === null || !existing.equals(want)) return false;
+  // Same bytes; it must also grant nothing `mode` does not (a secret someone
+  // made world-readable is rewritten 0600). "Nothing beyond", not "equal", so
+  // a umask that narrowed the original create does not force a write forever.
+  // Read after the content: a file swapped in between only makes this answer
+  // false (a write), never a skipped write over something else.
+  let st;
+  try {
+    st = await lstat(join(await realRoot(root), ...assertRelativeUnder(rel)));
+  } catch (err) {
+    // Gone since the read: there is nothing to keep, so the caller writes.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+  if (owner && (st.uid !== owner.uid || st.gid !== owner.gid)) return false;
+  return st.isFile() && (st.mode & 0o7777 & ~mode) === 0;
+}
+
+/**
  * Write `data` as a regular file at `rel` under `root`, creating real
  * directories on the way (never following a link) and replacing an existing
  * file by rename (never writing through one). Throws LinkRefusedError on any
  * link on the way.
+ *
+ * `owner`, when given, is applied to the new file BEFORE it is renamed into
+ * place, so the path never holds a file the intended owner cannot read — for
+ * a root daemon writing into a worktree its container user owns.
  */
-export async function writeRegularFileUnder(root: string, rel: string, data: string | Uint8Array, mode = 0o644, immutable = false): Promise<void> {
+export async function writeRegularFileUnder(
+  root: string,
+  rel: string,
+  data: string | Uint8Array,
+  mode = 0o644,
+  immutable = false,
+  owner?: { uid: number; gid: number },
+): Promise<void> {
   const parts = assertRelativeUnder(rel);
   const rootReal = await realRoot(root);
   const dir = (await walkDirs(rootReal, parts.slice(0, -1), true))!;
@@ -148,6 +203,7 @@ export async function writeRegularFileUnder(root: string, rel: string, data: str
   const fh = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
   try {
     await fh.writeFile(data);
+    if (owner) await fh.chown(owner.uid, owner.gid);
   } finally {
     await fh.close();
   }

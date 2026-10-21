@@ -46,10 +46,12 @@ import { getDaemonContext, hasDaemonContext } from './context';
 import { mintMcpToken, type McpIdentity, type MintMcpTokenOptions } from './mcp-tokens';
 import {
   planTurnCredential,
+  sessionCredentialCommandField,
   refuseLaunchWhileMemberInside,
   TurnCredentialUnavailableError,
   type TurnCredentialPlan,
 } from './turn-credentials';
+import { workContainerLaunchedWithoutSessionPlaceholder } from './container-credential-launch';
 import { assertTurnStartAllowed, holdAgentStart } from './usage-pause';
 import { isUsagePauseRefusal } from './rpc-error';
 import { getMcpConfigDir } from './paths';
@@ -57,7 +59,7 @@ import { getCurrentSha, getRemoteDefaultBranch, createWorktreeFromSha, recoverMi
 import { ensureTaskWorktree } from './task-worktree';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonCommandFields, containerHandoffFileModeFor } from '../protocol';
-import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchNameFromId } from '../task/identity';
+import { shortId, displayId, taskRef, deriveTaskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../task/identity';
 import { taskBranchFor, looksLikeTaskBranch } from '../git/branch-prefix';
 import { renderTaskTurnPrompt } from '../task/turn-prompt-render';
 import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystemPrompt } from '../task/turn-context';
@@ -74,6 +76,7 @@ import { isLinkedTask as isLinkedTaskFn } from '../task/linked';
 import { getAgentPackaging } from '../agent/registry';
 import { profileForAgentName, profileNameForAgent } from '../config/agent-profiles';
 import { applyRunnerAgent } from './task-harness';
+import { roleTargetForProfile } from '../config/default-target';
 import { assertKnownAgentProfile } from './agent-profile-check';
 import { getDataDir } from '../project-paths';
 import { isFeatureEnabled } from '../utils/features';
@@ -547,11 +550,22 @@ async function validateTask(storage: Storage, taskId: string, root: string, agen
     if (!parentTask) {
       throw new RpcError(400, `Parent task not found: ${parentIdAfterRetarget}`);
     }
+    // The parent need not have run on THIS machine: in a distributed setup (a
+    // VM clone, another developer's checkout, Teams) its worktree and session
+    // live elsewhere and only its branch reached the remote. ensureTaskWorktree
+    // restores it from the local worktree, then the local branch, then the
+    // remote; the child's base is then resolved from that branch through
+    // resolveUpstreamMergeRef, exactly as for a parent that ran here.
     const parentSession = await storage.getSessionByTaskId(parentTask.id);
-    if (!parentSession && !await pathExists(getWorktreePath(root, parentTask))) {
-      throw new RpcError(400, `Cannot start child task: parent task has no worktree. Start the parent first with: lazy start ${displayId(parentTask)}`);
+    const parentBranch = parentSession?.git_branch ?? getBranchName(parentTask);
+    try {
+      await ensureTaskWorktree(root, parentTask, parentBranch);
+    } catch (err) {
+      // Only a parent with no session can be one that never ran; a parent that
+      // did run keeps the restore error as it was.
+      if (!(err instanceof RpcError) || err.status !== 409 || parentSession) throw err;
+      throw new RpcError(400, `Cannot start child task: could not branch from parent task ${displayId(parentTask)}. ${err.message} If the parent has not run anywhere yet, start it first with: lazy start ${displayId(parentTask)}`);
     }
-    await ensureTaskWorktree(root, parentTask, parentSession?.git_branch);
   }
 
   // Check task status
@@ -917,6 +931,11 @@ async function launchTaskRun(
         throw new RpcError(500, `Failed to fetch ${parentBranch}: ${err instanceof Error ? err.message : err}. Use --force-local to start from local HEAD.`);
       }
     }
+
+    // Record the base on the TASK, as the child path does: the session's
+    // git_start_sha is local-only, and the backlog-recovery sweep reads this.
+    await storage.updateTaskBranchedFromSha(t.id, startSha);
+    t.branched_from_sha = startSha;
   }
 
   // --- Pinned base (lazy clone --same-base / --base) ---
@@ -1377,13 +1396,20 @@ async function launchTaskRun(
     // recorded earlier rides it too. See src/task/environment-replaced.ts.
     // `lazy env set` since this container was created: env is fixed at create.
     const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, t.id, containerName);
+    const mustRecreateForImage = mustRecreateForRunnerImage(t);
+    // A session turn into a container launched WITHOUT a session placeholder
+    // (made under solo billing) cannot be handed its credential; see
+    // mustRecreateForCredentialPlan. A kind change alone never recreates.
+    const mustRecreateForCredential = credentialPlan.mode === 'session'
+      && await workContainerLaunchedWithoutSessionPlaceholder(projectRoot, t.id);
     await recordRecreationIfRunning(
       storage,
       t.id,
       recreationReason(
-        credentialPlan.mode === 'session' && credentialPlan.kindChanged,
+        mustRecreateForCredential,
         mustRecreateForContainerAgent(sess, t.agent_id),
         mustRecreateForEnv,
+        mustRecreateForImage,
       ),
       runner, containerName,
     );
@@ -1405,27 +1431,15 @@ async function launchTaskRun(
       sync_after_work: autoSyncAfterTurn && !isLinkedTaskFn(t),
       ...(lowHighLoop ? { low_high_loop: { review_effort: lowHighLoop.reviewEffort } } : {}),
       ...wrapUpFields,
+      ...sessionCredentialCommandField(credentialPlan, () => roleTargetForProfile(profile)),
       ...commonCommandFields(branchConfig),
     };
     writeCommand(protoDir, startCommand);
 
     // --- Launch supervisor ---
-    // A running container's env was fixed when it was created, so a turn whose
-    // placeholder must now live in a DIFFERENT env var (its owner's credential
-    // kind changed, or a system turn took over from a human) cannot be served by
-    // it — the client would emit the wrong request shape and the proxy would
-    // refuse with auth_kind_mismatch. Recreate instead. The token VALUE is
-    // deliberately stable across turns for exactly this reason: only a KIND
-    // change costs a container.
-    const mustRecreateForCredential = credentialPlan.mode === 'session' && credentialPlan.kindChanged;
-    if (credentialPlan.mode === 'session' && credentialPlan.kindChanged && (await runner.isRunning(containerName))) {
-      logger.info(
-        `[${tRef}] Recreating container: this turn's credential is a different kind ` +
-        `(${credentialPlan.kind}) than the running container was launched with.`,
-      );
-      await runner.removeRun(containerName);
-    }
-
+    // A credential KIND change no longer costs the container: the command above
+    // carries this turn's placeholder and the env var it needs, and the running
+    // supervisor installs it (src/supervisor/turn-credential-env.ts).
     const mustRecreateForAgent = mustRecreateForContainerAgent(sess, t.agent_id);
     if (mustRecreateForAgent) {
       logger.info(
@@ -1438,7 +1452,8 @@ async function launchTaskRun(
       logger.info(`[${tRef}] Recreating container: task environment changed (lazy env) — launch env is fixed at create time`);
     }
 
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(t) && (await runner.isRunning(containerName))) {
+    if (mustRecreateForImage) phases.note('recreating container: the runner image this task runs on changed');
+    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForImage && (await runner.isRunning(containerName))) {
       // Supervisor already running — it will pick up the new command
       phases.note(`reusing running container ${containerName}`);
     } else {

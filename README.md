@@ -655,7 +655,7 @@ lazy report --pdf
 lazy report --pdf --out <path-to-pdf>
 ```
 
-An example of the output can be found [here](public-docs/lazy-report-example-20260523.md).
+Its options are documented [here](public-docs/reference/cli/report.md).
 
 ### Protected branches and tasks
 
@@ -1073,7 +1073,7 @@ Two `FROM` spellings lazy cannot supply for you:
 ### Runner images are tagged with the lazy release version
 
 Every image lazy builds is tagged with `lazy`'s <major>.<minor> release version,
-e.g. `lazy-runner:0.92`, not `lazy-runner:latest`. You can always rebuild the image
+e.g. `lazy-runner:0.93`, not `lazy-runner:latest`. You can always rebuild the image
 with `lazy upgrade` but even if you don't, `lazy` will automatically rebuild it every 14
 days or when it notices a change in `Dockerfile.lazy`. The default image is the exception:
 it is pulled from the release (`ghcr.io/getlazy/lazy-runner`), keeps the agent CLIs it was

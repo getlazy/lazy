@@ -88,6 +88,24 @@ describe('a turn that ends with uncommitted work', () => {
     expect(workTurn!.uncommitted).toBeUndefined();
   });
 
+  // INVARIANT: a worktree parked mid-merge is not "loose work". Its dirty paths
+  // are the merge's conflicts, nothing is about to be dropped, and accept already
+  // names the merge state; the turn record must not describe it a second way.
+  test('a turn that ends mid-merge records no uncommitted paths', async () => {
+    const taskId = await createTask(ctx, 'Mid-merge', 'Do the work');
+    const result = await ctx.lazyMocked(
+      ['start', taskId, '--yes', '--follow'],
+      MOCK_CLAUDE_SUCCESS,
+      { env: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_LEAVE_MID_MERGE: '1' } },
+    );
+    expectSuccess(result);
+    await runReconcile(ctx.root, ctx.protocolBase);
+
+    const workTurn = readTurns(ctx.root, taskId).find(t => t.role === 'agent');
+    expect(workTurn).toBeDefined();
+    expect(workTurn!.uncommitted).toBeUndefined();
+  });
+
   test('`lazy show --full` names the paths and says they are not on the branch', async () => {
     const taskId = await runTurnLeaving('public-docs/troubleshooting.md,notes/scratch.md');
 

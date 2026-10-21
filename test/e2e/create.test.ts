@@ -136,6 +136,16 @@ describe('lazy create', () => {
     expectError(result, 'task is abandoned');
   });
 
+  // INVARIANT: a dash-prefixed --parent is refused before it reaches git as an
+  // option (`--output=...` would write a file), and no task is created.
+  test('refuses a dash-prefixed --parent and creates no task', async () => {
+    const result = await ctx.lazy(['create', '--goal', 'Option parent', '--parent', '--output=/tmp/lazy-parent-pwn']);
+
+    expectFailure(result);
+    expectError(result, "cannot start with '-'");
+    expect((await ctx.lazy(['list', '--all'])).stdout).not.toContain('Option parent');
+  });
+
   // INVARIANT (fix-target-adoption): when the user runs `lazy create` while
   // checked out on a non-default branch, the task target MUST NOT silently
   // adopt that branch. Top-level tasks target the repo default (origin/HEAD
@@ -260,7 +270,7 @@ describe('lazy create', () => {
     const startChildResult = await ctx.lazy(['start', childId, '--yes']);
     expectFailure(startChildResult);
     expectError(startChildResult, 'Cannot start child task');
-    expectError(startChildResult, 'parent task has no worktree');
+    expectError(startChildResult, `lazy/${parentId}`);
     expectError(startChildResult, `lazy start ${parentId}`);
   });
 });

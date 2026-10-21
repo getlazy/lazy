@@ -6,7 +6,7 @@ The project overview is a project's landing page: what needs you, what has been 
 
 ## Top bar
 
-Inside a project the bar reads team name, then project name, then the project's pages: **Review**, **Clusters**, **Tasks**, **Raised**, **Search**, **Builders**, **Settings** and **Messages**. Small counters sit beside some of them: waiting for review, running, and unread messages, and the blocking and other open raised items. **Settings** opens [project settings](project-settings.md). Pressing Cmd/Ctrl+K opens a command palette.
+Inside a project the bar reads team name, then project name, then the project's pages: **Review**, **Builders**, **Clusters**, **Tasks**, **Raised**, **Search**, **Settings** and **Messages**. Small counters sit beside some of them: waiting for review, running, and unread messages, and the blocking and other open raised items. **Settings** opens [project settings](project-settings.md). Pressing Cmd/Ctrl+K opens a command palette.
 
 ## Header
 

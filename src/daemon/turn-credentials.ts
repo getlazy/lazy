@@ -47,6 +47,9 @@ import {
 import { endpointRequirementsForProfile } from '../credentials/endpoint-requirements';
 import type { SessionCredentialLookup, SessionRequestContext } from '../proxy/session-auth';
 import type { Storage } from '../storage/interface';
+import { workContainerLaunchedWithoutSessionPlaceholder } from './container-credential-launch';
+import { teamSessionPathTarget } from '../utils/role-target';
+import type { RoleTarget } from '../config/types';
 import type { TurnOwner } from '../types';
 
 /**
@@ -81,7 +84,12 @@ export type TurnCredentialPlan =
       token: string;
       kind: UserCredentialKind;
       ownerUserId: string;
-      /** True when the container must be recreated — see session-credentials.ts. */
+      /**
+       * True when the credential KIND changed since this task's last binding (or
+       * there was none) — see session-credentials.ts. No longer a reason to
+       * recreate the container: every turn hands its supervisor the placeholder
+       * and the env var it belongs in (turnCredentialCommandEnv).
+       */
       kindChanged: boolean;
     };
 
@@ -363,11 +371,12 @@ export async function turnCredentialProblem(
 export async function prepareTurnLaunch(
   projectRoot: string,
   input: { taskId: string; sessionId: string; storage?: Storage },
-): Promise<{ mustRecreateContainer: boolean }> {
+): Promise<{ mustRecreateContainer: boolean; plan: TurnCredentialPlan }> {
   try {
     const plan = await planTurnCredential(projectRoot, input);
     return {
       mustRecreateContainer: await mustRecreateForCredentialPlan(projectRoot, input.taskId, plan),
+      plan,
     };
   } catch (err) {
     if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
@@ -380,10 +389,27 @@ export async function prepareTurnLaunch(
  * credential, or has to be recreated. The one place that decides, for both the
  * RPC turn paths and the daemon's own automations.
  *
- * Two ways a running container's env can be wrong for the turn about to start:
+ * A SESSION plan never needs a new container. A running container's env is
+ * fixed at create, but the agent does not read the placeholder from there: the
+ * turn's command carries it, with the env var its kind needs
+ * (turnCredentialCommandEnv), and the supervisor installs it in its own env
+ * before the agent starts. So a turn whose owner holds a different credential
+ * kind than the last one — a member on OAuth after the service credential's
+ * API key, or the reverse, which Teams does whenever a daemon-started turn
+ * falls between two of a person's — runs in the SAME container, and the
+ * task's services in it keep running (engineer, 2026-10-20: starting a turn
+ * must leave them alone). It used to recreate the container on every such
+ * change.
  *
- *   KIND CHANGED — the placeholder has to move to a different env var, and a
- *   running container's env cannot be changed.
+ * Two ways a running container's env is still wrong for the turn:
+ *
+ *   NO PLACEHOLDER TO REPLACE — the plan is a session plan, but the container
+ *   was launched WITHOUT a session placeholder: created under solo billing (the
+ *   daemon's own credential, as a grant) before the project switched to member
+ *   billing. The supervisor only replaces a placeholder the container holds, so
+ *   the agent would keep the solo grant and the proxy would refuse the turn
+ *   (`auth_kind_mismatch`). What each container was launched with is recorded
+ *   at launch (./container-credential-launch.ts).
  *
  *   LEFTOVER PLACEHOLDER — the plan says use the daemon's own credential, but
  *   this task has a binding, so its container was launched holding a
@@ -400,7 +426,7 @@ export async function mustRecreateForCredentialPlan(
   // they leave. Here because every turn-launching path reaches this function
   // under the task's lifecycle lock — the same lock a member's entry takes.
   await refuseLaunchWhileMemberInside(projectRoot, taskId);
-  if (plan.mode === 'session') return plan.kindChanged;
+  if (plan.mode === 'session') return workContainerLaunchedWithoutSessionPlaceholder(projectRoot, taskId);
   return (await getTaskSessionBinding(projectRoot, taskId)) !== null;
 }
 
@@ -496,9 +522,9 @@ export function envVarForCredentialKind(kind: UserCredentialKind): string {
  * The credential env a task's container should be launched with, or null to use
  * the daemon's own (the single-user default).
  *
- * Read at container-launch time from the binding the launcher already made, so
- * the launch path has exactly one source of truth for both halves of the
- * decision — whether to recreate the container, and what to put in its env.
+ * Read at container-launch time from the binding the launcher already made.
+ * Only a NEW container takes it from here; a reused one is handed each turn's
+ * placeholder by that turn's command (turnCredentialCommandEnv).
  */
 export async function sessionCredentialEnvFor(
   projectRoot: string,
@@ -520,14 +546,55 @@ export async function sessionCredentialEnvFor(
   // container ensure`) would otherwise be handed the daemon's real credential,
   // which is the one thing this feature exists to prevent. Give it a placeholder
   // that is bound to nobody instead — every request it makes is refused with
-  // unknown_session_token, and the task's next real turn recreates the container
-  // with a placeholder that resolves.
+  // unknown_session_token until the task's next real turn, whose command hands
+  // the supervisor a placeholder that resolves (src/supervisor/turn-credential-env.ts);
+  // the container is kept.
   return [{ key: 'ANTHROPIC_API_KEY', value: unboundPlaceholder() }];
 }
 
 /** A syntactically valid placeholder that is deliberately bound to nobody. */
 function unboundPlaceholder(): string {
   return `${SESSION_TOKEN_PREFIX}unbound-${randomBytes(16).toString('hex')}`;
+}
+
+/**
+ * The credential env a turn's COMMAND carries to its supervisor, or undefined.
+ *
+ * Only for a session plan, and only for a profile whose LAUNCH is handed the
+ * session placeholder itself — claude-code or pi on the primary Anthropic
+ * profile, exactly the rule teamModeLaunchCreds applies (teamSessionPathTarget).
+ * A codex or cursor container holds none on purpose, and a claude-code / pi
+ * profile with its own endpoint or a non-Anthropic credential is launched with
+ * a per-profile grant instead: the member's session placeholder must never be
+ * written into such a container's command file. The supervisor installs these values in its own
+ * env before the agent starts (src/supervisor/turn-credential-env.ts), which is
+ * what lets a running container serve a turn whose credential kind — and so
+ * whose env var, and placeholder value — differs from the one it was created
+ * with. The value is the placeholder the container already holds or its
+ * replacement; it confers nothing outside the binding the proxy checks.
+ */
+export function turnCredentialCommandEnv(
+  plan: TurnCredentialPlan,
+  target: Pick<RoleTarget, 'harness' | 'credential' | 'endpoint'>,
+): Array<{ key: string; value: string }> | undefined {
+  if (plan.mode !== 'session') return undefined;
+  if (target.harness !== 'claude-code' && target.harness !== 'pi') return undefined;
+  if (!teamSessionPathTarget(target)) return undefined;
+  return credentialEnvForPlan(plan) ?? undefined;
+}
+
+/**
+ * `{ session_credential_env }` for a work command, or `{}` — spread into the
+ * command literal. `resolveTarget` gives the task's launch target and is only
+ * called for a session plan: a solo install never resolves anything here.
+ */
+export function sessionCredentialCommandField(
+  plan: TurnCredentialPlan,
+  resolveTarget: () => Pick<RoleTarget, 'harness' | 'credential' | 'endpoint'>,
+): { session_credential_env?: Array<{ key: string; value: string }> } {
+  if (plan.mode !== 'session') return {};
+  const env = turnCredentialCommandEnv(plan, resolveTarget());
+  return env ? { session_credential_env: env } : {};
 }
 
 /** The launch-time credential env for a plan, or null to use the daemon env. */

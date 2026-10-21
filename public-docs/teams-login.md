@@ -122,6 +122,11 @@ never there: `lazy daemon start` / `stop` / `status`, `lazy init`,
 Each one says the clone is bound and points at `lazy logout` as the way back
 to working locally.
 
+If this clone already runs a local daemon (you used lazy here before binding
+it), `lazy login` refuses until you stop it with `lazy daemon stop`. Binding
+also makes lazy forget that local daemon, so a bound clone's commands always
+go to your Teams install and never to the old local project.
+
 A bound clone can never do more than the browser can. A few task settings have
 no control in the browser, so the command-line options that set them are
 refused from a bound clone: `--runner` and the `--review` settings on

@@ -5,7 +5,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, rm, stat, readFile, writeFile, mkdir, symlink, realpath, lstat } from 'fs/promises';
+import { mkdtemp, rm, stat, readFile, writeFile, mkdir, symlink, realpath, lstat, chmod } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -287,6 +287,79 @@ describe('task files: registry and delivery', () => {
     expect(await deliveredExcludeFileFor(worktree)).not.toBeNull();
     expect((await git(['add', '-A'], worktree)).exitCode).toBe(0);
     expect((await git(['status', '--porcelain'], worktree)).stdout).toBe('');
+  });
+
+  // INVARIANT: delivering a file set that has not changed touches NOTHING in the
+  // worktree — every delivered file, the exclude list and the manifest keep
+  // their inode and mtime. Delivery runs before every turn launch (and once more
+  // on every Teams environment push), while the task's services keep running in
+  // its container: a dev server watching `.env` restarted on every replace, so
+  // each turn restarted the person's app (engineer, 2026-10-20).
+  test('an unchanged file set is not rewritten: same inode and mtime for every file it delivers', async () => {
+    const { root, worktree } = await setupProject(base);
+    await setTaskFiles(root, taskId, [{ path: '.env', contents: SECRET }, { path: 'config/sa.json', contents: '{"key":"private-key-material-xyz"}' }]);
+    await deliverTaskFiles(root, taskId, worktree);
+    const watched = ['.env', 'config/sa.json', '.lazy-task-sandbox/task-files.exclude', '.lazy-task-sandbox/task-files.json'];
+    const snapshot = async () => Promise.all(watched.map(async (p) => {
+      const st = await lstat(join(worktree, p));
+      return { p, ino: st.ino, mtimeMs: st.mtimeMs, mode: st.mode };
+    }));
+    const before = await snapshot();
+    // A coarse-mtime filesystem would hide a rewrite inside the same tick.
+    await Bun.sleep(20);
+
+    // What every launch does, and what a Teams push of the same set does.
+    await setTaskFiles(root, taskId, [{ path: '.env', contents: SECRET }, { path: 'config/sa.json', contents: '{"key":"private-key-material-xyz"}' }]);
+    const again = await deliverTaskFiles(root, taskId, worktree);
+    await deliverTaskFiles(root, taskId, worktree);
+
+    expect(again).toEqual({ written: ['.env', 'config/sa.json'], refused: [], retired: [] });
+    expect(await snapshot()).toEqual(before);
+  });
+
+  // The other half: a CHANGED file is still written (and only that one), and a
+  // secret someone loosened to world-readable is put back to 0600.
+  test('a changed file is written; its unchanged sibling is left alone', async () => {
+    const { root, worktree } = await setupProject(base);
+    await setTaskFiles(root, taskId, [{ path: '.env', contents: SECRET }, { path: 'b.txt', contents: 'bbbbbbbbbbbbbbbb' }]);
+    await deliverTaskFiles(root, taskId, worktree);
+    const sibling = await lstat(join(worktree, 'b.txt'));
+    const envBefore = await lstat(join(worktree, '.env'));
+    await Bun.sleep(20);
+
+    await setTaskFiles(root, taskId, [{ path: '.env', contents: 'API_TOKEN=rotated-0123456789abcdef\n' }, { path: 'b.txt', contents: 'bbbbbbbbbbbbbbbb' }]);
+    await deliverTaskFiles(root, taskId, worktree);
+    expect(await readFile(join(worktree, '.env'), 'utf-8')).toBe('API_TOKEN=rotated-0123456789abcdef\n');
+    expect((await lstat(join(worktree, '.env'))).ino).not.toBe(envBefore.ino);
+    const siblingAfter = await lstat(join(worktree, 'b.txt'));
+    expect([siblingAfter.ino, siblingAfter.mtimeMs]).toEqual([sibling.ino, sibling.mtimeMs]);
+
+    await chmod(join(worktree, 'b.txt'), 0o644);
+    await deliverTaskFiles(root, taskId, worktree);
+    expect((await stat(join(worktree, 'b.txt'))).mode & 0o777).toBe(0o600);
+  });
+
+  // INVARIANT: a ROOT daemon (a Teams machine) never leaves a delivered secret
+  // owned by root in a worktree its container user owns — the 0600 file would be
+  // unreadable to the task's running services until the next supervisor
+  // adoption. The new file is handed over BEFORE it is renamed into place.
+  // Root-only: elsewhere there is nobody to hand it to.
+  test.if(process.getuid?.() === 0)('a root daemon writes a changed file already owned by the worktree owner', async () => {
+    const { root, worktree } = await setupProject(base);
+    await Bun.spawn(['chown', '-R', '1234:1234', worktree]).exited;
+    // root's git refuses a worktree another uid owns; a real root daemon trusts
+    // its task worktrees through its own config.
+    const trust = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: '*' };
+    Object.assign(process.env, trust);
+    try {
+      await setTaskFiles(root, taskId, [{ path: '.env', contents: SECRET }]);
+      await deliverTaskFiles(root, taskId, worktree);
+    } finally {
+      for (const k of Object.keys(trust)) delete process.env[k];
+    }
+    const st = await stat(join(worktree, '.env'));
+    expect([st.uid, st.gid, st.mode & 0o777]).toEqual([1234, 1234, 0o600]);
+    expect((await stat(join(worktree, '.lazy-task-sandbox/task-files.exclude'))).uid).toBe(1234);
   });
 
   // INVARIANT: a retired file stays in the worktree where the agent can read

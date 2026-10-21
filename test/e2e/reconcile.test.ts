@@ -12,7 +12,7 @@ import {
   protocolDir as getProtocolDir,
 } from '../../src/protocol';
 import type { CompletedResponse, ErrorResponse } from '../../src/protocol';
-import { reconcileTasks } from '../../src/utils/reconcile';
+import { reconcileTasks, settleAutoResumes } from '../../src/utils/reconcile';
 import { beginLaunch, endLaunch } from '../../src/runner/launch-in-flight';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 import { readTaskStatus } from '../helpers/storage';
@@ -93,6 +93,9 @@ async function runReconcile(root: string): Promise<void> {
   const storage = await openProjectStorage(root);
   try {
     await reconcileTasks(storage, root);
+    // The reconciler dispatches auto-resume launches off its sweep; let them
+    // finish before this storage handle closes.
+    await settleAutoResumes();
   } finally {
     await storage.close();
   }

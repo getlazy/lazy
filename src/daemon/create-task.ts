@@ -26,6 +26,7 @@ import {
   parseReviewMode,
   parseReviewToggle,
   reviewOverrideMetadata,
+  reviewOverridesApplied,
   type ReviewSettingsOverrides,
 } from '../review/mode';
 import type { Task, TaskType } from '../types';
@@ -42,6 +43,7 @@ import { assertAgentProfileRunnable, assertKnownAgentProfile } from './agent-pro
 import { assertNoModelOnTiered } from '../agent/tiered-model';
 import { inheritedCustomImageMetadata } from '../docker/worktree-image';
 import { deriveCode, displayId, shortId, validateCode } from '../task/identity';
+import { describeCommitRunTarget } from '../run/identity';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { RpcError } from './rpc-error';
 
@@ -83,6 +85,7 @@ export interface CreateTaskResult {
    * whole or not at all. Kept on the wire because clients read it.
    */
   warnings: string[];
+  reviewSettingsApplied?: boolean;
 }
 
 /**
@@ -166,13 +169,15 @@ export async function createTask(
     if (codeError) {
       throw new RpcError(400, `Invalid code '${typedCode}': ${codeError}`);
     }
+    await assertCodeIsNotARunSlug(storage, typedCode);
     code = typedCode;
   } else if (input.deriveCode !== false) {
     // Suggestion the form advertised: a kebab-case slug from the goal, when
     // the goal itself is a valid code. Too-short or reserved goals stay
-    // uncoded (the short id is the address) rather than inventing padding.
+    // uncoded (the short id is the address) rather than inventing padding —
+    // and so does one that is a running commit's address.
     const suggested = deriveCode(goal);
-    if (suggested) {
+    if (suggested && !(await storage.getCommitRunBySlug(suggested))) {
       code = suggested;
       derivedCode = true;
     }
@@ -305,6 +310,10 @@ export async function createTask(
     if (isDuplicateCodeError(message)) {
       throw new RpcError(400, message);
     }
+    // The store's backstop for a run created between the check above and here.
+    if (isCommitRunCodeError(message)) {
+      throw new RpcError(409, message);
+    }
     throw new Error(`failed to create task: ${message}`, { cause: err instanceof Error ? err : undefined });
   }
 
@@ -313,7 +322,27 @@ export async function createTask(
     displayId: displayId(created),
     derivedCode,
     warnings: [],
+    reviewSettingsApplied: reviewOverridesApplied(reviewOverrides, created.metadata),
   };
+}
+
+/**
+ * Refuse a task code that is a commit run's slug (src/daemon/commit-run.ts):
+ * both would answer on `<code>.<service>.<suffix>`, and the service proxy
+ * resolves the run. A 409 naming the run, before anything is written.
+ */
+export async function assertCodeIsNotARunSlug(storage: Pick<Storage, 'getCommitRunBySlug'>, code: string): Promise<void> {
+  const run = await storage.getCommitRunBySlug(code);
+  if (run) {
+    throw new RpcError(409,
+      `Code '${code}' is the address of a running commit (${describeCommitRunTarget(run)}), whose services answer on that name. ` +
+      'Choose a different code, or remove that run first.');
+  }
+}
+
+/** FileStorage's refusal when a code is a commit run's slug (its lock-held backstop). */
+export function isCommitRunCodeError(message: string): boolean {
+  return /^Code '.+' is the address of a running commit\b/.test(message);
 }
 
 /** FileStorage's exact refusal when a non-terminal task already holds this code. */

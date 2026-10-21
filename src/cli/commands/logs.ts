@@ -1,11 +1,11 @@
 /**
  * `lazy daemon logs` command.
  *
- * Tails the daemon log file. Primary debugging tool.
+ * Prints the tail of the daemon log file (-f follows). Primary debugging tool.
  *
- *   lazy daemon logs                 — tail -f the daemon log (last 50 lines, then follow)
- *   lazy daemon logs -n 100          — show last 100 lines then follow
- *   lazy daemon logs --no-follow     — show recent lines and exit
+ *   lazy daemon logs                 — print the last 200 lines and exit
+ *   lazy daemon logs -n 100          — print the last 100 lines and exit
+ *   lazy daemon logs -f              — print the recent lines, then follow
  *   lazy daemon logs <task>          — filter to lines mentioning this task (by short ID or code)
  */
 
@@ -14,6 +14,8 @@ import { parseFlags, requireLazyRoot } from '../helpers';
 import { getLogPath } from '../../daemon/paths';
 import { writeStdout } from '../../utils/stdio';
 import { isDaemonRunning } from '../../daemon';
+
+const DEFAULT_LOG_LINES = 200;
 
 export async function commandLogs(args: string[]): Promise<void> {
   const parsed = parseFlags(args, [
@@ -43,9 +45,9 @@ export async function commandLogs(args: string[]): Promise<void> {
 
   const numLines = parsed.flags.has('lines')
     ? parseInt(parsed.flags.get('lines') as string, 10)
-    : 50;
-  const noFollow = parsed.flags.get('no-follow') === true;
-  const follow = !noFollow;
+    : DEFAULT_LOG_LINES;
+  // Like tail: print the recent lines and exit; follow only when asked.
+  const follow = parsed.flags.get('follow') === true && parsed.flags.get('no-follow') !== true;
 
   // Task filter: first positional arg is the task identifier.
   // Used as a plain substring match against log lines — works with
@@ -53,7 +55,7 @@ export async function commandLogs(args: string[]): Promise<void> {
   const filterPattern = parsed.positional[0] ?? null;
 
   // Header so it's obvious what's being tailed.
-  console.error(`Tailing lazy daemon log: ${logPath}`);
+  console.error(`${follow ? 'Following' : 'Showing'} lazy daemon log: ${logPath}`);
   if (filterPattern) {
     console.error(`Filter: ${filterPattern}`);
   }
@@ -186,22 +188,22 @@ async function followLog(filePath: string, filterPattern: string | null): Promis
 export function logsUsage(): void {
   console.log(`Usage: lazy daemon logs [options] [<task>]
 
-Tail the daemon log file. Primary debugging tool.
+Print the tail of the daemon log file (add -f to follow). Primary debugging tool.
 
 Arguments:
   <task>              Filter log output to lines mentioning this task
                       (by short ID, full ID, or task code)
 
 Options:
-  -n, --lines N       Number of lines to show (default: 50)
-  -f, --follow        Follow log output (default, can be explicit)
-  --no-follow         Show recent lines and exit
+  -n, --lines N       Number of lines to show (default: 200)
+  -f, --follow        Keep following new log output (default: print and exit)
+  --no-follow         Print and exit (the default; accepted for old scripts)
   --project PATH      Explicit project root (default: auto-detect)
 
 Examples:
-  lazy daemon logs                    # Tail daemon log (last 50 lines + follow)
-  lazy daemon logs -n 100             # Show last 100 lines + follow
-  lazy daemon logs --no-follow        # Show last 50 lines and exit
+  lazy daemon logs                    # Last 200 lines, then exit
+  lazy daemon logs -n 100             # Last 100 lines, then exit
+  lazy daemon logs -f                 # Last 200 lines, then follow
   lazy daemon logs abc12345           # Filter to task abc12345
   lazy daemon logs fix-auth           # Filter to task code fix-auth
   lazy daemon logs -n 200 abc12345    # Last 200 lines for task abc12345`);

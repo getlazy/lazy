@@ -8,6 +8,8 @@ import { unquoteGitPath } from './quote-path';
 import { withRemoteRetry } from '../utils/retry';
 import { pathExists, ensureDir, stat, copyFile, chmod } from '../utils/fs';
 import { TaskMutex } from '../utils/task-mutex';
+import { withFileLock } from '../utils/file-lock';
+import { createHash } from 'crypto';
 import type { Task } from '../types';
 import { targetBranchOf } from '../task-target';
 import {
@@ -1588,7 +1590,7 @@ export async function recoverMissingWorktree(
   cwd?: string,
   opts: WorktreeRecoveryOptions = {},
 ): Promise<WorktreeRecoveryResult> {
-  return worktreeRecoveryMutex.withLock(resolve(cwd ?? process.cwd(), worktreePath),
+  return withWorktreeRecoveryLock(worktreePath, cwd,
     () => recoverMissingWorktreeUnlocked(worktreePath, branch, cwd, opts));
 }
 
@@ -1616,6 +1618,35 @@ async function validateRecoveredWorktree(
     }
   }
   return { recovered: true, branchExists: true, dirty: await hasUncommittedChanges(worktreePath) };
+}
+
+/** How long a recovery waits for another process recovering the same checkout. */
+const WORKTREE_RECOVERY_LOCK_WAIT_MS = 30 * 60_000;
+
+/**
+ * Hold the in-process mutex AND a cross-process lock for one worktree path.
+ * Two `git worktree add` runs into the same path are not safe to race: each
+ * writes the shared `<path>/.git` file (last writer wins, so both checkouts
+ * end up in one gitdir and collide on its index.lock), and the one that fails
+ * deletes the whole directory on exit — under the other's checkout, possibly
+ * after the other already reported it recovered. So only one process may run
+ * a recovery of a path at a time; the next one then finds and validates the
+ * finished checkout. The lock lives in the repository's common git dir, keyed
+ * by the resolved path, and flock(2) releases it if its holder dies.
+ */
+async function withWorktreeRecoveryLock<T>(worktreePath: string, cwd: string | undefined, action: () => Promise<T>): Promise<T> {
+  const absolute = resolve(cwd ?? process.cwd(), worktreePath);
+  return worktreeRecoveryMutex.withLock(absolute, async () => {
+    const common = await runGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd });
+    if (common.exitCode !== 0) {
+      throw new Error(`Cannot recover worktree ${worktreePath}: could not find the repository's git directory (${common.stderr.trim()}).`);
+    }
+    const digest = createHash('sha256').update(absolute).digest('hex').slice(0, 32);
+    return withFileLock(join(common.stdout.trim(), 'lazy-worktree-recovery', `${digest}.lock`), action, {
+      timeoutMs: WORKTREE_RECOVERY_LOCK_WAIT_MS,
+      waitingFor: `another process to finish restoring ${worktreePath}`,
+    });
+  });
 }
 
 async function recoverMissingWorktreeUnlocked(
@@ -1727,7 +1758,7 @@ export async function recoverMissingWorktreeWithFetch(
   cwd?: string,
   opts: WorktreeRecoveryOptions = {},
 ): Promise<WorktreeRecoveryResult> {
-  return worktreeRecoveryMutex.withLock(resolve(cwd ?? process.cwd(), worktreePath), async () => {
+  return withWorktreeRecoveryLock(worktreePath, cwd, async () => {
     const existing = await validateRecoveredWorktree(worktreePath, branch, cwd);
     if (existing) return existing;
     // Try local recovery first (fast path)
@@ -2203,13 +2234,13 @@ export async function getCommitIdentities(shas: string[], cwd?: string): Promise
  * (`rev-parse --verify --quiet` exiting 1 with nothing on stderr); any other
  * git failure throws, so an error is never shown as "no changes" or "gone".
  */
-export async function getCommitPatch(sha: string, cwd?: string): Promise<{ patch: string; missing: boolean }> {
+export async function getCommitPatch(sha: string, cwd?: string): Promise<{ patch: string; message: string; missing: boolean }> {
   if (!/^[0-9a-f]{4,64}$/i.test(sha)) {
     throw new Error(`getCommitPatch: '${sha}' is not a hex commit SHA`);
   }
   const where = cwd ?? process.cwd();
   const exists = await runGit(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], { cwd });
-  if (exists.exitCode === 1 && exists.stderr.trim() === '') return { patch: '', missing: true };
+  if (exists.exitCode === 1 && exists.stderr.trim() === '') return { patch: '', message: '', missing: true };
   if (exists.exitCode !== 0) {
     throw new Error(`getCommitPatch: could not look up ${sha} in ${where} (exit ${exists.exitCode}): ${exists.stderr.trim()}`);
   }
@@ -2217,5 +2248,9 @@ export async function getCommitPatch(sha: string, cwd?: string): Promise<{ patch
   if (r.exitCode !== 0) {
     throw new Error(`getCommitPatch: git show ${sha} failed in ${where} (exit ${r.exitCode}): ${r.stderr.trim()}`);
   }
-  return { patch: r.stdout, missing: false };
+  const message = await runGit(['log', '-1', '--format=%B', sha], { cwd });
+  if (message.exitCode !== 0) {
+    throw new Error(`getCommitPatch: git log ${sha} failed in ${where} (exit ${message.exitCode}): ${message.stderr.trim()}`);
+  }
+  return { patch: r.stdout, message: message.stdout.trimEnd(), missing: false };
 }

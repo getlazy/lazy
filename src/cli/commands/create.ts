@@ -229,6 +229,11 @@ export async function commandCreate(args: string[]): Promise<void> {
     // name. Same precedence as `lazy reparent` — try task first, then branch.
     let parentTask: Task | null = null;
     if (parentValue !== undefined) {
+      // A value beginning with `-` is a git option, never a task or branch.
+      if (parentValue.startsWith('-')) {
+        console.error(`--parent '${parentValue}' is not a task or branch name — names cannot start with '-'.`);
+        process.exit(1);
+      }
       const resolved = await storage.resolveTask(parentValue);
       if (resolved.task) {
         if (TERMINAL_STATUSES.includes(resolved.task.status)) {
@@ -244,7 +249,7 @@ export async function commandCreate(args: string[]): Promise<void> {
         // Not a task — try as a raw branch name. Verify it resolves locally so
         // we don't store a typo as the integration target.
         const root = requireLazyRoot();
-        const verify = await runGit(['rev-parse', '--verify', '--quiet', parentValue], { cwd: root });
+        const verify = await runGit(['rev-parse', '--verify', '--quiet', `${parentValue}^{commit}`], { cwd: root });
         if (verify.exitCode !== 0) {
           console.error(`--parent '${parentValue}' is neither a known task nor a local git branch.`);
           process.exit(1);

@@ -551,7 +551,7 @@ export async function collectDaemonHealth(
       },
     },
     {
-      id: 'tasks:interrupted', group: 'tasks', name: 'Interrupted tasks resume',
+      id: 'tasks:interrupted', group: 'tasks', name: 'Interrupted task recovery',
       run: async () => {
         const cfg = await config();
         const interrupted = await collectInterrupted(await getOrCreateStorage(), await tasks());

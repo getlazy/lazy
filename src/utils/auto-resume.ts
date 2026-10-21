@@ -16,7 +16,7 @@ import { resolveAndPersistLowHighLoop } from '../daemon/effort';
 import type { EffortLevel } from '../config/types';
 import { resolveTurnLaunchIdentity } from '../daemon/launch-identity';
 import { createRunner } from '../runner';
-import { harnessForTask, setRunnerAgentForTask } from '../daemon/task-harness';
+import { harnessForTask, setRunnerAgentForTask, agentTargetForTask } from '../daemon/task-harness';
 import { stampSessionRunner, removeTaskRun, mustRecreateForContainerAgent } from '../runner/session-launch';
 import { mustRecreateForTaskEnv } from '../daemon/task-env';
 import { deliverTaskFilesForLaunch } from '../daemon/task-files';
@@ -32,7 +32,7 @@ import { parentTaskIdOf } from '../task-target';
 import { writeDaemonMcpConfig } from '../daemon/task-launcher';
 import { resolveUpstreamMergeRefForCommand } from '../daemon/upstream-command-ref';
 import { resolveWrapUpCommandFields } from '../daemon/wrap-up-plan';
-import { planTurnCredential, mustRecreateForCredentialPlan, systemTurnBlock } from '../daemon/turn-credentials';
+import { planTurnCredential, mustRecreateForCredentialPlan, systemTurnBlock, sessionCredentialCommandField } from '../daemon/turn-credentials';
 import { takeTaskAllowanceAtLaunch, usagePauseHold } from '../daemon/usage-pause';
 import { hasDaemonContext } from '../daemon/context';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from './feedback-redelivery';
@@ -384,7 +384,7 @@ export async function autoResumeTask(
     await recordRecreationIfRunning(
       storage,
       task.id,
-      recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv),
+      recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)),
       runner, containerName,
     );
     const envNotice = await environmentReplacedPrefix(storage, task.id);
@@ -491,6 +491,7 @@ export async function autoResumeTask(
         worktreePath,
         config,
       })),
+      ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
       ...commonCommandFields(config),
     };
     // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).

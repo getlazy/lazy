@@ -8,6 +8,7 @@ import { readProjectSettingsFile, worktreePathFor } from '../helpers/storage';
 import { openSse, frameData } from '../helpers/sse';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
+import { teamsServiceHostLabel } from '../../src/serve/teams-host';
 
 /**
  * `servePorts` — where a task's declared `[serve]` services are reachable — and
@@ -367,5 +368,57 @@ describe('daemon servePorts RPC', () => {
     // the feed would be stale the moment it was buffered — call servePorts.
     expect(removed.data).not.toContain('hostPort');
     expect(created.data).not.toContain('hostPort');
+  });
+  // --- Readable Lazy Teams service names (src/serve/teams-host.ts) ---
+
+  describe('Lazy Teams service host names', () => {
+    const serviceHost = { projectTag: 'k3x7', projectSlug: 'web', teamSlug: 'acme' };
+
+    // Every external surface confirms its inputs: a context Teams sent wrongly
+    // is a 400 naming the field, never silently answered without labels.
+    test('servePorts refuses a malformed serviceHost and accepts a valid one', async () => {
+      const taskId = await createTask(ctx, 'Serve ports: teams context');
+
+      const bad = await rpcStatus('servePorts', { taskId, serviceHost: { ...serviceHost, projectTag: 'P15' } });
+      expect(bad.status).toBe(400);
+      expect(bad.message).toContain('projectTag');
+
+      const ok = await rpc('servePorts', { taskId, serviceHost }) as Record<string, unknown>;
+      expect(ok.unavailable).toBe('not-running');
+    });
+
+    // INVARIANT: the daemon turns a label back into its task and service — the
+    // cold-link question Teams asks after sign-in — from the label's tail, and
+    // still finds the service after the readable part went out of date.
+    test('resolveServiceHost names the task and service a label routes to', async () => {
+      await declareServePorts();
+      const taskId = await createTask(ctx, 'Serve ports: resolve a label');
+      const state = await rpc('servePorts', { taskId }) as { taskId: string; displayId: string };
+      const label = teamsServiceHostLabel({ subjectLabel: state.displayId, subjectId: state.taskId, port: 5173, context: serviceHost });
+
+      const answer = await rpc('resolveServiceHost', { label, serviceHost }) as {
+        matches: Array<{ kind: string; id: string; service: { port: number; label: string } | null }>;
+      };
+      expect(answer.matches).toHaveLength(1);
+      expect(answer.matches[0]).toMatchObject({ kind: 'task', id: state.taskId, service: { port: 5173, label: '5173' } });
+
+      // Written before the project was renamed: the readable part is stale,
+      // the tail still routes, and the one matching port is found.
+      const stale = teamsServiceHostLabel({ subjectLabel: 'old-name', subjectId: state.taskId, port: 3000, context: { ...serviceHost, projectSlug: 'old' } });
+      const renamed = await rpc('resolveServiceHost', { label: stale, serviceHost }) as typeof answer;
+      expect(renamed.matches[0]?.service?.port).toBe(3000);
+    });
+
+    test('resolveServiceHost refuses a label for another project or not a label at all', async () => {
+      const other = await rpcStatus('resolveServiceHost', { label: 'ui-3000-web-acme-zzzz3f9a1c2e', serviceHost });
+      expect(other.status).toBe(400);
+      expect(other.message).toContain('project tag');
+
+      const junk = await rpcStatus('resolveServiceHost', { label: 'ui--3000--p15', serviceHost });
+      expect(junk.status).toBe(400);
+
+      const none = await rpc('resolveServiceHost', { label: 'ui-3000-web-acme-k3x7ffffffff', serviceHost }) as { matches: unknown[] };
+      expect(none.matches).toEqual([]);
+    });
   });
 });

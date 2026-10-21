@@ -6,7 +6,7 @@ This section has one page per main screen. Each page shows the screen and then l
 
 ## Navigation
 
-The top bar shows where you are: **Lazy Teams**, then the team, then the project. Inside a project it links to **Review**, **Clusters**, **Tasks**, **Raised**, **Search**, **Builders**, **Settings** and **Messages**. Your account is behind the round avatar at the right.
+The top bar shows where you are: **Lazy Teams**, then the team, then the project. Inside a project it links to **Review**, **Builders**, **Clusters**, **Tasks**, **Run**, **Raised**, **Search**, **Settings** and **Messages**. Your account is behind the round avatar at the right.
 
 ## Account and team
 
@@ -26,7 +26,7 @@ The top bar shows where you are: **Lazy Teams**, then the team, then the project
 | [Task](task.md) | One task: its goal, report, tabs and feedback. |
 | [Review queue](review-queue.md) | Tasks waiting for a decision. |
 | [Clusters](clusters.md) | Cluster tasks and their progress. |
-| [Run](run.md) | Not documented yet. |
+| [Run](run.md) | Run the product at a branch or a commit, without a task. |
 | [Raised](raised.md) | Questions and follow-ups agents raised. |
 | [Builders](builders.md) | Builder conversations and files. |
 | [Messages](messages.md) | The project inbox. |

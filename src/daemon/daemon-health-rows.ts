@@ -776,7 +776,7 @@ export interface InterruptedTask {
 }
 
 export function buildInterruptedRow(tasks: InterruptedTask[], autoResume: boolean): DaemonHealthRow {
-  const base = { id: 'tasks:interrupted', group: 'tasks' as const, name: 'Interrupted tasks resume' };
+  const base = { id: 'tasks:interrupted', group: 'tasks' as const, name: 'Interrupted task recovery' };
   if (tasks.length === 0) return { ...base, state: 'ok', reason: 'no interrupted tasks' };
   const stranded = autoResume
     ? tasks.filter(t => t.state === 'gave-up')
@@ -797,6 +797,7 @@ export function buildInterruptedRow(tasks: InterruptedTask[], autoResume: boolea
     const why = autoResume ? 'auto-resume gave up on' : '[daemon] auto_resume is off, so nothing resumes';
     return {
       ...base,
+      name: 'Interrupted tasks need manual recovery',
       state: 'warn',
       reason: `${why} ${stranded.map(t => t.code).join(', ')} (${summary})`,
       remedy: 'Resume each by hand with `lazy resume <task>` once whatever interrupted it is fixed.',

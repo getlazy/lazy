@@ -5,7 +5,8 @@ This page is generated from `lazy stats tokens --help`.
 ```text
 Usage: lazy stats tokens [--since <duration>] [--limit <n>] [--top <n>] [--role <role>] [--task <id>] [--subtree] [--json]
 
-Token accounting from the proxy audit trail. The lazy proxy records one audit
+Token accounting from the proxy audit trail (bounded; it rotates), plus the
+usage recorded durably on each task's turns when --task is given. The lazy proxy records one audit
 record per forwarded request — attributed to a role (builder/agent) and a task
 by the per-launch credential lazy issues — with the token usage parsed out of the response. This
 command rolls those records up:

@@ -48,6 +48,12 @@ export const PALETTE_COMMANDS: readonly PaletteCommand[] = [
     href: '/clusters',
   },
   {
+    id: 'runs',
+    label: 'Navigate to runs',
+    keywords: 'run commit branch main default services',
+    href: '/runs',
+  },
+  {
     // The nav no longer carries a Search link — the box and this chord are the
     // two entry points, so the palette must be able to reach the full page or
     // the page becomes unreachable from the chrome.

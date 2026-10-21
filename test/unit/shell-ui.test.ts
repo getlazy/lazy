@@ -59,10 +59,23 @@ describe('shellClientScript', () => {
 
   test('a custom key handler is attached for the clipboard shortcuts', () => {
     expect(script).toContain('s.term.attachCustomKeyEventHandler(makeKeyHandler(s))');
-    // Ctrl/Cmd+V and Shift+Insert paste through the async clipboard API.
+    // INVARIANT: a paste lands once. Ctrl/Cmd+V and Shift+Insert are kept from
+    // the PTY (no ^V) and left to the browser's paste event, so keydown pastes
+    // nothing itself - except Ctrl+V on a Mac, where no native paste follows.
+    // The Paste button reads the clipboard.
     expect(script).toContain('navigator.clipboard.readText()');
-    expect(script).toContain("ev.key === 'Insert'");
-    expect(script).toContain("if (key === 'v') { pasteInto(s); return false; }");
+    expect(script).toContain("if (ev.shiftKey && ev.key === 'Insert') return false;");
+    // ^V is kept from the PTY: the 'v' branch always returns false...
+    expect(script).toMatch(/if \(key === 'v'\) \{[^}]*return false;\s*\}/);
+    // ...and its only paste is the Mac Ctrl+V exception.
+    expect(script).toContain(
+      "if (ev.ctrlKey && !ev.metaKey && /Mac/.test(navigator.platform)) pasteInto(s);",
+    );
+    // Nothing else on keydown pastes: the handler calls pasteInto exactly once.
+    const fromHandler = script.slice(script.indexOf('function makeKeyHandler'));
+    const handlerBody = fromHandler.slice(0, fromHandler.indexOf('let resizeTimer'));
+    expect(handlerBody.match(/pasteInto\(/g)).toHaveLength(1);
+    expect(script).toContain('registerOscHandler(52');
     // Ctrl+C copies a selection, and without one falls through so ^C still
     // reaches the process as the interrupt.
     expect(script).toContain('s.term.getSelection()');

@@ -75,6 +75,11 @@ that came from the project's own default is shown faded, so the line never
 presents a default as a choice somebody made. If the last turn actually ran on
 something different, the line says that too.
 
+The next line shows the effective review mode, gate and auto-fix setting. Choose
+these on the **New task** form or change them with **Edit**. Changes on a task
+that has already run apply to its next review. Choosing an inherited value
+explicitly pins it to the task.
+
 The **More** tab shows the task's current **prompt** — what the agent was
 asked to do, including any later edit — with **Prompt history** one link away.
 The rest of the task's identity — branch, turn and commit counts, timestamps — is
@@ -240,18 +245,31 @@ What the task is serving and whether anything is answering on it — a green
 the port is published and nothing is behind it. When the task is not running at
 all, the card says so once rather than listing every service as dead.
 
-Each running service has an address of the form
-`http://<task>.<service>.lazy.localhost:<port>` — the same name lazy's own
-`lazy url` prints, on the port your project's daemon is reached on from the
-machine running Teams. That name answers from a browser **on that machine**
-(Chrome and Firefox resolve `*.localhost` to it without any setup) whether the
-project runs directly on it or inside a microVM: the daemon carries the request
-the last hop to the task's container itself.
+![The Services tab of a task: the web service running, with an Open link and its readable address. On an install with a services host the address ends in that host; this one was taken on the Teams machine itself, so it ends in localhost](images/teams-topics/teams-services-open-link.png)
 
-The addresses are shown as **text, not links**, and the card says why: they
-answer from a browser on the machine running Teams and from nowhere else, and a
-link that opens for one reviewer and is dead for the next would be worse than
-saying so.
+Each running service has an **Open** link. Open goes through Lazy Teams, so it
+works from any browser signed in to Teams as a member of the project, on any
+machine, with WebSockets and hot reload passing through. Beside it is the
+service's own readable address under the install's services host: the task, the
+port, the project and the team, then a short id
+(`fix-login-3000-web-acme-k3x73f9a1c2e.<services host>`).
+
+That address is the preview link to give a reviewer. Someone not signed in goes
+through Teams' sign-in and then lands on the service; someone who is not a
+member of the project is refused, and leaving the team ends access on the next
+request. Opening a declared service that is not answering yet shows a page
+that says whether something is bringing it up and how long it has waited,
+checks again every few seconds, opens the service as soon as it answers, and
+offers **Run services** when nothing is starting it (see
+[Reaching a task's running services](self-hosting-lazy-teams.md#reaching-a-tasks-running-services)).
+A service the task does not declare or serve takes you to the task's
+**Services** tab instead. Older service links keep working.
+
+When the install has no services host, the card shows no address and says what
+an operator must set up — see
+[Reaching a task's running services](self-hosting-lazy-teams.md#reaching-a-tasks-running-services).
+Declaring services, and previewing a task's files, is covered in
+[Reaching a task's dev server](serve-ports.md#under-lazy-teams).
 
 Where a declared port is not being served at all, the card says exactly that and
 stops — it does not guess at a cause, because it was not told one.
@@ -1003,7 +1021,23 @@ the refusal message itself, so you do not have to go looking for it.
 
 ## Turns
 
-Turn history is grouped into **chunks** — one human intervention plus every
+The **Turns** tab opens on the **Conversation**: each message from a person —
+the start prompt, your feedback, a question — followed directly by the agent's
+reply to it. Everything lazy and the agent said to each other in between
+(reminders to commit, wrap-up steps, the self-review, syncs, recovered turns)
+is folded into one line such as *5 mechanical turns: nudge, self-review,
+wrap-up*; open it to read them. A comment you write while the agent is working
+is your message too, so it stays open, with the agent's answer, between your
+message and the final reply. Each exchange links to its raw turns, and
+**All turns** switches the tab to the full chunk view described below. The same
+view is the default on the local dashboard. In Lazy Teams, when the agent filed a
+report for its reply, the report is shown as the reply.
+
+**Current review** shows your latest feedback or question together with the
+agent's reply, so the answer appears where you asked. It updates by itself when
+the reply arrives.
+
+Underneath, turn history is grouped into **chunks** — one human intervention plus every
 automation turn that followed. Chunks appear **newest first**; turns inside each
 chunk stay in chronological order. Each chunk says when it opened and how long
 it ran, so you can see at a glance whether the agent was working for twenty

@@ -31,6 +31,7 @@ import { buildPublishArgs } from '../serve/ports';
 // cycle between the capture and daemon layers.
 import { getTaskEnv, planTaskEnvLaunchFile, recordTaskEnvLaunched } from '../daemon/task-env';
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
+import { recordContainerCredentialLaunch } from '../daemon/container-credential-launch';
 import { isSessionPlaceholderToken, lookupSessionBinding, setSessionBindingOrigin } from '../daemon/session-credentials';
 import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
 import { buildTaskGitMounts } from './git-mounts';
@@ -2690,7 +2691,7 @@ export async function ensureAgentBinary(): Promise<string> {
   // The stamp records BOTH the source hash and the install the last build
   // produced, because the install path is no longer a fixed name.
   const hashFile = agentBinaryStampPath(binDir);
-  const currentHash = calculateSourceHash(sourceRoot) + ':' + target;
+  const currentHash = (await calculateSourceHash(sourceRoot)) + ':' + target;
 
   const stamp = await readAgentBinaryStamp(hashFile);
   if (stamp && stamp.sourceHash === currentHash && stamp.installName) {
@@ -2894,24 +2895,31 @@ async function buildAgentBinaryFromSourceCheckout(
 }
 
 /**
- * Calculate a hash of the lazy source files to detect changes
+ * Calculate a hash of the lazy source files to detect changes.
+ *
+ * Runs on every container launch in dev mode (a Teams daemon runs lazy from
+ * source), over ~1000 files. It used to read them with readFileSync, which held
+ * the daemon's event loop for 300-450ms per launch — and stalled the image
+ * check it runs beside (launchBuilderDetached's Promise.all) for the same time.
+ * Reads are async and concurrent; the hash is fed in sorted order, so the value
+ * is unchanged.
  */
-function calculateSourceHash(lazyRoot: string): string {
+async function calculateSourceHash(lazyRoot: string): Promise<string> {
   const hash = createHash('sha256');
   const srcDir = join(lazyRoot, 'src');
 
   // Hash package.json (dependency changes) and all .ts source files
-  const packageJson = join(lazyRoot, 'package.json');
-  if (existsSync(packageJson)) {
-    hash.update(readFileSync(packageJson, 'utf-8'));
+  try {
+    hash.update(await readFile(join(lazyRoot, 'package.json'), 'utf-8'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
 
-  // Use a simple recursive glob via Bun to find all .ts files
-  const glob = new Bun.Glob('**/*.ts');
-  const files = Array.from(glob.scanSync({ cwd: srcDir, absolute: true })).sort();
-  for (const file of files) {
-    hash.update(readFileSync(file, 'utf-8'));
-  }
+  const files: string[] = [];
+  for await (const file of new Bun.Glob('**/*.ts').scan({ cwd: srcDir, absolute: true })) files.push(file);
+  files.sort();
+  const contents = await Promise.all(files.map((file) => readFile(file, 'utf-8')));
+  for (const content of contents) hash.update(content);
 
   return hash.digest('hex');
 }
@@ -4066,6 +4074,9 @@ async function launchSupervisorOnce(
   // owner's credential kind. Null for every single-user install, where this
   // falls through to the daemon's own credential exactly as before.
   const sessionCredential = taskUuid ? await sessionCredentialEnvFor(repoRoot, taskUuid) : null;
+  // Whether this container holds a session placeholder a later turn's command
+  // can replace, or must be recreated to get one (mustRecreateForCredentialPlan).
+  if (taskUuid) await recordContainerCredentialLaunch(repoRoot, taskUuid, containerName, sessionCredential ? 'session' : 'other');
 
   // Supervisor launches are always the `agent` role; the task turn it runs
   // inherits this env, so proxied traffic is attributed to agent + task.

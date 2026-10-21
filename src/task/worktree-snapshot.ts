@@ -12,11 +12,13 @@ import type { Turn } from '../types';
  * Is this snapshot still describing the turn the worktree is sitting at the end
  * of?
  *
- * Snapshots have no lifecycle: one is written only when a turn ends DIRTY,
- * nothing ever marks one consumed, and `getLatestWorktreeSnapshot` returns the
- * newest ever taken in the session. So once a task has had a single dirty turn,
- * that patch stayed the candidate for every later unblock that found a clean
- * worktree — forever.
+ * One is written only when a turn ends DIRTY, and `getLatestWorktreeSnapshot`
+ * returns the newest ever taken in the session. Snapshots are now RETIRED
+ * (`retireWorktreeSnapshots`) when an unblock applies one and when a later turn
+ * ends clean; this rule is the independent bound that predates that lifecycle,
+ * and it still covers a snapshot retirement missed (the retire is best-effort
+ * at turn end). Before either, a single dirty turn left its patch the candidate
+ * for every later unblock that found a clean worktree — forever.
  *
  * That was harmless only by accident: every stored patch had lost the newline
  * ending its last line and `git apply` rejected all of them as corrupt. Now

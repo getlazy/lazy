@@ -23,7 +23,7 @@ Subcommands:
                  (the address only — to SIGN IN, run: lazy dashboard)
   list        List ALL running lazy daemons on this host (marks strays)
   kill-stray  Reap daemons whose project root no longer exists on disk
-  logs        Tail the daemon log file (primary debugging tool)
+  logs        Print the daemon log tail; --follow keeps streaming (primary debugging tool)
   auto-budget Control + inspect the auto-react daily budget (list/update/pause/resume)
   config      Inspect + override concurrency caps at runtime (get/set/reset, ephemeral)
   resume-queue  Show the slow-lane auto-resume queue (read-only)

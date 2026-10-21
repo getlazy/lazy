@@ -69,16 +69,7 @@ describe('a submitted subtask whose parent is accepted into a protected target',
     expectSuccess(await ctx.lazyMocked(['start', taskId, '--yes'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_MOCK_SHOULD_COMMIT: '1' },
     }));
-    // This suite's daemon has a remote, so right after the first turn its sync
-    // can run a short sync turn: `lazy wait` then reports `working` (exit 1)
-    // and the task is `blocked` again a moment later. Wait until it settles.
-    for (let attempt = 0; ; attempt++) {
-      const waitResult = await ctx.lazy(['wait', taskId]);
-      if (waitResult.exitCode === 0) return;
-      if (attempt >= 3 || !waitResult.stdout.includes('is now working')) {
-        throw new Error(`wait failed for ${taskId}: ${waitResult.stderr}\n${waitResult.stdout}`);
-      }
-    }
+    expectSuccess(await ctx.lazy(['wait', taskId]));
   }
 
   /**
@@ -297,6 +288,14 @@ describe('a submitted subtask whose parent is accepted into a protected target',
     expect(readTaskStatus(ctx.root, childId)).toBe('blocked');
   }, 240_000);
 
+  async function waitForMetadata(taskId: string, key: string): Promise<void> {
+    const deadline = Date.now() + 30_000;
+    while (!readTaskJson(ctx.root, taskId).metadata?.[key]) {
+      if (Date.now() > deadline) throw new Error(`task ${taskId} never got metadata ${key}`);
+      await Bun.sleep(50);
+    }
+  }
+
   function retargets(): Array<{ taskId: string; base: string; ok: boolean }> {
     const path = join(ctx.protocolBase, 'mock-retargets.jsonl');
     if (!existsSync(path)) return [];
@@ -315,6 +314,12 @@ describe('a submitted subtask whose parent is accepted into a protected target',
     const branch = readSessionJson(ctx.root, taskId)!.git_branch as string;
     writeForge('mock-review-create.json', { url: PR_URL, id: '7' });
     expectSuccess(await ctx.lazy(['submit', taskId, '--yes']));
+    // Submit refreshes the PR description in the background, and that refresh
+    // ends by rewriting task.json with its watermark. The edits below go
+    // straight to the file, outside the daemon's lock, so a refresh still in
+    // flight would overwrite them with the record it read before them —
+    // dropping the link and putting `submitted` back. Let it land first.
+    await waitForMetadata(taskId, 'fidelity_turn_seq');
 
     // The task is linked (what `lazy link <pr-url>` records), and the PR's
     // owner has pointed it at `develop`.

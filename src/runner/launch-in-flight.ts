@@ -23,7 +23,21 @@
  * lack the task id.
  */
 
-const inFlight = new Set<string>();
+// Reference-counted, not a Set: the reconciler registers a dispatched
+// auto-resume under the task id for its whole duration, and the runner's own
+// launch registers the same task key inside it — the inner release must not
+// clear the outer registration.
+const inFlight = new Map<string, number>();
+
+function add(k: string): void {
+  inFlight.set(k, (inFlight.get(k) ?? 0) + 1);
+}
+
+function remove(k: string): void {
+  const n = (inFlight.get(k) ?? 0) - 1;
+  if (n > 0) inFlight.set(k, n);
+  else inFlight.delete(k);
+}
 
 function keysFor(runName: string, taskId?: string): string[] {
   return taskId ? [`run:${runName}`, `task:${taskId}`] : [`run:${runName}`];
@@ -32,11 +46,11 @@ function keysFor(runName: string, taskId?: string): string[] {
 /** Run `fn` with the launch registered for its whole duration, success or failure. */
 export async function withLaunchInFlight<T>(runName: string, taskId: string | undefined, fn: () => Promise<T>): Promise<T> {
   const keys = keysFor(runName, taskId);
-  for (const k of keys) inFlight.add(k);
+  for (const k of keys) add(k);
   try {
     return await fn();
   } finally {
-    for (const k of keys) inFlight.delete(k);
+    for (const k of keys) remove(k);
   }
 }
 
@@ -47,12 +61,28 @@ export function launchInFlight(runName: string, taskId?: string): boolean {
 
 /** Test seam: mark a launch as in progress without running one. Pair with {@link endLaunch}. */
 export function beginLaunch(runName: string, taskId?: string): void {
-  for (const k of keysFor(runName, taskId)) inFlight.add(k);
+  for (const k of keysFor(runName, taskId)) add(k);
 }
 
 /** Test seam: the counterpart of {@link beginLaunch}. */
 export function endLaunch(runName: string, taskId?: string): void {
-  for (const k of keysFor(runName, taskId)) inFlight.delete(k);
+  for (const k of keysFor(runName, taskId)) remove(k);
+}
+
+/**
+ * Register a launch known only by task id — the reconciler's dispatched
+ * auto-resume, whose run name is not resolved until the runner is created.
+ * Returns the release; calling it more than once is harmless.
+ */
+export function beginTaskLaunch(taskId: string): () => void {
+  const k = `task:${taskId}`;
+  add(k);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    remove(k);
+  };
 }
 
 /** Is ANY launch in progress in this process? (The machine-integrity canary stays out of a launch's way.) */

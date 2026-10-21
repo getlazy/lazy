@@ -8,6 +8,7 @@
  */
 
 import { pinChosenEffort } from './effort';
+import { assertCodeIsNotARunSlug } from './create-task';
 import type { ActorInput, Task, TaskType } from '../types';
 import { isTerminalStatus, VALID_TASK_TYPES, invalidTaskTypeMessage } from '../types';
 import type { Storage } from '../storage/interface';
@@ -28,6 +29,11 @@ import { validateCode, displayId, taskRef } from '../task/identity';
 import { taskBranchFor } from '../git/branch-prefix';
 import { logger } from '../utils/logger';
 import { RpcError } from './rpc-error';
+import {
+  parseReviewMode, parseReviewGate, parseReviewToggle, reviewOverrideMetadata, reviewOverridesApplied,
+  REVIEW_MODE_INPUTS, REVIEW_GATE_INPUTS, REVIEW_TOGGLE_INPUTS,
+  type ReviewSettingsOverrides,
+} from '../review/mode';
 
 export interface EditTaskInput {
   taskId: string;
@@ -41,6 +47,9 @@ export interface EditTaskInput {
   parent?: string | null;
   effort?: string;
   agent?: string;
+  review?: string;
+  reviewGate?: string;
+  reviewAutoFix?: string;
   /** Omit = no change; null or '' = clear runner override */
   runner?: string | null;
   /**
@@ -56,6 +65,7 @@ export interface EditTaskResult {
   displayId: string;
   changes: string[];
   announcements?: string[];
+  reviewSettingsApplied?: boolean;
 }
 
 async function wouldCreateCycle(storage: Storage, taskId: string, parentId: string): Promise<boolean> {
@@ -85,6 +95,9 @@ function describeEdit(input: EditTaskInput, field: string): string {
     case 'effort': return `effort → ${input.effort}`;
     case 'type': return `type → ${input.type}`;
     case 'agent': return `agent → ${input.agent}`;
+    case 'review': return `review mode → ${input.review}`;
+    case 'reviewGate': return `review gate → ${input.reviewGate}`;
+    case 'reviewAutoFix': return `review auto-fix → ${input.reviewAutoFix}`;
     case 'runner': return cleared(input.runner) ? 'runner override cleared' : `runner → ${input.runner}`;
     case 'code': return cleared(input.code) ? 'code cleared' : `code → ${input.code}`;
     case 'parent': return cleared(input.parent) ? 'parent cleared (integrates into main)' : `parent → ${input.parent}`;
@@ -202,14 +215,15 @@ export async function editTask(
     input.model !== undefined ||
     input.effort !== undefined ||
     input.runner !== undefined ||
-    input.agent !== undefined;
+    input.agent !== undefined ||
+    input.review !== undefined || input.reviewGate !== undefined || input.reviewAutoFix !== undefined;
 
   const isMidFlightSafeEdit = (hasMidFlightEdit || isCosmeticRename) && !hasLockedFieldEdit;
 
   if (!editability.canEditLockedFields && !isMidFlightSafeEdit && (hasLockedFieldEdit || hasMidFlightEdit)) {
     throw new RpcError(
       400,
-      `Cannot edit task ${displayId(task)}: task has already been started; only model, effort, runner and agent can be changed (not combined with goal/prompt/type/parent), and the code can be changed on its own.`,
+      `Cannot edit task ${displayId(task)}: task has already been started; only model, effort, runner, agent and review settings can be changed (not combined with goal/prompt/type/parent), and the code can be changed on its own.`,
     );
   }
 
@@ -253,17 +267,11 @@ export async function editTask(
     if (codeError) {
       throw new RpcError(400, `Invalid code: ${codeError}`);
     }
-    // The same collision rule as create: no two live tasks share a code.
-    const clash = input.code === task.code
-      ? undefined
-      : (await storage.listTasks()).find(t => t.id !== task.id && t.code === input.code && !isTerminalStatus(t.status));
-    if (clash) {
-      throw new RpcError(
-        409,
-        `A task with code '${input.code}' already exists (${clash.id.slice(0, 8)}, status: ${clash.status}). ` +
-        'Choose a different code or close/reject the existing task first.',
-      );
-    }
+    await assertCodeFree(storage, task, input.code);
+    // Nor a code that is a running commit's address (src/daemon/commit-run.ts):
+    // checked here, before any write, so a refused rename edits nothing. The
+    // store refuses it again inside its lock.
+    if (input.code !== task.code) await assertCodeIsNotARunSlug(storage, input.code);
   }
   await assertKnownAgentProfile(projectRoot, input.agent);
   if (input.model !== undefined && input.model !== null && input.model !== '') {
@@ -287,8 +295,31 @@ export async function editTask(
     throw new RpcError(400, 'Model name cannot be empty');
   }
 
+  const reviewOverrides: ReviewSettingsOverrides = {};
+  if (input.review !== undefined) {
+    const mode = parseReviewMode(input.review);
+    if (!mode) throw new RpcError(400, `Invalid review mode '${input.review}'. Must be one of: ${REVIEW_MODE_INPUTS.join(', ')}`);
+    reviewOverrides.mode = mode;
+  }
+  if (input.reviewGate !== undefined) {
+    const gate = parseReviewGate(input.reviewGate);
+    if (!gate) throw new RpcError(400, `Invalid review gate '${input.reviewGate}'. Must be one of: ${REVIEW_GATE_INPUTS.join(', ')}`);
+    reviewOverrides.gate = gate;
+  }
+  if (input.reviewAutoFix !== undefined) {
+    const autoFix = parseReviewToggle(input.reviewAutoFix);
+    if (autoFix === null) throw new RpcError(400, `Invalid review auto-fix '${input.reviewAutoFix}'. Must be one of: ${REVIEW_TOGGLE_INPUTS.join(', ')}`);
+    reviewOverrides.auto_fix = autoFix;
+  }
+
   const changes: string[] = [];
   const announcements: string[] = [];
+  for (const [key, value] of Object.entries(reviewOverrideMetadata(reviewOverrides))) {
+    await storage.updateTaskMetadata(task.id, key, value);
+  }
+  if (input.review !== undefined) changes.push('review');
+  if (input.reviewGate !== undefined) changes.push('reviewGate');
+  if (input.reviewAutoFix !== undefined) changes.push('reviewAutoFix');
 
   // Runner — changeable any time; takes effect next turn.
   if (input.runner !== undefined) {
@@ -403,10 +434,40 @@ export async function editTask(
 
   await recordEditInJournal(storage, task.id, input, changes);
 
+  let reviewSettingsApplied = true;
+  if (Object.keys(reviewOverrides).length > 0) {
+    try {
+      const saved = await storage.getTask(task.id);
+      reviewSettingsApplied = reviewOverridesApplied(reviewOverrides, saved?.metadata);
+    } catch (err) {
+      logger.warn(`Could not confirm review settings on ${displayId(task)} after edit: ${err instanceof Error ? err.message : String(err)}`);
+      reviewSettingsApplied = false;
+    }
+  }
+
   return {
     taskId: task.id,
     displayId: displayId(task),
     changes,
+    reviewSettingsApplied,
     ...(announcements.length > 0 ? { announcements } : {}),
   };
+}
+
+/**
+ * The collision rule shared with create: no two live tasks share a code. Every
+ * surface that sets a code (daemon edit, `lazy edit`, `lazy_edit`) calls this,
+ * so the rule lives once.
+ */
+export async function assertCodeFree(storage: Storage, task: Task, code: string): Promise<void> {
+  const clash = code === task.code
+    ? undefined
+    : (await storage.listTasks()).find(t => t.id !== task.id && t.code === code && !isTerminalStatus(t.status));
+  if (clash) {
+    throw new RpcError(
+      409,
+      `A task with code '${code}' already exists (${clash.id.slice(0, 8)}, status: ${clash.status}). ` +
+      'Choose a different code or close/reject the existing task first.',
+    );
+  }
 }

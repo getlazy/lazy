@@ -366,13 +366,19 @@ export class ProxyAuditLog {
       if (!(await exists(this.segmentPath(n)))) break;
       await rm(this.segmentPath(n), { force: true });
     }
-    for (let n = this.retained - 1; n >= 1; n--) {
+    // Shift only the segments that exist (numbered contiguously from 1), never
+    // every slot of the retention depth: a large budget over small segments
+    // allows hundreds of thousands of slots, and probing each one on every
+    // rotation made a single append take tens of seconds.
+    let highest = 0;
+    while (highest < this.retained - 1 && (await exists(this.segmentPath(highest + 1)))) highest++;
+    for (let n = highest; n >= 1; n--) {
       try {
         await rename(this.segmentPath(n), this.segmentPath(n + 1));
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-        // That segment does not exist yet (log younger than the retention
-        // depth) — nothing to shift.
+        // Another writer in the same daemon (the credential-verdict path)
+        // moved it since the probe — nothing left to shift.
       }
     }
     await rename(this.path, this.segmentPath(1));

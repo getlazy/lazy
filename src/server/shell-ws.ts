@@ -2,7 +2,8 @@
  * Web-shell WebSocket upgrader: the daemon side of `lazy shell --container` in
  * the browser.
  *
- * Route: `GET /tasks/:id/shell/ws`. On upgrade the daemon opens a PTY
+ * Route: `GET /tasks/:id/shell/ws` — and `GET /runs/:id/shell/ws` for a commit
+ * run's own container (see {@link resolveRunShellTarget}). On upgrade the daemon opens a PTY
  * `docker exec` into the task's OWN container (resolved server-side, never from
  * a client string) and relays bytes to the browser's xterm.js terminal. See
  * docs/web-shell.md for the decision record and threat model.
@@ -26,6 +27,8 @@
 import type { Server, ServerWebSocket } from 'bun';
 import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
+import type { CommitRun } from '../storage/types';
+import { runContainerName } from '../run/identity';
 import type { Runner } from '../runner';
 import type { ShellUnavailableCode } from './shell-ui';
 import { parseShellSessionMode, planPairOrChatExec } from './shell-pair';
@@ -154,6 +157,8 @@ export interface ShellUpgraderDeps {
 }
 
 const SHELL_WS_PATH_RE = /^\/tasks\/([^/]+)\/shell\/ws$/;
+/** A commit run's shell (src/daemon/commit-run.ts), from its dashboard page. */
+const RUN_SHELL_WS_PATH_RE = /^\/runs\/([^/]+)\/shell\/ws$/;
 
 export function clampDim(value: string | null, fallback: number, max: number): number {
   const n = value === null ? NaN : parseInt(value, 10);
@@ -251,6 +256,39 @@ export async function resolveShellTarget(
     return { available: false, code: 'not-running', reason: `Container for this task is not running.` };
   }
   return resolved;
+}
+
+/**
+ * The exec target for a COMMIT RUN's web shell: the run's own container, named
+ * from its slug by the one naming rule (`runContainerName`,
+ * src/run/identity.ts) — exactly as the attach route's `run:<id>` resolution
+ * and the run's Start services name it. Nothing from the client: the run is
+ * looked up by the id in the path and everything after comes from its record.
+ *
+ * Entered directly, not through a member container: a run's container holds
+ * no credential and runs no agent (docs/design/run-any-commit.md, "Shell").
+ * The liveness probe is affordable here for the same reason as
+ * {@link resolveShellTarget}'s: it runs on a user's explicit action, after
+ * the client ensured the container.
+ */
+export async function resolveRunShellTarget(
+  root: string,
+  run: Pick<CommitRun, 'slug'>,
+  runnerFor: () => Promise<Pick<Runner, 'type' | 'usesSandbox' | 'isRunning'>> = () => createRunner(root),
+): Promise<ShellTarget> {
+  const runner = await runnerFor();
+  if (!runner.usesSandbox()) {
+    return {
+      available: false,
+      code: 'no-container-runner',
+      reason: `This project runs on the ${runner.type} runner, which has no container to enter.`,
+    };
+  }
+  const container = runContainerName(root, run.slug);
+  if (!(await runner.isRunning(container))) {
+    return { available: false, code: 'not-running', reason: `The run's environment is not running.` };
+  }
+  return { available: true, container, binary: runner.type === 'podman' ? 'podman' : 'docker' };
 }
 
 export function refusal(status: number, message: string): Response {
@@ -388,8 +426,9 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
 
     async tryUpgrade(req: Request, server: Server<unknown>): Promise<UpgradeOutcome> {
       const url = new URL(req.url);
-      const match = SHELL_WS_PATH_RE.exec(url.pathname);
-      if (!match) return null; // not our route
+      const runMatch = RUN_SHELL_WS_PATH_RE.exec(url.pathname);
+      const match = runMatch ? null : SHELL_WS_PATH_RE.exec(url.pathname);
+      if (!match && !runMatch) return null; // not our route
 
       // Authorization FIRST — before the method or the task id says anything.
       // The upgrader runs ahead of the HTTP handler's dashboard gate, so it
@@ -399,6 +438,38 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
       if (denial) return denial;
 
       if (req.method !== 'GET') return refusal(405, 'Method not allowed');
+
+      const cols = clampDim(url.searchParams.get('cols'), DEFAULT_TERM_COLS, MAX_TERM_COLS);
+      const rows = clampDim(url.searchParams.get('rows'), DEFAULT_TERM_ROWS, MAX_TERM_ROWS);
+
+      if (runMatch) {
+        // A run is entered with a shell and only a shell: there is no agent
+        // session in it to pair with or chat to.
+        const runMode = url.searchParams.get('mode');
+        if (runMode !== null && runMode !== 'shell') {
+          return refusal(400, `A run is entered with a shell, not in "${runMode}" mode.`);
+        }
+        const runId = decodePathSegment(runMatch[1]!);
+        const storage = await deps.getStorage();
+        const run = await storage.getCommitRun(runId);
+        if (!run) return refusal(404, `Run not found: ${runId}`);
+        const target = await resolveRunShellTarget(deps.root, run);
+        if (!target.available) return refusal(409, target.reason);
+        const runData: ShellSocketData = {
+          socketPath: '',
+          container: target.container,
+          binary: target.binary,
+          cols,
+          rows,
+          exec: null,
+          cmd: SHELL_CMD,
+          env: ['TERM=xterm-256color'],
+          onClose: null,
+        };
+        if (!server.upgrade(req, { data: runData })) return refusal(426, 'Expected a WebSocket upgrade request.');
+        return 'upgraded';
+      }
+      if (!match) return null;
 
       // Same rule as the HTTP router: a malformed escape must 404, not throw
       // out of the upgrade (decodeURIComponent raises URIError on '%zz').
@@ -411,8 +482,6 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
       const resolved = await resolveShellTarget(deps.root, task, session);
       if (!resolved.available) return refusal(409, resolved.reason);
 
-      const cols = clampDim(url.searchParams.get('cols'), DEFAULT_TERM_COLS, MAX_TERM_COLS);
-      const rows = clampDim(url.searchParams.get('rows'), DEFAULT_TERM_ROWS, MAX_TERM_ROWS);
       const mode = parseShellSessionMode(url.searchParams.get('mode'));
 
       let cmd = SHELL_CMD;

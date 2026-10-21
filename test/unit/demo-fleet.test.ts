@@ -287,7 +287,7 @@ describe('status prints every command with where it runs', () => {
     expect(lines).toHaveLength(3);
     expect(lines[0]).toContain(`"${INPUTS.smolvmBinary}" machine exec --name lazy-lazy-demo-shop-1 -- sh -c 'cd /lazy/projects/lazy-demo-shop-1/repo; . /lazy/projects/lazy-demo-shop-1/daemon/env.*.sh; exec lazy watch demo-serve'`);
     expect(lines[1]).toContain('exec lazy show demo-serve');
-    expect(lines[2]).toContain('exec lazy daemon logs --no-follow -n 200');
+    expect(lines[2]).toContain('exec lazy daemon logs -n 200');
     for (const line of lines) expect(line).toContain('# inside the guest, from the host');
     expect(fleetHowToBlock(manifest, [], null).join('\n')).toContain('exec lazy watch demo-serve');
     expect(guestWatchLines({ ...manifest, task: null })).toEqual([]);

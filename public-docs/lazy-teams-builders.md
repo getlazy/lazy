@@ -12,7 +12,7 @@ previous conversations, and find the files builders have left for you.
 Choose **Fill window** above the terminal to make it cover the whole window, and
 **Exit full window** (or **Esc**, when the terminal itself is not focused — inside it Esc goes to your program) to return to the page. You can also drag the terminal's bottom-right resize handle to
 change its height. **Page Up** and **Page Down** scroll the terminal's captured
-output, **Ctrl/Cmd+C** copies a selection and **Ctrl/Cmd+V** or **Paste** pastes;
+output (on Claude Code's fullscreen view they go to Claude Code, which scrolls itself), **Ctrl/Cmd+C** copies a selection, a copy Claude Code makes lands on your clipboard, and **Ctrl/Cmd+V** or **Paste** pastes;
 other key combinations keep their existing terminal behavior. Every terminal in
 Teams — builders, a task's Shell, Watch and Verify's Run in shell, and the
 admin machine shell — has the same controls.

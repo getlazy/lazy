@@ -147,6 +147,94 @@ assert.deepEqual(await recoverMissingWorktree(${JSON.stringify(worktree)}, 'lazy
     });
   });
 
+  async function waitForFile(path: string) {
+    const deadline = Date.now() + 20_000;
+    while (!await pathExists(path)) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
+      await Bun.sleep(20);
+    }
+  }
+
+  // INVARIANT: only one process at a time runs `git worktree add` for a given
+  // checkout; a second recovery waits for the first and then validates its
+  // result. Racing adds share <path>/.git and the failing one deletes the
+  // directory on exit, so a concurrent recovery could fail ("index.lock: File
+  // exists") or destroy a checkout another process had reported recovered.
+  test('a second process waits for a recovery holding the lock mid-checkout instead of running its own add', async () => {
+    await rm(worktree, { recursive: true });
+    const entered = join(root, 'add-entered');
+    const release = join(root, 'add-release');
+    const calls = join(root, 'add-calls');
+    await withGitWrapper(`if [ "$1" = worktree ] && [ "$2" = add ]; then
+  echo add >> ${JSON.stringify(calls)}
+  touch ${JSON.stringify(entered)}
+  while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done
+fi`, async env => {
+      const operations = join(import.meta.dir, '../../src/git/operations.ts');
+      const script = `
+import assert from 'node:assert/strict';
+import { recoverMissingWorktree } from ${JSON.stringify(operations)};
+assert.deepEqual(await recoverMissingWorktree(${JSON.stringify(worktree)}, 'lazy/recover-task', ${JSON.stringify(root)}), { recovered: true, branchExists: true, dirty: false });
+`;
+      const first = runRecoveryProcess(script, env);
+      await waitForFile(entered);
+      let secondDone = false;
+      const second = runRecoveryProcess(script, env).finally(() => { secondDone = true; });
+      await Bun.sleep(1_000);
+      expect(secondDone).toBe(false);
+      expect((await readFile(calls, 'utf8')).trim().split('\n')).toHaveLength(1);
+      await writeFile(release, '');
+      await Promise.all([first, second]);
+      expect((await readFile(calls, 'utf8')).trim().split('\n')).toHaveLength(1);
+      expect(await readFile(join(worktree, 'tracked.txt'), 'utf8')).toBe('saved work\n');
+      expect(git(['symbolic-ref', '--short', 'HEAD'], worktree)).toBe('lazy/recover-task');
+    });
+  }, 30_000);
+
+  test('two processes restoring one checkout with a slow real git checkout both succeed', async () => {
+    const entered = join(root, 'smudge-entered');
+    const release = join(root, 'smudge-release');
+    await writeFile(join(worktree, '.gitattributes'), 'tracked.txt filter=slow\n');
+    git(['add', '.gitattributes'], worktree);
+    git(['commit', '-qm', 'slow checkout'], worktree);
+    git(['config', 'filter.slow.smudge', `touch ${JSON.stringify(entered)}; while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done; cat`]);
+    git(['config', 'filter.slow.clean', 'cat']);
+    await rm(worktree, { recursive: true });
+    const operations = join(import.meta.dir, '../../src/git/operations.ts');
+    const script = `
+import assert from 'node:assert/strict';
+import { recoverMissingWorktree } from ${JSON.stringify(operations)};
+const result = await recoverMissingWorktree(${JSON.stringify(worktree)}, 'lazy/recover-task', ${JSON.stringify(root)});
+assert.equal(result.recovered, true);
+`;
+    let finishedEarly = 0;
+    const runs = [0, 1].map(() => runRecoveryProcess(script, process.env).finally(() => { finishedEarly++; }));
+    await waitForFile(entered);
+    await Bun.sleep(1_000);
+    // Neither may report the checkout recovered while it is still being written.
+    expect(finishedEarly).toBe(0);
+    await writeFile(release, '');
+    await Promise.all(runs);
+    expect(await readFile(join(worktree, 'tracked.txt'), 'utf8')).toBe('saved work\n');
+    expect(git(['symbolic-ref', '--short', 'HEAD'], worktree)).toBe('lazy/recover-task');
+    expect(git(['status', '--porcelain'], worktree)).toBe('');
+  }, 30_000);
+
+  test('still reports git\'s failure when no competing recovery appears', async () => {
+    await rm(worktree, { recursive: true });
+    await withGitWrapper(`if [ "$1" = worktree ] && [ "$2" = add ]; then
+  echo "fatal: simulated checkout failure" >&2
+  exit 128
+fi`, async env => {
+      const operations = join(import.meta.dir, '../../src/git/operations.ts');
+      await runRecoveryProcess(`
+import assert from 'node:assert/strict';
+import { recoverMissingWorktree } from ${JSON.stringify(operations)};
+await assert.rejects(recoverMissingWorktree(${JSON.stringify(worktree)}, 'lazy/recover-task', ${JSON.stringify(root)}), /Could not check out branch.*simulated checkout failure/);
+`, env);
+    });
+  }, 20_000);
+
   test.each([false, true])('a diff and terminal restore the same checkout concurrently (remote-only: %s)', async remoteOnly => {
     if (remoteOnly) {
       const origin = join(root, 'origin.git');

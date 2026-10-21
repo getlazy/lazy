@@ -80,6 +80,7 @@ const REFUSED_COMMANDS: Readonly<Record<string, string>> = {
   ensureTaskContainer: 'container plumbing on the daemon host.',
   ensureTaskWorktree: 'session plumbing on the daemon host: it restores the worktree on the DAEMON\'s disk, a path a bound clone cannot use for `lazy shell --host`. Teams\' own recovery runs inside the daemon, never through this proxy.',
   getDaemonMcpConfig: 'mints an MCP session token — control-plane.',
+  getTaskMcpConfig: 'hands a host pairing session its task\'s MCP token — control-plane; a bound clone pairs on the server, never with --host against this daemon.',
   revokeDaemonMcpToken: 'control-plane.',
   setProjectSettings: 'the settings page is its own admin surface; not relayed for the CLI.',
   conversationPromote: 'not yet classified for the proxy.',
@@ -108,7 +109,7 @@ const REFUSED_COMMANDS: Readonly<Record<string, string>> = {
  * and why their lists are what they are.
  */
 const NOT_SENT_BY_THE_CLI: Readonly<Record<string, string>> = {
-  tokenStats: 'sent by `lazy stats latency` through queryTokenStats (a wrapper the scan does not follow); the proxy admits only modes "latency-cli" and "latency-history" (CliRpcCommand.body_refusal).',
+  tokenStats: 'sent by `lazy stats latency` through queryTokenStats (a wrapper the scan does not follow); the proxy admits only modes latency-cli, latency-history, tokens-cli and tools-cli (CliRpcCommand.body_refusal).',
   storage: 'sent by RemoteStorage as { method, args }; its args are StorageMethodPolicy\'s question.',
 };
 

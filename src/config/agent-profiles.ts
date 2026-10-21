@@ -75,6 +75,12 @@ export interface AgentProfileConfig {
    * `endpoint` is always a URL and never means "a URL or a name".
    */
   named_endpoint?: string;
+  /**
+   * `false` declares this profile's models as unable to reason (pi harness only),
+   * for a model that rejects `reasoning_effort` outright (a legacy gpt-4o). Unset
+   * means reasoning ON, which is what lets a task's effort reach the model.
+   */
+  reasoning?: boolean;
   /** Ordered usage tiers — makes this a TIERED profile. See {@link ResolvedTier}. */
   tiers?: AgentTierConfig[];
 }
@@ -202,6 +208,8 @@ export interface AgentProfile {
    * sees an ordinary concrete profile.
    */
   tiers?: ResolvedTier[];
+  /** False only when the block wrote `reasoning = false` (pi). Absent = reasoning declared. */
+  reasoning?: boolean;
 }
 
 /** Credential name meaning "this upstream authenticates nobody". */
@@ -387,7 +395,7 @@ export const BUILTIN_PROFILE_NAMES: readonly string[] = Object.keys(BUILTIN_PROF
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const NAME_MAX = 64;
 
-const PROFILE_KEYS = ['harness', 'model', 'endpoint', 'credential', 'description', 'named_endpoint', 'tiers'] as const;
+const PROFILE_KEYS = ['harness', 'model', 'endpoint', 'credential', 'description', 'named_endpoint', 'reasoning', 'tiers'] as const;
 
 /** Keys a TIERED profile may carry — everything else comes from its tiers. */
 const TIERED_PROFILE_KEYS = ['harness', 'description', 'tiers'] as const;
@@ -847,6 +855,20 @@ function resolveProfile(
     );
   }
 
+  let reasoning: boolean | undefined;
+  if (raw?.reasoning !== undefined) {
+    if (typeof raw.reasoning !== 'boolean') {
+      throw new Error(`lazy.toml ${where} reasoning must be true or false.`);
+    }
+    if (harness !== 'pi') {
+      throw new Error(
+        `lazy.toml ${where} sets reasoning, which only the "pi" harness uses (it declares the model's ` +
+        `capabilities to pi). Remove it, or set harness = "pi".`,
+      );
+    }
+    if (!raw.reasoning) reasoning = false;
+  }
+
   const ownCredential = (raw?.credential ?? '').trim();
   // An endpoint the user wrote must name what pays it — no hostname inference.
   // Only a built-in's own fixed endpoint falls back to defaultCredentialFor.
@@ -890,6 +912,7 @@ function resolveProfile(
     credential,
     credentialExplicit,
     wire,
+    ...(reasoning === false ? { reasoning } : {}),
     builtin: raw === undefined,
     // A block overriding a built-in keeps the built-in's description unless it
     // writes its own — but only while it still runs that harness against the

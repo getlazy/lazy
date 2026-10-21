@@ -43,7 +43,7 @@ import type { Storage } from '../storage';
 import type { Task } from '../types';
 import type { FollowHandle, Runner } from '../runner/types';
 import { createRunner } from '../runner';
-import { taskRef, getWorktreePath, displayId } from '../task/identity';
+import { taskRef, getWorktreePath, displayId, taskAuditForms } from '../task/identity';
 import { findLatestSessionFile, watchSessionReplayStart, watchEntryBelongsToTurn } from '../agent/session-discovery';
 import { WatchTurnTracker } from '../agent/watch-turns';
 import { renderEntryLines, type RawLogEntry } from '../render/watch-renderer';
@@ -200,8 +200,7 @@ export function startTaskWatchStream(opts: {
   // The proxy stamps events with the REF the agent was launched under (a code,
   // or a short id), never necessarily the full id we hold here — so pass every
   // form this task answers to, exactly as ProxyActivityFilter asks callers to.
-  const taskForms = [...new Set([task.id, displayId(task), taskRef(task), task.code]
-    .filter((f): f is string => typeof f === 'string' && f.trim().length > 0))];
+  const taskForms = taskAuditForms(task);
   const proxyFilter = { taskIds: taskForms };
 
   emit(renderWithColors(() => dim(`${PROXY_LINE_PREFIX} agent API requests through lazy's proxy`)));

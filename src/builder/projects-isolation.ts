@@ -521,6 +521,29 @@ export async function classifyResumeSession(opts: {
 }
 
 /**
+ * Does any isolation dir under `root` hold a copy of `sessionId` that a launch
+ * could resume (directly, or by adopting a seeded copy)? Read-only: nothing is
+ * created, seeded or adopted.
+ *
+ * This is what an explicit resume from the Builders page asks BEFORE it stops a
+ * running builder or claims a run: when the file is gone, Claude Code has
+ * nothing to continue, and the answer must be a refusal that says so — never a
+ * fresh, empty conversation started in its place.
+ */
+export async function holdsBuilderSessionFile(
+  root: string,
+  lazyRoot: string,
+  sessionId: string,
+  /** Home whose own `.claude/projects` an adopting launch also accepts (see resolveBuilderProjectsDir). */
+  homeDirAbs: string,
+): Promise<boolean> {
+  const encodedCwd = encodeProjectPath(lazyRoot);
+  const { usable, seededOnly } = await scanResumeCandidates(root, encodedCwd, sessionId);
+  if (usable !== null || seededOnly !== null) return true;
+  return pathExists(join(homeDirAbs, '.claude', 'projects', encodedCwd, `${sessionId}.jsonl`));
+}
+
+/**
  * Resolve the per-builder projects dir to mount, creating it if needed.
  *
  * - resumeId set + some isolation dir holds a RESUMABLE copy of it → reuse the dir

@@ -175,7 +175,9 @@ export async function recordSessionCommits(
     try {
       await storage.createCommit(session.id, c.sha, c.message);
     } catch (err) {
-      logger.debug(`Task ${label}: could not record commit ${c.sha.substring(0, 8)}: ${err instanceof Error ? err.message : err}`);
+      // Warn, not debug: the next turn's recompute heals this, but a task whose next turn never
+      // comes would keep a short history with nobody told (debug logging is off by default).
+      logger.warn(`Task ${label}: could not record commit ${c.sha.substring(0, 8)}: ${err instanceof Error ? err.message : err}`);
     }
   }
   return scan;

@@ -33,13 +33,15 @@ async function runMcpSession(
   taskId: string,
   worktreePath: string,
   messages: Array<{ method: string; id: number; params?: Record<string, unknown> }>,
+  extraEnv: Record<string, string> = {},
 ): Promise<JsonRpcResponse[]> {
-  const proc = Bun.spawn(['bun', 'run', AGENT_ENTRY, 'mcp', '--task-id', taskId, '--worktree', worktreePath], {
+  // An empty taskId runs the server in builder (project-scoped) mode.
+  const proc = Bun.spawn(['bun', 'run', AGENT_ENTRY, 'mcp', ...(taskId ? ['--task-id', taskId] : []), '--worktree', worktreePath], {
     cwd: root,
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env, ...MCP_SERVER_ENV_PINS },
+    env: { ...process.env, ...MCP_SERVER_ENV_PINS, ...extraEnv },
   });
 
   const stdin = proc.stdin as import('bun').FileSink;
@@ -470,6 +472,41 @@ describe('lazy-agent mcp', () => {
     expect(parsed.agent_profiles_error).toContain('[agents.broken] description must be a string');
   });
 
+  // INVARIANT: lazy_commit unstages lazy's own runtime files an agent force-staged
+  // BEFORE deciding what to commit — they never ship, stay on disk, and are reported.
+  test('lazy_commit leaves force-staged runtime files out of the commit', async () => {
+    const { mkdirSync } = await import('fs');
+    mkdirSync(join(ctx.root, '.lazy-task-sandbox'), { recursive: true });
+    writeFileSync(join(ctx.root, '.lazy-task-sandbox', 'x'), 'runtime\n');
+    writeFileSync(join(ctx.root, 'real-file.txt'), 'real\n');
+    ctx.git('add', '-f', '.lazy-task-sandbox/x', 'real-file.txt');
+    const taskId = '00000000-0000-0000-0000-000000000001';
+
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_commit', arguments: { message: 'Real work only' } } },
+    ]);
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }> };
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.committed).toBe(true);
+    expect(parsed.unstaged_runtime_files).toEqual(['.lazy-task-sandbox/x']);
+    const files = ctx.git('show', '--name-only', '--format=', 'HEAD').stdout;
+    expect(files).toContain('real-file.txt');
+    expect(files).not.toContain('.lazy-task-sandbox');
+    expect(await readFile(join(ctx.root, '.lazy-task-sandbox', 'x'), 'utf8')).toBe('runtime\n');
+
+    // Only a runtime file staged: nothing to commit, but the removal is reported.
+    writeFileSync(join(ctx.root, '.lazy-task-sandbox', 'y'), 'runtime\n');
+    ctx.git('add', '-f', '.lazy-task-sandbox/y');
+    const again = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_commit', arguments: { message: 'Nothing real' } } },
+    ]);
+    const parsed2 = JSON.parse((again.find(r => r.id === 2)!.result as { content: Array<{ text: string }> }).content[0].text);
+    expect(parsed2.committed).toBe(false);
+    expect(parsed2.unstaged_runtime_files).toEqual(['.lazy-task-sandbox/y']);
+  });
+
   test('lazy_commit commits changes', async () => {
     // Create a file to commit
     writeFileSync(join(ctx.root, 'test-file.txt'), 'hello from MCP test\n');
@@ -612,6 +649,20 @@ describe('lazy-agent mcp', () => {
     expect(result.isError).toBe(true);
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.error).toContain('own task');
+  });
+
+  // INVARIANT: a dash-prefixed parent is refused before it reaches git as an
+  // option (`--output=...` would write a file) and no task is created.
+  test('lazy_create (builder) refuses a dash-prefixed parent and creates no task', async () => {
+    const responses = await runMcpSession(ctx.root, '', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_create', arguments: { goal: 'Option parent', parent: '--output=/tmp/lazy-parent-pwn' } } },
+    ]);
+
+    const result = responses.find(r => r.id === 2)!.result as { content: Array<{ text: string }>; isError?: boolean };
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).error).toContain("cannot start with '-'");
+    expect((await ctx.lazy(['list', '--all'])).stdout).not.toContain('Option parent');
   });
 
   // An agent passing its OWN task id as parent is allowed (equivalent to omitting it).
@@ -928,6 +979,28 @@ describe('lazy-agent mcp', () => {
     expect(result.isError).toBe(true);
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.error).toContain('cannot change a task\'s parent');
+  });
+
+  // INVARIANT: lazy_edit applies create's code-collision rule: two live tasks
+  // never share a code. A task's own current code is a no-op, not a clash.
+  test('lazy_edit refuses a code another live task uses, allows own code', async () => {
+    const aId = await createTask(ctx, 'Code owner');
+    const bId = await createTask(ctx, 'Code taker');
+    const bFull = await fullTaskId(ctx, bId);
+    await ctx.lazy(['edit', aId, '--code', 'dup-mcp']);
+
+    const responses = await runMcpSession(ctx.root, bFull, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_edit', arguments: { task_id: bId, code: 'dup-mcp' } } },
+      { method: 'tools/call', id: 3, params: { name: 'lazy_edit', arguments: { task_id: bId, code: 'own-mcp' } } },
+      { method: 'tools/call', id: 4, params: { name: 'lazy_edit', arguments: { task_id: bId, code: 'own-mcp' } } },
+    ]);
+    type R = { content: Array<{ text: string }>; isError?: boolean };
+    const r2 = responses.find(r => r.id === 2)!.result as R;
+    expect(r2.isError).toBe(true);
+    expect(r2.content[0].text).toContain("already exists");
+    expect((responses.find(r => r.id === 3)!.result as R).isError).toBeFalsy();
+    expect((responses.find(r => r.id === 4)!.result as R).isError).toBeFalsy();
   });
 
   test('lazy_show returns task details', async () => {
@@ -1767,5 +1840,130 @@ describe('lazy-agent mcp', () => {
 
     const listed = JSON.parse((responses.find(r => r.id === 2)!.result as any).content[0].text);
     expect(listed.artifacts.map((a: any) => a.name)).toEqual(['out.txt']);
+  });
+
+  // --- artifact retrieval shapes ---
+  async function getArtifact(taskId: string, args: Record<string, unknown>) {
+    const responses = await runMcpSession(ctx.root, taskId, ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_get', arguments: args } },
+    ]);
+    const result = responses.find(r => r.id === 2)!.result as any;
+    return JSON.parse(result.content[0].text);
+  }
+
+  test('lazy_artifact_get returns small text inline and a path (no base64) for binary', async () => {
+    const short = await createTask(ctx, 'Shapes');
+    const full = await fullTaskId(ctx, short);
+    writeFileSync(join(ctx.root, 'note.txt'), 'hello\n');
+    writeFileSync(join(ctx.root, 'blob.bin'), Buffer.from([0, 1, 2, 255, 254]));
+    await ctx.lazy(['artifact', 'add', short, 'note.txt', 'blob.bin']);
+
+    const text = await getArtifact(full, { name: 'note.txt' });
+    expect(text.content).toBe('hello\n');
+    expect(text.path).toBeUndefined();
+
+    const bin = await getArtifact(full, { name: 'blob.bin' });
+    expect(bin.content_base64).toBeUndefined();
+    expect(bin.content).toBeUndefined();
+    // Not yet materialized by a launch, so the bytes are written out beside the sandbox.
+    expect([...(await readFile(bin.path))]).toEqual([0, 1, 2, 255, 254]);
+    expect(bin.path).toContain('.lazy-task-sandbox/');
+  });
+
+  test('lazy_artifact_get on another task writes under the worktree sandbox, not inline', async () => {
+    const full = await fullTaskId(ctx, await createTask(ctx, 'Reader2'));
+    const other = await createTask(ctx, 'Publisher2');
+    writeFileSync(join(ctx.root, 'blob.bin'), Buffer.from([0, 1, 2, 255]));
+    await ctx.lazy(['artifact', 'add', other, 'blob.bin']);
+
+    const got = await getArtifact(full, { task_id: other, name: 'blob.bin' });
+    expect(got.content_base64).toBeUndefined();
+    expect(got.path).toContain('.lazy-task-sandbox/fetched/');
+    expect([...(await readFile(got.path))]).toEqual([0, 1, 2, 255]);
+  });
+
+  test('lazy_artifact_get lists tarball members and reads one member inline', async () => {
+    const short = await createTask(ctx, 'Tarball');
+    const full = await fullTaskId(ctx, short);
+    await Bun.write(join(ctx.root, 'pk/report.txt'), 'probe ok\n');
+    await Bun.write(join(ctx.root, 'pk/data.bin'), Buffer.from([0, 9, 9]));
+    const tar = Bun.spawn(['tar', '-czf', 'probe.tgz', '-C', 'pk', 'report.txt', 'data.bin'], { cwd: ctx.root, env: { ...process.env, COPYFILE_DISABLE: '1' } });
+    expect(await tar.exited).toBe(0);
+    await ctx.lazy(['artifact', 'add', short, 'probe.tgz']);
+
+    const listing = await getArtifact(full, { name: 'probe.tgz' });
+    expect(listing.content_base64).toBeUndefined();
+    expect((await readFile(listing.path)).length).toBeGreaterThan(0);
+    expect(listing.members).toEqual([
+      { name: 'report.txt', size: 9 },
+      { name: 'data.bin', size: 3 },
+    ]);
+
+    const one = await getArtifact(full, { name: 'probe.tgz', member: 'report.txt' });
+    expect(one.content).toBe('probe ok\n');
+  });
+
+  test('re-adding an artifact name replaces content, sha and is reflected by list', async () => {
+    const short = await createTask(ctx, 'Replace');
+    const full = await fullTaskId(ctx, short);
+    writeFileSync(join(ctx.root, 'r.txt'), 'one');
+    await ctx.lazy(['artifact', 'add', short, 'r.txt']);
+    const list = async () => {
+      const r = await runMcpSession(ctx.root, full, ctx.root, [
+        { method: 'initialize', id: 1, params: {} },
+        { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_list', arguments: {} } },
+      ]);
+      return JSON.parse((r.find(x => x.id === 2)!.result as any).content[0].text).artifacts;
+    };
+    const first = (await list())[0];
+    await Bun.sleep(20);
+    writeFileSync(join(ctx.root, 'r.txt'), 'two!');
+    await ctx.lazy(['artifact', 'add', short, 'r.txt']);
+    const after = await list();
+    expect(after).toHaveLength(1);
+    expect(after[0].sha256).not.toBe(first.sha256);
+    expect(after[0].size).toBe(4);
+    expect(after[0].created_at).not.toBe(first.created_at);
+    expect((await getArtifact(full, { name: 'r.txt' })).content).toBe('two!');
+  });
+
+  test('lazy_artifact_get writes large text to a path, and member errors are actionable', async () => {
+    const short = await createTask(ctx, 'Large');
+    const full = await fullTaskId(ctx, short);
+    writeFileSync(join(ctx.root, 'big.txt'), 'x'.repeat(70 * 1024));
+    writeFileSync(join(ctx.root, 'plain.txt'), 'hi');
+    await ctx.lazy(['artifact', 'add', short, 'big.txt', 'plain.txt']);
+    const big = await getArtifact(full, { name: 'big.txt' });
+    expect(big.content).toBeUndefined();
+    expect((await readFile(big.path)).length).toBe(70 * 1024);
+
+    const errText = async (args: Record<string, unknown>) => {
+      const r = await runMcpSession(ctx.root, full, ctx.root, [
+        { method: 'initialize', id: 1, params: {} },
+        { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_get', arguments: args } },
+      ]);
+      const res = r.find(x => x.id === 2)!.result as any;
+      expect(res.isError).toBe(true);
+      return res.content[0].text as string;
+    };
+    expect(await errText({ name: 'plain.txt', member: 'x' })).toContain('not a tar, tgz or zip');
+  });
+
+  test('builder mode writes under .artifacts in the scratch dir, which scratch capture skips', async () => {
+    const other = await createTask(ctx, 'ForBuilder');
+    writeFileSync(join(ctx.root, 'blob.bin'), Buffer.from([0, 7, 7]));
+    await ctx.lazy(['artifact', 'add', other, 'blob.bin']);
+    const scratch = join(ctx.root, 'scratch-dir');
+    const r = await runMcpSession(ctx.root, '', ctx.root, [
+      { method: 'initialize', id: 1, params: {} },
+      { method: 'tools/call', id: 2, params: { name: 'lazy_artifact_get', arguments: { task_id: other, name: 'blob.bin' } } },
+    ], { LAZY_SCRATCH_DIR: scratch });
+    const got = JSON.parse((r.find(x => x.id === 2)!.result as any).content[0].text);
+    expect(got.content_base64).toBeUndefined();
+    expect(got.path.startsWith(join(scratch, '.artifacts') + '/')).toBe(true);
+    expect([...(await readFile(got.path))]).toEqual([0, 7, 7]);
+    // INVARIANT: capture skips dot-prefixed entries, so a fetched copy is never re-captured as scratch.
+    expect(got.path.slice(scratch.length + 1).split('/')[0].startsWith('.')).toBe(true);
   });
 });

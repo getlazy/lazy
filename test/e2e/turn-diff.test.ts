@@ -4,6 +4,7 @@ import { writeFileSync, readFileSync, mkdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes, extractTaskId } from '../helpers/assertions';
 import { createTask, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { readTurns, writeTurns } from '../helpers/storage';
 
 describe('lazy diff --turn', () => {
   let ctx: TestContext;
@@ -16,6 +17,8 @@ describe('lazy diff --turn', () => {
     await ctx.cleanup();
   });
 
+  // INVARIANT: `--turn latest` resolves to the newest WORK turn, never a wrap-up
+  // (nudge) turn. The presentation step records an empty agent turn after the work turn.
   test('--turn latest shows changes from the most recent turn', async () => {
     const taskId = await createTask(ctx, 'Turn diff test', 'Do work');
 
@@ -31,13 +34,32 @@ describe('lazy diff --turn', () => {
     expectOutput(diffResult, 'agent-output');
   });
 
+  // INVARIANT: a wrap-up (nudge) turn recorded after the work turn changes no code, so
+  // `--turn latest` must still show the work turn's diff, not "No changes in this turn".
+  test('--turn latest skips a trailing nudge turn', async () => {
+    const taskId = await createTask(ctx, 'Nudge after work', 'Do work');
+    await startAndReconcile(ctx, taskId);
+    const turns = readTurns(ctx.root, taskId);
+    const last = turns[turns.length - 1];
+    writeTurns(ctx.root, taskId, [...turns, {
+      role: 'agent', content: 'presented', turn_type: 'nudge', sequence: (last.sequence ?? turns.length) + 1,
+    }]);
+
+    const diffResult = await ctx.lazy(['diff', taskId, '--turn', 'latest']);
+    expectSuccess(diffResult);
+    expectOutput(diffResult, 'agent-output');
+    // The nudge turn carries no SHAs; picking it degrades to the whole-task fallback.
+    expectOutputExcludes(diffResult, 'per-turn diff unavailable');
+    expectOutputExcludes(diffResult, 'No changes in this turn');
+  });
+
   test('--turn with specific sequence number shows that turn\'s changes', async () => {
     const taskId = await createTask(ctx, 'Specific turn diff', 'Do work');
 
     await startAndReconcile(ctx, taskId);
 
-    // The agent turn should be sequence 1 (human=0, agent=1)
-    const diffResult = await ctx.lazy(['diff', taskId, '--turn', '1']);
+    // Turns are numbered from 1: human=1, agent work turn=2
+    const diffResult = await ctx.lazy(['diff', taskId, '--turn', '2']);
     expectSuccess(diffResult);
     expectOutput(diffResult, 'agent-output');
   });

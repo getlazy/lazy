@@ -28,10 +28,18 @@
  *   control token) is refused (403); so — with a 409 — is everyone while a
  *   turn is running, since member terminals and turns take turns with the
  *   worktree (./member-entry.ts).
+ * - A COMMIT RUN (`run:<id>`, ./commit-run.ts). The target is the run's own
+ *   container, named from its slug, and a Shell is the only mode. Unlike a
+ *   task's, it is entered directly — not through a member container — because
+ *   a member container exists to keep a member's credential away from an
+ *   agent's processes, and a run's container holds no credential and runs no
+ *   agent. Like its services, it is shared: what one person starts in it the
+ *   others see.
  */
 
 import type { Storage } from '../storage';
-import type { BuilderSession } from '../storage/types';
+import type { BuilderSession, CommitRun } from '../storage/types';
+import { RUN_ATTACH_PREFIX, runContainerName } from '../run/identity';
 import type { Session, Task, ActorInput } from '../types';
 import type { Runner, RunnerType } from '../runner';
 import { createRunner } from '../runner';
@@ -75,6 +83,13 @@ export type SessionAttachTarget =
       session: Session;
       container: string;
       binary: string;
+    }
+  | {
+      kind: 'run';
+      sessionId: string;
+      run: CommitRun;
+      container: string;
+      binary: string;
     };
 
 export type SessionAttachResolution =
@@ -85,7 +100,7 @@ type RunnerView = Pick<Runner, 'type' | 'usesSandbox' | 'runNameForTask'>;
 
 export interface ResolveSessionAttachOptions {
   projectRoot: string;
-  storage: Pick<Storage, 'getBuilderSession' | 'getSession' | 'getTask' | 'getSessionByTaskId' | 'getSessionTurns'>;
+  storage: Pick<Storage, 'getBuilderSession' | 'getSession' | 'getTask' | 'getSessionByTaskId' | 'getSessionTurns' | 'getCommitRun'>;
   sessionId: string;
   /** The person the CALLER's credential names, or null when it names nobody. */
   callerEmail: string | null;
@@ -115,6 +130,19 @@ export async function resolveSessionAttachTarget(
 ): Promise<SessionAttachResolution> {
   const { projectRoot, storage, sessionId, callerEmail, multiMember } = opts;
   const runnerFor = opts.runnerFor ?? ((type) => createRunner(projectRoot, type));
+
+  if (sessionId.startsWith(RUN_ATTACH_PREFIX)) {
+    const run = await storage.getCommitRun(sessionId.slice(RUN_ATTACH_PREFIX.length));
+    if (!run) return { ok: false, status: 404, message: `Run not found: ${sessionId}` };
+    const runner = await runnerFor(undefined);
+    if (!runner.usesSandbox()) {
+      return { ok: false, status: 409, message: `This project runs on the ${runner.type} runner, which has no container to enter.` };
+    }
+    return {
+      ok: true,
+      target: { kind: 'run', sessionId, run, container: runContainerName(projectRoot, run.slug), binary: binaryFor(runner) },
+    };
+  }
 
   const builder = await storage.getBuilderSession(sessionId);
   // A fleet store serves many projects; another project's row is "not found".
@@ -302,19 +330,22 @@ export async function confirmAttachTargetRunning(
   return {
     ok: false,
     status: 409,
-    message: `Container for this task is not running.`,
+    message: target.kind === 'run'
+      ? "This run's container is not running. Run services (or Start container) starts it."
+      : `Container for this task is not running.`,
   };
 }
 
 export interface AttachSessionInfo {
   sessionId: string;
-  kind: 'builder' | 'task';
+  kind: 'builder' | 'task' | 'run';
   /** Path of the WebSocket route, on this daemon's `/rpc` port. */
   attachPath: string;
   /** Terminal modes the route accepts for this session (`?mode=`). */
   modes: string[];
   container: string;
   taskId?: string;
+  runId?: string;
   /**
    * Task sessions: per-mode reasons the upgrade would be refused for THIS
    * caller right now (absent key = that mode would open). The upgrade stays
@@ -456,9 +487,10 @@ export async function handleAttachSession(
     sessionId: target.sessionId,
     kind: target.kind,
     attachPath: sessionAttachPath(target.sessionId),
-    modes: target.kind === 'builder' ? ['attach'] : ['shell', 'pair', 'chat'],
+    modes: target.kind === 'builder' ? ['attach'] : target.kind === 'run' ? ['shell'] : ['shell', 'pair', 'chat'],
     container: target.container,
     ...(target.kind === 'task' ? { taskId: target.task.id } : {}),
+    ...(target.kind === 'run' ? { runId: target.run.id } : {}),
     ...(preflight ? { refusals: preflight.refusals, credentialMissing: preflight.credentialMissing } : {}),
   };
 }

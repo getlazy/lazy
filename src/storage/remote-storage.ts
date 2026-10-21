@@ -49,6 +49,7 @@ import type {
   InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
+  WorktreeSnapshotRetiredReason,
   TaskTreeNode,
   ListTasksOptions,
   TaskCodeEntry,
@@ -59,6 +60,8 @@ import type {
   BuilderResumeIntent,
   BuilderSession,
   BuilderSessionUpdate,
+  CommitRun,
+  CommitRunUpdate,
   ProjectSettings,
   StatusChange,
   TagEvent,
@@ -438,6 +441,10 @@ export class RemoteStorage implements Storage {
     return this.call<WorktreeSnapshot | null>('getWorktreeSnapshotForTurn', { sessionId, turnSequence });
   }
 
+  async retireWorktreeSnapshots(sessionId: string, reason: WorktreeSnapshotRetiredReason, snapshotId?: string): Promise<number> {
+    return this.call<number>('retireWorktreeSnapshots', { sessionId, reason, snapshotId });
+  }
+
   // --- Task Tree Operations ---
 
   async getChildTasks(parentTaskId: string): Promise<Task[]> {
@@ -618,7 +625,7 @@ export class RemoteStorage implements Storage {
       prompt?: string;
       code?: string;
       parent?: string;
-      actor: Actor;
+      actor: ActorInput;
     },
   ): Promise<import('../types').PromoteConversationResult> {
     return this.call<import('../types').PromoteConversationResult>('promoteConversation', {
@@ -913,6 +920,34 @@ export class RemoteStorage implements Storage {
     // RemoteStorage client cannot match on BuilderSessionStateConflictError
     // (same reachability shape as BuilderSessionActiveError).
     return this.call<BuilderSession>('updateBuilderSession', { id, patch, expectedState, expectedBuilderId });
+  }
+
+  // --- Commit runs ---
+  // The daemon refuses the three writes to a member's token: runs are written
+  // by the daemon's own runs.* commands (src/daemon/commit-run.ts).
+
+  async createCommitRun(run: CommitRun): Promise<CommitRun> {
+    return this.call<CommitRun>('createCommitRun', { run });
+  }
+
+  async getCommitRun(id: string): Promise<CommitRun | null> {
+    return this.call<CommitRun | null>('getCommitRun', { id });
+  }
+
+  async getCommitRunBySlug(slug: string): Promise<CommitRun | null> {
+    return this.call<CommitRun | null>('getCommitRunBySlug', { slug });
+  }
+
+  async listCommitRuns(): Promise<CommitRun[]> {
+    return this.call<CommitRun[]>('listCommitRuns', {});
+  }
+
+  async updateCommitRun(id: string, patch: CommitRunUpdate): Promise<CommitRun> {
+    return this.call<CommitRun>('updateCommitRun', { id, patch });
+  }
+
+  async deleteCommitRun(id: string): Promise<boolean> {
+    return this.call<boolean>('deleteCommitRun', { id });
   }
 
   // --- Tags ---

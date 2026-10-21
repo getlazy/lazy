@@ -128,19 +128,35 @@ export async function commandTokens(args: string[]): Promise<void> {
     subtreeLabel = `${label} + ${result.task.descendants} nested task(s)`;
   }
 
+  const durable = result.durable as { tokens: number; turnsWithUsage: number; agentTurns: number } | null;
+  const warnings = (result.warnings as string[] | undefined) ?? [];
+
   if (json) {
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify({ ...report, durable, warnings }, null, 2));
     return;
   }
+
+  const printDurable = (): void => {
+    if (durable && durable.agentTurns > 0) {
+      console.log(
+        theme.label(`Recorded on turns: ${num(durable.tokens)} tokens`) +
+          dim(` (${durable.turnsWithUsage} of ${durable.agentTurns} agent turn(s) reported usage; durable, not bounded)`),
+      );
+    }
+    for (const w of warnings) console.log(theme.warning(`warning: ${w}`));
+  };
 
   if (report.totals.requests === 0) {
     console.log(
       subtreeLabel
-        ? `No proxied requests recorded for ${subtreeLabel}.`
+        ? `No proxied requests in the audit trail for ${subtreeLabel} (the trail is bounded and may have rotated).`
         : 'No proxied requests recorded yet — run a task and retry.',
     );
+    printDurable();
     return;
   }
+
+  printDurable();
 
   if (subtreeLabel) console.log(theme.label(`Subtree: ${subtreeLabel}`));
   renderReport(report, top);
@@ -150,7 +166,8 @@ export async function commandTokens(args: string[]): Promise<void> {
 export function tokensUsage(): void {
   console.log(`Usage: lazy stats tokens [--since <duration>] [--limit <n>] [--top <n>] [--role <role>] [--task <id>] [--subtree] [--json]
 
-Token accounting from the proxy audit trail. The lazy proxy records one audit
+Token accounting from the proxy audit trail (bounded; it rotates), plus the
+usage recorded durably on each task's turns when --task is given. The lazy proxy records one audit
 record per forwarded request — attributed to a role (builder/agent) and a task
 by the per-launch credential lazy issues — with the token usage parsed out of the response. This
 command rolls those records up:

@@ -71,18 +71,9 @@ async function deliveredState(ctx: TestContext, shortId: string, text: string): 
   return mark !== undefined && comment.created_at <= mark;
 }
 
-/**
- * `lazy wait` returns as soon as an agent turn is RECORDED, which can be a
- * moment before the reconciler flips the status — so wait until it has parked.
- */
+/** `lazy wait` returns only once the task has left `working`, i.e. parked. */
 async function waitParked(ctx: TestContext, shortId: string): Promise<void> {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const r = await ctx.lazy(['wait', shortId]);
-    if (r.exitCode === 0) return;
-    if (!r.stdout.includes('is now working')) expectSuccess(r);
-    await Bun.sleep(500);
-  }
-  throw new Error(`task ${shortId} never parked`);
+  expectSuccess(await ctx.lazy(['wait', shortId]));
 }
 
 async function untilInvocations(ctx: TestContext, n: number): Promise<void> {

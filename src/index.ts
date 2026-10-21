@@ -3,7 +3,8 @@
 import { init } from './cli/init';
 import { findLazyRoot, findGitRoot } from './project-paths';
 import { isTTY, promptYesNo } from './cli/editor';
-import { readTeamsLogin, MultipleTeamsLoginsError, type TeamsLogin } from './teams/login';
+import { CredentialIndexParseError } from './credentials/store';
+import { readTeamsLogin, MultipleTeamsLoginsError, corruptIndexMeansLocal, type TeamsLogin } from './teams/login';
 import {
   commandCreate, createUsage,
   commandEdit, editUsage,
@@ -200,7 +201,7 @@ Daemon:
   daemon status          Show daemon status and web URL
   daemon list            List ALL running lazy daemons on this host (marks strays)
   daemon kill-stray      Reap daemons whose project root no longer exists
-  daemon logs            Tail daemon log file (primary debugging tool)
+  daemon logs            Print daemon log tail; -f follows (primary debugging tool)
   daemon auto-budget     Control/inspect the auto-react daily budget (list/update/pause/resume)
   daemon config          Inspect/override concurrency caps at runtime (get/set/reset)
   server                 Start daemon and show web dashboard URL
@@ -443,7 +444,21 @@ const hiddenCommands: Record<string, (args: string[]) => Promise<void>> = {
     const { installMcpKeepAlive, reportMcpStartupFailure } = await import('./mcp/process-guards');
     installMcpKeepAlive();
 
+    // --daemon-config: forward every call to the daemon with the token in that
+    // file — the same proxy server `lazy-agent mcp` runs inside a task
+    // container. `lazy pair --host` launches this, so a host-paired agent acts
+    // with its task's own token (src/supervisor/host-session-mcp.ts).
+    const daemonConfigIdx = cmdArgs.indexOf('--daemon-config');
+    if (daemonConfigIdx !== -1 && daemonConfigIdx + 1 >= cmdArgs.length) {
+      console.error('Missing value for --daemon-config <path>');
+      process.exit(1);
+    }
     try {
+      if (daemonConfigIdx !== -1) {
+        const { startMcpServerDaemonProxy } = await import('./mcp/index');
+        await startMcpServerDaemonProxy(cmdArgs[daemonConfigIdx + 1], taskId, { readOnly, review });
+        return;
+      }
       const { startMcpServer } = await import('./mcp/index');
       await startMcpServer({ taskId, worktreePath, boundToTeams: await mcpServesBoundClone() }, { readOnly, review });
     } catch (err) {
@@ -526,12 +541,13 @@ function lazyRootOrNull(): string | null {
  * loud refusal from `resolveStorage`; `login`/`logout` recover it) is what
  * should decide what happens next, not this preflight.
  *
- * Any OTHER error (a corrupted credential index, which breaks every
- * credential it holds and answers nothing about Teams binding specifically)
- * is answered `null` — proceed as an ordinary local project — rather than
- * swallowed into the same "bound" bucket: `lazy doctor`'s own diagnosis of
- * that exact corruption must still run, which skipping its daemon auto-start
- * on a guess would get in the way of.
+ * A corrupted credential index cannot say whether the clone is bound. It is
+ * answered by the shared rule `corruptIndexMeansLocal`: a recorded local
+ * daemon target means an ordinary local project (`null`); otherwise
+ * `'unreadable'` — no local daemon is auto-started (it would write a fresh
+ * target and turn a bound clone's writes towards a local store), but the
+ * clone is not treated as bound either, so `lazy doctor` still runs degraded
+ * and reports the broken file. Any other error is answered `null`.
  */
 /**
  * The Teams install and project a hand-run `lazy mcp` serves, when its clone
@@ -545,15 +561,17 @@ async function mcpServesBoundClone(): Promise<{ url: string; project: string } |
   const root = findLazyRoot();
   if (!root) return undefined;
   const login = await resolveCloneBinding(root);
-  if (!login || login === 'ambiguous') return undefined;
+  if (!login || login === 'ambiguous' || login === 'unreadable') return undefined;
   return { url: login.binding.teams_url, project: login.binding.project };
 }
 
-async function resolveCloneBinding(root: string): Promise<TeamsLogin | 'ambiguous' | null> {
+async function resolveCloneBinding(root: string): Promise<TeamsLogin | 'ambiguous' | 'unreadable' | null> {
   try {
     return await readTeamsLogin(root);
   } catch (err) {
-    return err instanceof MultipleTeamsLoginsError ? 'ambiguous' : null;
+    if (err instanceof MultipleTeamsLoginsError) return 'ambiguous';
+    if (err instanceof CredentialIndexParseError && !corruptIndexMeansLocal(root, err)) return 'unreadable';
+    return null;
   }
 }
 
@@ -609,7 +627,7 @@ if (!isHelpOrVersion && command !== 'completion' && !isProjectFreeSystemQuery &&
       const root = lazyRootOrNull();
       if (!root) return false;
       const binding = await resolveCloneBinding(root);
-      return binding !== null && binding !== 'ambiguous';
+      return binding !== null && binding !== 'ambiguous' && binding !== 'unreadable';
     })();
   if (!rewritesStoragePath && !skipsLocalStore) {
     const { validateConfigPaths } = await import('./cli/config-path-validation');

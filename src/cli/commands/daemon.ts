@@ -6,7 +6,7 @@
  *   lazy daemon stop      — graceful shutdown via RPC over the daemon's TCP port
  *   lazy daemon restart   — stop + start
  *   lazy daemon status    — show PID, uptime, web/dashboard address
- *   lazy daemon logs      — tail the daemon log file
+ *   lazy daemon logs      — print the daemon log tail (-f follows)
  *
  * Per-project: each project gets its own daemon process. Commands must be
  * run inside a lazy project directory (error otherwise).
@@ -39,7 +39,7 @@ import {
   enumerateDaemons,
   type DaemonRecord,
 } from '../../daemon';
-import { dashboardUrlFromStatus } from '../../daemon/dashboard-availability';
+import { dashboardUrlFromStatus, webOffLine } from '../../daemon/dashboard-availability';
 import { checkDashboardAddress, dashboardAddressNote } from '../../daemon/dashboard-address';
 import { listInteractiveSessions, describeInteractiveSession } from '../../daemon/interactive-registry';
 import { startDaemonBackground } from '../../daemon/auto-start';
@@ -546,8 +546,9 @@ async function daemonStatus(args: string[]): Promise<void> {
       // reachable against a daemon built before that fix — but silently
       // omitting the Web line made the "degraded" mode invisible (see the
       // original "Daemon context not initialized" bug) and must never
-      // regress.
-      console.log('  Web:     not bound (degraded — restart after freeing the port)');
+      // regress. A managed daemon deliberately has no dashboard; the payload
+      // says so explicitly and the line names that instead of "degraded".
+      console.log(`  Web:     ${webOffLine(status)}`);
     }
     // Proxy: the primary way to find the (OS-assigned by default) proxy address.
     // INVARIANT: always print this line. The proxy is always on, so an absent
@@ -976,7 +977,7 @@ Subcommands:
                  (the address only — to SIGN IN, run: lazy dashboard)
   list        List ALL running lazy daemons on this host (marks strays)
   kill-stray  Reap daemons whose project root no longer exists on disk
-  logs        Tail the daemon log file (primary debugging tool)
+  logs        Print the daemon log tail; --follow keeps streaming (primary debugging tool)
   auto-budget Control + inspect the auto-react daily budget (list/update/pause/resume)
   config      Inspect + override concurrency caps at runtime (get/set/reset, ephemeral)
   resume-queue  Show the slow-lane auto-resume queue (read-only)

@@ -34,6 +34,7 @@ import { getDaemonDir, getMcpTokensPath, getTokenPath, getMcpConfigDir } from '.
 import { buildDockerArgs, buildSupervisorDockerArgs } from '../../src/capture/claude';
 import { buildBuilderDockerArgs } from '../../src/runner/docker-runner';
 import { DAEMON_MCP_CONFIG_PREFIX } from '../../src/daemon/task-launcher';
+import { buildRunContainerDockerArgs } from '../../src/daemon/commit-run-container';
 
 /** A fixed project root — nothing here touches the filesystem. */
 const PROJECT_ROOT = '/tmp/lazy-invariant-project';
@@ -173,8 +174,34 @@ function builderArgs(binary: string, daemonConfigPath?: string): string[] {
   });
 }
 
+/** A commit run's container (src/daemon/commit-run-container.ts). */
+function commitRunArgs(binary: string): string[] {
+  const worktree = join(PROJECT_ROOT, '.lazy', 'worktrees', 'lazy-run-main');
+  return buildRunContainerDockerArgs({
+    binary,
+    name: 'lazyrun-main-0123abcd',
+    imageName: 'lazy-runner:latest',
+    repoRoot: PROJECT_ROOT,
+    runId: 'run-1',
+    worktreePath: worktree,
+    network: binary === 'docker' ? 'lazy-runs' : null,
+    gitMountArgs: ['-v', `${PROJECT_ROOT}/.git:${PROJECT_ROOT}/.git:ro`],
+    adoptPaths: [worktree],
+    readOnlyPaths: [],
+    publishArgs: ['-p', '127.0.0.1:0:3000'],
+    customMountArgs: [],
+    runArgs: [],
+    envArgs: [],
+    gitConfigEnv: {},
+  });
+}
+
 describe('no container launch path mounts the daemon state dir', () => {
   for (const binary of ['docker', 'podman']) {
+    test(`${binary}: a commit run's container`, () => {
+      assertNoDaemonDirExposure(commitRunArgs(binary));
+    });
+
     test(`${binary}: one-shot agent run`, () => {
       assertNoDaemonDirExposure(agentOneShotArgs(binary));
     });

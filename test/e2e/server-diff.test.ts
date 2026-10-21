@@ -3,6 +3,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { checkDaemonHealth } from '../../src/daemon';
 import { signInToDashboard } from '../helpers/dashboard-session';
+import { screenshotDashboardPage } from '../helpers/page-screenshot';
 
 // INVARIANT (one-diff-renderer): the commit detail page renders through the
 // SAME renderer as the review surface — light-DOM rows carrying (file, side,
@@ -22,7 +23,7 @@ describe('lazy server diff rendering', () => {
     // runs the mock agent, so per-CLI-call env would not reach it).
     ctx = await setupTestLazy({
       withDaemon: true,
-      daemonEnv: { LAZY_MOCK_SHOULD_COMMIT: '1' },
+      daemonEnv: { LAZY_MOCK_SHOULD_COMMIT: '1', LAZY_MOCK_COMMIT_BODY: 'Full commit body for review.' },
     });
   });
 
@@ -63,6 +64,14 @@ describe('lazy server diff rendering', () => {
 
     expect(target).not.toBeNull();
     const { html } = target!;
+    // INVARIANT: the commit page reads the full message from git, including its body.
+    expect(html).toContain('Full commit body for review.');
+    if (process.env.LAZY_COMMIT_SCREENSHOT_OUTPUT) {
+      await screenshotDashboardPage({ fetch, base, path: target!.path, out: process.env.LAZY_COMMIT_SCREENSHOT_OUTPUT });
+    }
+    if (process.env.LAZY_COMMIT_SCREENSHOT_PHONE_OUTPUT) {
+      await screenshotDashboardPage({ fetch, base, path: target!.path, out: process.env.LAZY_COMMIT_SCREENSHOT_PHONE_OUTPUT, width: 390, height: 844 });
+    }
 
     // Light-DOM rows, addressable per line — the property the shadow-DOM
     // renderer structurally could not provide.

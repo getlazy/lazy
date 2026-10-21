@@ -247,6 +247,63 @@ describe('recoverBacklogWithCommits', () => {
     expect((await env.storage.getTask(ref))?.status).toBe('working');
   });
 
+  // INVARIANT 1, top-level case: a top-level task's start SHA lived only on its
+  // session (`git_start_sha`), never on the task, and the session blob is local
+  // — so after a machine move a top-level task has no base on record at all. The
+  // sweep used to skip every such task, hiding real work in `backlog`. With no
+  // recorded base, the honest base is where the branch left the integration
+  // branch it merges back into: their merge-base.
+  test('recovers a top-level backlog task that has no recorded base', async () => {
+    const task = await env.storage.createTask('top-level, no base');
+    const ref = task.id.substring(0, 8);
+    expect(task.branched_from_sha).toBeFalsy();
+    makeBranchWithCommits(env, ref, 1);
+
+    await recoverBacklogWithCommits(env.storage, env.lazyRoot);
+
+    expect((await env.storage.getTask(ref))?.status).toBe('blocked');
+  });
+
+  // INVARIANT 2 under the fallback base: the merge-base must not mistake the
+  // empty init commit — or later work on the integration branch — for the
+  // task's own work.
+  test('does NOT recover a top-level task with no recorded base and only the init commit', async () => {
+    const task = await env.storage.createTask('top-level, mid-launch');
+    const ref = task.id.substring(0, 8);
+    makeBranchWithInitCommitOnly(env, ref);
+    await writeFile(join(env.lazyRoot, 'later.txt'), 'later\n');
+    git(env.lazyRoot, 'add', '.');
+    git(env.lazyRoot, 'commit', '-m', 'later main work');
+
+    await recoverBacklogWithCommits(env.storage, env.lazyRoot);
+
+    expect((await env.storage.getTask(ref))?.status).toBe('backlog');
+  });
+
+  // INVARIANT 2 under the fallback base: when local main is ahead of origin and
+  // the task was cut from LOCAL main, the base is the newer merge-base. The
+  // older one (with origin/main) would count local main's own commit as the
+  // task's work and recover an init-only branch.
+  test('uses the newest integration merge-base when local main is ahead of origin', async () => {
+    git(env.lazyRoot, 'update-ref', 'refs/remotes/origin/main', env.baseSha);
+    await writeFile(join(env.lazyRoot, 'local-only.txt'), 'local\n');
+    git(env.lazyRoot, 'add', '.');
+    git(env.lazyRoot, 'commit', '-m', 'local main work not on origin');
+    const localMain = git(env.lazyRoot, 'rev-parse', 'HEAD').stdout;
+
+    const task = await env.storage.createTask('top-level, cut from local main');
+    const ref = task.id.substring(0, 8);
+    git(env.lazyRoot, 'branch', `lazy/${ref}`, localMain);
+    const wt = join(env.lazyRoot, '..', `${ref}-local-wt`);
+    git(env.lazyRoot, 'worktree', 'add', wt, `lazy/${ref}`);
+    git(wt, 'commit', '--allow-empty', '-m', `Initialize task ${ref}: do the work`);
+    git(env.lazyRoot, 'worktree', 'remove', wt, '--force');
+
+    await recoverBacklogWithCommits(env.storage, env.lazyRoot);
+
+    expect((await env.storage.getTask(ref))?.status).toBe('backlog');
+  });
+
   // Mixed batch: only the tasks that actually have work get recovered.
   // Verifies the sweep applies its check per-task, not all-or-nothing.
   test('handles mixed batch correctly', async () => {

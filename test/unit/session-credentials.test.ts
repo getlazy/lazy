@@ -37,10 +37,12 @@ import {
   envVarForCredentialKind,
   sessionCredentialEnvFor,
   mustRecreateForCredentialPlan,
+  turnCredentialCommandEnv,
   createSessionCredentialResolver,
   TurnCredentialUnavailableError,
 } from '../../src/daemon/turn-credentials';
 import { runAsTurnOwnerRequest } from '../../src/daemon/turn-owner';
+import { recordContainerCredentialLaunch } from '../../src/daemon/container-credential-launch';
 import { closeAllStorage, initDaemonStorage } from '../../src/daemon/rpc-handlers';
 import { pinConfig } from '../helpers/pin-config';
 
@@ -297,6 +299,89 @@ describe('turn credential planning', () => {
     await planAs('alice', root, { taskId: TASK, sessionId: SESSION });
     const second = await planAs('alice', root, { taskId: TASK, sessionId: 'session-2' });
     expect(await mustRecreateForCredentialPlan(root, TASK, second)).toBe(false);
+  });
+
+  // INVARIANT: alternating turn owners whose credentials are of DIFFERENT kinds
+  // — a member on OAuth, then someone on an API key (another member, or the
+  // service credential for a turn nobody asked for), then the first member
+  // again — never recreates the task's container. The
+  // container keeps the task's services running while the agent works; starting
+  // a turn must leave them alone (engineer, 2026-10-20). What makes it safe: each
+  // command carries the turn's placeholder in the env var its kind needs, and the
+  // supervisor installs it (src/supervisor/turn-credential-env.ts).
+  // INVARIANT: a container launched WITHOUT a session placeholder — created under
+  // solo billing before the project switched to member billing — IS recreated
+  // for a session turn. The supervisor only replaces a placeholder the container
+  // holds, so reusing it would leave the agent on the solo grant and the proxy
+  // would refuse the turn (auth_kind_mismatch). Once relaunched holding one, the
+  // container is reused again. A review container's record never stands in for
+  // the work container's.
+  test('a container launched under solo billing is recreated for a member turn; one holding a placeholder is not', async () => {
+    await recordContainerCredentialLaunch(root, TASK, 'lazy-review-task', 'other');
+    await recordContainerCredentialLaunch(root, TASK, 'lazy-task', 'other');
+    await putUserCredential(root, { userId: 'alice', kind: 'oauth', token: 'oat-alice' });
+
+    const plan = await planAs('alice', root, { taskId: TASK, sessionId: SESSION });
+    expect(plan.mode).toBe('session');
+    expect(await mustRecreateForCredentialPlan(root, TASK, plan)).toBe(true);
+
+    await recordContainerCredentialLaunch(root, TASK, 'lazy-task', 'session');
+    expect(await mustRecreateForCredentialPlan(root, TASK, plan)).toBe(false);
+  });
+
+  // INVARIANT: only the work container the next turn would reuse decides. A
+  // stale 'other' entry under a work-run name no longer in use (an earlier
+  // container of this task) never forces a recreate — otherwise every turn
+  // would recreate the container, the very bug this task removes.
+  test('a stale solo-billing record under an old work-run name does not force a recreate', async () => {
+    await recordContainerCredentialLaunch(root, TASK, 'lazy-old-name', 'other');
+    await recordContainerCredentialLaunch(root, TASK, 'lazy-task', 'session');
+    await putUserCredential(root, { userId: 'alice', kind: 'oauth', token: 'oat-alice' });
+    const plan = await planAs('alice', root, { taskId: TASK, sessionId: SESSION });
+    expect(await mustRecreateForCredentialPlan(root, TASK, plan)).toBe(false);
+  });
+
+  test('alternating credential kinds reuse the container and hand each turn its own placeholder', async () => {
+    await putUserCredential(root, { userId: 'alice', kind: 'oauth', token: 'oat-alice' });
+    await putUserCredential(root, { userId: 'bob', kind: 'api-key', token: 'key-bob' });
+
+    const member = await planAs('alice', root, { taskId: TASK, sessionId: SESSION });
+    const other = await planAs('bob', root, { taskId: TASK, sessionId: 'session-2' });
+    const memberAgain = await planAs('alice', root, { taskId: TASK, sessionId: 'session-3' });
+
+    for (const plan of [member, other, memberAgain]) {
+      expect(plan.mode).toBe('session');
+      expect(await mustRecreateForCredentialPlan(root, TASK, plan)).toBe(false);
+    }
+    const token = (p: typeof member) => (p.mode === 'session' ? p.token : '');
+    const onSession = (harness: string) => ({ harness, credential: 'anthropic', endpoint: '' });
+    expect(turnCredentialCommandEnv(other, onSession('claude-code'))).toEqual([{ key: 'ANTHROPIC_API_KEY', value: token(other) }]);
+    expect(turnCredentialCommandEnv(memberAgain, onSession('claude-code'))).toEqual([{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: token(memberAgain) }]);
+    // pi is handed the same placeholder; the supervisor mirrors it for pi.
+    expect(turnCredentialCommandEnv(memberAgain, onSession('pi'))).toEqual([{ key: 'CLAUDE_CODE_OAUTH_TOKEN', value: token(memberAgain) }]);
+    // A codex or cursor container holds no Anthropic placeholder on purpose, and
+    // a command never hands it one; a solo install's daemon env carries none either.
+    expect(turnCredentialCommandEnv(memberAgain, onSession('codex'))).toBeUndefined();
+    expect(turnCredentialCommandEnv(memberAgain, onSession('cursor'))).toBeUndefined();
+    expect(turnCredentialCommandEnv({ mode: 'daemon-env' }, onSession('claude-code'))).toBeUndefined();
+  });
+
+  // INVARIANT: the member's session placeholder rides a command ONLY to a
+  // container whose launch was handed it — claude-code / pi on the primary
+  // Anthropic profile (teamSessionPathTarget, the rule teamModeLaunchCreds
+  // applies). A claude-code or pi profile with its own endpoint, or paid by a
+  // non-Anthropic credential, is launched with a per-profile grant; writing the
+  // session placeholder into its command file would hand that container a
+  // credential its launch deliberately withheld.
+  test('a profile off the session path never gets the session placeholder in its command', async () => {
+    await putUserCredential(root, { userId: 'alice', kind: 'oauth', token: 'oat-alice' });
+    const plan = await planAs('alice', root, { taskId: TASK, sessionId: SESSION });
+    expect(plan.mode).toBe('session');
+    for (const harness of ['claude-code', 'pi']) {
+      expect(turnCredentialCommandEnv(plan, { harness, credential: 'anthropic', endpoint: 'http://gateway.internal:8080' })).toBeUndefined();
+      expect(turnCredentialCommandEnv(plan, { harness, credential: 'openrouter', endpoint: '' })).toBeUndefined();
+      expect(turnCredentialCommandEnv(plan, { harness, credential: 'anthropic', endpoint: '' })).toHaveLength(1);
+    }
   });
 
   test('the resolver maps a live placeholder to its owner and current secret', async () => {

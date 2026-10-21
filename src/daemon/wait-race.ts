@@ -26,8 +26,6 @@ export interface WaitStorage {
   resolveTask(input: string): Promise<{ task: Task | null; ambiguousMatches?: Task[] }>;
   getTask(id: string): Promise<Task | null>;
   getSessionByTaskId(id: string): Promise<{ id: string } | null>;
-  getTurnCountByTaskId(id: string): Promise<number>;
-  getSessionTurns(sessionId: string): Promise<Array<{ sequence: number; role: string; timestamp: number }>>;
   /** Needed only when `interruptOnNewChildOf` is set. */
   getChildTasks?(parentTaskId: string): Promise<Task[]>;
   /** Needed only when `interruptOnNewChildOf` is set. */
@@ -53,8 +51,6 @@ export interface WaitRaceResult {
   display_id: string;
   status: string;
   timed_out: boolean;
-  turn_count?: number;
-  latest_turn?: { sequence: number; role: string; timestamp: number };
   /** Every task that was waited on, with its status at return time. */
   tasks: WaitTaskSnapshot[];
   /** Tasks still working at return time (excludes the winner). */
@@ -129,7 +125,6 @@ interface WaitTarget {
   id: string;
   display: string;
   code: string | null;
-  initialTurnCount: number;
   status: string;
   /** Never started: a start the usage pause is holding. */
   heldStart: boolean;
@@ -228,7 +223,6 @@ async function resolveTargets(storage: WaitStorage, inputs: string[]): Promise<W
       id: task.id,
       display: displayId(task),
       code: task.code ?? null,
-      initialTurnCount: session ? await storage.getTurnCountByTaskId(task.id) : 0,
       status: task.status,
       heldStart: isUsagePauseHeldStart(task),
     });
@@ -275,8 +269,11 @@ function buildResult(
 }
 
 /**
- * Poll a set of tasks until the FIRST one leaves 'working' or records a new
- * agent turn, or the timeout expires.
+ * Poll a set of tasks until the FIRST one leaves 'working'. INVARIANT: only a
+ * status change settles a wait. The reconciler records the agent turn BEFORE it
+ * parks the task, so a poll between the two used to see a new agent turn on a
+ * still-working task and return "now working" (exit 1). A turn is never
+ * evidence the task finished. Ends at the timeout otherwise.
  */
 export async function raceWait(
   storage: WaitStorage,
@@ -375,10 +372,9 @@ export async function raceWait(
         continue;
       }
       // A held start the daemon has just launched: from here it is an ordinary
-      // running task, and only a turn AFTER its launch counts as finishing one.
+      // running task, and from then on only a status change settles it.
       if (target.heldStart) {
         target.heldStart = false;
-        target.initialTurnCount = await storage.getTurnCountByTaskId(target.id);
         if (task.status === 'working') continue;
       }
 
@@ -386,28 +382,6 @@ export async function raceWait(
       if (task.status !== 'working') {
         const tasks = await currentSnapshots(storage, targets, observed, observedHeld);
         return buildResult(target, task.status, tasks, withInterruption({}));
-      }
-
-      // Check if turn count increased with an agent turn
-      const currentTurnCount = await storage.getTurnCountByTaskId(target.id);
-      if (currentTurnCount > target.initialTurnCount) {
-        // Verify the latest turn is from the agent
-        const sess = await storage.getSessionByTaskId(target.id);
-        if (sess) {
-          const turns = await storage.getSessionTurns(sess.id);
-          const latestTurn = turns[turns.length - 1];
-          if (latestTurn && latestTurn.role === 'agent') {
-            const tasks = await currentSnapshots(storage, targets, observed, observedHeld);
-            return buildResult(target, task.status, tasks, withInterruption({
-              turn_count: currentTurnCount,
-              latest_turn: {
-                sequence: latestTurn.sequence,
-                role: latestTurn.role,
-                timestamp: latestTurn.timestamp,
-              },
-            }));
-          }
-        }
       }
     }
 

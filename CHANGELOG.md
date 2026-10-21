@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.93.1208] - 2026-10-20 - Run any commit
+
+Lazy Teams can now run the default branch, any pushed branch or a specific commit with its services, links and a shell, without creating a task. Builders gain Resume and Continue from a summary, and a task's Turns tab reads as a conversation. The rest is fixes: services survive a turn start, browser terminals copy, paste and scroll properly, and several recovery paths no longer fail or stall.
+
+### Added
+
+- **Conversation view of a task** — Turns opens on each message and the agent's reply, with lazy's nudges, wrap-up and syncs folded; Current review shows the reply where you asked
+- **Teams: Continue from a summary** — start a new builder of yours from a summary of any builder's transcript, a teammate's included
+- **Teams: Resume on the Builders page** — resume any of your own stopped or ended builders from the list or its page; a running one is stopped only after you confirm
+- **Run any commit without a task** — Teams' new Run page runs the default branch, any pushed branch or a specific commit with its services, links and a shell; branch runs Pull latest; on a project not yet upgraded the page says it is still updating
+- **Teams task review settings** — choose a task's review mode, gate and auto-fix in the task form, including after work has started.
+- **`lazy pair <task> --host` gets the task's lazy tools** — the host session can create, start and accept subtasks into its task, like in-container pairing
+- **`reasoning = false` on a pi agent profile** — lets a model with no reasoning support (e.g. gpt-4o) run instead of failing on the effort setting
+
+### Changed
+
+- **`lazy daemon logs`** — prints the last 200 lines and exits (use `-f` to follow, `-n` for more); piping to `tail` no longer hangs
+- **`lazy daemon status` on a Teams machine** — shows `Web: off (Lazy Teams serves the UI)` instead of "not bound (degraded)"
+- **Readable service links in Lazy Teams** — a service opens at `<task>-<port>-<project>-<team>-<id>` instead of an opaque `--p15` name; shared links work after sign-in, and old links keep working
+- **Teams: Builders in the project navigation** — now second from the left, between Review and Clusters
+- **Lazy Teams project upgrades** — project, task and builder pages show the actual image, machine and daemon restart step to every member instead of an outage
+- **Teams: database pool** — now at least 8 connections whatever `RAILS_MAX_THREADS` says, so a default boot no longer warns that Solid Queue lacks connections; native installs now run 3 web threads
+
+### Fixed
+
+- **Services keep running when a turn starts** — unchanged secret files are no longer rewritten (restarting dev servers), and a turn on another credential kind reuses the container
+- **Teams god-mode Restart** — stops and starts a running project (its machine on the microVM backend) with freshly resolved secrets instead of leaving the running daemon alone
+- **Lazy Teams restarts** — a project whose setup was cut off by stopping or restarting Teams is picked up again within minutes, instead of reading "being set up" for 25 minutes on its old version
+- **Teams builder start** — less dead time before the terminal is usable: start-up checks run side by side and no longer stall the daemon
+- **Browser terminals copy, paste and page** — in Teams and the dashboard, a paste arrives once, Claude Code's own copies reach your clipboard, and Page Up/Down scroll its fullscreen view
+- **Turns queued behind a busy agent** — a sync or unblock started while the previous turn was still finishing now runs as a live turn, so its agent can commit (including a resolved merge) instead of being refused
+- **Missing task checkout recovery** — when the daemon and a CLI command restore the same deleted task checkout at once, the slower one no longer fails with "Could not check out branch"
+- **`lazy start` on a subtask** — starts even when the parent ran on another machine, branching from the parent's branch on the remote; refuses naming the branch when it exists nowhere
+- **Backlog recovery for top-level tasks** — a top-level task left in backlog with real work on its branch is now recovered to blocked, like subtasks already were
+- **Crash recovery** — one slow automatic resume (e.g. an image build) no longer delays noticing and recovering every other crashed task
+- **Promoting a builder conversation** — the new task now records who promoted it, in Lazy Teams and on a laptop
+- **`lazy wait`** — no longer returns "now working" right after a start; it waits until the task actually leaves `working`.
+- **Mid-merge turns no longer report loose work** — a task parked with an unresolved merge no longer lists its conflicted files as uncommitted work.
+- **Failed commit-record saves are no longer silent** — a commit lazy could not record now shows up as a warning in the daemon log.
+- **Teams Doctor** — no longer shows checks that don't apply to Teams, and names interrupted tasks that need manual recovery.
+- **Task artifacts** — remove attached files from the Artifacts tab in the dashboard and Lazy Teams.
+- **Proxy** — when an agent gives up on a model request, the upstream request is stopped too, so it no longer holds a concurrency slot or bills tokens.
+- **`lazy stats tokens` / `lazy_token_stats`** — tasks that ran turns no longer show 0 tokens, and a zero that means "unknown" is flagged as such.
+- **Commit details** — show the complete commit message, including its body, in the dashboard and Lazy Teams.
+- **Lazy Teams daemon upgrades** — detect project daemons running code different from their image, including registry installs and older saved images.
+- **Teams project machines** — idle project machines give memory back, and leftover machines of deleted projects this install created are stopped.
+- **`lazy diff --turn latest`** — shows the newest work turn instead of an empty wrap-up turn recorded after it
+- **`lazy upgrade`** — a failing image rebuild now aborts before anything is stopped, and `--images` keeps the current image instead of removing it first
+- **Dashboard Reject dialog** — now says Reject abandons the task (branch kept) and asks for a reason, instead of claiming to send the work back
+- **`lazy builder --help` / `lazy upgrade --help` / `lazy daemon health --help`** — no longer mention the removed host runner
+- **`lazy_artifact_get`** — binary or large artifacts come back as a file path instead of base64, and archives list their members.
+- **`lazy_commit`** — runtime files lazy excludes (e.g. `.lazy-task-sandbox/`) that an agent already staged are unstaged instead of committed
+- **`lazy create --parent` / `lazy_create`** — a dash-prefixed parent is refused instead of being passed to git as an option
+- **`lazy edit --code` / `lazy_edit`** — refuse a code that another live task already uses, matching `lazy create`
+- **Builder and pairing conversations** — no longer lost when the daemon is down at session end; they are kept and stored once the daemon runs
+- **`lazy unblock`** — a backed-up set of uncommitted changes is restored at most once, and never after a later turn ended clean, so edits you discarded stay discarded
+- **Teams: Regions tab** — rows show the walkthrough's notes, including how many files it left unnamed and any size cap it hit
+- **`lazy stats tokens` / `lazy stats tools` in a clone bound to Teams** — now work, showing your own tasks plus project-wide model totals, never another member's tasks
+- **`lazy login`** — refuses while a local daemon runs and forgets old local daemons, so a damaged credential file never sends a bound clone's commands to a local store
+- **Commit authors in Lazy Teams** — an accept the daemon finishes after a crash, and commits a builder makes, now name the member instead of the service credential's owner
+- **Claude Code API errors** — a turn whose final result is an API error is now always recorded as failed, including when Claude Code fails to exit afterwards
+
 ## [0.92.1203] - 2026-10-19 - Documentation
 
 The documentation site is reorganised into tutorials, how-to guides, reference, explanation and architecture, led by the dashboard and checked against the code.
@@ -21,6 +83,7 @@ The documentation site is reorganised into tutorials, how-to guides, reference, 
 Lazy Teams, in private alpha, now owns each project's environment: admins define variables, secrets and secret files once, and every task gets its effective set without anything being committed. Failed turns say why wherever you look, task services restart after every turn, in Teams pull requests link back to the task and its running app, microVM installs move to smolvm 1.29, and every upgrade backs up the task store first (Teams also its database). Clones bound to a Teams project gain `lazy shell --local` and most task verbs, and tiered agent profiles fall through endpoints as usage windows fill.
 
 ### Added
+
 - **Teams: secrets warning** — the Environment page and docs state that a secret can be read by anyone who can work on a task it applies to, like CI secrets on GitHub
 - **Teams: machine data integrity checks** — project machines check their own memory hourly and re-check stored image data after each build, alerting only when something was damaged
 - **`lazy:adopt_store` VM size** — optional `CPUS=`, `MEMORY_MIB=` and `STORAGE_GIB=` size the adopted project's machine; omitted ones follow the installation default
@@ -88,6 +151,7 @@ Lazy Teams, in private alpha, now owns each project's environment: admins define
 - **`lazy_wait` interruption** — a subtask added to the waiting task from outside now ends the wait with an `interrupted` reason instead of looking like a timeout.
 
 ### Changed
+
 - **Teams on microVMs runs smolvm 1.29.0** — up from 1.9.3, with cleaner disk shutdown and a newer guest kernel; stop all projects (God mode, or `bin/native-rails lazy:projects:stop_all`) before upgrading a native install, which otherwise refuses
 - **PR/MR description** — now reads Goal then Summary; the Summary says what was actually built, including when it differs from the ask, and the verbatim prompt is gone (old descriptions drop it on refresh)
 - **Teams: machine setup upgrades in place** — forwarder and Docker settings now ship in ordinary upgrades (Docker's apply at its next restart); machines are replaced one last time
@@ -127,6 +191,7 @@ Lazy Teams, in private alpha, now owns each project's environment: admins define
 - **Usage-pause override** — `--override-usage-pause` replaces `--past-usage-pause`, and the builder's MCP tools take `override_usage_pause`.
 
 ### Fixed
+
 - **Storage lock on Lazy Teams stores** — a lazy process outside a project's machine no longer takes over the lock that machine's live daemon holds
 - **Failed turns are visible** — a turn that fails on a broken credential or config shows `failed:<reason>` with the fix everywhere, files one alert, and broken credentials appear in `lazy stats limits`
 - **Storage lock** — two lazy processes reclaiming the same stale lock at once can no longer both end up writing to the store
@@ -458,6 +523,7 @@ Every action and every agent turn is now attributed to the person who asked for 
 - **`lazy daemon health`** — one OK / WARN / FAIL row per daemon part (loops, sweeps, proxy, storage lock, runner, stuck tasks, dashboard), with remedies and `--json`
 
 ### Changed
+
 - **Lazy no longer writes comments or reviews to pull requests** — it opens the PR and keeps its own description section current, nothing else
 - **`lazy raised` replaces follow-ups** — follow-ups and raised items are one queue with a blocking flag; the follow-up MCP tools are gone
 - **Protected files are approved at `lazy accept`, not at unblock**
@@ -481,6 +547,7 @@ Every action and every agent turn is now attributed to the person who asked for 
 - **`lazy submit` on a subtask** — opens a PR/MR against the parent task's branch when a person asks; it follows the subtask if the parent lands first, and closes after a local accept
 
 ### Fixed
+
 - **`lazy accept` keeps a landed merge** — later failures are retried instead of undoing the accept, an interrupted accept is finished, and a leftover `index.lock` no longer stops it
 - **An edited prompt is the one used** — `lazy clone`, `lazy redo` and agents' `lazy_show` no longer use the superseded prompt
 - **1M context through the proxy** — Claude Code gets a 1M-context model's full window instead of a silent 200k cap

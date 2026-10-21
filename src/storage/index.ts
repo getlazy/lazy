@@ -37,6 +37,7 @@ export type {
   TurnRole,
   TokenUsage,
   WorktreeSnapshot,
+  WorktreeSnapshotRetiredReason,
   TaskTreeNode,
   ListTasksOptions,
   TaskCodeEntry,

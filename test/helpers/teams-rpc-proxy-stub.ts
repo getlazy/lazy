@@ -81,12 +81,12 @@ export async function relayTeamsRpc(req: Request, opts: TeamsRpcRelayOptions): P
       { status: 403 },
     );
   }
-  if (command === 'tokenStats' && params.mode !== 'latency-cli' && params.mode !== 'latency-history') {
+  if (command === 'tokenStats' && !['latency-cli', 'latency-history', 'tokens-cli', 'tools-cli'].includes(params.mode)) {
     return Response.json(
       {
         error:
-          "'tokenStats' can only carry mode \"latency-cli\" or \"latency-history\" from a clone logged in to Lazy Teams: " +
-          'token totals name credentials, and Teams does not offer them to a bound clone.',
+          "'tokenStats' can only carry a mode of latency-cli, latency-history, tokens-cli or tools-cli from a clone logged in to Lazy Teams: " +
+          "other modes name every member's work, and Teams does not offer them to a bound clone.",
       },
       { status: 403 },
     );

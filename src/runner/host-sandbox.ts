@@ -317,23 +317,21 @@ export function buildBuilderPermissionArgs(
 }
 
 /**
- * The absolute store path to deny host agents, from `[storage] external_path`,
- * normalized (`~` expanded, trailing slashes stripped) so the file-tool rules
- * come out as `Read(//abs)` / `Read(//abs/**)` and never `//abs//**`.
+ * The absolute store path to deny host agents, normalized (`~` expanded,
+ * trailing slashes stripped) so the file-tool rules come out as `Read(//abs)` /
+ * `Read(//abs/**)` and never `//abs//**`.
  *
- * Two gaps, stated honestly:
- * - A RELATIVE path is skipped rather than resolved. The supervisor-side
- *   caller has no project root, and both callers must build byte-identical
- *   settings (the boundary guard fingerprints what the runner builds).
- * - An EMPTY path means the store is the derived default `~/.lazy/<project>`,
- *   whose name needs an async git lookup this synchronous settings builder
- *   cannot make — so it is not denied here. `lazy init` writes an explicit
- *   external_path, which is the common case.
+ * Reads `storage.resolved_path`, which loadConfig derives once with the project
+ * root — covering the empty default `~/.lazy/<project>` and relative paths — so
+ * the runner and the supervisor command, both built from the same loaded
+ * config, deny the identical path (the boundary guard fingerprints what the
+ * runner builds). A hand-built config without it falls back to an absolute
+ * `external_path`, and otherwise denies nothing.
  */
 export function hostSandboxStorePath(
-  config: { storage?: { external_path?: string } },
+  config: { storage?: { external_path?: string; resolved_path?: string } },
 ): string | undefined {
-  const raw = config.storage?.external_path;
+  const raw = config.storage?.resolved_path || config.storage?.external_path;
   if (!raw) return undefined;
   const expanded = expandTilde(raw);
   return isAbsolute(expanded) ? resolve(expanded) : undefined;

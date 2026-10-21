@@ -27,11 +27,22 @@
  * - `usage_paused` — the usage pause refused a launch a person asked for
  *   (src/daemon/usage-pause.ts). Read by the callers that must tell it from a
  *   failure: a reparent whose follow-up sync was refused has still reparented.
+ *
+ * - `run_checkout_dirty` — a commit run's checkout holds changes somebody
+ *   made, and moving or removing it would discard them
+ *   (src/daemon/commit-run-checkout.ts). The client shows `details.dirtyFiles`
+ *   and asks again with `confirmDiscard: true`.
  */
-export type RpcErrorCode = 'task_busy' | 'usage_paused' | 'runner_image_not_ready';
+export type RpcErrorCode = 'task_busy' | 'usage_paused' | 'runner_image_not_ready' | 'run_checkout_dirty';
 
 export class RpcError extends Error {
-  constructor(public status: number, message: string, public code?: RpcErrorCode) {
+  /**
+   * `details`: structured data a client acts on, sent beside the message as
+   * `{ error, code, details }` — only where a refusal carries something the
+   * client must show (the files a confirmation would discard). Never a second
+   * spelling of the message.
+   */
+  constructor(public status: number, message: string, public code?: RpcErrorCode, public details?: Record<string, unknown>) {
     super(message);
   }
 }

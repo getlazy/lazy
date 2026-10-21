@@ -89,6 +89,17 @@ export function extractModelId(obj: Record<string, unknown>): string | undefined
 
 /** Assert the fields every caller of parseResponse relies on. */
 function requireResponseFields(obj: Record<string, unknown>): AgentResponse {
+  // A provider/API error still ends in a result line carrying `result` and
+  // `session_id` — with the error text as `result`, `is_error: true`, and
+  // (verified on 2.1.300, test/fixtures/claude-code/api-error-400.jsonl)
+  // `subtype: "success"`, so `is_error` is the only reliable signal. Throw with
+  // Claude Code's own text so classifyFailure can read it, never record the
+  // error as the turn's summary.
+  if (obj.is_error === true) {
+    const status = typeof obj.api_error_status === 'number' ? ` (HTTP ${obj.api_error_status})` : '';
+    const text = typeof obj.result === 'string' && obj.result.trim() ? `: ${obj.result.trim()}` : '';
+    throw new Error(`Claude Code turn ended in error${status}${text}`);
+  }
   if (!obj.result || !obj.session_id) {
     throw new Error('Claude Code response missing required fields (result, session_id)');
   }

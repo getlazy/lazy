@@ -115,7 +115,13 @@ A container's environment is fixed when it is created. Lazy normally keeps a
 task's container running between turns, but when the task's variables have
 changed since the container was created, the next launch (`unblock`, an
 automatic resume, `ask`, `sync`) replaces the container so the agent sees the
-new values. A turn that is already running keeps the values it started with, so
+new values. Starting a turn otherwise leaves the container, and the services
+running in it, alone: a file that already holds exactly its contents is
+left untouched, so a dev server watching it is not restarted, and a turn on a
+different kind of credential reuses the container. Every replacement is
+written to the task's **Journal** with its reason (a changed agent or
+variable, a different runner image, a restored checkout, a requested restart),
+and the agent is told on its next work turn. A turn that is already running keeps the values it started with, so
 a change made while a task is `working` takes effect at the task's **next**
 launch. `lazy env set`/`unset`/`clear` say so when the task is working.
 

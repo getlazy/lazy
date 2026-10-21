@@ -100,6 +100,13 @@ for it, and you do not have to wait for anything to finish first: work that was
 running is picked up again where it left off, with its conversation and its
 uncommitted changes intact.
 
+If you stop or restart Lazy Teams while a project is still being set up or
+upgraded, that project is picked up again within a few minutes of Lazy Teams
+coming back; it does not stay at "being set up" in the meantime. Until a
+project is on the new version, a page that needs something only the new version
+has (such as the Run page) says the project is still on an older version and is
+being updated, rather than showing an error.
+
 The readiness check names the version it found, and the Installation page in god
 mode shows it alongside any project not yet on it. There is a **Restart all
 project daemons** button there for the rare case where you want it now; if a

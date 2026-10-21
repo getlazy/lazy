@@ -64,6 +64,18 @@ export interface LaunchBuilderHeadlessResult {
   exitCode: number;
 }
 
+/**
+ * A builder launch that was asked to resume a named conversation cannot, because
+ * the projects dir the container will see does not hold its session file.
+ * Thrown before `docker run`, so nothing was started.
+ */
+export class BuilderResumeUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BuilderResumeUnavailableError';
+  }
+}
+
 /** Inputs for a daemon-owned, detached interactive builder session. */
 export interface LaunchBuilderDetachedParams {
   lazyRoot: string;
@@ -83,6 +95,13 @@ export interface LaunchBuilderDetachedParams {
   homeDirAbs: string;
   /** Claude session id to `--resume`, or null for a fresh session. */
   resumeSessionId?: string | null;
+  /**
+   * The resume was ASKED FOR by name (the Builders page's Resume), so a
+   * conversation the container cannot see is a refusal
+   * ({@link BuilderResumeUnavailableError}), never the fresh conversation an
+   * ordinary restart falls back to.
+   */
+  requireResume?: boolean;
   debug?: boolean;
   /**
    * Where the launch reports its phases (image, agent binary, projects probe,

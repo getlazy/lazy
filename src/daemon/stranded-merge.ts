@@ -89,6 +89,16 @@ import {
   followThroughBackoffMs,
 } from './accept-intent';
 import { AcceptRefusedError } from './accept-refusal';
+import { runWithGitAuthor, type GitAuthor } from '../identity/git-author';
+import { actorEmail, actorName } from '../actor-ref';
+
+/** The person an actor names, as a git author — null for a bare role. */
+export function gitAuthorOfActor(actor: ActorInput | undefined): GitAuthor | null {
+  const email = actorEmail(actor);
+  if (!email) return null;
+  const name = actorName(actor);
+  return { email, ...(name ? { name } : {}) };
+}
 
 /**
  * Task metadata key marking a LOCAL merge phase that is in flight, carrying the
@@ -454,7 +464,11 @@ export async function resumeDeadAccept(storage: Storage, lazyRoot: string, task:
     }
     logger.warn(`Task ${displayId(task)}: resuming an accept that died mid-flight (attempt ${attempt}/${MAX_ACCEPT_RESUME_ATTEMPTS}).`);
     const { acceptTask } = await import('./task-lifecycle');
-    await acceptTask(lazyRoot, {
+    // The squash is the ACCEPTER's commit, not the daemon's: author it as the
+    // person the intent saved (AGENTS.md, "An agent's work is attributed to
+    // whoever asked for the turn"). A role-only actor, or no intent, names
+    // nobody and falls through to the configured system identity.
+    await runWithGitAuthor(gitAuthorOfActor(intent?.actor), () => acceptTask(lazyRoot, {
       taskId: task.id,
       reason: intent?.reason ?? 'Accept resumed by the daemon after the accepting process died (original reason was not recorded).',
       actor: intent?.actor ?? 'system',
@@ -464,7 +478,7 @@ export async function resumeDeadAccept(storage: Storage, lazyRoot: string, task:
       ...(intent?.allowReviewIssues ? { allowReviewIssues: true } : {}),
       // No callerTaskId, ever: see AcceptIntent. A resume into an active parent
       // is refused (parent-active) and rescheduled until the parent is quiet.
-    });
+    }));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     // Somebody else (a human re-accept, or remote-sync) finished this accept

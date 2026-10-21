@@ -88,6 +88,7 @@ function rowHtml(seg: string, a: TaskArtifact, text: string | undefined, markdow
             ${originTag}
             <span class="text-muted">${escapeHtml(formatArtifactBytes(a.size))} · ${escapeHtml(a.mime_type)} · added by ${escapeHtml(a.created_by)} ${timestampHtml(a.created_at)}</span>
             <a class="btn btn-sm" href="${escapeHtml(artifactFileHref(seg, a.name, true))}" download>Download</a>
+            <details class="lz-artifact-remove"><summary class="btn btn-sm">Remove</summary><form method="post" action="/tasks/${escapeHtml(seg)}/artifacts/remove"><input type="hidden" name="name" value="${escapeHtml(a.name)}"><button class="btn btn-sm" type="submit">Confirm removal</button></form></details>
           </div>
           ${preview ? `<details class="lz-artifact-preview"${open}><summary>Preview</summary>${preview}</details>` : ''}
         </li>`;

@@ -45,7 +45,10 @@ import { spawn } from '../utils/spawn';
 import type { Storage } from '../storage';
 import type { Session, Task } from '../types';
 import { isTerminalStatus } from '../task-state-machine';
-import { PhaseReporter, SERVE_RUN_PHASES, serveRunPhasePlan, throttleNotes, type PhaseNotify, type ProgressEmitter } from './progress';
+import { PhaseReporter, SERVE_RUN_PHASES, RUN_SERVE_RUN_PHASES, serveRunPhasePlan, throttleNotes, type PhaseNotify, type ProgressEmitter } from './progress';
+import type { EnsureRunContainerParams, EnsureRunContainerResult } from './commit-run-container';
+import { runContainerName, runWorktreePath } from '../run/identity';
+import type { CommitRun } from '../storage/types';
 
 /** Where the services process's pid and output live, inside the task's container. */
 export const SERVICES_PID_FILE = '/tmp/lazy-services.pid';
@@ -256,6 +259,8 @@ export const STARTING_WINDOW_SECONDS = 120;
 export interface ServeRunDeps {
   getStorage?: () => Promise<Storage>;
   ensureContainer?: (projectRoot: string, params: EnsureTaskContainerParams) => Promise<EnsureTaskContainerResult>;
+  /** A commit run's bring-up (./commit-run-container.ts); defaults to ensureRunContainer. */
+  ensureRunContainer?: (projectRoot: string, params: EnsureRunContainerParams) => Promise<EnsureRunContainerResult>;
   exec?: (argv: string[], timeoutMs: number) => Promise<{ exitCode: number | null; stdout: string; stderr: string }>;
   resolveCmd?: (storage: Storage, projectRoot: string) => Promise<string>;
   resolveStopCmd?: (storage: Storage) => Promise<string>;
@@ -287,6 +292,29 @@ async function resolveTaskOrThrow(storage: Storage, ref: string): Promise<Task> 
 }
 
 /**
+ * What Start services acts on: a task, or a commit run (./commit-run.ts) — the
+ * product at one commit without a task. Exactly one of the two ids.
+ */
+export type ServeSubjectParams = { taskId: string; runId?: undefined } | { runId: string; taskId?: undefined };
+
+/** Read `taskId` / `runId` off RPC params: exactly one, a non-empty string. */
+export function serveSubjectParams(params: Record<string, unknown>): ServeSubjectParams {
+  const taskId = params.taskId;
+  const runId = params.runId;
+  if (taskId !== undefined && runId !== undefined) throw new RpcError(400, "Give either 'taskId' or 'runId', not both.");
+  if (typeof runId === 'string' && runId) return { runId };
+  if (runId !== undefined) throw new RpcError(400, "'runId' must be a non-empty string.");
+  if (typeof taskId === 'string' && taskId) return { taskId };
+  throw new RpcError(400, "Missing required parameter 'taskId' (or 'runId' for a run).");
+}
+
+async function resolveRunOrThrow(storage: Storage, ref: string): Promise<CommitRun> {
+  const run = (await storage.getCommitRun(ref)) ?? (await storage.getCommitRunBySlug(ref));
+  if (!run) throw new RpcError(404, `Run not found: ${ref}`);
+  return run;
+}
+
+/**
  * Run the project's Start services command in the task's container, bringing
  * the container up first if it is not (the same bring-up as Start container,
  * which works whether or not a member has a terminal open). A second call
@@ -303,24 +331,39 @@ async function resolveTaskOrThrow(storage: Storage, ref: string): Promise<Task> 
  */
 export async function runStartServices(
   projectRoot: string,
-  params: { taskId: string },
+  params: ServeSubjectParams,
   deps: ServeRunDeps = {},
 ): Promise<{ containerName: string; command: string; containerStarted: boolean }> {
   const reporter = new PhaseReporter(deps.progress, 'serve.run');
   const storage = await (deps.getStorage ?? getOrCreateStorage)();
-  const task = await resolveTaskOrThrow(storage, params.taskId);
-  // A finished task's environment is not something to bring back: bringing
-  // the container up would recreate its worktree.
-  if (isTerminalStatus(task.status)) {
-    throw new RpcError(409, `Task ${displayId(task)} is ${task.status}; its services cannot be started.`);
+  // The subject decides only two things: how its environment is brought up,
+  // and what the phases are called. Everything after is the same.
+  let subject: string;
+  let ensure: (p: Omit<EnsureTaskContainerParams, 'taskId'>) => Promise<EnsureTaskContainerResult>;
+  let P: typeof SERVE_RUN_PHASES | typeof RUN_SERVE_RUN_PHASES = SERVE_RUN_PHASES;
+  let filesInPlace = 'task files are in place';
+  if (params.runId !== undefined) {
+    const run = await resolveRunOrThrow(storage, params.runId);
+    subject = run.slug;
+    P = RUN_SERVE_RUN_PHASES;
+    filesInPlace = 'the checkout is in place';
+    ensure = async (p) => (deps.ensureRunContainer ?? (await import('./commit-run-container')).ensureRunContainer)(projectRoot, { runId: run.id, ...p });
+  } else {
+    const task = await resolveTaskOrThrow(storage, params.taskId);
+    // A finished task's environment is not something to bring back: bringing
+    // the container up would recreate its worktree.
+    if (isTerminalStatus(task.status)) {
+      throw new RpcError(409, `Task ${displayId(task)} is ${task.status}; its services cannot be started.`);
+    }
+    subject = displayId(task);
+    ensure = (p) => (deps.ensureContainer ?? ensureTaskContainer)(projectRoot, { taskId: task.id, ...p });
   }
   const command = await (deps.resolveCmd ?? resolveProjectStartServicesCmd)(storage, projectRoot);
   if (!command) {
     throw new RpcError(409, 'No Start services command is designated for this project. Designate one first: Settings › Services on the dashboard, or the project\'s Configuration page in Lazy Teams.');
   }
 
-  const P = SERVE_RUN_PHASES;
-  reporter.announce(serveRunPhasePlan(), displayId(task));
+  reporter.announce(serveRunPhasePlan(P), subject);
   // Which phase is open decides where a failure is reported. The restore and
   // the launch happen inside one bring-up, so the hooks open them as they begin.
   let restoring = false;
@@ -343,7 +386,7 @@ export async function runStartServices(
   const onLaunching = () => {
     launching = true;
     flushRestoreNote();
-    if (!restoring) reporter.skip(P.restore, 'task files are in place');
+    if (!restoring) reporter.skip(P.restore, filesInPlace);
     reporter.begin(P.environment, 'the environment is not running — starting it');
   };
   // Narration from the launch itself (image resolution, a docker build).
@@ -351,9 +394,7 @@ export async function runStartServices(
 
   let container: EnsureTaskContainerResult;
   try {
-    container = await (deps.ensureContainer ?? ensureTaskContainer)(projectRoot, {
-      taskId: task.id, notify: (d) => notify(d), restoreProgress, onLaunching,
-    });
+    container = await ensure({ notify: (d) => notify(d), restoreProgress, onLaunching });
   } catch (err) {
     flushRestoreNote();
     const reason = readableFailure(err);
@@ -366,7 +407,7 @@ export async function runStartServices(
   } else {
     flushRestoreNote();
     if (restoring) reporter.end();
-    else reporter.skip(P.restore, 'task files are in place');
+    else reporter.skip(P.restore, filesInPlace);
     reporter.skip(P.environment, 'already running');
   }
 
@@ -445,18 +486,27 @@ function rethrowReadable(err: unknown, reason: string): Error {
 /** Stop the services process in the task's container. A container that is not running has nothing to stop. */
 export async function stopStartServices(
   projectRoot: string,
-  params: { taskId: string },
+  params: ServeSubjectParams,
   deps: ServeRunDeps = {},
 ): Promise<{ stopped: boolean }> {
   const storage = await (deps.getStorage ?? getOrCreateStorage)();
-  const task = await resolveTaskOrThrow(storage, params.taskId);
-  const session = await storage.getSessionByTaskId(task.id);
-  const target = await (deps.containerTarget ?? taskContainerTarget)(projectRoot, task, session);
+  let target: { binary: string; name: string } | null;
+  let worktreePath: string;
+  if (params.runId !== undefined) {
+    const run = await resolveRunOrThrow(storage, params.runId);
+    target = await runContainerTarget(projectRoot, run);
+    worktreePath = runWorktreePath(projectRoot, run.slug);
+  } else {
+    const task = await resolveTaskOrThrow(storage, params.taskId);
+    const session = await storage.getSessionByTaskId(task.id);
+    target = await (deps.containerTarget ?? taskContainerTarget)(projectRoot, task, session);
+    worktreePath = getWorktreePathForRef(projectRoot, taskRef(task));
+  }
   if (!target) return { stopped: false };
   const stopCmd = await (deps.resolveStopCmd ?? resolveProjectStopServicesCmd)(storage);
   // The worktree is mounted at the same path inside the container.
   const argv = stopCmd
-    ? [target.binary, 'exec', '-w', getWorktreePathForRef(projectRoot, taskRef(task)), target.name,
+    ? [target.binary, 'exec', '-w', worktreePath, target.name,
         'sh', '-c', stopServicesScript(true), 'lazy-services-stop', stopCmd]
     : [target.binary, 'exec', target.name, 'sh', '-c', stopServicesScript()];
   const result = await (deps.exec ?? defaultExec)(argv, 30_000);
@@ -472,6 +522,15 @@ export async function stopStartServices(
       : `Could not stop the services in ${target.name}: ${detail}`);
   }
   return { stopped: true };
+}
+
+/** A run's container when it is running; null otherwise. */
+export async function runContainerTarget(projectRoot: string, run: CommitRun): Promise<{ binary: string; name: string } | null> {
+  const runner = await createRunner(projectRoot);
+  if (!runner.usesSandbox()) return null;
+  const name = runContainerName(projectRoot, run.slug);
+  if (!(await runner.isRunning(name))) return null;
+  return { binary: containerBinaryFor(runner.type), name };
 }
 
 /** The task's container when it is running on a container runner; null otherwise. */

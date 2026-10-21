@@ -26,6 +26,7 @@ import { join } from 'path';
 import { runGit } from '../../src/utils/git';
 import type { Storage } from '../../src/storage';
 import type { Commit } from '../../src/types';
+import { logger } from '../../src/utils/logger';
 import { scanSessionCommits, recordSessionCommits } from '../../src/task/session-commits';
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -155,6 +156,26 @@ describe('session commit scan', () => {
 
     await recordSessionCommits(storage, { id: 's1', git_start_sha: branchPoint }, repo, 'test');
     expect(commits.length).toBe(2);
+  });
+
+  test('a commit record that fails to save is surfaced at warn level, not debug', async () => {
+    // INVARIANT: a failed commit-record write is WARNED. The range is recomputed every turn so a
+    // later turn heals it, but a task whose next turn never comes would otherwise silently keep a
+    // short history, and debug logging is off by default.
+    const own = await commit(repo, 'task.txt', 'work\n', 'task: real work');
+    const { storage } = fakeStorage();
+    (storage as unknown as { createCommit: () => Promise<never> }).createCommit = async () => {
+      throw new Error('disk full');
+    };
+    const warnings: string[] = [];
+    const original = logger.warn;
+    logger.warn = (m: string) => { warnings.push(m); };
+    try {
+      await recordSessionCommits(storage, { id: 's1', git_start_sha: branchPoint }, repo, 'test');
+    } finally {
+      logger.warn = original;
+    }
+    expect(warnings.some(w => w.includes(own.substring(0, 8)) && w.includes('disk full'))).toBe(true);
   });
 
   test('a branch point that is not an ancestor of the tip falls back to the merge base', async () => {

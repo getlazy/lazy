@@ -657,7 +657,17 @@ export const SERVE_RUN_PHASES = {
   services: { id: 'services', label: 'Start services' },
 } as const satisfies Record<string, PlannedPhase>;
 
-export function serveRunPhasePlan(): PlannedPhase[] {
-  const p = SERVE_RUN_PHASES;
+/**
+ * The same phases for a COMMIT RUN (src/daemon/commit-run.ts): same ids, so a
+ * client's checklist keys on them unchanged; labels that say what happens to a
+ * run — its checkout, its environment.
+ */
+export const RUN_SERVE_RUN_PHASES = {
+  restore: { id: 'restore-files', label: 'Check out the commit', optional: true },
+  environment: { id: 'environment', label: "Start the run's environment", optional: true },
+  services: { id: 'services', label: 'Start services' },
+} as const satisfies Record<string, PlannedPhase>;
+
+export function serveRunPhasePlan(p: typeof SERVE_RUN_PHASES | typeof RUN_SERVE_RUN_PHASES = SERVE_RUN_PHASES): PlannedPhase[] {
   return [p.restore, p.environment, p.services];
 }

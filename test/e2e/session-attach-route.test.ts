@@ -104,7 +104,14 @@ describe('session attach route', () => {
     return target.replace(/^http/, 'ws') + path;
   }
 
-  beforeEach(async () => {
+  /**
+   * A fresh project, its runner switched to docker, its daemon restarted
+   * against the fakes — managed or not. Managed and local tests never share a
+   * project: a managed daemon persists member billing in the credential
+   * registry on first read, one-way, so a "local" daemon restarted on that
+   * store would still be in team mode and refuse its own git identity.
+   */
+  async function setUp(managed: boolean): Promise<void> {
     workDir = await mkdtemp(join(tmpdir(), 'lzatt-'));
     docker = await installFakeDocker(workDir);
     engine = startFakeEngine(join(workDir, 'engine.sock'));
@@ -122,8 +129,7 @@ describe('session attach route', () => {
     await writeFile(configPath, patched);
 
     await ctx.restartDaemon({
-      LAZY_TEST_FORCE_MANAGED: '1',
-      LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
+      ...(managed ? { LAZY_TEST_FORCE_MANAGED: '1', LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root) } : {}),
       LAZY_BUILDER_HOMES_BASE_DIR: homesBase,
       PATH: `${docker.binDir}:${process.env.PATH ?? ''}`,
       DOCKER_HOST: `unix://${engine.socketPath}`,
@@ -131,7 +137,7 @@ describe('session attach route', () => {
     target = getDaemonTcpTarget(ctx.root)!;
     sharedToken = readToken(ctx.root)!;
     if (!target || !sharedToken) throw new Error('test daemon did not record a TCP target and token');
-  });
+  }
 
   afterEach(async () => {
     delete process.env.LAZY_BUILDER_HOMES_BASE_DIR;
@@ -140,134 +146,134 @@ describe('session attach route', () => {
     await rm(workDir, { recursive: true, force: true });
   });
 
-  // INVARIANT: in managed mode the dashboard shell is gone (404) and the
-  // attach route is how a member reaches a session — authenticated by their
-  // actor token, never by a dashboard session. The dashboard route must not
-  // come back to make the attach route work, and the attach route must not
-  // be gated by the dashboard's guard.
-  test('authenticates with an actor token while the dashboard shell 404s in managed mode', async () => {
-    const { alice, session } = await startAliceSession();
+  describe('managed', () => {
+    beforeEach(() => setUp(true));
 
-    const dashboardShell = await fetch(`${target}/tasks/anything/shell/ws`, {
-      headers: { Authorization: `Bearer ${alice}` },
-    });
-    expect(dashboardShell.status).toBe(404);
+    // INVARIANT: in managed mode the dashboard shell is gone (404) and the
+    // attach route is how a member reaches a session — authenticated by their
+    // actor token, never by a dashboard session. The dashboard route must not
+    // come back to make the attach route work, and the attach route must not
+    // be gated by the dashboard's guard.
+    test('authenticates with an actor token while the dashboard shell 404s in managed mode', async () => {
+      const { alice, session } = await startAliceSession();
 
-    const info = await rpc(alice, 'attachSession', {}) as AttachSessionInfo;
-    expect(info.sessionId).toBe(session.id);
-    expect(info.kind).toBe('builder');
-    expect(info.container).toBe(session.containerName!);
-    expect(info.attachPath).toBe(`/rpc/sessions/${session.id}/attach/ws`);
+      const dashboardShell = await fetch(`${target}/tasks/anything/shell/ws`, {
+        headers: { Authorization: `Bearer ${alice}` },
+      });
+      expect(dashboardShell.status).toBe(404);
 
-    const headers = { Authorization: `Bearer ${alice}`, 'X-Lazy-Project': ctx.root };
+      const info = await rpc(alice, 'attachSession', {}) as AttachSessionInfo;
+      expect(info.sessionId).toBe(session.id);
+      expect(info.kind).toBe('builder');
+      expect(info.container).toBe(session.containerName!);
+      expect(info.attachPath).toBe(`/rpc/sessions/${session.id}/attach/ws`);
 
-    // No token: the /rpc gate, answered before anything is looked up.
-    const anonymous = await fetch(`${target}${info.attachPath}`, { headers: { 'X-Lazy-Project': ctx.root } });
-    expect(anonymous.status).toBe(401);
+      const headers = { Authorization: `Bearer ${alice}`, 'X-Lazy-Project': ctx.root };
 
-    // Another member's valid token: a 403, and no socket.
-    const bob = await mintUserToken(BOB_EMAIL);
-    const bobAttempt = await fetch(`${target}${info.attachPath}`, {
-      headers: { Authorization: `Bearer ${bob}`, 'X-Lazy-Project': ctx.root },
-    });
-    expect(bobAttempt.status).toBe(403);
-    let bobRpc: unknown = null;
-    try { await rpc(bob, 'attachSession', { id: session.id }); } catch (err) { bobRpc = err; }
-    expect(bobRpc).toBeInstanceOf(RpcApplicationError);
-    expect((bobRpc as RpcApplicationError).status).toBe(403);
+      // No token: the /rpc gate, answered before anything is looked up.
+      const anonymous = await fetch(`${target}${info.attachPath}`, { headers: { 'X-Lazy-Project': ctx.root } });
+      expect(anonymous.status).toBe(401);
 
-    // Alice's token: a real terminal, relayed both ways.
-    const attach = openAttach(wsUrl(info.attachPath), headers);
-    await attach.opened;
-    expect(attach.output.join('')).toContain(`attached:${session.containerName}`);
-    attach.ws.send(new TextEncoder().encode('ping-from-alice'));
-    await Bun.sleep(300);
-    expect(attach.output.join('')).toContain('ping-from-alice');
-    await attach.closed();
+      // Another member's valid token: a 403, and no socket.
+      const bob = await mintUserToken(BOB_EMAIL);
+      const bobAttempt = await fetch(`${target}${info.attachPath}`, {
+        headers: { Authorization: `Bearer ${bob}`, 'X-Lazy-Project': ctx.root },
+      });
+      expect(bobAttempt.status).toBe(403);
+      let bobRpc: unknown = null;
+      try { await rpc(bob, 'attachSession', { id: session.id }); } catch (err) { bobRpc = err; }
+      expect(bobRpc).toBeInstanceOf(RpcApplicationError);
+      expect((bobRpc as RpcApplicationError).status).toBe(403);
 
-    expect(engine.attaches).toEqual([session.containerName!]);
-    expect(engine.execCreates).toEqual([]);
-  }, 180_000);
+      // Alice's token: a real terminal, relayed both ways.
+      const attach = openAttach(wsUrl(info.attachPath), headers);
+      await attach.opened;
+      expect(attach.output.join('')).toContain(`attached:${session.containerName}`);
+      attach.ws.send(new TextEncoder().encode('ping-from-alice'));
+      await Bun.sleep(300);
+      expect(attach.output.join('')).toContain('ping-from-alice');
+      await attach.closed();
 
-  // INVARIANT: on a MANAGED daemon a member's builder session is theirs even
-  // when team mode is off. Team mode means "some member stored a credential";
-  // a session outlives its member's credential, so once that is removed the
-  // project is back on the service credential alone with the session still
-  // running. Keyed on team mode, any member could then list, stop and end it.
-  test('on a managed daemon another member cannot list, stop or end a session', async () => {
-    const { session } = await startAliceSession();
-    await rpc(sharedToken, 'revokeUserCredential', { userId: ALICE_EMAIL });
-    const bob = await mintUserToken(BOB_EMAIL);
+      expect(engine.attaches).toEqual([session.containerName!]);
+      expect(engine.execCreates).toEqual([]);
+    }, 180_000);
 
-    const bobList = await rpc(bob, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
-    expect(bobList.map((s) => s.id)).not.toContain(session.id);
+    // INVARIANT: on a MANAGED daemon a member's builder session is theirs even
+    // when team mode is off. Team mode means "some member stored a credential";
+    // a session outlives its member's credential, so once that is removed the
+    // project is back on the service credential alone with the session still
+    // running. Keyed on team mode, any member could then list, stop and end it.
+    test('on a managed daemon another member cannot list, stop or end a session', async () => {
+      const { session } = await startAliceSession();
+      await rpc(sharedToken, 'revokeUserCredential', { userId: ALICE_EMAIL });
+      const bob = await mintUserToken(BOB_EMAIL);
 
-    for (const command of ['stopBuilderSession', 'endBuilderSession']) {
-      let refused: unknown = null;
-      try { await rpc(bob, command, { id: session.id }); } catch (err) { refused = err; }
-      expect(refused).toBeInstanceOf(RpcApplicationError);
-      expect((refused as RpcApplicationError).status).toBe(403);
-    }
-    expect(await docker.containers()).toContain(session.containerName!);
-  }, 180_000);
+      const bobList = await rpc(bob, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+      expect(bobList.map((s) => s.id)).not.toContain(session.id);
 
-  // INVARIANT: a dropped socket DETACHES; the session outlives it. The
-  // reattach reaches the same container, and nothing is launched or exec'd in
-  // between — the container's process is the session (§5.7).
-  test('a dropped socket reattaches to the SAME container rather than starting a second one', async () => {
-    const { alice, session } = await startAliceSession();
-    const launchesBefore = (await docker.invocations()).filter((l) => l.includes(' -d ')).length;
-    const url = wsUrl(`/rpc/sessions/${session.id}/attach/ws`);
-    const headers = { Authorization: `Bearer ${alice}`, 'X-Lazy-Project': ctx.root };
+      for (const command of ['stopBuilderSession', 'endBuilderSession']) {
+        let refused: unknown = null;
+        try { await rpc(bob, command, { id: session.id }); } catch (err) { refused = err; }
+        expect(refused).toBeInstanceOf(RpcApplicationError);
+        expect((refused as RpcApplicationError).status).toBe(403);
+      }
+      expect(await docker.containers()).toContain(session.containerName!);
+    }, 180_000);
 
-    // The drop is a clean client close; the daemon's close path (exec.close()
-    // on the socket) is the same for an abrupt one.
-    const first = openAttach(url, headers);
-    await first.opened;
-    await first.closed();
+    // INVARIANT: a dropped socket DETACHES; the session outlives it. The
+    // reattach reaches the same container, and nothing is launched or exec'd in
+    // between — the container's process is the session (§5.7).
+    test('a dropped socket reattaches to the SAME container rather than starting a second one', async () => {
+      const { alice, session } = await startAliceSession();
+      const launchesBefore = (await docker.invocations()).filter((l) => l.includes(' -d ')).length;
+      const url = wsUrl(`/rpc/sessions/${session.id}/attach/ws`);
+      const headers = { Authorization: `Bearer ${alice}`, 'X-Lazy-Project': ctx.root };
 
-    const second = openAttach(url, headers);
-    await second.opened;
-    expect(second.output.join('')).toContain(`attached:${session.containerName}`);
-    await second.closed();
+      // The drop is a clean client close; the daemon's close path (exec.close()
+      // on the socket) is the same for an abrupt one.
+      const first = openAttach(url, headers);
+      await first.opened;
+      await first.closed();
 
-    expect(engine.attaches).toEqual([session.containerName!, session.containerName!]);
-    expect(engine.execCreates).toEqual([]);
-    const launchesAfter = (await docker.invocations()).filter((l) => l.includes(' -d ')).length;
-    expect(launchesAfter).toBe(launchesBefore);
-    expect(await docker.containers()).toContain(session.containerName!);
+      const second = openAttach(url, headers);
+      await second.opened;
+      expect(second.output.join('')).toContain(`attached:${session.containerName}`);
+      await second.closed();
 
-    // The registry still holds the one running session.
-    const again = await rpc(alice, 'attachSession', {}) as AttachSessionInfo;
-    expect(again.sessionId).toBe(session.id);
-    expect(again.container).toBe(session.containerName!);
-  }, 180_000);
+      expect(engine.attaches).toEqual([session.containerName!, session.containerName!]);
+      expect(engine.execCreates).toEqual([]);
+      const launchesAfter = (await docker.invocations()).filter((l) => l.includes(' -d ')).length;
+      expect(launchesAfter).toBe(launchesBefore);
+      expect(await docker.containers()).toContain(session.containerName!);
 
-  // INVARIANT: on a laptop the one user finds their own session with no id.
-  // attachSession is a READ, so the identity gate never stamps it; the
-  // session row was written by startBuilderSession under the daemon's git
-  // identity, so discovery must resolve that same identity to match it.
-  test('locally, attachSession with no id finds the session startBuilderSession started', async () => {
-    const homesBase = join(workDir, 'homes');
-    await ctx.restartDaemon({
-      LAZY_BUILDER_HOMES_BASE_DIR: homesBase,
-      PATH: `${docker.binDir}:${process.env.PATH ?? ''}`,
-      DOCKER_HOST: `unix://${engine.socketPath}`,
-    });
-    target = getDaemonTcpTarget(ctx.root)!;
-    sharedToken = readToken(ctx.root)!;
-    await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
-      dockerfileHash: await calculateImageInputsHash(ctx.root),
-      inputs: await calculateImageInputManifest(ctx.root),
-    });
-    await seedAgentBinaryStamp(ctx.agentHome!);
+      // The registry still holds the one running session.
+      const again = await rpc(alice, 'attachSession', {}) as AttachSessionInfo;
+      expect(again.sessionId).toBe(session.id);
+      expect(again.container).toBe(session.containerName!);
+    }, 180_000);
+  });
 
-    const session = await rpc(sharedToken, 'startBuilderSession', {}) as BuilderSession;
-    expect(session.state).toBe('running');
-    expect(session.memberEmail).toBeTruthy();
+  describe('local', () => {
+    beforeEach(() => setUp(false));
 
-    const info = await rpc(sharedToken, 'attachSession', {}) as AttachSessionInfo;
-    expect(info.sessionId).toBe(session.id);
-    expect(info.container).toBe(session.containerName!);
-  }, 180_000);
+    // INVARIANT: on a laptop the one user finds their own session with no id.
+    // attachSession is a READ, so the identity gate never stamps it; the
+    // session row was written by startBuilderSession under the daemon's git
+    // identity, so discovery must resolve that same identity to match it.
+    test('locally, attachSession with no id finds the session startBuilderSession started', async () => {
+      await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
+        dockerfileHash: await calculateImageInputsHash(ctx.root),
+        inputs: await calculateImageInputManifest(ctx.root),
+      });
+      await seedAgentBinaryStamp(ctx.agentHome!);
+
+      const session = await rpc(sharedToken, 'startBuilderSession', {}) as BuilderSession;
+      expect(session.state).toBe('running');
+      expect(session.memberEmail).toBeTruthy();
+
+      const info = await rpc(sharedToken, 'attachSession', {}) as AttachSessionInfo;
+      expect(info.sessionId).toBe(session.id);
+      expect(info.container).toBe(session.containerName!);
+    }, 180_000);
+  });
 });

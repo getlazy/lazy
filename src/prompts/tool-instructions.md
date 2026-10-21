@@ -102,7 +102,7 @@ Available tools:
                      kind of work (params: name?). No name lists them; a name returns one.
   lazy_artifact_list List a task's artifacts — files attached to it and files it published
                      back. Metadata only (params: task_id?)
-  lazy_artifact_get  Read one artifact's content by name (params: task_id?, name)
+  lazy_artifact_get  Read one artifact's content by name (params: task_id?, name, member?)
   lazy_artifact_add  Attach a file to your task or a direct subtask — publish an output
                      (report, rendered image, data dump) so the human can retrieve it
                      without digging in your worktree (params: task_id?, path | content |

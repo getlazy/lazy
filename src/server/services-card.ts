@@ -49,6 +49,26 @@ export interface ServicesCardControls extends ContainerControls {
   canConfigure: boolean;
 }
 
+/**
+ * What the card describes, beyond the state and the buttons.
+ *
+ * A COMMIT RUN (src/daemon/commit-run.ts) renders the same card on its own
+ * page (./runs-page.ts). Two things differ, and only these: there is no
+ * `lazy url` command (it addresses tasks), and the remedies name the run's
+ * controls instead of a task restart. A run's page also offers a waiting page
+ * for a service that is starting (`waitHref`), the dashboard's "Open when it
+ * answers".
+ */
+export interface ServicesCardOptions {
+  subject?: 'task' | 'run';
+  /**
+   * Where Open goes for a published service nothing answers on yet, or null
+   * for none. The caller offers it only while Start services is running, so a
+   * page that would wait forever is never linked.
+   */
+  waitHref?: (serviceName: string) => string | null;
+}
+
 /** A serve state whose services have been through the liveness probe. */
 export interface ProbedServeState extends Omit<TaskServeState, 'services'> {
   services: ProbedService[];
@@ -95,22 +115,24 @@ export function servicesBodyHtml(
   taskRef: string,
   serve: ProbedServeState,
   controls?: ServicesCardControls,
+  opts: ServicesCardOptions = {},
 ): string {
+  const isRun = opts.subject === 'run';
   // Start services + Configure ride every card state: starting the command
   // only needs a shell (which brings the container up itself), and designating
   // the project-wide command (in Settings) does not depend on ports being published.
   const actions = `${startServicesHtml(controls)}${configureServicesHtml(controls)}`;
 
   if (serve.declared.length === 0) {
-    return `<p class="rv-hint">This task declares no services. Declare the ports it serves in ` +
+    return `<p class="rv-hint">${isRun ? 'This project' : 'This task'} declares no services. Declare the ports it serves in ` +
       `lazy.toml — <code>[serve]</code> <code>ports = [3000]</code> or <code>[serve.services]</code> — ` +
-      `and restart the task to publish them.</p>` +
+      `and ${isRun ? 'stop the environment and run services again' : 'restart the task'} to publish them.</p>` +
       actions;
   }
 
   if (serve.unavailable === 'no-container-runner') {
     return `<p class="rv-hint">${escapeHtml(serve.runnerType)} runner — services share this machine's ` +
-      `network, so anything the task starts is already on <code>http://127.0.0.1:&lt;port&gt;</code>. ` +
+      `network, so anything ${isRun ? 'it' : 'the task'} starts is already on <code>http://127.0.0.1:&lt;port&gt;</code>. ` +
       `There is no container mapping to look up.</p>` +
       actions;
   }
@@ -123,7 +145,7 @@ export function servicesBodyHtml(
     const names = serve.declared.map((s) => s.name).join(', ');
     return `<p class="svc-down">${dotHtml(false, 'Container not running — no ports are published')}` +
       `<span class="text-muted">` +
-      `Container not running — nothing is published. ` +
+      `${isRun ? 'Environment' : 'Container'} not running — nothing is published. ` +
       `${serve.declared.length} declared: ${escapeHtml(names)}.</span>` +
       (controls ? startContainerHtml(controls.taskId, controls) : '') +
       `</p>` +
@@ -134,7 +156,13 @@ export function servicesBodyHtml(
     .map((s) => {
       let target: string;
       if (!s.url) {
-        target = `<span class="text-muted">not published — restart the task to pick up [serve]</span>`;
+        target = `<span class="text-muted">not published — ${isRun ? 'stop the environment and run services again' : 'restart the task'} to pick up [serve]</span>`;
+      } else if (s.listening === false && opts.waitHref?.(s.name)) {
+        // Starting: Open goes to a page that waits for the port to answer and
+        // then sends the browser on — what the bare link would do once the
+        // server is up, without a "nothing is listening" bounce first.
+        target = `<a class="svc-wait-link" href="${escapeHtml(opts.waitHref(s.name)!)}">Open when it answers</a>` +
+          `<span class="text-muted">nothing listening on port ${s.port} yet</span>`;
       } else if (s.listening === false) {
         // Published, but the app is not up. NOT a link: the subdomain URL
         // would redirect a navigation straight back to this task's page with a
@@ -152,7 +180,7 @@ export function servicesBodyHtml(
       }
       const cls = s.listening === true ? 'svc-row svc-up' : s.listening === false ? 'svc-row svc-off' : 'svc-row';
       return `<li class="${cls}">${dotHtml(s.listening)}` +
-        `<span class="svc-name">${escapeHtml(s.name)}</span>${target}${commandHtml(taskRef, s.name)}</li>`;
+        `<span class="svc-name">${escapeHtml(s.name)}</span>${target}${isRun ? '' : commandHtml(taskRef, s.name)}</li>`;
     })
     .join('');
 
@@ -216,6 +244,7 @@ export function servicesCardHtml(
   task: { id: string; code?: string | null },
   serve: ProbedServeState | null,
   controls?: ServicesCardControls,
+  opts: ServicesCardOptions = {},
 ): string {
   if (!serve) return '';
   const taskRef = task.code ?? task.id.substring(0, 8);
@@ -225,11 +254,11 @@ export function servicesCardHtml(
     : serve.unavailable === 'not-running'
       // Say the state, not a count: "2 declared" next to a card whose services
       // are all unreachable is the reading the engineer flagged.
-      ? 'container not running'
+      ? (opts.subject === 'run' ? 'environment not running' : 'container not running')
       : serve.unavailable
         ? `${serve.declared.length} declared`
         : `${live}/${serve.services.length} listening`;
-  const bodyHtml = servicesBodyHtml(taskRef, serve, controls);
+  const bodyHtml = servicesBodyHtml(taskRef, serve, controls, opts);
   return viewedCardHtml({
     key: 'services',
     // The tick clears when what the card SAYS changes — so it hashes the URL as

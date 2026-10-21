@@ -25,6 +25,26 @@ import { acceptRemedyOf, type AcceptRemedy } from '../types/accept-remedy';
 
 export type ActionRunStatus = 'running' | 'done' | 'failed';
 
+/**
+ * A refusal the human can answer in the dialog by confirming: the daemon
+ * refused because going ahead would lose something (a run's checkout holds
+ * somebody's files), and calling again with an explicit flag is the
+ * confirmation. The dialog lists `items` under the failed step and offers one
+ * button that re-posts the refused form with `fields` added — the same POST a
+ * JS-off page offers as a plain form. The ROUTE composes this from the
+ * daemon's structured refusal; nothing here decides what needs confirming.
+ */
+export interface ActionConfirm {
+  /** The lines the confirmation is about (the files a discard would lose). */
+  items: string[];
+  /** The button's label, e.g. "Discard them and pull". */
+  label: string;
+  /** Fields added to the re-posted form, e.g. `{ confirm_discard: '1' }`. */
+  fields: Record<string, string>;
+  /** Where the confirmation posts; the refused form's own action when absent. */
+  action?: string;
+}
+
 export interface ActionRunState {
   id: string;
   taskId: string;
@@ -40,6 +60,14 @@ export interface ActionRunState {
    * repeating the error text a second time.
    */
   remedy?: AcceptRemedy;
+  /** A confirm-and-retry the dialog offers instead of a dead end. */
+  confirm?: ActionConfirm;
+  /**
+   * Lines a finished action leaves for the page it redirects to (what a Pull
+   * discarded and kept) — read back by that page from this registry, never
+   * from the URL.
+   */
+  notes?: string[];
   /** Where the page should go on success. */
   redirect?: string;
   startedAt: number;
@@ -114,7 +142,10 @@ export function actionRunMatchesPath(
 export function beginActionRun(opts: {
   taskId: string;
   operation: string;
-  work: (onProgress: ProgressEmitter) => Promise<{ redirect: string }>;
+  /** `actionId` is this action's own id, for a redirect that names it. */
+  work: (onProgress: ProgressEmitter, actionId: string) => Promise<{ redirect: string; notes?: string[] }>;
+  /** Read a confirm-and-retry off a failure, when the refusal is one. */
+  confirmOf?: (err: unknown) => ActionConfirm | undefined;
 }): ActionRunState {
   const existingId = inflightByKey.get(keyOf(opts.taskId, opts.operation));
   if (existingId) {
@@ -141,10 +172,11 @@ export function beginActionRun(opts: {
   };
 
   void opts
-    .work(onProgress)
+    .work(onProgress, run.id)
     .then((result) => {
       run.status = 'done';
       run.redirect = result.redirect;
+      if (result.notes && result.notes.length) run.notes = result.notes;
       run.endedAt = Date.now();
       inflightByKey.delete(keyOf(opts.taskId, opts.operation));
       notify(run);
@@ -156,6 +188,8 @@ export function beginActionRun(opts: {
       // errors (a 400, a raised-item gate) so the page stays on the message.
       const remedy = acceptRemedyOf(err);
       if (remedy) run.remedy = remedy;
+      const confirm = opts.confirmOf?.(err);
+      if (confirm) run.confirm = confirm;
       run.endedAt = Date.now();
       inflightByKey.delete(keyOf(opts.taskId, opts.operation));
       notify(run);
@@ -196,6 +230,7 @@ export function actionRunJson(run: ActionRunState): Record<string, unknown> {
     events: run.events,
     ...(run.error ? { error: run.error } : {}),
     ...(run.remedy ? { remedy: run.remedy } : {}),
+    ...(run.confirm ? { confirm: run.confirm } : {}),
     ...(run.redirect ? { redirect: run.redirect } : {}),
   };
 }

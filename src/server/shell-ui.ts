@@ -50,8 +50,13 @@ export type ShellAvailability =
  * The panel ships EMPTY: tabs and terminals are created by the client script on
  * demand, one per session. Nothing connects on load — a page render must never
  * exec into a container by itself.
+ *
+ * `opts.base` puts the panel on a page that is not a task's: a commit run's
+ * (`/runs/<id>`, ./runs-page.ts), whose container-ensure and shell ws routes
+ * hang off that path instead of `/tasks/<id>`.
  */
-export function shellPanelHtml(taskId: string, avail: ShellAvailability): string {
+export function shellPanelHtml(taskId: string, avail: ShellAvailability, opts: { base?: string } = {}): string {
+  const baseAttr = opts.base ? ` data-lz-shell-base="${escapeHtml(opts.base)}"` : '';
   if (!avail.available) {
     return (
       `<div class="lz-shell" data-lz-shell-task="${escapeHtml(taskId)}">` +
@@ -61,7 +66,7 @@ export function shellPanelHtml(taskId: string, avail: ShellAvailability): string
     );
   }
   return (
-    `<div class="lz-shell" data-lz-shell-task="${escapeHtml(taskId)}"` +
+    `<div class="lz-shell" data-lz-shell-task="${escapeHtml(taskId)}"${baseAttr}` +
     ` data-lz-xterm-js="${XTERM_JS_PATH}" data-lz-xterm-fit="${XTERM_FIT_JS_PATH}" data-lz-xterm-css="${XTERM_CSS_PATH}">` +
     `<button type="button" class="btn" data-lz-shell-open>Shell</button>` +
     `<div class="lz-shell-panel" hidden>` +
@@ -132,11 +137,11 @@ export function shellTabHtml(input: {
  * - **Clipboard keys.** xterm.js hands the terminal every keystroke, so
  *   Ctrl+V/Cmd+V would reach the PTY as a literal ^V instead of pasting.
  *   `attachCustomKeyEventHandler` intercepts the shortcuts a terminal user
- *   expects — paste on Ctrl/Cmd+V and Shift+Insert, copy on Ctrl/Cmd+C *when
- *   there is a selection* (with none, ^C stays the interrupt it has to be).
- *   Paste reads `navigator.clipboard.readText()`, which some browsers refuse or
- *   prompt for; if it is unavailable or denied nothing is pasted and the
- *   browser's own right-click paste (which xterm handles natively) still works.
+ *   expects — Ctrl/Cmd+V and Shift+Insert are kept from the PTY so the
+ *   browser's own paste event (which xterm handles) pastes exactly once, copy
+ *   on Ctrl/Cmd+C *when there is a selection* (with none, ^C stays the
+ *   interrupt it has to be), and OSC 52 — a program setting the clipboard —
+ *   is written to it. The Paste button reads `navigator.clipboard.readText()`.
  * - **Run opens a NEW tab.** `window.lzShellRun(text, taskId, label)` — what the
  *   How-to-verify Run buttons and the Services card's Start services button
  *   call — always creates a fresh labelled session and runs the text there. It
@@ -189,6 +194,9 @@ export function shellClientScript(): string {
     if (root.__lzWired) return;
     root.__lzWired = true;
     const taskId = root.getAttribute('data-lz-shell-task');
+    // A page that is not a task's, when the root names one — a commit run's
+    // ('/runs/<id>'), whose container and ws route live there. Null for a task.
+    const shellBase = root.getAttribute('data-lz-shell-base');
     const panel = root.querySelector('.lz-shell-panel');
     const tabsEl = root.querySelector('[data-lz-shell-tabs]');
     const sessionsEl = root.querySelector('[data-lz-shell-sessions]');
@@ -266,15 +274,25 @@ export function shellClientScript(): string {
     function makeKeyHandler(s) {
       return function handleKey(ev) {
         if (ev.type !== 'keydown') return true;
-        if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey && (ev.key === 'PageUp' || ev.key === 'PageDown')) {
+        // A program's full screen (alternate buffer) has no scrollback: the
+        // program scrolls itself, so the key goes to it.
+        if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey && (ev.key === 'PageUp' || ev.key === 'PageDown')
+            && s.term.buffer.active.type !== 'alternate') {
           ev.preventDefault();
           s.term.scrollPages(ev.key === 'PageUp' ? -1 : 1);
           return false;
         }
-        if (ev.shiftKey && ev.key === 'Insert') { pasteInto(s); return false; }
+        // Paste keys: the browser's own paste event follows and xterm pastes it
+        // once; false only stops xterm sending the key (^V). Pasting here too
+        // delivered the text twice. The Paste button still uses pasteInto.
+        if (ev.shiftKey && ev.key === 'Insert') return false;
         if (!ev.ctrlKey && !ev.metaKey) return true;
         const key = (ev.key || '').toLowerCase();
-        if (key === 'v') { pasteInto(s); return false; }
+        // Except Ctrl+V on a Mac: no native paste follows it there.
+        if (key === 'v') {
+          if (ev.ctrlKey && !ev.metaKey && /Mac/.test(navigator.platform)) pasteInto(s);
+          return false;
+        }
         if (key === 'c') {
           const selection = s.term.getSelection();
           // No selection: ^C must stay the interrupt, so let xterm send it.
@@ -483,11 +501,25 @@ export function shellClientScript(): string {
         return;
       }
       if (!s.term) {
-        s.term = new window.Terminal({ cursorBlink: true, fontSize: 13, scrollback: 5000, convertEol: false });
+        s.term = new window.Terminal({ cursorBlink: true, fontSize: 13, scrollback: 5000, convertEol: false, macOptionClickForcesSelection: true });
         s.fit = new window.FitAddon.FitAddon();
         s.term.loadAddon(s.fit);
         s.term.open(s.termEl);
         s.term.attachCustomKeyEventHandler(makeKeyHandler(s));
+        // OSC 52: a program setting the clipboard (Claude Code copies its own
+        // selection this way). "?" asks to READ it, which is never allowed.
+        s.term.parser.registerOscHandler(52, function (data) {
+          const encoded = data.slice(data.indexOf(';') + 1);
+          if (!encoded || encoded === '?' || !(navigator.clipboard && navigator.clipboard.writeText)) return true;
+          // Only right after the person clicked or typed: output alone must
+          // never replace their clipboard.
+          if (navigator.userActivation && !navigator.userActivation.isActive) return true;
+          let text;
+          try { text = new TextDecoder().decode(Uint8Array.from(atob(encoded), function (c) { return c.charCodeAt(0); })); }
+          catch (e) { return true; /* not base64: nothing to copy */ }
+          navigator.clipboard.writeText(text).catch(function () { /* copy refused */ });
+          return true;
+        });
         s.term.onData((d) => {
           if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(new TextEncoder().encode(d));
         });
@@ -507,7 +539,7 @@ export function shellClientScript(): string {
           if (s.closedByUser) return;
           s.status = detail;
           refreshStatus(); refreshIndex();
-        });
+        }, shellBase || undefined);
         if (s.closedByUser) return;
         if (!ensured.ok) {
           // The one place a Start container button belongs on this panel: after
@@ -526,8 +558,10 @@ export function shellClientScript(): string {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       // data-lz-task-id holds the URL-ESCAPED segment — interpolate raw; a
       // second escape turns %20 into %2520, a different address.
-      let url = proto + '//' + location.host + '/tasks/' + taskId +
-        '/shell/ws?cols=' + cols + '&rows=' + rows;
+      let url = shellBase
+        ? proto + '//' + location.host + shellBase + '/shell/ws?cols=' + cols + '&rows=' + rows
+        : proto + '//' + location.host + '/tasks/' + taskId +
+          '/shell/ws?cols=' + cols + '&rows=' + rows;
       if (s.mode && s.mode !== 'shell') url += '&mode=' + encodeURIComponent(s.mode);
       const ws = new WebSocket(url);
       s.ws = ws;

@@ -54,6 +54,7 @@ import mermaidCss from './styles/mermaid.css' with { type: 'text' };
 import terminalPanelsCss from './styles/terminal-panels.css' with { type: 'text' };
 import tabsCss from './styles/tabs.css' with { type: 'text' };
 import statsCss from './styles/stats.css' with { type: 'text' };
+import runsCss from './styles/runs.css' with { type: 'text' };
 
 /** The route every page links to. */
 export const STYLESHEET_PATH = '/assets/app.css';
@@ -95,6 +96,7 @@ export const STYLESHEET_PARTS: readonly StylesheetPart[] = [
   { name: 'terminal-panels.css', bundled: terminalPanelsCss, path: 'styles/terminal-panels.css' },
   { name: 'tabs.css', bundled: tabsCss, path: 'styles/tabs.css' },
   { name: 'stats.css', bundled: statsCss, path: 'styles/stats.css' },
+  { name: 'runs.css', bundled: runsCss, path: 'styles/runs.css' },
 ];
 
 /** The stylesheet as compiled into this binary. */

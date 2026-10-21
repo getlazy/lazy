@@ -337,6 +337,7 @@ describe('task rows', () => {
     expect(buildInterruptedRow([{ code: 'a', state: 'queued' }, { code: 'b', state: 'stopped' }], true).state).toBe('ok');
     const gaveUp = buildInterruptedRow([{ code: 'a', state: 'gave-up' }], true);
     expect(gaveUp.state).toBe('warn');
+    expect(gaveUp.name).toBe('Interrupted tasks need manual recovery');
     expect(gaveUp.remedy).toContain('lazy resume');
   });
 

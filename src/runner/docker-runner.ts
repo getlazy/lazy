@@ -12,6 +12,7 @@ import { lazyDataDirMaskArgs, resolveLazyDataDir } from '../capture/lazy-dir-mas
 import type { AgentResponse } from '../types';
 import type { AgentExecArgs } from '../agent/interface';
 import type { Runner, RunInfo, FollowHandle, HealthCheck, RunStream, DiagnoseOptions, RunInfoProbe } from './types';
+import { BuilderResumeUnavailableError } from './types';
 import type { PhaseNotify } from '../daemon/progress';
 import { parsePortBindings, type PortBinding } from '../serve/ports';
 import type { RunnerType, RoleTarget } from '../config/types';
@@ -1681,6 +1682,19 @@ export class DockerRunner implements Runner {
       phase('agent binary', () => ensureAgentBinary()),
     ]);
 
+    // The projects-dir write probe is a whole container run of its own, and it
+    // needs only the image: start it now, beside the launch-file writes below,
+    // instead of after them. Its answer is awaited where the mount is decided.
+    const projectsProbe: Promise<boolean> | null = projects && !projects.trustWritable
+      // adopt: this dir is under the member's own lazy-owned home, and the
+      // container's entry adopts it too — probe what the builder will see.
+      ? phase('projects dir write probe', () => this.probeProjectsDirWritable(projects.hostDir, imageName, true))
+      : null;
+    // Awaited below; this only keeps a failed launch-file write (which throws
+    // first and is the real failure) from leaving the probe's result unhandled.
+    // probeProjectsDirWritable itself never rejects.
+    projectsProbe?.catch(() => undefined);
+
     const { loadConfig } = await import('../config/loader');
     const config = await loadConfig(lazyRoot);
     const dataDir = join(lazyRoot, config.data.path);
@@ -1696,6 +1710,9 @@ export class DockerRunner implements Runner {
     // its container config) were readable and writable by every other member's
     // container. Each file below is bind-mounted individually; the directory
     // itself is mounted nowhere. See builderSessionLaunchDir.
+    // The launch files (prompt, configs, credential store, permissions) are
+    // timed as one step: the home/credential setup leg of a start.
+    const launchFilesStarted = Date.now();
     const tmpDir = builderSessionLaunchDir(homeDirAbs, builderId);
     await mkdirAsync(tmpDir, { recursive: true });
     await mkdirAsync(join(homeDirAbs, '.claude'), { recursive: true });
@@ -1768,14 +1785,11 @@ export class DockerRunner implements Runner {
     // default-target write would both leave the session without its lazy tool
     // permissions and silently rewrite the host operator's real settings.
     await writeToolPermissions(BUILDER_READ_ONLY_TOOLS, homeDirAbs);
+    trace?.note(`launch files written in ${Date.now() - launchFilesStarted}ms`);
 
     let useProjectsMount = false;
     if (projects) {
-      const probeWritable = projects.trustWritable
-        ? true
-        // adopt: this dir is under the member's own lazy-owned home, and the
-        // container's entry adopts it too — probe what the builder will see.
-        : await phase('projects dir write probe', () => this.probeProjectsDirWritable(projects.hostDir, imageName, true));
+      const probeWritable = projects.trustWritable ? true : await projectsProbe!;
       useProjectsMount = shouldMountProjectsDir({ trustWritable: projects.trustWritable, probeWritable });
     }
 
@@ -1787,6 +1801,12 @@ export class DockerRunner implements Runner {
     if (resumeSessionId) {
       const seen = useProjectsMount && projects ? projects.hostDir : join(homeDirAbs, '.claude', 'projects');
       if (!(await projectsDirHoldsSession(seen, lazyRoot, resumeSessionId))) {
+        if (params.requireResume) {
+          throw new BuilderResumeUnavailableError(
+            `Conversation ${resumeSessionId} is not in the projects dir this builder would see (${seen}), ` +
+            `so it cannot be resumed. Nothing was started.`,
+          );
+        }
         logger.warn(
           `Builder ${builderId}: conversation ${resumeSessionId} is not in the projects dir the container will see ` +
           `(${seen}), so it cannot be resumed; starting a fresh conversation instead.`,

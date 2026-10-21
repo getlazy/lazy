@@ -534,7 +534,7 @@ effect, not by what it stores. One consequence worth knowing: a read-only turn
 (§5) serves read tools only, so an *asked* agent cannot ask a conversation. That
 is the intended reading of "read-only" — an ask turn does not spawn more agents.
 
-## 12. Artifacts: attach and read over MCP, remove only at a terminal
+## 12. Artifacts: attach and read over MCP, remove on human surfaces
 
 `lazy artifact` has four subcommands — `add`, `list`, `get`, `rm`. MCP has three
 tools: `lazy_artifact_add`, `lazy_artifact_list`, `lazy_artifact_get`. There is
@@ -545,9 +545,9 @@ nine design files synced out of a tool that will not re-emit them identically,
 a dump produced by a run that has ended. Attaching is additive and re-attaching
 a name replaces it, so the worst an agent can do over MCP is add or overwrite
 what it can also see. Deleting is the one artifact operation that destroys
-something the caller did not create, and it takes two seconds at a terminal
-(`lazy artifact rm <task> <name>`), so exposing it buys nothing and costs the
-inputs.
+something the caller did not create. A person can remove one from the
+dashboard or Teams Artifacts tab, or with `lazy artifact rm <task> <name>`;
+the agent's MCP toolset cannot delete it.
 
 Two smaller asymmetries in the same feature, both on the WRITE side:
 

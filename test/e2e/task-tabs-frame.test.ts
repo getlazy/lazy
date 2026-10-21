@@ -222,7 +222,9 @@ describe('tabbed task page frame', () => {
     expect(html).toContain('lzSwitchTaskTab');
     expect(html).toContain("searchParams.set('fragment'");
     expect(html).toContain('data-lz-tab-index');
-    expect(html).toContain('<h3>Tabs</h3>');
+    // INVARIANT: fresh tasks expose shortcut help; the dialog content is escaped in the page script until opened.
+    expect(html).toContain('data-rv-nav-help title="Keyboard shortcuts (?)"');
+    expect(html).toContain('\\u003ch3\\u003eTabs\\u003c/h3\\u003e');
     const fragment = await fetch(`${base}/tasks/${id}/changes?fragment=1`);
     expect(fragment.status).toBe(200);
     const body = await fragment.text();

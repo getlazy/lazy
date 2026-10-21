@@ -12,8 +12,8 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { mkdir, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
-import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask } from '../helpers/fixtures';
+import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
+import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { findFullTaskId, taskFilePath } from '../helpers/storage';
 import { auditLogPath, ProxyAuditLog } from '../../src/proxy/audit-log';
 import { emptyToolStatsRecord, foldAuditRecord } from '../../src/proxy/tool-stats';
@@ -120,9 +120,10 @@ function flat(stdout: string): string {
   return stdout.replace(/\s+/g, ' ');
 }
 
-const NOW = Date.now();
+
 
 function sampleRecords(): SeedRecord[] {
+  const NOW = Date.now();
   return [
     { role: 'agent', taskId: 'task-alpha', model: 'claude-opus-5', ts: NOW - 60_000, input: 1000, output: 100 },
     { role: 'agent', taskId: 'task-alpha', model: 'claude-opus-5', ts: NOW - 30_000, input: 2000, output: 200 },
@@ -469,7 +470,7 @@ describe('lazy stats tools', () => {
 
   test('says so when the window holds requests but no tool calls', async () => {
     await seedAudit(ctx.root, [
-      { role: 'agent', taskId, model: 'claude-opus-5', ts: NOW - 1_000, input: 10, output: 1 },
+      { role: 'agent', taskId, model: 'claude-opus-5', ts: Date.now() - 1_000, input: 10, output: 1 },
     ]);
     const result = await ctx.lazy(['stats', 'tools', taskShortId, '--since', '1d']);
     expectSuccess(result);
@@ -619,5 +620,71 @@ describe('lazy stats tools over the durable record', () => {
     expectOutput(result, '9,100');
     expect(result.stdout).toContain('Read');
     expect(result.stdout).toContain('Bash');
+  });
+});
+
+describe('lazy stats tokens --task <code> (the proxy attributes traffic by task CODE)', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy();
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: the proxy stamps audit records with the task CODE, never the full id, so `--task <code>`
+  // (and `--subtree`) must match on the code. Matching only ids reported 0 tokens for tasks that ran turns.
+  test('a task whose records carry its code shows non-zero tokens', async () => {
+    const created = await ctx.lazy(['create', '--goal', 'Tune token spend', '--code', 'tune-token-spend']);
+    expectSuccess(created);
+    const short = extractTaskId(created.stdout);
+    const fullId = findFullTaskId(ctx.root, short);
+    const code = JSON.parse(await Bun.file(taskFilePath(ctx.root, short, 'task.json')).text()).code as string | undefined;
+    // The proxy attributes by CODE; a fallback to an id would let this pass without exercising one.
+    if (!code || code === short || code === fullId) throw new Error(`fixture task has no distinct code (got ${code})`);
+    const now = Date.now();
+    await seedAudit(ctx.root, [
+      { role: 'agent', taskId: code, model: 'claude-sonnet-5-5', ts: now - 2000, input: 1000, output: 234 },
+      { role: 'agent', taskId: `${code}-other`, model: 'claude-sonnet-5-5', ts: now - 1000, input: 9999, output: 1 },
+    ]);
+    for (const args of [['--task', code], ['--task', fullId], ['--task', code, '--subtree']]) {
+      const result = await ctx.lazy(['stats', 'tokens', ...args]);
+      expectSuccess(result);
+      expectOutput(result, '1 proxied request(s)');
+      expectOutput(result, '1,234');
+    }
+  });
+
+  // INVARIANT: a zero from the bounded trail is never presented as "used nothing" — it says the trail may have rotated.
+  test('an empty trail for a real task says so instead of implying zero use', async () => {
+    const short = await createTask(ctx, 'Tune token spend');
+    const result = await ctx.lazy(['stats', 'tokens', '--task', short]);
+    expectSuccess(result);
+    expectOutput(result, 'may have rotated');
+  });
+});
+
+describe('lazy stats tokens --task after a completed turn, with an empty trail', () => {
+  let ctx: TestContext;
+
+  beforeEach(async () => {
+    ctx = await setupTestLazy({ withDaemon: true });
+  });
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: usage recorded on a completed turn is durable and survives the proxy trail rotating away.
+  test('reports the tokens recorded on the turn', async () => {
+    const id = await createTask(ctx, 'Tune token spend', 'Some work');
+    expectSuccess(await ctx.lazyMocked(['start', id, '--yes'], MOCK_CLAUDE_SUCCESS));
+    expectSuccess(await ctx.lazy(['wait', id]));
+    const result = await ctx.lazy(['stats', 'tokens', '--task', id]);
+    expectSuccess(result);
+    expectOutput(result, 'Recorded on turns:');
+    expect(result.stdout).not.toContain('Recorded on turns: 0 ');
   });
 });

@@ -91,6 +91,7 @@ import type {
   InFlightTurnOutcome,
   TokenUsage,
   WorktreeSnapshot,
+  WorktreeSnapshotRetiredReason,
   TaskTreeNode,
   ListTasksOptions,
   TaskCodeEntry,
@@ -102,6 +103,8 @@ import type {
   BuilderResumeIntent,
   BuilderSession,
   BuilderSessionUpdate,
+  CommitRun,
+  CommitRunUpdate,
   ProjectSettings,
   TurnsFile,
   CommitsFile,
@@ -188,6 +191,8 @@ import { actorEmail, actorFields, actorName, actorRole, personFieldsAs } from '.
 import type { ActorInput } from '../types';
 import { RESTORE_MARKER_FILENAME, StorageLock, StoreRestoreInProgressError } from '../utils/storage-lock';
 import { TaskMutex } from '../utils/task-mutex';
+import { describeCommitRunTarget } from '../run/identity';
+import { taskHostLabel } from '../serve/subdomain';
 
 const STORAGE_VERSION = 1;
 
@@ -1374,6 +1379,7 @@ export class FileStorage implements Storage {
         if (conflict) {
           throw new Error(`A task with code '${code}' already exists (${conflict.id.slice(0, 8)}, status: ${conflict.status}). Choose a different code or close/reject the existing task first.`);
         }
+        await this.refuseCodeOfCommitRun(code);
       }
 
       const id = randomUUID();
@@ -1657,6 +1663,7 @@ export class FileStorage implements Storage {
 
       const task = await this.readTask(join(this.taskDir(fullId), 'task.json'));
       if (!task) return;
+      if (code && code !== task.code) await this.refuseCodeOfCommitRun(code);
 
       task.code = code;
 
@@ -3075,6 +3082,46 @@ export class FileStorage implements Storage {
     return matching.sort((a, b) => b.timestamp - a.timestamp)[0];
   }
 
+  async retireWorktreeSnapshots(
+    sessionId: string,
+    reason: WorktreeSnapshotRetiredReason,
+    snapshotId?: string
+  ): Promise<number> {
+    if (reason !== 'consumed' && reason !== 'superseded') {
+      throw new Error(`Invalid worktree snapshot retire reason: ${String(reason)}`);
+    }
+    return this.lock.withLock(async () => {
+      const taskId = await this.findTaskIdBySessionPrefix(sessionId);
+      if (!taskId) {
+        throw new Error(`Session not found: ${sessionId}`);
+      }
+
+      const snapshotsFile = await this.readJson<SnapshotsFile>(
+        join(this.taskDir(taskId), 'snapshots.json')
+      );
+      const snapshots = snapshotsFile?.snapshots ?? [];
+      this.migrateTimestampFields(
+        snapshots as unknown as Record<string, unknown>[],
+        ['timestamp']
+      );
+
+      const now = Date.now();
+      let retired = 0;
+      for (const s of snapshots) {
+        if (s.session_id !== sessionId || s.retired_at !== undefined) continue;
+        if (snapshotId !== undefined && s.id !== snapshotId) continue;
+        s.retired_at = now;
+        s.retired_reason = reason;
+        retired++;
+      }
+
+      if (retired > 0) {
+        await this.atomicWriteTask(taskId, { 'snapshots.json': { snapshots } });
+      }
+      return retired;
+    });
+  }
+
   // --- Task Tree Operations ---
 
   async getChildTasks(parentTaskId: string): Promise<Task[]> {
@@ -3825,7 +3872,7 @@ export class FileStorage implements Storage {
       prompt?: string;
       code?: string;
       parent?: string;
-      actor: Actor;
+      actor: ActorInput;
     },
   ): Promise<import('../types').PromoteConversationResult> {
     const { createPromotedTask } = await import('../raised/promote-task');
@@ -5517,6 +5564,89 @@ export class FileStorage implements Storage {
       next[idx] = updated;
       await this.writeJson(this.builderSessionsPath, { sessions: next });
       return updated;
+    });
+  }
+
+  // --- Commit runs ---
+
+  private get commitRunsPath(): string {
+    return join(this.basePath, 'commit-runs.json');
+  }
+
+  private async readCommitRuns(): Promise<CommitRun[]> {
+    const file = await this.readJson<{ runs: CommitRun[] }>(this.commitRunsPath);
+    return file?.runs ?? [];
+  }
+
+  /**
+   * A task code that is a live run's slug would make the two answer on the
+   * same service hostname (`<slug>.<service>.<suffix>`), and the proxy
+   * resolves the run first — so the task's services would be unreachable.
+   * Called inside the storage lock by both code writers.
+   */
+  private async refuseCodeOfCommitRun(code: string): Promise<void> {
+    const run = (await this.readCommitRuns()).find(r => r.slug === code);
+    if (run) {
+      throw new Error(
+        `Code '${code}' is the address of a running commit (${describeCommitRunTarget(run)}), whose services answer on that name. ` +
+        `Choose a different code, or remove that run first.`,
+      );
+    }
+  }
+
+  async createCommitRun(run: CommitRun): Promise<CommitRun> {
+    return this.lock.withLock(async () => {
+      const runs = await this.readCommitRuns();
+      const same = runs.find(r => r.slug === run.slug || r.id === run.id);
+      if (same) {
+        throw new Error(`A run already answers on '${run.slug}' (${describeCommitRunTarget(same)}).`);
+      }
+      // A task answers on its HOST LABEL — its code, or its short id when the
+      // code is not a label (src/serve/subdomain.ts).
+      const task = (await this.listTasks()).find(t => !isTerminalStatus(t.status) && taskHostLabel(t) === run.slug);
+      if (task) {
+        throw new Error(
+          `Task ${run.slug} (${task.id.slice(0, 8)}, ${task.status}) already answers on the name '${run.slug}', so a run there could not be reached. ` +
+          `Close that task, or rename it, first.`,
+        );
+      }
+      await this.writeJson(this.commitRunsPath, { runs: [...runs, run] });
+      return run;
+    });
+  }
+
+  async getCommitRun(id: string): Promise<CommitRun | null> {
+    return (await this.readCommitRuns()).find(r => r.id === id) ?? null;
+  }
+
+  async getCommitRunBySlug(slug: string): Promise<CommitRun | null> {
+    return (await this.readCommitRuns()).find(r => r.slug === slug) ?? null;
+  }
+
+  async listCommitRuns(): Promise<CommitRun[]> {
+    return (await this.readCommitRuns()).sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  async updateCommitRun(id: string, patch: CommitRunUpdate): Promise<CommitRun> {
+    return this.lock.withLock(async () => {
+      const runs = await this.readCommitRuns();
+      const idx = runs.findIndex(r => r.id === id);
+      if (idx === -1) throw new Error(`Run not found: ${id}`);
+      const updated: CommitRun = { ...runs[idx]!, ...patch, updated_at: new Date().toISOString() };
+      const next = [...runs];
+      next[idx] = updated;
+      await this.writeJson(this.commitRunsPath, { runs: next });
+      return updated;
+    });
+  }
+
+  async deleteCommitRun(id: string): Promise<boolean> {
+    return this.lock.withLock(async () => {
+      const runs = await this.readCommitRuns();
+      const next = runs.filter(r => r.id !== id);
+      if (next.length === runs.length) return false;
+      await this.writeJson(this.commitRunsPath, { runs: next });
+      return true;
     });
   }
 

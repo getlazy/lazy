@@ -539,7 +539,7 @@ export function guestWatchLines(fleet: Pick<FleetManifest, 'smolvmBinary' | 'mac
   return [
     `Watch:      ${exec} sh -c '${prelude} exec lazy watch ${fleet.task.code}'   # inside the guest, from the host — streams the agent live; Ctrl-C to stop`,
     `            ${exec} sh -c '${prelude} exec lazy show ${fleet.task.code}'    # inside the guest, from the host — the task record and its turns, no stream`,
-    `            ${exec} sh -c '${prelude} exec lazy daemon logs --no-follow -n 200'   # inside the guest, from the host — the daemon's own log`,
+    `            ${exec} sh -c '${prelude} exec lazy daemon logs -n 200'   # inside the guest, from the host — the daemon's own log`,
   ];
 }
 

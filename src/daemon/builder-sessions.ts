@@ -55,7 +55,7 @@ export async function multiMemberDaemon(projectRoot: string): Promise<boolean> {
   return isManagedMode() || (await teamModeEnabled(projectRoot));
 }
 import type { ActorIdentity } from './actor-tokens';
-import type { BuilderSession, BuilderSessionUpdate, BuilderRunnerImage } from '../storage/types';
+import type { BuilderSession, BuilderSessionUpdate, BuilderRunnerImage, BuilderContinuedFrom } from '../storage/types';
 import { customImageReady, describeRunnerImage, runnerImageStatus, syncRunnerImageTarget } from './runner-image';
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
@@ -75,12 +75,16 @@ import {
   persistBuilderSessionClaudeConfig,
   builderSessionLaunchDir,
 } from '../builder/claude-home';
-import { rm } from 'fs/promises';
+import { rm, stat } from 'fs/promises';
 import {
   resolveBuilderProjectsDirForLaunch,
   isTrustedResumeProjectsDir,
   builderSessionProjectsRoot,
+  holdsBuilderSessionFile,
 } from '../builder/projects-isolation';
+import { decideBuilderResume } from '../builder/resume-rules';
+import { continuationFor } from '../builder/identity-view';
+import { BuilderResumeUnavailableError } from '../runner/types';
 import { logger } from '../utils/logger';
 import { BuilderStartTrace } from './builder-start-trace';
 import { describeLaunchWarmup } from './launch-warmup';
@@ -383,8 +387,20 @@ async function launchDetachedContainer(opts: {
   resumeSessionId: string | null;
   launchPlan: SessionLaunchPlan;
   trace: BuilderStartTrace;
+  /**
+   * The member asked for THIS conversation by name (handleResumeBuilder): a
+   * seeded-only copy is adopted, as `lazy builder --resume <id> --import`
+   * would, and a conversation the container cannot see is refused rather than
+   * replaced by a fresh one.
+   */
+  explicitResume?: boolean;
+  /**
+   * A continued run's seed (BuilderSession.continuationSeed): the source
+   * Builder named, then its summary, appended to the system prompt.
+   */
+  continuationSeed?: string | null;
 }): Promise<{ containerName: string; resumed: string | null; runnerImage: BuilderRunnerImage | null }> {
-  const { projectRoot, memberEmail, builderId, resumeSessionId, launchPlan, trace } = opts;
+  const { projectRoot, memberEmail, builderId, resumeSessionId, launchPlan, trace, explicitResume = false } = opts;
   const config = await loadConfig(projectRoot);
   const runner = await createRunner(projectRoot);
   if (!runner.usesSandbox() || !runner.launchBuilderDetached) {
@@ -440,7 +456,7 @@ async function launchDetachedContainer(opts: {
   ));
 
   const dataDirAbs = join(projectRoot, config.data.path);
-  const homeDirAbs = await ensureBuilderSessionHomeDir(projectRoot, memberEmail);
+  const homeDirAbs = await trace.phase('member home', () => ensureBuilderSessionHomeDir(projectRoot, memberEmail));
 
   // Member-scoped projects isolation (the transcript-exposure fix): the per-run
   // dirs root under THIS member's own home rather than <dataDir>/builder-projects,
@@ -454,26 +470,31 @@ async function launchDetachedContainer(opts: {
     lazyRoot: projectRoot,
     resumeId,
     homeDirAbs,
+    adopt: explicitResume,
     projectsRootAbs: builderSessionProjectsRoot(homeDirAbs),
   });
   // Whether the conversation can really be resumed is decided in ONE place,
   // the runner (launchBuilderDetached), once it knows which projects dir the
   // container actually mounts; it reports back what it resumed.
-  const projectsHostDir = await resolveProjects(resumeSessionId);
-  const projects = projectsHostDir
-    ? {
-        hostDir: projectsHostDir,
-        trustWritable: await isTrustedResumeProjectsDir({ hostDir: projectsHostDir, lazyRoot: projectRoot, resumeId: resumeSessionId }),
-      }
-    : undefined;
+  // Timed on its own: a fresh run dir is seeded with copies of every earlier
+  // builder transcript of this member, a cost that grows with history.
+  const projects = await trace.phase('projects dir (resolve + seed history)', async () => {
+    const hostDir = await resolveProjects(resumeSessionId);
+    return hostDir
+      ? { hostDir, trustWritable: await isTrustedResumeProjectsDir({ hostDir, lazyRoot: projectRoot, resumeId: resumeSessionId }) }
+      : undefined;
+  });
+  if (projects) trace.note(await describeProjectsDir(projects.hostDir));
 
-  const systemPrompt = await trace.phase('system prompt', () => buildSystemPrompt(projectRoot, runner));
+  const basePrompt = await trace.phase('system prompt', () => buildSystemPrompt(projectRoot, runner));
+  const systemPrompt = opts.continuationSeed ? `${basePrompt}\n\n${opts.continuationSeed}\n` : basePrompt;
+  if (opts.continuationSeed) trace.note('system prompt carries a continuation seed (continued from a summary)');
 
   // While the project's own image is missing, building or failed, the builder
   // starts on lazy's default image instead of waiting on (or starting) a
   // build — and says so: the run records it and the builder page shows a
   // banner, never a silent swap (src/daemon/runner-image.ts).
-  await syncRunnerImageTarget();
+  await trace.phase('runner image target', () => syncRunnerImageTarget());
   const useDefaultImage = !customImageReady();
   if (useDefaultImage) trace.note(`runner image: starting on lazy's default image — ${describeRunnerImage()}`);
 
@@ -488,6 +509,7 @@ async function launchDetachedContainer(opts: {
       authEnvVars,
       homeDirAbs,
       resumeSessionId,
+      requireResume: explicitResume && resumeSessionId !== null,
       trace,
     });
     const project = runnerImageStatus();
@@ -913,6 +935,21 @@ export async function handleStartBuilderSession(
   params: Record<string, unknown>,
 ): Promise<BuilderSession> {
   const memberEmail = actorEmail(params.actor as ActorInput | undefined) ?? null;
+  return runTracedStart(projectRoot, memberEmail, 'startBuilderSession',
+    (trace) => startBuilderSessionLocked(projectRoot, memberEmail, trace));
+}
+
+/**
+ * One start of this member's builder, under the member's start lock and timed
+ * by one trace: the plain start, and a resume of a conversation picked from the
+ * Builders page, are the same launch with different preparation.
+ */
+async function runTracedStart(
+  projectRoot: string,
+  memberEmail: string | null,
+  verb: string,
+  locked: (trace: BuilderStartTrace) => Promise<BuilderSession>,
+): Promise<BuilderSession> {
   // Every phase of this start, and how long it took, lands in the daemon log
   // under one prefix carrying the run id and builder id (BuilderStartTrace).
   // How long a start took, success or not, is also the other half of reading a
@@ -924,13 +961,10 @@ export async function handleStartBuilderSession(
   try {
     const lockKey = builderStartLockKey(projectRoot, memberEmail);
     if (builderStartMutex.isLocked(lockKey)) trace.note('waiting for this member\'s previous start to finish');
-    const row = await builderStartMutex.withLock(
-      lockKey,
-      () => startBuilderSessionLocked(projectRoot, memberEmail, trace),
-    );
+    const row = await builderStartMutex.withLock(lockKey, () => locked(trace));
     trace.setRunId(row.id, row.builderId);
     const launchedHere = row.builderId === trace.builderId;
-    trace.finish(`startBuilderSession: builder session ${row.id} is ${row.state}` +
+    trace.finish(`${verb}: builder session ${row.id} is ${row.state}` +
       (launchedHere ? '' : ' (already running; nothing launched)'));
     if (launchedHere) await persistTimeline(trace);
     if (row.state === 'running' && launchedHere && row.containerName) {
@@ -950,6 +984,21 @@ export async function handleStartBuilderSession(
  * later start's timeline, or a running builder's from a rejoin that failed, is
  * never overwritten. A no-op before the row exists or once it moved on.
  */
+/** How many transcripts (and bytes) a launch's projects dir holds — what seeding copied. */
+async function describeProjectsDir(hostDir: string): Promise<string> {
+  let files = 0;
+  let bytes = 0;
+  try {
+    for await (const rel of new Bun.Glob('**/*.jsonl').scan({ cwd: hostDir })) {
+      files += 1;
+      bytes += (await stat(join(hostDir, rel))).size;
+    }
+  } catch (err) {
+    return `projects dir ${hostDir}: could not count its transcripts (${err instanceof Error ? err.message : String(err)})`;
+  }
+  return `projects dir holds ${files} transcript(s), ${Math.round(bytes / 1024)} KiB (seeded copies included)`;
+}
+
 function persistTimeline(trace: BuilderStartTrace): Promise<void> {
   if (!trace.ownsRun()) return Promise.resolve();
   return trace.persist(async (runId, startTimeline) => {
@@ -1037,8 +1086,17 @@ async function startBuilderSessionLocked(
   projectRoot: string,
   memberEmail: string | null,
   trace: BuilderStartTrace,
+  opts: { resume?: ResumeRequest; seed?: SeedRequest } = {},
 ): Promise<BuilderSession> {
   const storage = await getOrCreateStorage();
+  const resume = opts.resume ?? null;
+  const seed = opts.seed ?? null;
+  // Either names a conversation the member picked, so a live run of theirs is
+  // stopped for it only when they confirmed.
+  const picked = resume ?? seed;
+  // A credential planned early, so a resume that must stop a live builder
+  // first is refused for money BEFORE anything is stopped.
+  let preplanned: SessionLaunchPlan | null = null;
 
   let existing = await storage.getActiveBuilderSessionForMember(projectRoot, memberEmail);
   if (existing) trace.setRunId(existing.id, existing.builderId);
@@ -1061,11 +1119,29 @@ async function startBuilderSessionLocked(
     // not answer is refused, never read as "dead" — that reading stopped and
     // relaunched a LIVE builder because one probe was slow.
     const liveness = await probeBuilderRun(runner, existing.containerName);
+    let stoppedForResume = false;
     if (liveness.state === 'unknown') {
       logger.warn(`startBuilderSession: liveness of ${existing.containerName} unknown: ${liveness.reason}`);
       throw new RpcError(503, 'Could not check whether your builder is running right now. Try again in a moment.');
     }
-    if (liveness.state === 'running') {
+    if (liveness.state === 'running' && picked) {
+      if (resume && existing.agentSessionId && resume.segments.includes(existing.agentSessionId)) {
+        trace.note('this builder is already the member\'s running one; nothing launched');
+        return existing;
+      }
+      if (!picked.replaceRunning) throw runningBuilderRefusal(seed ? 'continue' : 'resume');
+      preplanned = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, trace.builderId, memberEmail));
+      trace.note(`stopping the member's running builder session ${existing.id} first, as confirmed`);
+      try {
+        await handleStopBuilderSession(projectRoot, { id: existing.id, actor: picked.actor });
+      } catch (err) {
+        await releaseTurnCredential(projectRoot, trace.builderId);
+        throw err;
+      }
+      existing = await storage.getActiveBuilderSessionForMember(projectRoot, memberEmail);
+      if (existing) assertSessionRowActionable(existing);
+      stoppedForResume = true;
+    } else if (liveness.state === 'running') {
       if (existing.state === 'starting') {
         // The container from a crashed start is already up; reconcile the row
         // rather than racing a second launch underneath it.
@@ -1075,44 +1151,47 @@ async function startBuilderSessionLocked(
       // a terminal to it; this call is idempotent discovery until then.
       return existing;
     }
-    // Read how it ended BEFORE the cleanup below removes the container.
-    const lastExit = existing.state === 'running'
-      ? await describeDeadContainer(runner, existing.containerName, liveness.exitCode, existing.id, await supervisorLogHostFileFor(projectRoot, existing))
-      : null;
-    // Already confirmed dead above, so this is cleanup (release any lingering
-    // resources, capture the resume intent) rather than a stop that can fail
-    // the way endBuilderSession's can — a hiccup capturing the intent must
-    // not block starting a fresh session underneath a container that is
-    // already gone.
-    const stopResult = await stopSessionContainer(projectRoot, existing, { knownGone: true });
-    // The outgoing launch is confirmed dead. Release what it held NOW, while
-    // the row still carries the builder id those resources are keyed by —
-    // releaseOutgoingSessionResources would otherwise only run on the resume
-    // below, and if THAT launch failed the row would sit stopped holding a
-    // live MCP token and credential binding until some later resume.
-    await releaseOutgoingSessionResources(projectRoot, existing);
-    // CAS on the state the liveness check saw. endBuilderSession does not take
-    // the start mutex, so a member's end can land anywhere in this branch —
-    // and against a container that is already gone it SUCCEEDS. An unguarded
-    // write here then overwrote that 'ended' with 'stopped', and the resume
-    // below relaunched a session its member had ended (§5.7). Same shape as
-    // the resume claim's guard.
-    const expectedState = existing.state;
-    try {
-      existing = await storage.updateBuilderSession(existing.id, {
-        state: 'stopped',
-        containerName: null,
-        agentSessionId: (stopResult.ok ? stopResult.agentSessionId : null) ?? existing.agentSessionId,
-        ...(lastExit ? { lastExit } : {}),
-      }, expectedState);
-    } catch (err) {
-      if (!(err instanceof BuilderSessionStateConflictError)) throw err;
-      throw new RpcError(
-        409,
-        `Builder session ${existing.id} was ended while this start was recovering its dead container ` +
-        `(expected '${expectedState}', found '${err.actualState}'). The ended session is terminal; ` +
-        `start again to create a fresh session.`,
-      );
+    // The stop above already put the live builder down the ordinary way.
+    if (!stoppedForResume && existing && liveness.state === 'gone') {
+      // Read how it ended BEFORE the cleanup below removes the container.
+      const lastExit = existing.state === 'running'
+        ? await describeDeadContainer(runner, existing.containerName!, liveness.exitCode, existing.id, await supervisorLogHostFileFor(projectRoot, existing))
+        : null;
+      // Already confirmed dead above, so this is cleanup (release any lingering
+      // resources, capture the resume intent) rather than a stop that can fail
+      // the way endBuilderSession's can — a hiccup capturing the intent must
+      // not block starting a fresh session underneath a container that is
+      // already gone.
+      const stopResult = await stopSessionContainer(projectRoot, existing, { knownGone: true });
+      // The outgoing launch is confirmed dead. Release what it held NOW, while
+      // the row still carries the builder id those resources are keyed by —
+      // releaseOutgoingSessionResources would otherwise only run on the resume
+      // below, and if THAT launch failed the row would sit stopped holding a
+      // live MCP token and credential binding until some later resume.
+      await releaseOutgoingSessionResources(projectRoot, existing);
+      // CAS on the state the liveness check saw. endBuilderSession does not take
+      // the start mutex, so a member's end can land anywhere in this branch —
+      // and against a container that is already gone it SUCCEEDS. An unguarded
+      // write here then overwrote that 'ended' with 'stopped', and the resume
+      // below relaunched a session its member had ended (§5.7). Same shape as
+      // the resume claim's guard.
+      const expectedState = existing.state;
+      try {
+        existing = await storage.updateBuilderSession(existing.id, {
+          state: 'stopped',
+          containerName: null,
+          agentSessionId: (stopResult.ok ? stopResult.agentSessionId : null) ?? existing.agentSessionId,
+          ...(lastExit ? { lastExit } : {}),
+        }, expectedState);
+      } catch (err) {
+        if (!(err instanceof BuilderSessionStateConflictError)) throw err;
+        throw new RpcError(
+          409,
+          `Builder session ${existing.id} was ended while this start was recovering its dead container ` +
+          `(expected '${expectedState}', found '${err.actualState}'). The ended session is terminal; ` +
+          `start again to create a fresh session.`,
+        );
+      }
     }
   }
 
@@ -1123,8 +1202,9 @@ async function startBuilderSessionLocked(
   // once. Failure past this point releases the admitted slot in the catch
   // below; nothing else exists yet to unwind.
   const builderId = trace.builderId;
-  const admission = await handleBuilderSlot(projectRoot, { action: 'admit', builderId });
+  const admission = await trace.phase('builder slot', () => handleBuilderSlot(projectRoot, { action: 'admit', builderId }));
   if (!admission.admitted) {
+    if (preplanned) await releaseTurnCredential(projectRoot, builderId);
     throw new RpcError(
       429,
       `Builder concurrency limit reached (${admission.running}/${admission.limit} slots in use). ` +
@@ -1142,7 +1222,8 @@ async function startBuilderSessionLocked(
   let claimed: BuilderSession | null = null;
   let launchedContainer: string | null = null;
   try {
-    const launchPlan = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail));
+    const launchPlan = preplanned
+      ?? await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail));
     if (existing && existing.state === 'stopped') {
       // Reached either straight from the stale branch above — where these
       // calls are idempotent no-ops — or on a row left stopped by an earlier
@@ -1151,7 +1232,25 @@ async function startBuilderSessionLocked(
       // builderId: the replacement is what makes the outgoing id unrevokable
       // forever.
       await releaseOutgoingSessionResources(projectRoot, existing);
-      const resumeSessionId = existing.agentSessionId;
+      // A resume picked from the Builders page names its own conversation; the
+      // claim below records it, so nothing was re-pointed before the gates.
+      // A continuation starts a FRESH conversation on this run.
+      const resumeSessionId = seed ? null : resume?.sessionId ?? existing.agentSessionId;
+      // What the run's builder is seeded with: the new seed; nothing once a
+      // resume re-points the run at another conversation; else what it had.
+      const repointed = !!seed || (!!resume && resume.sessionId !== existing.agentSessionId);
+      const continuation = seed
+        ? { continuedFrom: seed.continuedFrom, continuationSeed: seed.seed }
+        : repointed
+          ? (resume!.continuation ?? { continuedFrom: null, continuationSeed: null })
+          : null;
+      // The outgoing conversation keeps its continuation when the run moves on.
+      const pastContinuations = repointed && existing.continuedFrom && existing.agentSessionId
+        ? [
+            { agentSessionId: existing.agentSessionId, continuedFrom: existing.continuedFrom, continuationSeed: existing.continuationSeed ?? null },
+            ...(existing.pastContinuations ?? []).filter((c) => c.agentSessionId !== existing!.agentSessionId),
+          ]
+        : null;
       try {
         // CAS on the resume claim: the member may end the STOPPED session
         // while this start is claiming it (endBuilderSession accepts a
@@ -1163,6 +1262,10 @@ async function startBuilderSessionLocked(
           containerName: builderRunName(builderId),
           builderId,
           lastExit: null,
+          ...(resume ? { agentSessionId: resume.sessionId } : {}),
+          ...(seed ? { agentSessionId: null } : {}),
+          ...(continuation ?? {}),
+          ...(pastContinuations ? { pastContinuations } : {}),
         }, 'stopped');
       } catch (err) {
         if (!(err instanceof BuilderSessionStateConflictError)) throw err;
@@ -1186,6 +1289,8 @@ async function startBuilderSessionLocked(
         resumeSessionId,
         launchPlan,
         trace,
+        explicitResume: resume !== null,
+        continuationSeed: continuation ? continuation.continuationSeed : existing.continuationSeed ?? null,
       });
       launchedContainer = launched.containerName;
       // A conversation that could not be resumed is forgotten, or the next
@@ -1206,7 +1311,9 @@ async function startBuilderSessionLocked(
         state: 'starting',
         containerName: builderRunName(builderId),
         builderId,
-        agentSessionId: null,
+        agentSessionId: resume?.sessionId ?? null,
+        ...(seed ? { continuedFrom: seed.continuedFrom, continuationSeed: seed.seed } : {}),
+        ...(resume?.continuation ? resume.continuation : {}),
         createdAt: now,
         updatedAt: now,
         endedAt: null,
@@ -1230,16 +1337,20 @@ async function startBuilderSessionLocked(
       return winner;
     }
     trace.setRunId(claimed.id);
-    const { containerName, runnerImage } = await launchDetachedContainer({
+    const freshLaunch = await launchDetachedContainer({
       projectRoot,
       memberEmail,
       builderId,
-      resumeSessionId: null,
+      resumeSessionId: resume?.sessionId ?? null,
       launchPlan,
       trace,
+      explicitResume: resume !== null,
+      continuationSeed: seed?.seed ?? resume?.continuation?.continuationSeed ?? null,
     });
-    launchedContainer = containerName;
-    return await reconcileClaimedSession(projectRoot, claimed, containerName, { runnerImage });
+    launchedContainer = freshLaunch.containerName;
+    return await reconcileClaimedSession(projectRoot, claimed, freshLaunch.containerName, resume && freshLaunch.resumed !== resume.sessionId
+      ? { agentSessionId: null, runnerImage: freshLaunch.runnerImage }
+      : { runnerImage: freshLaunch.runnerImage });
   } catch (err) {
     await handleBuilderSlot(projectRoot, { action: 'release', builderId }).catch(() => {});
     // Planning can bind before a claim or launch fails, including failures
@@ -1263,6 +1374,213 @@ async function startBuilderSessionLocked(
     }
     throw err;
   }
+}
+
+/** What "Continue from a summary" asks of the locked start: a fresh conversation, seeded. */
+interface SeedRequest {
+  /** Appended to the builder's system prompt (buildContinuationSeed). */
+  seed: string;
+  continuedFrom: BuilderContinuedFrom;
+  /** The member confirmed that a live builder of theirs may be stopped first. */
+  replaceRunning: boolean;
+  actor: unknown;
+}
+
+function runningBuilderRefusal(verb: 'resume' | 'continue'): RpcError {
+  return new RpcError(
+    409,
+    verb === 'resume'
+      ? 'You already have a builder running. Stop it first, or press Resume again and confirm ' +
+        'stopping it (its conversation is kept).'
+      : 'You already have a builder running. Stop it first, or continue again and confirm ' +
+        'stopping it (its conversation is kept).',
+  );
+}
+
+/** What a resume picked from the Builders page asks of the locked start. */
+interface ResumeRequest {
+  /** The Claude session to continue: the Builder's newest segment. */
+  sessionId: string;
+  /** Every segment of the Builder: a live run on any of them already IS it. */
+  segments: string[];
+  /** The member confirmed that a live builder of theirs may be stopped first. */
+  replaceRunning: boolean;
+  actor: unknown;
+  /** The continuation recorded for this conversation, carried onto the run it resumes in. */
+  continuation: { continuedFrom: BuilderContinuedFrom; continuationSeed: string | null } | null;
+}
+
+/**
+ * Resume a Builder the member picked from the Builders page — the daemon side of
+ * `lazy builder --resume <id>` for a member's daemon-owned run.
+ *
+ * `builderId` is a Builder id, a segment id or a unique prefix (the same
+ * resolution the Builder page uses). Which Builders may be resumed is
+ * decideBuilderResume's rule; this handler adds the two things it cannot know:
+ *
+ *   - THE SESSION FILE. Claude Code continues a conversation from its JSONL in
+ *     the member's own builder home. When no copy is left there the answer is a
+ *     409 that says so, before anything is stopped or claimed — never a fresh,
+ *     empty conversation in its place. The launch re-checks against the dir the
+ *     container really mounts (`requireResume`), for the same reason.
+ *   - THE MEMBER'S CURRENT RUN. One run per member per project (§5.7). A run
+ *     that is already this Builder is returned as it is. Any other live run is
+ *     refused (409) unless `replaceRunning` is true, and then it is STOPPED — its
+ *     conversation kept and still listed — before this one starts: two builders
+ *     are never run side by side, and one is never stopped silently. A stopped
+ *     run is re-pointed at the picked conversation BY ITS CLAIM, and with no run
+ *     the fresh claim names it — so a resume refused for a credential or a slot
+ *     changes no row and stops nothing (the credential is planned before a
+ *     confirmed stop). A row that says running over a dead container is
+ *     treated as stopped, as the ordinary start does.
+ */
+export async function handleResumeBuilder(
+  projectRoot: string,
+  params: Record<string, unknown>,
+): Promise<BuilderSession> {
+  const memberEmail = actorEmail(params.actor as ActorInput | undefined) ?? null;
+  const ref = typeof params.builderId === 'string' ? params.builderId.trim() : '';
+  if (!ref) throw new RpcError(400, 'resumeBuilder: `builderId` is required');
+  const replaceRunning = params.replaceRunning === true;
+
+  const storage = await getOrCreateStorage();
+  const builder = await storage.getBuilder(ref);
+  if (!builder) throw new RpcError(404, `No builder matches ${ref} in this project.`);
+  const decision = decideBuilderResume(builder, memberEmail, await multiMemberDaemon(projectRoot));
+  if (decision.kind === 'refuse') throw new RpcError(decision.status, decision.message);
+  const sessionId = decision.sessionId;
+
+  const homeDirAbs = resolveBuilderSessionHomeDir(projectRoot, memberEmail);
+  if (!(await holdsBuilderSessionFile(builderSessionProjectsRoot(homeDirAbs), projectRoot, sessionId, homeDirAbs))) {
+    throw new RpcError(
+      409,
+      `This builder's session file (${sessionId.slice(0, 8)}) is no longer on this server, so Claude Code ` +
+      `has nothing to continue. Its transcript is still here to read. Nothing was started.`,
+    );
+  }
+
+  const continuation = continuationFor(await storage.listBuilderSessions(projectRoot), builder.segments);
+  try {
+    return await runTracedStart(projectRoot, memberEmail, 'resumeBuilder', (trace) => {
+      trace.note(`resuming builder ${builder.id} (session ${sessionId})`);
+      return startBuilderSessionLocked(projectRoot, memberEmail, trace, {
+        resume: {
+          sessionId, segments: builder.segments, replaceRunning, actor: params.actor,
+          continuation,
+        },
+      });
+    });
+  } catch (err) {
+    if (err instanceof BuilderResumeUnavailableError) throw new RpcError(409, err.message);
+    throw err;
+  }
+}
+
+/**
+ * "Continue from a summary" — start a NEW builder of the caller's, seeded with a
+ * summary of a listed Builder's readable transcript and a line naming it and
+ * who had it. Open to every member for every Builder, their own included
+ * (engineer's rules, 2026-10-20); full-fidelity Resume of a teammate's Builder
+ * stays refused (decideBuilderResume).
+ *
+ * What the summariser reads is the transcript every member can already read on
+ * the Builders page — role and text per message (renderSummaryInput) — never
+ * the session file, so a teammate's commands and their output never leave
+ * their owner. Nothing of the source Builder is copied or changed.
+ *
+ * Order: everything that can refuse runs BEFORE the model spends anything — the
+ * Builder must exist and have text, the caller must be able to pay for the
+ * builder role's profile, and a live builder of theirs is refused (409) unless
+ * `replaceRunning` confirms it may be stopped. The summary is made OUTSIDE the
+ * start lock, billed to the caller as a one-shot beside any task
+ * (withOneshotCredential), or, in offline mode, replaced by a labelled excerpt
+ * with no model at all. Then the ordinary locked start runs a fresh
+ * conversation on the caller's own run, which records where it came from.
+ */
+export async function handleContinueBuilderFromSummary(
+  projectRoot: string,
+  params: Record<string, unknown>,
+): Promise<BuilderSession> {
+  const memberEmail = actorEmail(params.actor as ActorInput | undefined) ?? null;
+  const ref = typeof params.builderId === 'string' ? params.builderId.trim() : '';
+  if (!ref) throw new RpcError(400, 'continueBuilderFromSummary: `builderId` is required');
+  const replaceRunning = params.replaceRunning === true;
+
+  const storage = await getOrCreateStorage();
+  const { resolveBuilderTranscript } = await import('../builder/identity-transcript');
+  const resolved = await resolveBuilderTranscript(storage, ref);
+  if (!resolved) throw new RpcError(404, `No builder matches ${ref} in this project.`);
+  if ('ambiguous' in resolved) {
+    throw new RpcError(400, `'${ref}' matches ${resolved.ambiguous.length} builders. Use a longer prefix.`);
+  }
+  const { builder, conversation } = resolved;
+  if (!conversation.messages.some((m) => m.text && m.text.trim())) {
+    throw new RpcError(409, `Builder ${builder.id} has no readable messages to summarise. Nothing was started.`);
+  }
+
+  // Money first: the summary and the builder both run on the builder role's
+  // profile, billed to the caller.
+  const { oneshotCredentialProblem, withOneshotCredential } = await import('./oneshot-credential');
+  const problem = await oneshotCredentialProblem(projectRoot, memberEmail);
+  if (problem) throw new RpcError(400, `Continuing a builder is billed to you. ${problem} Nothing was started.`);
+  await refuseUnconfirmedRunningBuilder(projectRoot, memberEmail, replaceRunning);
+
+  const { buildSummaryPrompt, excerptSummary, buildContinuationSeed } = await import('../builder/continue-from-summary');
+  const { loadCompactContext } = await import('../memory/run-compact');
+  const { offline } = await loadCompactContext(projectRoot);
+  let summary: string;
+  let method: BuilderContinuedFrom['method'];
+  if (offline) {
+    summary = excerptSummary(conversation);
+    method = 'excerpt';
+  } else {
+    const { runOneshot } = await import('../oneshot');
+    const prompt = buildSummaryPrompt(conversation);
+    let result: string;
+    try {
+      const response = await withOneshotCredential(projectRoot, 'builder-continue', memberEmail, (env) =>
+        runOneshot({ prompt, effort: 'low', repoAccess: 'none', ...(env ? { ownerCredentialEnv: env } : {}) }, projectRoot));
+      result = (response.result ?? '').trim();
+    } catch (err) {
+      if (err instanceof TurnCredentialUnavailableError) throw new RpcError(400, err.message);
+      throw new RpcError(502, `Could not summarise builder ${builder.id}: ${err instanceof Error ? err.message : String(err)}. Nothing was started.`);
+    }
+    if (!result) throw new RpcError(502, `The summary of builder ${builder.id} came back empty. Nothing was started.`);
+    summary = result;
+    method = 'llm';
+  }
+
+  const continuedFrom: BuilderContinuedFrom = {
+    builderId: builder.id,
+    title: builder.title,
+    memberEmail: builder.memberEmail ?? null,
+    method,
+  };
+  const seed = buildContinuationSeed({ source: continuedFrom, memberEmail, summary });
+  return runTracedStart(projectRoot, memberEmail, 'continueBuilderFromSummary', (trace) => {
+    trace.note(`continuing builder ${builder.id} from a summary (${method})`);
+    return startBuilderSessionLocked(projectRoot, memberEmail, trace, {
+      seed: { seed, continuedFrom, replaceRunning, actor: params.actor },
+    });
+  });
+}
+
+/**
+ * The 409 for a live builder the member did not agree to stop, asked BEFORE a
+ * summary is paid for. The locked start asks again; this is only the early
+ * answer. A runtime that cannot answer is left to the locked start's own 503.
+ */
+async function refuseUnconfirmedRunningBuilder(
+  projectRoot: string,
+  memberEmail: string | null,
+  replaceRunning: boolean,
+): Promise<void> {
+  if (replaceRunning) return;
+  const storage = await getOrCreateStorage();
+  const existing = await storage.getActiveBuilderSessionForMember(projectRoot, memberEmail);
+  if (!existing?.containerName || (existing.state !== 'running' && existing.state !== 'starting')) return;
+  const liveness = await probeBuilderRun(await createRunner(projectRoot), existing.containerName);
+  if (liveness.state === 'running') throw runningBuilderRefusal('continue');
 }
 
 /**

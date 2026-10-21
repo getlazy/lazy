@@ -13,7 +13,7 @@ import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { readPlanContent, enrichResponseWithPlanContent, reconcileTasks } from '../../src/utils/reconcile';
+import { readPlanContent, enrichResponseWithPlanContent, reconcileTasks, settleAutoResumes } from '../../src/utils/reconcile';
 import { openProjectStorage } from '../../src/daemon/rpc-handlers';
 import {
   writeCommand,
@@ -783,6 +783,9 @@ async function runReconcile(root: string): Promise<void> {
   const storage = await openProjectStorage(root);
   try {
     await reconcileTasks(storage, root);
+    // The reconciler dispatches auto-resume launches off its sweep; let them
+    // finish before this storage handle closes.
+    await settleAutoResumes();
   } finally {
     await storage.close();
   }

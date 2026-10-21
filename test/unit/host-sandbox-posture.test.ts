@@ -14,7 +14,7 @@
  * task summary and must be confirmed on a real host.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, afterAll } from 'bun:test';
 import {
   buildSandboxSettings,
   buildAgentSandboxArgs,
@@ -334,5 +334,64 @@ describe('host agents are denied lazy\'s own state', () => {
     expect(s.permissions.deny).toContain('Read(//tmp/x)');
     expect(s.permissions.deny).toContain('Read(//tmp/x/**)');
     expect(s.permissions.deny.some((r: string) => r.includes('//**'))).toBe(false);
+  });
+});
+
+describe('host sandbox: loaded configs deny the store they actually select', () => {
+  const tempRoots: string[] = [];
+  afterAll(async () => {
+    const { rm } = await import('fs/promises');
+    for (const r of tempRoots) await rm(r, { recursive: true, force: true });
+  });
+
+  async function loadWith(toml: string): Promise<{ root: string; config: ResolvedConfig }> {
+    const { mkdtemp, writeFile, realpath } = await import('fs/promises');
+    const { tmpdir } = await import('os');
+    const { loadConfig } = await import('../../src/config/loader');
+    const root = await realpath(await mkdtemp(`${tmpdir()}/host-sandbox-store-`));
+    tempRoots.push(root);
+    await writeFile(`${root}/lazy.toml`, toml);
+    const saved = { cfg: process.env.LAZY_CONFIG, host: process.env.LAZY_ALLOW_HOST_RUNNER };
+    delete process.env.LAZY_CONFIG;
+    process.env.LAZY_ALLOW_HOST_RUNNER = '1';
+    try {
+      return { root, config: await loadConfig(root) };
+    } finally {
+      if (saved.cfg !== undefined) process.env.LAZY_CONFIG = saved.cfg;
+      if (saved.host === undefined) delete process.env.LAZY_ALLOW_HOST_RUNNER;
+      else process.env.LAZY_ALLOW_HOST_RUNNER = saved.host;
+    }
+  }
+  const hostToml = (storage: string) =>
+    `[runner]\ntype = "dangerously-host-process-without-any-isolation"\npermission_mode = "sandbox"\n\n[storage]\nbackend = "external"\n${storage}\n`;
+
+  // INVARIANT: an empty external_path (store at the derived default
+  // ~/.lazy/<project>) is still denied to host agents. It was silently skipped
+  // because the synchronous settings builder could not derive the default.
+  test('empty external_path denies the derived default ~/.lazy/<project>', async () => {
+    const { root, config } = await loadWith(hostToml('external_path = ""'));
+    const { getProjectName } = await import('../../src/storage/index');
+    const { getHome } = await import('../../src/utils/home');
+    const expected = `${getHome()}/.lazy/${await getProjectName(root, config.remote.git_remote)}`;
+    expect(hostSandboxStorePath(config)).toBe(expected);
+    const s = settingsFrom((commonCommandFields(config) as { agent_extra_args?: string[] }).agent_extra_args ?? []);
+    expect(s.sandbox.filesystem.denyRead).toContain(expected);
+  });
+
+  // INVARIANT: a relative external_path is resolved against the PROJECT ROOT, never
+  // the process cwd, so the deny list names the same store whichever directory
+  // the daemon or CLI happens to run from.
+  test('relative external_path resolves against the project root, not the cwd', async () => {
+    const { config, root } = await loadWith(hostToml('external_path = "rel-store"'));
+    const { resolve } = await import('path');
+    expect(process.cwd()).not.toBe(root);
+    expect(hostSandboxStorePath(config)).toBe(resolve(root, 'rel-store'));
+    expect(hostSandboxStorePath(config)).not.toBe(resolve('rel-store'));
+  });
+
+  // The default needs a git subprocess on every load; only the host runner reads it.
+  test('non-host runners skip deriving the empty-path default', async () => {
+    const { config } = await loadWith('[storage]\nbackend = "external"\nexternal_path = ""\n');
+    expect(config.storage.resolved_path).toBeUndefined();
   });
 });

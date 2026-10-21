@@ -148,6 +148,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       }
       if (req.method !== 'GET') return refusal(405, 'Method not allowed');
 
+      const attachStarted = Date.now();
       const sessionId = decodePathSegment(match[1]);
       const storage = await deps.getStorage();
       // The PERSON comes from the token, never from the request.
@@ -168,6 +169,11 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       const requestedMode = url.searchParams.get('mode');
       if (target.kind === 'builder' && requestedMode !== null && requestedMode !== 'attach') {
         return refusal(400, `A builder session is attached to, not entered in "${requestedMode}" mode. Omit ?mode.`);
+      }
+      // A commit run's container is entered with a shell, and only a shell:
+      // there is no agent in it to pair or chat with.
+      if (target.kind === 'run' && requestedMode !== null && requestedMode !== 'shell') {
+        return refusal(400, `A run is entered with a shell, not in "${requestedMode}" mode.`);
       }
 
       // A member's task terminal needs nothing running beforehand: its
@@ -462,6 +468,11 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
           }
           return { ok: true };
         };
+      }
+      // The last leg of a builder start: how long the terminal's attach took to
+      // resolve and confirm its container before the socket opens.
+      if (target.kind === 'builder') {
+        logger.info(`builder terminal attach [run ${target.sessionId}]: container ${target.container} ready to attach after ${Date.now() - attachStarted}ms`);
       }
       if (!server.upgrade(req, { data })) {
         abort?.();

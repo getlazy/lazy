@@ -26,12 +26,14 @@
  * Authority therefore always tracks the current turn even though the string in
  * the container's env does not change.
  *
- * The one thing that cannot be re-pointed is the KIND, because the kind decides
- * which env var name the placeholder lives in. A turn whose owner holds a
- * different credential kind than the running container was launched with
- * therefore forces the container to be recreated (`kindChanged` below) — the
- * alternative would be the launch path manufacturing the very
- * `auth_kind_mismatch` the proxy exists to refuse.
+ * The KIND decides which env var name the placeholder lives in, and a kind
+ * change mints a new value (`kindChanged` below). Neither costs the container:
+ * every team-mode work command carries the turn's placeholder in the env var
+ * its kind needs, and the supervisor installs it in its own env before the
+ * agent starts (src/supervisor/turn-credential-env.ts) — so the agent never
+ * presents a stale placeholder in the wrong header, which the proxy would
+ * refuse as `auth_kind_mismatch`. The container's OWN env keeps what it was
+ * created with, which is what a service started in it sees.
  *
  * Placement: `~/.lazy/daemon/<slug>/session-credentials.json`, mode 0600. On
  * disk rather than in memory so a daemon restart mid-session does not silently
@@ -168,9 +170,9 @@ export interface BindTurnCredentialResult {
   token: string;
   /**
    * True when the credential KIND changed since this task's last binding (or
-   * there was no binding). The launch path must recreate the container in that
-   * case: the placeholder has to move to a different env var name, and a
-   * running container's env cannot be changed.
+   * there was no binding): the placeholder moves to a different env var and
+   * value. A running container is kept — the turn's command carries the new
+   * placeholder to its supervisor (src/supervisor/turn-credential-env.ts).
    */
   kindChanged: boolean;
 }

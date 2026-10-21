@@ -89,11 +89,15 @@ export function parseServeNotice(url: URL): ServeNotice | null {
  * against the host. No part of this is echoed from the request.
  */
 export function serveNoticePath(taskRef: string, service: string, reason: ServeNoticeReason): string {
-  const params = new URLSearchParams({
+  return `/tasks/${taskRef}?${serveNoticeQuery(service, reason)}`;
+}
+
+/** The notice's query string alone — also what a commit run's page is sent (src/run/identity.ts runPagePath). */
+export function serveNoticeQuery(service: string, reason: ServeNoticeReason): string {
+  return new URLSearchParams({
     [SERVE_NOTICE_SERVICE_PARAM]: service,
     [SERVE_NOTICE_REASON_PARAM]: reason,
-  });
-  return `/tasks/${taskRef}?${params.toString()}`;
+  }).toString();
 }
 
 /**

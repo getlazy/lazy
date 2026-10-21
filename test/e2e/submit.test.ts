@@ -5,7 +5,7 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { setTaskStatus, setTaskMetadata, readTaskStatus } from '../helpers/storage';
-import { reconcileTasks } from '../../src/utils/reconcile';
+import { reconcileTasks, settleAutoResumes } from '../../src/utils/reconcile';
 import { createStorage } from '../../src/storage';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 
@@ -32,6 +32,9 @@ async function runReconcile(root: string): Promise<void> {
   const storage = await createStorage(root, { backend: 'external', externalPath });
   try {
     await reconcileTasks(storage, root);
+    // The reconciler dispatches auto-resume launches off its sweep; let them
+    // finish before this storage handle closes.
+    await settleAutoResumes();
   } finally {
     await storage.close();
   }

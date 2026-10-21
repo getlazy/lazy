@@ -33,7 +33,7 @@ beforeEach(async () => {
   await chmod(join(bin, 'sync'), 0o755);
   // Never the real pkill: it would signal a containerd on the machine running the tests.
   for (const name of ['pkill', 'pgrep']) {
-    await writeFile(join(bin, name), `#!/bin/sh\necho "$0 $*" >>"${dir}/signals"\nexit 1\n`);
+    await writeFile(join(bin, name), `#!/bin/sh\necho "${name} $*" >>"${dir}/signals"\nexit 1\n`);
     await chmod(join(bin, name), 0o755);
   }
 });
@@ -65,8 +65,12 @@ test('stops a running dockerd with SIGTERM, then flushes the disk', async () => 
   expect(r.stdout).toContain('docker_stop=stopped');
   expect(await readFile(join(dir, 'got'), 'utf8')).toContain('term');
   expect(await readFile(join(dir, 'synced'), 'utf8')).toContain('sync');
-  // Never SIGKILL: no better than the power-off that follows.
-  expect(await readFile(join(dir, 'signals'), 'utf8')).not.toMatch(/-9|KILL/);
+  // Never SIGKILL: no better than the power-off that follows. The log holds the
+  // binary NAME and its arguments only: a full path carries the random mkdtemp
+  // suffix, which starts with "9" about 1 run in 62 and matched a bare /-9/.
+  const signals = await readFile(join(dir, 'signals'), 'utf8');
+  expect(signals).toContain('-TERM');
+  expect(signals).not.toMatch(/(^|\s)-(9|KILL|SIGKILL)(\s|$)/);
   // The marker that keeps --ensure from starting dockerd again (tested below).
   expect(await readFile(join(runDir, 'lazy-dockerd.machine-stopping'), 'utf8')).toMatch(/^\d+/);
 });

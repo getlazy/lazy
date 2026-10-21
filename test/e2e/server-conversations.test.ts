@@ -340,7 +340,7 @@ describe('web builder conversations', () => {
       version: number;
       entries: Array<{ sessionId: string; summary: string }>;
     };
-    expect(index.version).toBe(2);
+    expect(index.version).toBe(3);
     expect(index.entries).toHaveLength(1);
     expect(index.entries[0].sessionId).toBe('dd000000-cccc-4ccc-8ccc-cccccccccccc');
     expect(index.entries[0].summary).toBe('Listing title only');

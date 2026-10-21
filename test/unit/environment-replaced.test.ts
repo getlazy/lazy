@@ -17,7 +17,9 @@ import {
   ENVIRONMENT_REPLACED_KEY,
   REASON_AGENT_CHANGED,
   REASON_CREDENTIAL_CHANGED,
+  REASON_RUNNER_IMAGE_CHANGED,
   clearEnvironmentReplaced,
+  environmentReplacedJournalLine,
   environmentReplacedLine,
   environmentReplacedPrefix,
   recordRecreationIfRunning,
@@ -165,6 +167,22 @@ describe('environment replaced notice', () => {
     expect(count(first, 'Your environment was replaced')).toBe(1);
     expect(count(first, REASON_AGENT_CHANGED)).toBe(1);
     expect(count(first, REASON_CREDENTIAL_CHANGED)).toBe(1);
+  });
+
+  // INVARIANT: a runner-image switch that recreates a running container names
+  // its reason like every other recreation — it used to recreate silently — and
+  // every recreation is also told to the PERSON, as a journal entry on the task:
+  // the services they were using in that container stopped with it.
+  test('a runner-image recreation names its reason to the agent and the person', async () => {
+    const task = await storage.createTask('image', undefined, baseSha, undefined, undefined, 'claude-code');
+    await recordRecreationIfRunning(storage, task.id, recreationReason(false, false, false, true), RUNNING, 'c');
+    expect(count(await launchWorkTurn(task.id), EXPECTED(REASON_RUNNER_IMAGE_CHANGED))).toBe(1);
+    const journal = await storage.getTaskJournal(task.id);
+    expect(journal.map((j) => j.content)).toEqual([environmentReplacedJournalLine(REASON_RUNNER_IMAGE_CHANGED)]);
+    expect(journal[0].content).toContain("the task's services, was stopped");
+    // Nothing recreated, nothing journaled.
+    await recordRecreationIfRunning(storage, task.id, recreationReason(false, false, false, false), RUNNING, 'c');
+    expect(await storage.getTaskJournal(task.id)).toHaveLength(1);
   });
 });
 

@@ -23,7 +23,11 @@
  */
 
 import type { CredentialBinding } from '../credentials/store';
+import { rm } from 'fs/promises';
 import { jwtIssuerOrigin } from './token-origin';
+import { getWebHostPath, getWebPortPath } from '../daemon/paths';
+import { getDaemonTcpTarget } from '../daemon/lifecycle';
+import { CredentialIndexParseError } from '../credentials/store';
 import {
   deleteCredential,
   getStoredCredential,
@@ -221,11 +225,41 @@ export async function writeTeamsLogin(
   // error with no login at all — the working binding gone and the freshly
   // minted token live and held by nobody. A brief overlap is tolerable, because
   // `readTeamsLogin` reports two records loudly rather than picking one.
+  // Right after the save, before anything else can fail: see
+  // forgetLocalDaemonTarget.
+  await forgetLocalDaemonTarget(projectRoot);
+
   if (existing && existing.credentialName !== credentialName) {
     await deleteCredential(projectRoot, existing.credentialName);
   }
 
   return { credentialName, binding };
+}
+
+/**
+ * Forget this clone's recorded local daemon address. A bound clone has no
+ * local daemon, and {@link corruptIndexMeansLocal} relies on that: when the
+ * credential index will not parse, a recorded local target is what says the
+ * clone is local. A clone that ran a local daemon before binding would
+ * otherwise keep that record and, with a corrupt index, send its writes to the
+ * stale local store. Called at bind time and by every command a cleanly bound
+ * clone runs, so clones bound before this existed heal themselves too.
+ */
+export async function forgetLocalDaemonTarget(projectRoot: string): Promise<void> {
+  await rm(getWebPortPath(projectRoot), { force: true });
+  await rm(getWebHostPath(projectRoot), { force: true });
+}
+
+/**
+ * THE rule for a clone whose credential index will not parse, shared by the
+ * daemon client and the dispatcher's auto-start gate so they cannot disagree:
+ * the index cannot say whether the clone is bound, but a bound clone never has
+ * a recorded local daemon target, so one being recorded means local. Without a
+ * recorded target the answer is "unknown" — neither surface may then start or
+ * reach a local daemon, or a bound clone's writes land in a local store.
+ */
+export function corruptIndexMeansLocal(projectRoot: string, err: unknown): boolean {
+  return err instanceof CredentialIndexParseError && getDaemonTcpTarget(projectRoot) !== null;
 }
 
 /**

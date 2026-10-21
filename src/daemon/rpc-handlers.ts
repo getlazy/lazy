@@ -28,13 +28,14 @@ import { createTask as createTaskFromInput } from './create-task';
 import { reviewSettingsViewOf } from '../review/mode';
 import { existsSync } from 'fs';
 import { branchServeAdviceFor } from '../serve/branch-advice';
-import { getWorktreePath, getBranchNameFromId, displayId, shortId, taskRef } from '../task/identity';
+import { getWorktreePath, getBranchNameFromId, displayId, shortId, taskRef, taskAuditForms } from '../task/identity';
 import { parseStatsScope } from '../task/stats';
 import { latencyReport } from '../proxy/latency';
 import { collectDescendantTasks, loadTaskStats, loadTurnLatencyRollups } from '../task/stats-data';
 import { latencyHistory, rollupShapeProblem, type TurnLatencyRollup } from '../task/turn-latency';
 import {
   describeTokenStats,
+  durableTurnUsage,
   loadTokenReport,
   loadAudit,
   parseTokenStatsTaskType,
@@ -88,6 +89,8 @@ import { handleClearStartServicesCmd, handleClearStopServicesCmd, handleGetStart
 import { handleSetTeamsLinks } from './teams-links';
 import { mainServiceOf } from '../serve/ports';
 import { resolveProjectStartServicesCmd } from '../serve/start-cmd';
+import { parseTeamsServiceHostContext, parseTeamsServiceHostLabel, serviceForLabel, teamsServiceHostLabel } from '../serve/teams-host';
+import { taskHostLabel } from '../serve/subdomain';
 import { servicesRestartOf } from '../task/services-restart-record';
 import {
   handleReviewQueue,
@@ -168,6 +171,7 @@ import {
   wantsSection,
   buildNotesState,
   buildShowChunks,
+  buildShowConversation,
   buildShowTurns,
   buildShowFinal,
   buildShowReviews,
@@ -255,9 +259,9 @@ import { cloneTask, redoTask, listReparentTargets } from './clone-redo';
 import { linkTask, type LinkTaskParams } from './link-task';
 import { submitTaskPreflight } from './submit-preflight';
 import { ensureTaskContainer } from './task-container';
-import { runStartServices, stopStartServices, readServicesRunState, linkProcessesToServices, containerBinaryFor, type ServicesRunState } from './serve-run';
+import { runStartServices, stopStartServices, readServicesRunState, linkProcessesToServices, containerBinaryFor, serveSubjectParams, type ServicesRunState } from './serve-run';
 import { ensureTaskWorktree } from './task-worktree';
-import { getTaskServeState } from '../serve/discovery';
+import { getTaskServeState, getRunServeState } from '../serve/discovery';
 import { probeServices } from '../serve/probe';
 import { taskProgress } from './task-progress';
 import type { Comment } from '../types';
@@ -749,17 +753,30 @@ async function dispatchRpc(
     case 'ensureTaskContainer': return handleEnsureTaskContainer(projectRoot, params);
     case 'ensureTaskWorktree': return handleEnsureTaskWorktree(projectRoot, params);
     case 'servePorts': return handleServePorts(projectRoot, params);
+    case 'resolveServiceHost': return handleResolveServiceHost(projectRoot, params);
     case 'serve.getStartServicesCmd': return handleGetStartServicesCmd(projectRoot);
     case 'setTeamsLinks': return handleSetTeamsLinks(params);
     case 'serve.setStartServicesCmd': return handleSetStartServicesCmd(params);
     case 'serve.clearStartServicesCmd': return handleClearStartServicesCmd();
     case 'serve.setStopServicesCmd': return handleSetStopServicesCmd(params);
     case 'serve.clearStopServicesCmd': return handleClearStopServicesCmd();
-    case 'serve.run': return runStartServices(projectRoot, { taskId: requireString(params, 'taskId') }, { progress });
-    case 'serve.stop': return stopStartServices(projectRoot, { taskId: requireString(params, 'taskId') });
+    // Both take `taskId` OR `runId` (a commit run, ./commit-run.ts).
+    case 'serve.run': return runStartServices(projectRoot, serveSubjectParams(params), { progress });
+    case 'serve.stop': return stopStartServices(projectRoot, serveSubjectParams(params));
+    // The product at one commit without a task (./commit-run.ts). Shapes for
+    // clients: docs/design/run-any-commit.md.
+    case 'listBranches': return (await import('./commit-run')).handleListBranches(projectRoot, params);
+    case 'resolveCommit': return (await import('./commit-run')).handleResolveCommit(projectRoot, params);
+    case 'runs.list': return (await import('./commit-run')).handleListRuns(projectRoot);
+    case 'runs.show': return (await import('./commit-run')).handleShowRun(projectRoot, params);
+    case 'runs.create': return (await import('./commit-run')).handleCreateRun(projectRoot, params, progress);
+    case 'runs.pull': return (await import('./commit-run')).handlePullRun(projectRoot, params, progress);
+    case 'runs.remove': return (await import('./commit-run')).handleRemoveRun(projectRoot, params);
+    case 'runs.stopContainer': return (await import('./commit-run')).handleStopRunContainer(projectRoot, params);
+    case 'runs.setImageChoice': return (await import('./commit-run')).handleSetRunImageChoice(projectRoot, params);
     case 'taskProgress': return handleTaskProgress(projectRoot, params);
     case 'taskStats': return handleTaskStats(projectRoot, params);
-    case 'tokenStats': return handleTokenStats(projectRoot, params);
+    case 'tokenStats': return handleTokenStats(projectRoot, params, caller);
     case 'submitTask': return handleSubmitTask(projectRoot, params);
     case 'submitTaskPreflight': return handleSubmitTaskPreflight(projectRoot, params);
     case 'getTaskUpstreamStatus': return handleGetTaskUpstreamStatus(projectRoot, params);
@@ -815,10 +832,17 @@ async function dispatchRpc(
     case 'builderSlot': return handleBuilderSlot(projectRoot, params);
     case 'getDaemonMcpConfig': return handleGetDaemonMcpConfig(projectRoot, params);
     case 'revokeDaemonMcpToken': return handleRevokeDaemonMcpToken(projectRoot, params);
+    // A host pairing session's lazy_* tools: the task's own token (src/daemon/task-mcp-config.ts).
+    case 'getTaskMcpConfig':
+      return (await import('./task-mcp-config')).handleGetTaskMcpConfig(projectRoot, await getOrCreateStorage(), params);
     case 'startBuilderSession':
       return (await import('./builder-sessions')).handleStartBuilderSession(projectRoot, params);
     case 'stopBuilderSession':
       return (await import('./builder-sessions')).handleStopBuilderSession(projectRoot, params);
+    case 'resumeBuilder':
+      return (await import('./builder-sessions')).handleResumeBuilder(projectRoot, params);
+    case 'continueBuilderFromSummary':
+      return (await import('./builder-sessions')).handleContinueBuilderFromSummary(projectRoot, params);
     case 'endBuilderSession':
       return (await import('./builder-sessions')).handleEndBuilderSession(projectRoot, params);
     case 'attachSession':
@@ -946,10 +970,7 @@ async function resolveActivityFilterParams(
     const storage = await getOrCreateStorage();
     const { task } = await storage.resolveTask(raw);
     if (task) {
-      forms.add(task.id);
-      forms.add(shortId(task.id));
-      forms.add(taskRef(task));
-      if (task.code) forms.add(task.code);
+      for (const form of taskAuditForms(task)) forms.add(form);
     }
   } catch (err) {
     // Resolution is an enrichment, not a precondition: the raw form is still a
@@ -1450,6 +1471,7 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
   });
   const reviews = buildShowReviews(data.turns, review);
   const chunks = buildShowChunks(data.turns);
+  const conversation = buildShowConversation(data.turns);
   const final = buildShowFinal(data.turns);
   const fileViolations = await outstandingFileViolations(storage, result.task, projectRoot, data.turns);
   const turnBudgetMax = config.limits.max_turns_without_human;
@@ -1484,6 +1506,9 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
     // remote client must never re-implement it.
     notes: wantsSection(sections, 'notes') ? notes : null,
     chunks: page('chunks', chunks),
+    // The same chunks read as person -> reply, mechanical turns labelled
+    // (src/task/conversation.ts) — the default way a surface reads history.
+    conversation: page('conversation', conversation),
     reviews: page('reviews', reviews),
 
     /**
@@ -1530,6 +1555,7 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
     counts: {
       turns: data.turns.length,
       chunks: chunks.length,
+      conversation: conversation.length,
       commits: data.commits.length,
       comments: data.comments.length,
       journal: data.journal.length,
@@ -1723,10 +1749,10 @@ export async function handleCommitPatch(projectRoot: string, params: Record<stri
     throw new RpcError(404, `Commit ${wanted} is not a recorded commit of task ${result.task.code ?? result.task.id}`);
   }
   const [withIdentity] = await withCommitIdentities([commit], projectRoot);
-  const { patch, missing } = await getCommitPatch(commit.sha, projectRoot);
+  const { patch, message, missing } = await getCommitPatch(commit.sha, projectRoot);
   return {
     taskId: result.task.id,
-    commit: withIdentity,
+    commit: missing ? withIdentity : { ...withIdentity, message },
     patch,
     patchAvailable: patch.length > 0,
     // The object is gone from this repository — distinct from a commit that
@@ -3131,6 +3157,9 @@ export async function handleEditTask(projectRoot: string, params: Record<string,
       parent: params.parent === null || typeof params.parent === 'string' ? (params.parent as string | null) : undefined,
       effort: optionalString(params, 'effort'),
       agent: optionalString(params, 'agent'),
+      review: optionalString(params, 'review'),
+      reviewGate: optionalString(params, 'reviewGate'),
+      reviewAutoFix: optionalString(params, 'reviewAutoFix'),
       runner: params.runner === null || typeof params.runner === 'string' ? (params.runner as string | null) : undefined,
       // An edit is attributed like every other human act on a task. This
       // handler read no actor at all until `teams-identity-is-the-token`, so a
@@ -3386,6 +3415,15 @@ export async function handleStopTask(projectRoot: string, params: Record<string,
  * per-container token only the daemon can mint.
  */
 export async function handleEnsureTaskContainer(projectRoot: string, params: Record<string, unknown>) {
+  // A commit run's container (./commit-run-container.ts) — the same "bring the
+  // environment up, start nothing" for the product at one commit.
+  const subject = serveSubjectParams(params);
+  if (subject.runId !== undefined) {
+    return (await import('./commit-run-container')).ensureRunContainer(projectRoot, {
+      runId: subject.runId,
+      restart: optionalBoolean(params, 'restart'),
+    });
+  }
   return ensureTaskContainer(projectRoot, {
     taskId: requireString(params, 'taskId'),
     restart: optionalBoolean(params, 'restart'),
@@ -3427,28 +3465,32 @@ export async function handleEnsureTaskWorktree(projectRoot: string, params: Reco
  * "not running" IS the state. Only an unresolvable task ref is a 4xx.
  */
 export async function handleServePorts(projectRoot: string, params: Record<string, unknown>) {
-  const ref = requireString(params, 'taskId');
   const storage = await getOrCreateStorage();
-  const resolved = await storage.resolveTask(ref);
-  if (!resolved.task) {
-    if (resolved.ambiguousMatches?.length) {
-      throw new RpcError(409, `Ambiguous task ID '${ref}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
-    }
-    throw new RpcError(404, `Task not found: ${ref}`);
+  // Lazy Teams names each service ITSELF through this daemon's rule
+  // (src/serve/teams-host.ts): it sends its project tag and slugs, and every
+  // service answers with `teamsHostLabel`. Malformed is a 400, never ignored.
+  let teamsHost: ReturnType<typeof parseTeamsServiceHostContext>;
+  try {
+    teamsHost = parseTeamsServiceHostContext(params.serviceHost);
+  } catch (err) {
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
   }
-  const task = resolved.task;
-  const session = await storage.getSessionByTaskId(task.id);
-  const [state, startServicesCmd] = await Promise.all([
-    getTaskServeState(projectRoot, task, session, { alwaysProbe: true }),
-    resolveProjectStartServicesCmd(storage, projectRoot),
-  ]);
-  const services = await probeServices(state.services);
+  const host = await resolveServeHost(projectRoot, storage, params);
+  const { state } = host;
+  const startServicesCmd = await resolveProjectStartServicesCmd(storage, projectRoot);
+  const probed = await probeServices(state.services);
+  const services = teamsHost
+    ? probed.map((service) => ({
+      ...service,
+      teamsHostLabel: teamsServiceHostLabel({ ...host.subject, port: service.port, context: teamsHost }),
+    }))
+    : probed;
   // The service a PR/MR description links to (`[serve] main_service`, else the first).
   const serveConfig = (await loadConfig(projectRoot)).serve;
   const mainService = mainServiceOf(serveConfig.services, serveConfig.main_service)?.port ?? null;
-  // Whether Start services is running in the task's container, and its output
-  // — read from the container itself, only while it is up. null when nothing
-  // is running or the container could not be asked ("not known"). It costs an
+  // Whether Start services is running in the container, and its output — read
+  // from the container itself, only while it is up. null when nothing is
+  // running or the container could not be asked ("not known"). It costs an
   // exec into the container, so only a caller that renders it asks
   // (`includeServicesRun`: the Services tab).
   //
@@ -3468,22 +3510,143 @@ export async function handleServePorts(projectRoot: string, params: Record<strin
         return null;
       });
   }
-  // Ports the task BRANCH declares that the project root does not: advice only,
-  // read from the worktree's lazy.toml as untrusted data (src/serve/branch-advice.ts).
-  // The dashboard's Services tab shows the same list as "Ports on this branch only";
-  // it costs a worktree read, so only a caller that renders it asks (`includeBranchAdvice`).
-  const branchAdvice = optionalBoolean(params, 'includeBranchAdvice') === true
-    ? await branchServeAdviceFor(getWorktreePath(projectRoot, task), state.declared, taskRef(task))
-    : [];
+  // Ports the checkout's own lazy.toml declares that the project root does
+  // not: advice only, read as untrusted data (src/serve/branch-advice.ts). The
+  // dashboard's Services tab shows the same list as "Ports on this branch
+  // only"; it costs a worktree read, so only a caller that renders it asks
+  // (`includeBranchAdvice`). A run's advice carries no `lazy forward`
+  // command, which addresses tasks.
+  let branchAdvice: Array<Record<string, unknown>> = [];
+  if (optionalBoolean(params, 'includeBranchAdvice') === true) {
+    const advice = await branchServeAdviceFor(host.worktreePath, state.declared, host.forwardRef ?? '');
+    branchAdvice = host.forwardRef ? advice : advice.map(({ command: _command, ...rest }) => rest);
+  }
 
-  // Task identity travels with the state so a client holding several of these
-  // does not have to remember which ref it asked with. `startServicesCmd` is
-  // the project's designated Start services command ('' when none) — the same
-  // resolution the dashboard's Services card renders, so Lazy Teams shows and
-  // designates the one value (`serve.setStartServicesCmd`).
-  // `servicesRestart`: the last automatic restart after a work turn
-  // (src/daemon/services-restart.ts), null when none has run.
-  return { taskId: task.id, displayId: displayId(task), status: task.status, ...state, services, startServicesCmd, mainService, branchAdvice, servicesRun, servicesRestart: servicesRestartOf(task) };
+  // The host's identity travels with the state so a client holding several of
+  // these does not have to remember which ref it asked with. `startServicesCmd`
+  // is the project's designated Start services command ('' when none) — the
+  // same resolution the dashboard's Services card renders, so Lazy Teams shows
+  // and designates the one value (`serve.setStartServicesCmd`).
+  // `servicesRestart`: a task's last automatic restart after a work turn
+  // (src/daemon/services-restart.ts), null when none has run — always null for
+  // a run, which has no turns.
+  return { ...host.identity, ...state, services, startServicesCmd, mainService, branchAdvice, servicesRun, servicesRestart: host.servicesRestart };
+}
+
+/**
+ * What `servePorts` (and the dashboard and Teams Services surfaces behind it)
+ * answers about — a TASK (`taskId`) or a COMMIT RUN (`runId`,
+ * ./commit-run.ts) — resolved in ONE place, so the answer's shape and every
+ * rule after it are shared. Only identity, where the checkout is, and whether
+ * a `lazy forward` command applies differ.
+ */
+async function resolveServeHost(projectRoot: string, storage: Storage, params: Record<string, unknown>): Promise<{
+  state: Awaited<ReturnType<typeof getTaskServeState>>;
+  worktreePath: string;
+  /** The ref `lazy forward` takes, or null when the host has none (a run). */
+  forwardRef: string | null;
+  identity: Record<string, unknown>;
+  servicesRestart: ReturnType<typeof servicesRestartOf> | null;
+  /** What names the host in a Teams service label (src/serve/teams-host.ts). */
+  subject: { subjectLabel: string; subjectId: string };
+}> {
+  const subject = serveSubjectParams(params);
+  if (subject.runId !== undefined) {
+    const { resolveCommitRun } = await import('./commit-run-container');
+    const { runWorktreePath } = await import('../run/identity');
+    const { checkoutHead } = await import('./commit-run-checkout');
+    const run = await resolveCommitRun(storage, subject.runId);
+    const worktreePath = runWorktreePath(projectRoot, run.slug);
+    const [state, head] = await Promise.all([getRunServeState(projectRoot, run, { alwaysProbe: true }), checkoutHead(worktreePath)]);
+    return {
+      state,
+      worktreePath,
+      forwardRef: null,
+      // `checkoutHead`: the commit the checkout is ACTUALLY at, which a
+      // person in the run's shell can move away from `headSha`.
+      identity: { runId: run.id, slug: run.slug, target: run.target, headSha: run.head_sha, checkoutHead: head },
+      servicesRestart: null,
+      subject: { subjectLabel: run.slug, subjectId: run.id },
+    };
+  }
+  const ref = subject.taskId;
+  const resolved = await storage.resolveTask(ref);
+  if (!resolved.task) {
+    if (resolved.ambiguousMatches?.length) {
+      throw new RpcError(409, `Ambiguous task ID '${ref}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
+    }
+    throw new RpcError(404, `Task not found: ${ref}`);
+  }
+  const task = resolved.task;
+  const session = await storage.getSessionByTaskId(task.id);
+  return {
+    state: await getTaskServeState(projectRoot, task, session, { alwaysProbe: true }),
+    worktreePath: getWorktreePath(projectRoot, task),
+    forwardRef: taskRef(task),
+    identity: { taskId: task.id, displayId: displayId(task), status: task.status },
+    servicesRestart: servicesRestartOf(task),
+    subject: { subjectLabel: taskHostLabel(task), subjectId: task.id },
+  };
+}
+
+/**
+ * `resolveServiceHost` — which task or run a Lazy Teams service host label
+ * (src/serve/teams-host.ts) names, and which of its services.
+ *
+ * The cold-link path behind Teams' sign-in: a member followed a shared link
+ * with no service cookie yet, Teams matched the label's project tag to one of
+ * THAT member's projects, and asks the project's daemon for the rest. Every
+ * task and run whose id starts with the label's short id is a candidate —
+ * there can be more than one, and the member then picks (never a guess).
+ * `service` is null when the label no longer says which declared service it
+ * meant (renamed, and its port is ambiguous or gone).
+ *
+ * A read: nothing is started, and the answer names nothing the label did not
+ * already route to.
+ */
+export async function handleResolveServiceHost(projectRoot: string, params: Record<string, unknown>) {
+  const label = requireString(params, 'label');
+  let context: ReturnType<typeof parseTeamsServiceHostContext>;
+  try {
+    context = parseTeamsServiceHostContext(params.serviceHost);
+  } catch (err) {
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
+  if (!context) throw new RpcError(400, 'serviceHost is required: { projectTag, projectSlug, teamSlug }');
+  const parsed = parseTeamsServiceHostLabel(label);
+  if (!parsed) throw new RpcError(400, `Not a service host label: ${JSON.stringify(label)}`);
+  if (parsed.projectTag !== context.projectTag) {
+    throw new RpcError(400, `The label's project tag '${parsed.projectTag}' is not this project's ('${context.projectTag}').`);
+  }
+
+  const storage = await getOrCreateStorage();
+  const declared = (await loadConfig(projectRoot)).serve.services;
+  const [tasks, runs] = await Promise.all([storage.listTasks(), storage.listCommitRuns()]);
+  const matches: Array<Record<string, unknown>> = [];
+  for (const task of tasks) {
+    if (!task.id.toLowerCase().startsWith(parsed.shortId)) continue;
+    const subject = { subjectLabel: taskHostLabel(task), subjectId: task.id };
+    matches.push({
+      kind: 'task',
+      id: task.id,
+      displayId: displayId(task),
+      code: task.code ?? null,
+      goal: task.goal,
+      status: task.status,
+      service: serviceForLabel(label, subject, declared, context),
+    });
+  }
+  for (const run of runs) {
+    if (!run.id.toLowerCase().startsWith(parsed.shortId)) continue;
+    const subject = { subjectLabel: run.slug, subjectId: run.id };
+    matches.push({
+      kind: 'run',
+      id: run.id,
+      slug: run.slug,
+      service: serviceForLabel(label, subject, declared, context),
+    });
+  }
+  return { label: label.trim().toLowerCase(), matches };
 }
 
 // --- Live progress on a running task ---
@@ -3647,12 +3810,33 @@ export async function handleTaskStats(projectRoot: string, params: Record<string
     scope: result.scope,
     descendantCount: result.descendantCount,
     stats: result.stats,
-    proxyTokens: await loadTokenReport(projectRoot, tokenTasks.map(task => task.id)),
+    proxyTokens: await loadTokenReport(projectRoot, tokenTasks.flatMap(taskAuditForms)),
   };
 }
 
+/**
+ * The tasks a member's token may read token detail for: the ones whose creation
+ * entry names them. Same shape as an agent's own-subtree rule on `lazy_token_stats`:
+ * own work in detail, never another member's.
+ */
+async function memberOwnedTaskIds(storage: Storage, email: string): Promise<Set<string>> {
+  const me = canonicalPersonEmail(email);
+  const owned = new Set<string>();
+  for (const task of await storage.listTasks()) {
+    const history = await storage.getStatusHistory(task.id);
+    const first = history.reduce<(typeof history)[number] | undefined>(
+      (oldest, entry) => (!oldest || entry.timestamp < oldest.timestamp ? entry : oldest), undefined);
+    if (first?.actor_email && canonicalPersonEmail(first.actor_email) === me) owned.add(task.id);
+  }
+  return owned;
+}
+
 /** Daemon-owned token/tool/planning projection used by CLI and remote MCP clients. */
-export async function handleTokenStats(projectRoot: string, params: Record<string, unknown>) {
+export async function handleTokenStats(
+  projectRoot: string,
+  params: Record<string, unknown>,
+  caller: ActorIdentity = { kind: 'control' },
+) {
   const storage = await getOrCreateStorage();
   const mode = params.mode === undefined ? 'planning' : String(params.mode);
   const taskRef = params.task === undefined ? undefined : String(params.task);
@@ -3693,32 +3877,78 @@ export async function handleTokenStats(projectRoot: string, params: Record<strin
     let ids: string[] | undefined;
     let taskId = taskRef;
     let task: Task | undefined;
-    if (subtree) {
-      if (!taskRef) throw new RpcError(400, '--subtree needs a task');
+    let descendants: Task[] = [];
+    if (subtree && !taskRef) throw new RpcError(400, '--subtree needs a task');
+    if (taskRef) {
+      // Resolve the ref to every form the trail attributes traffic under. The
+      // proxy stamps records with the task CODE, so matching a code (or a full
+      // id) as a raw prefix of record ids matched nothing: a false zero.
       const resolved = await storage.resolveTask(taskRef);
-      if (!resolved.task) throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
-      task = resolved.task;
-      const descendants = await collectDescendantTasks(storage, task.id);
-      ids = [task.id, ...descendants.map(child => child.id)];
-      taskId = undefined;
+      if (resolved.task) {
+        task = resolved.task;
+        descendants = subtree ? await collectDescendantTasks(storage, task.id) : [];
+        ids = [task, ...descendants].flatMap(taskAuditForms);
+        taskId = undefined;
+      } else if (subtree) {
+        throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
+      }
+      // Otherwise `taskId` stays the raw ref and is prefix-matched against the
+      // trail, as before, for refs naming no stored task.
     }
     const role = params.role === undefined ? undefined : String(params.role);
-    const taskInfo = task ? { id: task.id, code: task.code, descendants: (ids?.length ?? 1) - 1 } : null;
+    // A member's token (a clone bound to Teams) sees its own tasks in detail and
+    // the project-wide model/endpoint aggregates, which name no task or credential.
+    const owned = caller.kind === 'user' && mode === 'tokens-cli' ? await memberOwnedTaskIds(storage, caller.email) : null;
+    if (owned) {
+      const resolvedTask = task ?? (taskRef ? (await storage.resolveTask(taskRef)).task : undefined);
+      if (taskRef && (!resolvedTask || !owned.has(resolvedTask.id))) {
+        throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
+      }
+      if (resolvedTask && !ids) ids = [resolvedTask.id];
+      ids = (ids ?? [...owned]).filter(id => owned.has(id));
+      taskId = undefined;
+      // An empty set must match nothing, not everything.
+      if (ids.length === 0) ids = ['(none)'];
+    }
+    const taskInfo = task
+      ? { id: task.id, code: task.code, descendants: owned ? descendants.filter(d => owned.has(d.id)).length : descendants.length }
+      : null;
     if (mode === 'latency-cli') {
       return {
         latency: latencyReport(await loadAudit(projectRoot, limit), { sinceMs, taskIds: ids, role, taskId }),
         task: taskInfo,
       };
     }
-    return {
-      report: await loadTokenReport(projectRoot, ids, {
-        sinceMs,
-        limit,
-        role,
-        taskId,
-      }),
-      task: taskInfo,
-    };
+    const report = await loadTokenReport(projectRoot, ids, { sinceMs, limit, role, taskId });
+    let durable: { tokens: number; turnsWithUsage: number; agentTurns: number } | null = null;
+    const warnings: string[] = [];
+    if (task) {
+      durable = { tokens: 0, turnsWithUsage: 0, agentTurns: 0 };
+      for (const { id } of [task, ...descendants].filter(t => !owned || owned.has(t.id))) {
+        const session = await storage.getSessionByTaskId(id);
+        const turns = session ? await storage.getSessionTurns(session.id) : [];
+        durable.agentTurns += turns.filter(t => t.role === 'agent').length;
+        const usage = durableTurnUsage(turns, sinceMs);
+        if (usage) {
+          durable.tokens += usage.total;
+          durable.turnsWithUsage += usage.turnsWithUsage;
+        }
+      }
+      // The per-turn figure is not role-filtered, so a --role reading is not comparable to it.
+      if (role === undefined && durable.tokens > 0 && durable.tokens > report.totals.totalTokens) {
+        warnings.push(
+          `The proxy audit trail holds ${report.totals.totalTokens.toLocaleString('en-US')} tokens for this task but its turns recorded ${durable.tokens.toLocaleString('en-US')}; the trail is bounded and may have rotated, so prefer the per-turn figure.`,
+        );
+      } else if (report.totals.requests === 0 && durable.agentTurns > 0 && durable.tokens === 0) {
+        warnings.push('No proxied requests in the trail and no usage on the turns: 0 means unknown, not unused.');
+      }
+    }
+    if (owned) {
+      const projectWide = await loadTokenReport(projectRoot, undefined, { sinceMs, limit, role });
+      report.byModel = projectWide.byModel;
+      report.byEndpoint = projectWide.byEndpoint;
+    }
+    return { report, durable, warnings, task: taskInfo };
   }
 
   const resolveTask = async (): Promise<Task | undefined> => {
@@ -3729,6 +3959,16 @@ export async function handleTokenStats(projectRoot: string, params: Record<strin
   };
   if (mode !== 'planning' && mode !== 'tools-cli') {
     throw new RpcError(400, `Invalid token stats mode: ${mode}`);
+  }
+  if (caller.kind === 'user') {
+    // A subtree would fold in children other members created under an owned task.
+    if (mode !== 'tools-cli' || !taskRef || subtree) {
+      throw new RpcError(403, "A member's token may read token details only for one of its own tasks (mode tools-cli with a task, no subtree).");
+    }
+    const target = (await storage.resolveTask(taskRef)).task;
+    if (!target || !(await memberOwnedTaskIds(storage, caller.email)).has(target.id)) {
+      throw new RpcError(404, `Task not found or ambiguous: ${taskRef}`);
+    }
   }
   const scope = mode === 'tools-cli' ? 'tools' : (params.scope === undefined ? undefined : String(params.scope));
   if (scope !== undefined && scope !== 'tokens' && scope !== 'tools') {
@@ -3781,9 +4021,27 @@ export async function handleTokenStats(projectRoot: string, params: Record<strin
  * read or rewrite the secrets its own task was given. See
  * docs/surface-asymmetries.md.
  */
-export async function handleTaskEnv(projectRoot: string, params: Record<string, unknown>) {
-  const action = requireString(params, 'action');
+/**
+ * What `taskEnv` / `taskFiles` act on: a task (`taskId`), or a commit run
+ * (`runId`, src/daemon/commit-run.ts). Both registries are keyed by an opaque
+ * id; only the refusal and the reply's identity differ. A control plane pushes
+ * a run only the project's "always" entries.
+ */
+async function resolveEnvSubject(projectRoot: string, params: Record<string, unknown>): Promise<{
+  id: string;
+  base: Record<string, unknown>;
+  /** Why it takes nothing new (a finished task), or null. */
+  finished: string | null;
+  worktreePath: string;
+}> {
   const storage = await getOrCreateStorage();
+  if (params.runId !== undefined) {
+    if (params.taskId !== undefined) throw new RpcError(400, "Give either 'taskId' or 'runId', not both.");
+    const { resolveCommitRun } = await import('./commit-run-container');
+    const run = await resolveCommitRun(storage, requireString(params, 'runId'));
+    const { runWorktreePath } = await import('../run/identity');
+    return { id: run.id, base: { runId: run.id, slug: run.slug }, finished: null, worktreePath: runWorktreePath(projectRoot, run.slug) };
+  }
   const ref = requireString(params, 'taskId');
   const resolved = await storage.resolveTask(ref);
   if (!resolved.task) {
@@ -3793,17 +4051,32 @@ export async function handleTaskEnv(projectRoot: string, params: Record<string, 
     throw new RpcError(404, `Task not found: ${ref}`);
   }
   const task = resolved.task;
+  return {
+    id: task.id,
+    base: { taskId: task.id, displayId: displayId(task), status: task.status },
+    // A finished task's env and files were cleared with its credentials
+    // (revokeTaskTokens); storing new ones now — a push racing the completion
+    // — would leave secrets that nothing ever clears.
+    finished: isTerminalStatus(task.status) ? `Task ${displayId(task)} is ${task.status}` : null,
+    worktreePath: getWorktreePath(projectRoot, task),
+  };
+}
+
+export async function handleTaskEnv(projectRoot: string, params: Record<string, unknown>) {
+  const action = requireString(params, 'action');
+  const subject = await resolveEnvSubject(projectRoot, params);
+  const { id, base } = subject;
 
   try {
     switch (action) {
       case 'list':
-        return { taskId: task.id, displayId: displayId(task), status: task.status, keys: await listTaskEnvKeys(projectRoot, task.id) };
+        return { ...base, keys: await listTaskEnvKeys(projectRoot, id) };
       case 'set': {
         // A finished task's env was cleared with its credentials
         // (revokeTaskTokens); storing values now — a push racing the
         // completion — would leave secrets that nothing ever clears.
-        if (isTerminalStatus(task.status)) {
-          throw new RpcError(409, `Task ${displayId(task)} is ${task.status}; it takes no environment variables.`);
+        if (subject.finished) {
+          throw new RpcError(409, `${subject.finished}; it takes no environment variables.`);
         }
         const vars = params.vars;
         if (!vars || typeof vars !== 'object' || Array.isArray(vars)) {
@@ -3819,18 +4092,18 @@ export async function handleTaskEnv(projectRoot: string, params: Record<string, 
         if (Object.keys(entries).length === 0) {
           throw new RpcError(400, `No variables given. Pass at least one KEY=VALUE.`);
         }
-        const keys = await setTaskEnv(projectRoot, task.id, entries);
-        return { taskId: task.id, displayId: displayId(task), status: task.status, keys, changed: Object.keys(entries).sort() };
+        const keys = await setTaskEnv(projectRoot, id, entries);
+        return { ...base, keys, changed: Object.keys(entries).sort() };
       }
       case 'unset': {
         const keys = optionalStringArray(params, 'keys') ?? [];
         if (keys.length === 0) throw new RpcError(400, `No variable names given.`);
-        const removed = await unsetTaskEnv(projectRoot, task.id, keys);
-        return { taskId: task.id, displayId: displayId(task), status: task.status, removed, keys: await listTaskEnvKeys(projectRoot, task.id) };
+        const removed = await unsetTaskEnv(projectRoot, id, keys);
+        return { ...base, removed, keys: await listTaskEnvKeys(projectRoot, id) };
       }
       case 'clear': {
-        const count = await clearTaskEnv(projectRoot, task.id);
-        return { taskId: task.id, displayId: displayId(task), status: task.status, removed: count, keys: [] };
+        const count = await clearTaskEnv(projectRoot, id);
+        return { ...base, removed: count, keys: [] };
       }
       default:
         throw new RpcError(400, `Unknown taskEnv action: ${action}`);
@@ -3894,17 +4167,8 @@ export async function handleTaskEnvSeed(projectRoot: string, params: Record<stri
  */
 export async function handleTaskFiles(projectRoot: string, params: Record<string, unknown>) {
   const action = requireString(params, 'action');
-  const storage = await getOrCreateStorage();
-  const ref = requireString(params, 'taskId');
-  const resolved = await storage.resolveTask(ref);
-  if (!resolved.task) {
-    if (resolved.ambiguousMatches?.length) {
-      throw new RpcError(409, `Ambiguous task ID '${ref}'. Matches: ${resolved.ambiguousMatches.map(t => `${shortId(t.id)} (${t.goal})`).join(', ')}`);
-    }
-    throw new RpcError(404, `Task not found: ${ref}`);
-  }
-  const task = resolved.task;
-  const base = { taskId: task.id, displayId: displayId(task), status: task.status };
+  const subject = await resolveEnvSubject(projectRoot, params);
+  const { id, base } = subject;
 
   try {
     switch (action) {
@@ -3912,26 +4176,26 @@ export async function handleTaskFiles(projectRoot: string, params: Record<string
         // `retired`: delivered earlier, no longer selected, still in the
         // worktree. lazy never removes them; the task page shows them so a
         // person can.
-        const worktree = getWorktreePath(projectRoot, task);
-        const retired = await pathExists(worktree) ? await retiredTaskFilePaths(projectRoot, task.id, worktree) : [];
-        return { ...base, paths: await listTaskFilePaths(projectRoot, task.id), retired };
+        const worktree = subject.worktreePath;
+        const retired = await pathExists(worktree) ? await retiredTaskFilePaths(projectRoot, id, worktree) : [];
+        return { ...base, paths: await listTaskFilePaths(projectRoot, id), retired };
       }
       case 'set': {
         // A finished task's files were cleared with its credentials
         // (revokeTaskTokens); storing new ones now would leave secrets that
         // nothing ever clears.
-        if (isTerminalStatus(task.status)) {
-          throw new RpcError(409, `Task ${displayId(task)} is ${task.status}; it takes no secret files.`);
+        if (subject.finished) {
+          throw new RpcError(409, `${subject.finished}; it takes no secret files.`);
         }
-        const paths = await setTaskFiles(projectRoot, task.id, params.files);
+        const paths = await setTaskFiles(projectRoot, id, params.files);
         // Stored. From here a failure is a DELIVERY failure, reported beside
         // the stored paths — never a 400 claiming the set did not happen.
-        const worktree = getWorktreePath(projectRoot, task);
+        const worktree = subject.worktreePath;
         let delivery: Awaited<ReturnType<typeof deliverTaskFiles>> | null = null;
         let deliveryError: string | undefined;
         if (await pathExists(worktree)) {
           try {
-            delivery = await deliverTaskFiles(projectRoot, task.id, worktree);
+            delivery = await deliverTaskFiles(projectRoot, id, worktree);
             // A root daemon (Teams microVM): hand the new files to the
             // container user, or a running agent cannot read them.
             await realignAfterDaemonWrite(worktree);
@@ -3942,15 +4206,15 @@ export async function handleTaskFiles(projectRoot: string, params: Record<string
         return { ...base, paths, delivery, ...(deliveryError ? { deliveryError } : {}) };
       }
       case 'clear': {
-        const removed = await clearTaskFiles(projectRoot, task.id);
-        const worktree = getWorktreePath(projectRoot, task);
+        const removed = await clearTaskFiles(projectRoot, id);
+        const worktree = subject.worktreePath;
         // lazy never deletes them: the files stay in the worktree, still
         // excluded from git and guarded, and `delivery.retired` names them.
         let delivery: Awaited<ReturnType<typeof deliverTaskFiles>> | null = null;
         let deliveryError: string | undefined;
         if (await pathExists(worktree)) {
           try {
-            delivery = await deliverTaskFiles(projectRoot, task.id, worktree);
+            delivery = await deliverTaskFiles(projectRoot, id, worktree);
           } catch (err) {
             deliveryError = `cleared, but the worktree could not be checked: ${err instanceof Error ? err.message : String(err)}`;
           }
@@ -5713,6 +5977,7 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   createWorktreeSnapshot: (s, a) => s.createWorktreeSnapshot(a.sessionId as string, a.turnSequence as number, a.uncommittedDiff as string, a.gitStatus as string),
   getLatestWorktreeSnapshot: (s, a) => s.getLatestWorktreeSnapshot(a.sessionId as string),
   getWorktreeSnapshotForTurn: (s, a) => s.getWorktreeSnapshotForTurn(a.sessionId as string, a.turnSequence as number),
+  retireWorktreeSnapshots: (s, a) => s.retireWorktreeSnapshots(a.sessionId as string, a.reason as 'consumed' | 'superseded', a.snapshotId as string | undefined),
 
   // Task Tree
   getChildTasks: (s, a) => s.getChildTasks(a.parentTaskId as string),
@@ -5928,6 +6193,14 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   listBuilderSessions: (s, a) => s.listBuilderSessions(a.projectRoot as string | undefined),
   updateBuilderSession: (s, a) =>
     s.updateBuilderSession(a.id as string, a.patch as any, a.expectedState as any, a.expectedBuilderId as any),
+  // Commit runs (src/daemon/commit-run.ts). The writes are refused to a
+  // member's token below (COMMIT_RUN_STORAGE_WRITE_METHODS).
+  createCommitRun: (s, a) => s.createCommitRun(a.run as any),
+  getCommitRun: (s, a) => s.getCommitRun(a.id as string),
+  getCommitRunBySlug: (s, a) => s.getCommitRunBySlug(a.slug as string),
+  listCommitRuns: (s) => s.listCommitRuns(),
+  updateCommitRun: (s, a) => s.updateCommitRun(a.id as string, a.patch as any),
+  deleteCommitRun: (s, a) => s.deleteCommitRun(a.id as string),
 
   // Tags
   addTaskTag: (s, a) => s.addTaskTag(a.taskId as string, a.tag as string, a.actor as any),
@@ -6056,6 +6329,11 @@ export async function handleStorageCall(
   // ...and a member does not WRITE these rows through the proxy at all: the
   // daemon writes them, and start/stop/end are the member's interface. A
   // member-written builderId or containerName reached `rm -rf` and `docker stop`.
+  // Run rows likewise: a row names the checkout lazy deletes and the
+  // container it removes, so only the daemon's runs.* commands write them.
+  if (COMMIT_RUN_STORAGE_WRITE_METHODS.has(method) && caller?.kind === 'user') {
+    throw new RpcError(403, `${method}: runs are written by the daemon, not through the storage proxy. Use runs.create, runs.pull or runs.remove.`);
+  }
   if (BUILDER_SESSION_MEMBER_SCOPED_WRITE_METHODS.has(method)) {
     (await import('./builder-sessions')).refuseMemberSessionStorageWrite(method, caller);
   }
@@ -6140,6 +6418,16 @@ export const BUILDER_SESSION_MEMBER_SCOPED_METHODS: ReadonlySet<string> = new Se
 export const BUILDER_SESSION_MEMBER_SCOPED_WRITE_METHODS: ReadonlySet<string> = new Set([
   'createBuilderSession',
   'updateBuilderSession',
+]);
+
+/**
+ * The Storage-proxy methods that WRITE a commit-run row, refused outright for
+ * user-kind callers (see handleStorageCall).
+ */
+export const COMMIT_RUN_STORAGE_WRITE_METHODS: ReadonlySet<string> = new Set([
+  'createCommitRun',
+  'updateCommitRun',
+  'deleteCommitRun',
 ]);
 
 /**

@@ -27,7 +27,7 @@ Every `lazy` command, generated from the usage text each command prints for `--h
 | [`lazy daemon auto-budget`](daemon-auto-budget.md) | Runtime control + visibility for the daemon's auto-react daily budget. |
 | [`lazy daemon config`](daemon-config.md) | Runtime control + visibility for the daemon's builder concurrency cap ([limits] max_concurrent_builders in lazy.toml) and the usage pause ([usage_pause] in lazy.toml). |
 | [`lazy daemon health`](daemon-health.md) | Check whether the running daemon's moving parts are alive — the things that can stop working without the daemon itself crashing: |
-| [`lazy daemon logs`](daemon-logs.md) | Tail the daemon log file. |
+| [`lazy daemon logs`](daemon-logs.md) | Print the tail of the daemon log file (add -f to follow). |
 | [`lazy daemon reload`](daemon-reload.md) | Re-read the lazy.toml the daemon is using and apply the startup-only settings that can change without a restart — [server] dashboard_url (links, sign-in and `lazy dashboard` use the new address) and [server] sync_interval. |
 | [`lazy daemon resume-queue`](daemon-resume-queue.md) | Read-only: show the slow-lane auto-resume queue — tasks whose fast-lane circuit breaker tripped (repeated crashes) and are now waiting for a round-robin retry. |
 | [`lazy dashboard`](dashboard.md) | Sign in to this project's web dashboard and open it in your browser. |
@@ -81,7 +81,7 @@ Every `lazy` command, generated from the usage text each command prints for `--h
 | [`lazy stats latency`](stats-latency.md) | How fast the models answered, per endpoint × model (× tier). |
 | [`lazy stats limits`](stats-limits.md) | The latest usage-limit reading per credential, as the lazy proxy saw it on model API responses: subscription utilization (5-hour and 7-day windows), API-key rate-limit headroom, and retry-after on refusals. |
 | [`lazy stats timings`](stats-timings.md) | Show recorded request traces ranked by SELF TIME — the time a span spent on its own work, with its children's time removed. |
-| [`lazy stats tokens`](stats-tokens.md) | Token accounting from the proxy audit trail. |
+| [`lazy stats tokens`](stats-tokens.md) | Token accounting from the proxy audit trail (bounded; it rotates), plus the usage recorded durably on each task's turns when --task is given. |
 | [`lazy stats tools`](stats-tools.md) | Which tool filled a task's context. |
 | [`lazy status`](status.md) | Show the current status of a task including worktree state, commits, and uncommitted changes. |
 | [`lazy stop`](stop.md) | Halt a running task without auto-resume. |

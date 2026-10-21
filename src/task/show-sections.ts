@@ -36,6 +36,7 @@ import { resolveNotesCutoff } from './turn-context';
 import { foldTurn, type TurnFold } from './wrapper-fold';
 import { resolveFinalState, finalHeadMovedLabel, type FinalState } from './final-state';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
+import { buildConversation, type ConversationExchange } from './conversation';
 import {
   successfulReviewTurnsOf,
   raisedItemIdsOf,
@@ -59,6 +60,7 @@ import type { ResolvedReviewVerdict, ReviewFinding } from '../types/review-repor
 export const SHOW_SECTION_NAMES = [
   'turns',
   'chunks',
+  'conversation',
   'commits',
   'comments',
   'journal',
@@ -182,6 +184,13 @@ export function buildShowChunks(turns: Turn[]): ShowChunk[] {
     boundary_sequence: chunk.boundary ? chunk.boundary.sequence : null,
     turn_sequences: chunk.turns.map((t) => t.sequence),
   }));
+}
+
+// --- Conversation ----------------------------------------------------------
+
+/** The chunks as person -> reply exchanges; the rule lives in conversation.ts. */
+export function buildShowConversation(turns: Turn[]): ConversationExchange[] {
+  return buildConversation(turns);
 }
 
 // --- Reviews --------------------------------------------------------------

@@ -362,6 +362,7 @@ nav.nav {
 }
 .commit-sha { font-family: var(--font-mono); color: var(--color-accent); }
 .commit-message { color: var(--color-text); }
+.commit-message-full { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 /* Commits nested under the agent/work turn that produced them. */
 .turn-commits {
   margin: 0 0 var(--space-3) var(--space-4);

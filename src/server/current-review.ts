@@ -41,6 +41,8 @@ import { attributionLabel } from '../actor-ref';
 
 export interface CurrentReviewInput {
   task: Task;
+  /** The latest person -> reply exchange, pre-rendered (templates.ts `latestExchangeHtml`). */
+  latestExchangeHtml?: string;
   /** The daemon judged the task's next turn paused: Unblock offers "let this turn through". */
   usagePaused?: boolean;
   comments: ReviewComment[];
@@ -265,8 +267,8 @@ function syncFormHtml(taskId: string, reason: string | null, busy: boolean, imag
 function rejectFormHtml(taskId: string, reason: string | null): string {
   return terminalVerbHtml('reject', 'Reject', reason, false, actionDialogTemplateHtml('reject', `
     <form method="post" action="/tasks/${escapeHtml(taskId)}/actions/reject" class="lz-action-form" data-lz-action-form>
-      <p>Reject this task's work and send it back with feedback.</p>
-      <input class="input" type="text" name="reason" required placeholder="Feedback for the agent">
+      <p>Reject abandons this task; its branch is kept. To send the work back for another round, leave feedback and unblock instead.</p>
+      <input class="input" type="text" name="reason" required placeholder="Reason for rejecting">
       <div class="rv-form-actions"><button type="submit" class="btn">Reject task</button></div>
     </form>`));
 }
@@ -397,6 +399,7 @@ export function currentReviewHtml(input: CurrentReviewInput): string {
     ${finalBannerHtml(input.final)}
     ${acceptChecklistHtml(seg, buildAcceptGate({ turns: input.turns ?? [], raisedItems: input.raisedItems, fileViolations: input.fileViolations, taskMetadata: task.metadata, queuedComments: queuedFeedbackCount(input) }))}
     ${restoredProtectedFilesHtml(input.restoredProtectedFiles ?? [])}
+    ${input.latestExchangeHtml ?? ''}
     ${queuedBlock}
     ${askBlock}
     ${proseThreadsFallbackHtml(seg, groupThreads(comments))}

@@ -99,6 +99,8 @@ export interface DaemonStatus {
    * then, and never treat a missing field as "off".
    */
   dashboardUrl?: string | null;
+  /** True when the daemon runs in managed (Lazy Teams) mode; absent on older daemons. */
+  managed?: boolean;
   autoReactBudget?: AutoReactBudgetEntry[];
   /** Anthropic passthrough proxy status. Absent only when the daemon could not
    *  read its own config while answering the health probe. */
@@ -618,7 +620,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
+    const data = await response.json() as { projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; managed?: boolean; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
     if (data.projectRoot !== projectRoot) {
       // A daemon answered, but for a different project — our port marker is
       // stale and another project's daemon now holds the port.
@@ -642,6 +644,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       bindHost: data.bindHost,
       // Preserve explicit `null` (dashboard off). A missing field stays
       // undefined so callers can fall back to formatting bindHost+webPort.
+      ...(typeof data.managed === 'boolean' ? { managed: data.managed } : {}),
       ...('dashboardUrl' in data ? { dashboardUrl: data.dashboardUrl ?? null } : {}),
       autoReactBudget: data.autoReactBudget,
       proxy: data.proxy,

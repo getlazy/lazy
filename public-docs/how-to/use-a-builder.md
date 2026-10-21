@@ -23,7 +23,7 @@ lazy builder list
 
 If `lazy upgrade` stops your builder to rebuild the image, it is relaunched in place afterwards with its conversation intact.
 
-In a clone logged in to Lazy Teams, `lazy builder` attaches your terminal to your builder running on the server, starting it if needed. Press ctrl-] to detach and leave it running. `lazy builder stop [<id>]` stops it and keeps the conversation; `lazy builder end [<id>]` ends it for good.
+In a clone logged in to Lazy Teams, `lazy builder` attaches your terminal to your builder running on the server, starting it if needed. Press ctrl-] to detach and leave it running. `lazy builder stop [<id>]` stops it and keeps the conversation; `lazy builder end [<id>]` ends the run; its conversation stays listed and can be resumed.
 
 ### Dashboard
 
@@ -41,7 +41,9 @@ Open **Builders** in your project.
 
 1. Choose **Start your builder**. If you already have one, the button reads **Open your builder** (running) or **Resume your builder** (stopped).
 2. Work in the terminal on the page. A builder runs on the account of the person using it, so you can only open your own.
-3. **Stop** keeps the transcript and **Resume** starts it again; **End** is final and the builder cannot be resumed.
+3. **Stop** keeps the transcript and **Resume** starts it again. **End** finishes the run; the transcript is kept, and the builder can still be resumed from the list.
+4. Each of your own builders in the list, stopped or ended, has a **Resume** button that continues it in a builder of yours. See [Resuming a builder](../reference/teams/builders.md#resuming-a-builder).
+5. Every builder in the list, a teammate's included, has **Continue**, which starts a new builder of yours from a summary of it. See [Continuing from a summary](../reference/teams/builders.md#continuing-from-a-summary).
 
 Below, each past builder has a transcript. Tick **Select message** beside messages and choose **Create task** to start a new task from them. See [Builders in Lazy Teams](../lazy-teams-builders.md).
 

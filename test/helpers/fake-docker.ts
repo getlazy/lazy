@@ -296,6 +296,12 @@ case "\${1:-}" in
     # agent image. Image probes (\`docker run --rm <image> which <bin>\`) match
     # neither and stay silent.
     if printf '%s' "\$*" | grep -q 'lazy.oneshot=1' || printf '%s' "\$*" | grep -q -- ' claude -p '; then
+      # The prompt rides STDIN, never argv (src/agent/argv-safety.ts), so the
+      # argv line above cannot show it: append what an interactive (\`-i\`) run
+      # was fed, so a test can assert on the prompt lazy actually sent.
+      case " \$* " in
+        *" -i "*) cat >> "\$STATE/invocations.log"; printf '\\n' >> "\$STATE/invocations.log" ;;
+      esac
       if [ -f "\$STATE/oneshot-response" ]; then
         result="\$(cat "\$STATE/oneshot-response")"
       else

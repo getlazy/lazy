@@ -132,7 +132,14 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // builder silently loses every lazy_* tool — the operator only sees an opaque
   // "-32000" buried in Claude's logs. Failing loudly here turns that into an
   // actionable error. See the `selfcheck` sentinel in agent-entry.ts.
-  await preflightAgentBinary('lazy-agent');
+  //
+  // The preflights below are independent of each other, so they run at once:
+  // each spawns a process or asks the daemon, and run one after another they
+  // were dead time before Claude Code could start. Every one still runs, and a
+  // failure is reported in the order they are listed — the binary check first,
+  // because a bad binary also breaks the MCP handshake with a vaguer message.
+  const sessionStartedAt = Date.now();
+  const preflights: Array<Promise<void>> = [preflightAgentBinary('lazy-agent')];
 
   // Preflight: prove the lazy MCP credential Claude Code's MCP child will read
   // is actually present in THIS container, and that ~/.claude.json names that
@@ -147,27 +154,32 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // stderr can be read. Claude Code's MCP child is a GRANDCHILD of this
   // supervisor whose stderr Claude owns and never re-emits, so the failure text
   // exists but goes nowhere — see probeLazyMcpServerStartup.
-  const sessionStartedAt = Date.now();
   if (config.daemonConfigPath) {
     const { preflightBuilderMcpConfig, probeLazyMcpServerStartup } =
       await import('../builder/mcp-config-check');
     const claudeConfigPath = join(getHome(), '.claude.json');
-    await preflightBuilderMcpConfig({
-      daemonConfigPath: config.daemonConfigPath,
-      claudeConfigPath,
-    });
-    await probeLazyMcpServerStartup({
-      claudeConfigPath,
-      cwd: config.worktreePath,
-    });
+    preflights.push((async () => {
+      await preflightBuilderMcpConfig({
+        daemonConfigPath: config.daemonConfigPath!,
+        claudeConfigPath,
+      });
+      await probeLazyMcpServerStartup({
+        claudeConfigPath,
+        cwd: config.worktreePath,
+      });
+    })());
 
     // Preflight: prove conversation capture can WRITE. The checks above cover
     // the agent's tool channel; capture is a different credential on a different
     // daemon surface, and its failure mode is the quietest in the system — a
     // 30-second timer logging into /tmp while the session's history and its
     // resume stamp are lost. See preflightBuilderCapture.
-    await preflightBuilderCapture(config.daemonConfigPath);
+    preflights.push(preflightBuilderCapture(config.daemonConfigPath));
   }
+  const settled = await Promise.allSettled(preflights);
+  const failed = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failed) throw failed.reason;
+  log(`[builder] Preflights passed in ${Date.now() - sessionStartedAt}ms`);
 
   // Read builder config for MCP proxy setup
   const builderConfig = JSON.parse(await readFile(config.builderConfigPath, 'utf-8'));

@@ -479,7 +479,7 @@ points.
 - **Container / run name** — on the task's session, next to `runner_type`. A
   docker session is found by container name, a host one by pidfile.
 - **Daemon log** — `daemon.log` under the daemon's own dir; `lazy daemon logs`
-  tails it and prints the path it is tailing.
+  prints its recent lines and the path it read (`-f` keeps following).
 
 The daemon reports the worktree, the store root and the task data dir as a
 `paths` block on its `show` RPC, for clients that are not a shell on this host;

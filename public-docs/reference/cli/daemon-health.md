@@ -13,7 +13,7 @@ stop working without the daemon itself crashing:
   Sweeps      each reconciler sweep's last run, duration and last error
   Proxy       it answers a self-check request (spends nothing), audit log writable
   Storage     who holds the storage lock, whether writes are completing
-  Runner      docker/podman (or the host agent) reachable, container image present
+  Runner      docker/podman reachable, container image present
   Tasks       working tasks with no live run, held syncs, interrupted tasks
               nothing will resume
   Dashboard   bound, and on which addresses

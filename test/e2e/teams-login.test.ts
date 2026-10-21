@@ -26,6 +26,8 @@ import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { getCredentialIndexPath, getCredentialsPath, getDaemonDir } from '../../src/daemon/paths';
 import { fakeTeamsJwt } from '../helpers/teams-jwt';
 import { setCredential } from '../../src/credentials/store';
+import { writePid, writeWebPort, generateToken } from '../../src/daemon/lifecycle';
+import { startForeignProcess } from '../helpers/foreign-process';
 
 const APPROVED_TOKEN = 'lz_cli_token_for_the_clone_wxyz';
 
@@ -224,6 +226,29 @@ describe('lazy login', () => {
 
     const secrets = JSON.parse(await readFile(getCredentialsPath(ctx.root), 'utf-8'));
     expect(secrets[`teams:http://127.0.0.1:${stub.server.port}`]).toBe(APPROVED_TOKEN);
+  });
+
+  // INVARIANT: a clone with a live local daemon is never bound — that daemon
+  // would keep running against the local store, unseen in a bound clone and
+  // unreachable after logout. Refused BEFORE the install is asked for a token.
+  test('a login is refused while a local daemon is running, before any token is minted', async () => {
+    // A live daemon as the lock-less fallback sees one: token, port marker and
+    // a live PID — a stand-in process, never this test runner, which the
+    // harness's daemon reaper would otherwise kill.
+    const holder = await startForeignProcess(tmpHome, 'lazy-daemon-stand-in');
+    let result;
+    try {
+      generateToken(ctx.root);
+      writeWebPort(ctx.root, 45678);
+      writePid(ctx.root, holder.pid);
+      result = await ctx.lazy(['login', stub.url, '--project', 'acme/api-server'], { env: env() });
+    } finally {
+      holder.kill();
+    }
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('lazy daemon stop');
+    expect(stub.requests).not.toContain('/api/cli/device/code');
   });
 
   test('--project skips the prompt and is matched exactly', async () => {

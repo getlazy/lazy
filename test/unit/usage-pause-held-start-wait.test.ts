@@ -23,11 +23,6 @@ function scripted(steps: Array<{ status: string; held?: boolean; session?: boole
     async resolveTask() { return { task: task() }; },
     async getTask() { poll++; return task(); },
     async getSessionByTaskId() { return at().session ? { id: 'sess' } : null; },
-    async getTurnCountByTaskId() { return at().turns ?? 0; },
-    async getSessionTurns() {
-      const n = at().turns ?? 0;
-      return Array.from({ length: n }, (_, i) => ({ sequence: i, role: i === n - 1 ? (at().lastRole ?? 'agent') : 'human', timestamp: i }));
-    },
   };
   return storage;
 }

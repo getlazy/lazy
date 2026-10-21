@@ -40,9 +40,9 @@ Use the builder to decide and direct; use a cluster to hand off a defined pile o
 ## In each surface
 
 - **CLI:** `lazy builder` starts a session; `lazy builder --resume <id>` resumes one and `lazy builder list` lists earlier conversations.
-- **Daemon dashboard:** the **Builders** page lists and shows captured conversations. It does not start a builder. Until a conversation has been captured it says so:
+- **Daemon dashboard:** the **Builders** page lists and shows captured conversations. It does not start a builder. Each captured conversation is one row:
 
-  ![The dashboard Builders page with no conversations yet. A line explains that past dialogues with the project's builder appear here once captured, above a search box and the message "No Builders yet".](../images/dashboard/builders.png)
+  ![The dashboard Builders page: a line explaining that past dialogues with the project's builder are captured as they happen, a search box, and a table with one builder conversation (id, started, ended, turns, title).](../images/dashboard/builders.png)
 
 - **Lazy Teams** (private alpha): the **Builders** page has a **Start your builder** button (it reads **Open your builder** while yours is running) and opens an in-browser terminal; the builder runs on the server. In a clone logged in to Teams, `lazy builder` attaches your terminal to it, and `lazy builder stop` and `lazy builder end` stop or finish it. See [Builders in Lazy Teams](../lazy-teams-builders.md).
 

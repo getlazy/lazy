@@ -239,4 +239,54 @@ describe('continuity relaunch takes the model from the daemon', () => {
       expect(launches[1]).not.toContain(MODEL_OVERRIDE_FLAG);
     });
   }
+  // INVARIANT: the agent-binary preflight runs before every RELAUNCH and not
+  // before the first launch. The first launch follows the builder supervisor's
+  // own preflight of the same binary moments earlier; a relaunch after a daemon
+  // restart is exactly when `lazy upgrade` may be rewriting the bind mount, so
+  // that check is the only guard left there.
+  test('preflights the agent binary before a relaunch, not before the first launch', async () => {
+    const events: string[] = [];
+    let pollCount = 0;
+    let finishFirst: ((code: number) => void) | undefined;
+
+    await mockModule(SPAWN_PATH, () => ({
+      spawn: () => {
+        events.push('launch');
+        if (events.filter(e => e === 'launch').length === 1) {
+          return {
+            exited: new Promise<number>((resolve) => { finishFirst = resolve; }),
+            kill: () => { finishFirst?.(0); },
+          };
+        }
+        return { exited: Promise.resolve(0), kill: () => {} };
+      },
+      spawnSyncUnsupervised: () => ({ exitCode: 0, stdout: Buffer.from(''), stderr: Buffer.from('') }),
+      DEFAULT_SUBPROCESS_TIMEOUT_MS: 60_000,
+    }));
+
+    const realSupervisor = await import(SUPERVISOR_BUILDER_PATH);
+    await mockModule(SUPERVISOR_BUILDER_PATH, () => ({
+      ...realSupervisor,
+      preflightAgentBinaryWithRetry: async () => { events.push('preflight'); },
+    }));
+
+    const { runBuilderWithContinuity } = await import(CONTINUITY_PATH);
+
+    const result = await runBuilderWithContinuity({
+      daemonConfigPath: '/tmp/daemon-mcp.json',
+      projectRoot: '/proj',
+      worktreePath: '/proj',
+      baseEnv: {},
+      log: () => {},
+      errorOut: () => {},
+      readStatus: async () => { pollCount += 1; return pollCount <= 2 ? gen1() : gen2(); },
+      fetchLaunchEnv: async () => ({ authEnvVars: [] }),
+      pollMs: 5,
+      sleep: async () => {},
+      buildClaudeArgs: () => ['claude'],
+    });
+
+    expect(result.restarts).toBe(1);
+    expect(events).toEqual(['launch', 'preflight', 'launch']);
+  });
 });

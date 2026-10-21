@@ -75,7 +75,9 @@ export async function runMcpSession(
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env, ...options?.env, ...MCP_SERVER_ENV_PINS },
+    // Fake-binary suites run the host-process runner, which the gate refuses without this
+    // test-only flag; the MCP server evaluates the same gate (lazy_commit etc.).
+    env: { ...process.env, LAZY_ALLOW_HOST_RUNNER: '1', ...options?.env, ...MCP_SERVER_ENV_PINS },
   });
 
   const responses: JsonRpcResponse[] = [];

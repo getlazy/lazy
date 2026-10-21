@@ -45,7 +45,7 @@ import { createHash } from 'crypto';
 
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
-import { storageDirFor } from '../helpers/storage';
+import { storageDirFor, writeConversationFile } from '../helpers/storage';
 import { DaemonClient, RpcApplicationError } from '../../src/daemon/client';
 import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
@@ -299,7 +299,13 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     const launches = await detachedLaunches();
     expect(launches.length).toBe(2);
     expect(launches[0]).not.toContain('--resume');
-    expect(launches[1]).toContain(`-- --resume ${CLAUDE_SESSION_ID}`);
+    // Claude's own argv is everything after lazy-agent's ` -- `; the resume
+    // must be there, wherever the other Claude flags put it.
+    const sep = launches[1]!.lastIndexOf(' -- ');
+    expect(sep).toBeGreaterThan(-1);
+    const claudeArgv = launches[1]!.slice(sep + 4).split(' ');
+    expect(claudeArgv.slice(claudeArgv.indexOf('--resume'), claudeArgv.indexOf('--resume') + 2))
+      .toEqual(['--resume', CLAUDE_SESSION_ID]);
     expect(launches[1]).toContain(`--name ${resumed.containerName}`);
   }, 180_000);
 
@@ -1008,5 +1014,248 @@ await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)
     }) as BuilderSession | null;
     expect(after?.state).toBe('ended');
     expect(await detachedLaunches()).toEqual([]);
+  }, 180_000);
+  // --- Resume from the Builders page (resumeBuilder) ---------------------
+
+  /**
+   * Capture a conversation as a member's builder did, so it is a listed Builder
+   * owned by `memberEmail`. Written straight into the store: the real capture
+   * stamps the owner from the RUN's own token on the builder storage surface,
+   * and every human-token route deliberately clears it.
+   */
+  function captureBuilder(sessionId: string, memberEmail: string): void {
+    writeConversationFile(ctx.root, {
+      memberEmail,
+      sessionId,
+      projectPath: ctx.root,
+      cwd: ctx.root,
+      version: null,
+      gitBranch: null,
+      summary: 'Plan the release',
+      startedAt: '2026-10-01T10:00:00Z',
+      endedAt: '2026-10-01T10:05:00Z',
+      importedAt: Date.now(),
+      totalUsage: { input_tokens: 0, output_tokens: 0 },
+      subagents: [],
+      messages: [
+        { uuid: `${sessionId}-u`, parentUuid: null, role: 'user', text: 'Plan the release', timestamp: '2026-10-01T10:00:00Z', model: null, usage: null },
+        { uuid: `${sessionId}-a`, parentUuid: `${sessionId}-u`, role: 'assistant', text: 'Here is a plan.', timestamp: '2026-10-01T10:01:00Z', model: null, usage: null },
+      ],
+      stats: { messageCount: 2, userMessageCount: 1, assistantMessageCount: 1, subagentCount: 0, totalTokens: 0 },
+    });
+  }
+
+  function claudeArgvOf(launch: string): string[] {
+    return launch.slice(launch.lastIndexOf(' -- ') + 4).split(' ');
+  }
+
+  // INVARIANT: an ENDED builder's conversation is still the member's to resume
+  // from the Builders list, in a builder run of theirs, continuing the same
+  // Claude session. "Ended" ends the run, not the conversation.
+  test('your own ended builder resumes from the Builders list, continuing its conversation', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const started = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await writeSessionFileAsContainer((await detachedLaunches())[0]!, CLAUDE_SESSION_ID);
+    await rpc(alice, 'endBuilderSession', { id: started.id });
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+
+    const resumed = await rpc(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
+    expect(resumed.state).toBe('running');
+    expect(resumed.memberEmail).toBe(ALICE_EMAIL);
+    expect(resumed.agentSessionId).toBe(CLAUDE_SESSION_ID);
+    expect(resumed.id).not.toBe(started.id);
+
+    const launches = await detachedLaunches();
+    expect(launches.length).toBe(2);
+    const argv = claudeArgvOf(launches[1]!);
+    expect(argv.slice(argv.indexOf('--resume'), argv.indexOf('--resume') + 2)).toEqual(['--resume', CLAUDE_SESSION_ID]);
+  }, 180_000);
+
+  // INVARIANT: a resume whose session file is gone is REFUSED, saying so, and
+  // starts nothing — never a fresh, empty conversation in its place.
+  test('a builder whose session file is gone is refused plainly and nothing starts', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+
+    const refusal = await rpcStatus(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID });
+    expect(refusal.status).toBe(409);
+    expect(refusal.message).toContain('no longer on this server');
+    expect(await detachedLaunches()).toEqual([]);
+    const rows = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(rows).toEqual([]);
+  }, 180_000);
+
+  // INVARIANT: resuming never runs two builders of one member side by side, and
+  // never stops the running one silently: without `replaceRunning` it is a 409;
+  // with it the running builder is stopped (its conversation kept) first.
+  test('a live builder is stopped only when the member confirms, then the picked one resumes', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const first = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    await writeSessionFileAsContainer((await detachedLaunches())[0]!, CLAUDE_SESSION_ID);
+    await rpc(alice, 'endBuilderSession', { id: first.id });
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+    const live = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(live.state).toBe('running');
+
+    const refused = await rpcStatus(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID });
+    expect(refused.status).toBe(409);
+    expect(refused.message).toContain('already have a builder running');
+    expect(await docker.containers()).toContain(live.containerName!);
+
+    const resumed = await rpc(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID, replaceRunning: true }) as BuilderSession;
+    expect(resumed.state).toBe('running');
+    expect(resumed.id).toBe(live.id);
+    expect(resumed.agentSessionId).toBe(CLAUDE_SESSION_ID);
+    expect(await docker.containers()).not.toContain(live.containerName!);
+    const launches = await detachedLaunches();
+    expect(launches.length).toBe(3);
+    expect(claudeArgvOf(launches[2]!)).toContain(CLAUDE_SESSION_ID);
+  }, 180_000);
+
+  // INVARIANT: a teammate's builder is never resumed as yours, and its file is
+  // never touched: the refusal names whose it is, and nothing launches.
+  test("a teammate's builder is refused, naming whose it is, and nothing launches", async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(BOB_EMAIL, 'oauth', BOB_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    const bob = await mintUserToken(BOB_EMAIL, 'Bob');
+    await armLaunchEnvironment();
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+
+    const refusal = await rpcStatus(bob, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID });
+    expect(refusal.status).toBe(403);
+    expect(refusal.message).toContain(ALICE_EMAIL);
+    expect(await detachedLaunches()).toEqual([]);
+  }, 180_000);
+
+  // INVARIANT: a resume refused for MONEY changes nothing — no run row is
+  // registered or re-pointed and nothing launches (MONEY BEFORE INFRASTRUCTURE).
+  test('a resume refused for a missing credential registers no run and launches nothing', async () => {
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+    // The session file where a run without its overlay left it.
+    const dir = join(resolveBuilderSessionHomeDir(ctx.root, ALICE_EMAIL), '.claude', 'projects', encodeProjectPath(ctx.root));
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${CLAUDE_SESSION_ID}.jsonl`), '{"type":"user"}\n');
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+
+    const refusal = await rpcStatus(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID });
+    expect(refusal.status).toBeGreaterThanOrEqual(400);
+    expect(refusal.message).not.toContain('no longer on this server');
+    expect(await detachedLaunches()).toEqual([]);
+    const rows = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(rows).toEqual([]);
+  }, 180_000);
+
+  // --- Continue from a summary (continueBuilderFromSummary) ---------------
+
+  // INVARIANT: any member may continue a TEAMMATE's builder from a summary of
+  // its readable transcript: a NEW builder of their own, seeded with the summary
+  // and the source named, recorded as continued from it — while the teammate's
+  // raw session is never resumed or copied for them.
+  test("a teammate's builder is continued from a summary as a new builder of yours", async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(BOB_EMAIL, 'oauth', BOB_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const bob = await mintUserToken(BOB_EMAIL, 'Bob');
+    await armLaunchEnvironment();
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+    // Offline: the summary is an excerpt made with no model, so the suite
+    // needs no model run; the model path is the same handler minus this branch.
+    await writeFile(join(ctx.root, '.lazy', 'offline.json'), JSON.stringify({ enabled: true }));
+
+    // Full-fidelity resume stays refused for anyone else.
+    expect((await rpcStatus(bob, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID })).status).toBe(403);
+
+    const run = await rpc(bob, 'continueBuilderFromSummary', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
+    expect(run.state).toBe('running');
+    expect(run.memberEmail).toBe(BOB_EMAIL);
+    expect(run.agentSessionId).toBeNull();
+    expect(run.continuedFrom).toEqual({
+      builderId: CLAUDE_SESSION_ID, title: 'Plan the release', memberEmail: ALICE_EMAIL, method: 'excerpt',
+    });
+
+    const launches = await detachedLaunches();
+    expect(launches.length).toBe(1);
+    // A fresh conversation, never Alice's session.
+    expect(claudeArgvOf(launches[0]!)).not.toContain('--resume');
+    expect(launches[0]!).not.toContain(CLAUDE_SESSION_ID);
+    // The seed is in the builder's system prompt: the source named, whose it
+    // was, and the readable text.
+    const prompt = await readFile(join(
+      builderSessionLaunchDir(resolveBuilderSessionHomeDir(ctx.root, BOB_EMAIL), run.builderId),
+      `builder-prompt-${run.builderId}.txt`,
+    ), 'utf-8');
+    expect(prompt).toContain(`(builder ${CLAUDE_SESSION_ID}), which ${ALICE_EMAIL} had`);
+    expect(prompt).toContain('Here is a plan.');
+
+    // Without confirming, a second continue never stops the running builder.
+    const refused = await rpcStatus(bob, 'continueBuilderFromSummary', { builderId: CLAUDE_SESSION_ID });
+    expect(refused.status).toBe(409);
+    expect(await detachedLaunches()).toHaveLength(1);
+  }, 180_000);
+
+  // INVARIANT: a continued builder keeps its seed and its "continued from" link
+  // after it is ended and resumed from the list — the continuation belongs to
+  // the conversation, not to the run row that first carried it.
+  test('a continued builder ended and resumed keeps its summary and its link', async () => {
+    const SOURCE_ID = '0a1b2c3d-0000-4000-8000-00000000a11c';
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(BOB_EMAIL, 'oauth', BOB_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const bob = await mintUserToken(BOB_EMAIL, 'Bob');
+    await armLaunchEnvironment();
+    captureBuilder(SOURCE_ID, ALICE_EMAIL);
+    await writeFile(join(ctx.root, '.lazy', 'offline.json'), JSON.stringify({ enabled: true }));
+    // Bob's continued conversation is stamped CLAUDE_SESSION_ID when it stops.
+    await installSupervisorStandIn(bob);
+
+    const run = await rpc(bob, 'continueBuilderFromSummary', { builderId: SOURCE_ID }) as BuilderSession;
+    await writeSessionFileAsContainer((await detachedLaunches())[0]!, CLAUDE_SESSION_ID);
+    const ended = await rpc(bob, 'endBuilderSession', { id: run.id }) as BuilderSession;
+    expect(ended.agentSessionId).toBe(CLAUDE_SESSION_ID);
+    captureBuilder(CLAUDE_SESSION_ID, BOB_EMAIL);
+
+    const resumed = await rpc(bob, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
+    expect(resumed.id).not.toBe(run.id);
+    expect(resumed.continuedFrom?.builderId).toBe(SOURCE_ID);
+    const prompt = await readFile(join(
+      builderSessionLaunchDir(resolveBuilderSessionHomeDir(ctx.root, BOB_EMAIL), resumed.builderId),
+      `builder-prompt-${resumed.builderId}.txt`,
+    ), 'utf-8');
+    expect(prompt).toContain(`(builder ${SOURCE_ID}), which ${ALICE_EMAIL} had`);
+
+    const listed = await rpc(bob, 'builderTranscript', { id: CLAUDE_SESSION_ID }) as { builder: { continuedFrom?: { builderId: string } } };
+    expect(listed.builder.continuedFrom?.builderId).toBe(SOURCE_ID);
+  }, 180_000);
+
+  // INVARIANT: a continue refused for MONEY happens before any summary is made
+  // or any run is registered.
+  test('a continue refused for a missing credential registers no run and launches nothing', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const bob = await mintUserToken(BOB_EMAIL, 'Bob');
+    await armLaunchEnvironment();
+    captureBuilder(CLAUDE_SESSION_ID, ALICE_EMAIL);
+
+    const refusal = await rpcStatus(bob, 'continueBuilderFromSummary', { builderId: CLAUDE_SESSION_ID });
+    expect(refusal.status).toBe(400);
+    expect(refusal.message).toContain('billed to you');
+    expect(await detachedLaunches()).toEqual([]);
+    const rows = await rpc(bob, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(rows).toEqual([]);
   }, 180_000);
 });

@@ -30,18 +30,27 @@ export function containerEnsureClientScript(): string {
   const inflight = new Map();
 
   // taskId is the URL-ESCAPED segment the panels hand in — interpolate raw; a
-  // second escape turns %20 into %2520, a different address.
-  function poll(taskId) {
-    return fetch('/tasks/' + taskId + '/container/state', { credentials: 'same-origin' })
+  // second escape turns %20 into %2520, a different address. base, when a
+  // panel passes one, is a page that is not a task's (a commit run's
+  // /runs/<id>), composed by the server and used as given.
+  function stateUrl(taskId, base) {
+    return base ? base + '/container/state' : '/tasks/' + taskId + '/container/state';
+  }
+  function ensureUrl(taskId, base) {
+    return base ? base + '/container/ensure' : '/tasks/' + taskId + '/container/ensure';
+  }
+
+  function poll(taskId, base) {
+    return fetch(stateUrl(taskId, base), { credentials: 'same-origin' })
       .then((res) => (res.ok ? res.json() : null));
   }
 
-  async function ensure(taskId, onProgress) {
+  async function ensure(taskId, base, onProgress) {
     const say = typeof onProgress === 'function' ? onProgress : function () {};
     say('Starting the container…');
     let res;
     try {
-      res = await fetch('/tasks/' + taskId + '/container/ensure', {
+      res = await fetch(ensureUrl(taskId, base), {
         method: 'POST',
         credentials: 'same-origin',
       });
@@ -70,7 +79,7 @@ export function containerEnsureClientScript(): string {
     for (;;) {
       await new Promise((r) => setTimeout(r, 1000));
       let state = null;
-      try { state = await poll(taskId); } catch (e) { state = null; }
+      try { state = await poll(taskId, base); } catch (e) { state = null; }
       if (!state) continue;
       if (state.detail) say(state.detail);
       if (state.phase === 'done') return { ok: true };
@@ -81,26 +90,28 @@ export function containerEnsureClientScript(): string {
     }
   }
 
-  window.lzEnsureContainer = function (taskId, onProgress) {
-    const running = inflight.get(taskId);
+  // base (optional) names a page that is not a task's — a commit run's.
+  window.lzEnsureContainer = function (taskId, onProgress, base) {
+    const key = base || taskId;
+    const running = inflight.get(key);
     if (running) {
       if (typeof onProgress === 'function') running.listeners.push(onProgress);
       return running.promise;
     }
     const listeners = typeof onProgress === 'function' ? [onProgress] : [];
     const entry = { listeners: listeners, promise: null };
-    entry.promise = ensure(taskId, function (detail) {
+    entry.promise = ensure(taskId, base, function (detail) {
       for (let i = 0; i < entry.listeners.length; i++) {
         try { entry.listeners[i](detail); } catch (e) { /* one panel's render must not stop the others */ }
       }
     }).then(
-      (r) => { inflight.delete(taskId); return r; },
+      (r) => { inflight.delete(key); return r; },
       (e) => {
-        inflight.delete(taskId);
+        inflight.delete(key);
         return { ok: false, error: e && e.message ? e.message : String(e) };
       },
     );
-    inflight.set(taskId, entry);
+    inflight.set(key, entry);
     return entry.promise;
   };
 })();

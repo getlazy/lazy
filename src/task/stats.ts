@@ -603,12 +603,16 @@ export interface TaskToolStats {
 export function buildToolStats(
   records: ProxyAuditRecord[],
   taskId: string,
+  /** Every form the proxy may have attributed this task's traffic under (see taskAuditForms); matched exactly. */
+  forms?: string[],
 ): TaskToolStats {
   // The header carries whatever id the launch had; a stats page has the full
   // one. Either being a prefix of the other is the same match `lazy stats
   // tokens --task` makes, and an empty id never matches anything.
+  const exact = forms ? new Set(forms) : null;
   const mine = records.filter((r) => {
     const id = r.taskId;
+    if (exact) return Boolean(id) && exact.has(id as string);
     return Boolean(id) && (taskId.startsWith(id as string) || (id as string).startsWith(taskId));
   });
   const proxyTotals = emptyTokenTotals();

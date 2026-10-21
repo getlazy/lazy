@@ -698,6 +698,9 @@ body.lz-shell-maximised { overflow: hidden; }
 .lz-artifact-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .lz-artifact-name { font-weight: 600; word-break: break-all; }
 .lz-artifact-head .btn { margin-left: auto; }
+.lz-artifact-remove { margin-left: auto; }
+.lz-artifact-remove summary { cursor: pointer; list-style: none; }
+.lz-artifact-remove form { margin-top: var(--space-2); }
 .lz-artifact-preview { margin-top: var(--space-2); }
 .lz-artifact-image { display: block; max-width: 100%; height: auto; margin-top: var(--space-2); border: 1px solid var(--border); }
 pre.lz-artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; }

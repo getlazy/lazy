@@ -195,14 +195,10 @@ export async function commandStart(args: string[]): Promise<void> {
             }
 
             retargetOrphan = true;
-          } else {
-            const parentSession = await storage.getSessionByTaskId(parentTask.id);
-            if (!parentSession) {
-              console.error(`Cannot start child task: parent task has no worktree.`);
-              console.error(`Start the parent first with: lazy start ${displayId(parentTask)}`);
-              process.exit(1);
-            }
           }
+          // Otherwise the daemon restores the parent's branch (locally, or
+          // from the remote when the parent ran on another machine) and
+          // refuses with the branch named when it exists nowhere.
         }
       }
 

@@ -79,8 +79,8 @@ export interface CloneTaskResult {
  * was cut from at `lazy start`, before the "Initialize task" commit and before
  * any turn ran — so before any pre-turn sync, which is what makes it the code
  * the original's first turn saw. `Turn.start_sha` is per turn and sits after
- * the init commit; `Task.branched_from_sha` is recorded only for subtasks and
- * is rewritten by reopen, so it is the fallback, not the source.
+ * the init commit; `Task.branched_from_sha` is recorded at launch for every task
+ * and is rewritten by reopen, so it is the fallback, not the source.
  */
 async function resolveCloneBase(
   projectRoot: string,

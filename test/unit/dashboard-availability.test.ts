@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   dashboardUrlFromStatus,
   dashboardAvailabilityFromStatus,
+  webOffLine,
 } from '../../src/daemon/dashboard-availability';
 import { formatDashboardUrl } from '../../src/daemon/dashboard-url';
 
@@ -66,5 +67,18 @@ describe('dashboardAvailabilityFromStatus', () => {
       running: true,
       dashboardUrl: 'http://lazy.localhost:26025',
     })).toEqual({ available: true, url: 'http://lazy.localhost:26025' });
+  });
+});
+
+describe('webOffLine', () => {
+  // INVARIANT: a managed (Lazy Teams) daemon's dashboard is deliberately off and
+  // the daemon says so; only an unmanaged daemon without a URL is "degraded".
+  test('managed daemon says the UI is served by Lazy Teams', () => {
+    expect(webOffLine({ managed: true })).toBe('off (Lazy Teams serves the UI)');
+  });
+
+  test('unmanaged or older daemon keeps the degraded line', () => {
+    expect(webOffLine({ managed: false })).toContain('not bound (degraded');
+    expect(webOffLine({})).toContain('not bound (degraded');
   });
 });

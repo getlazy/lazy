@@ -20,7 +20,7 @@ Non-disruptive image refresh (--images):
       (a blocked task reuses its live supervisor on unblock, so it does NOT
       switch on the next turn)
   For an immediate, disruptive switch of everything, run a full `lazy upgrade`.
-  Only applies to docker/podman runners (host-process has no image).
+  Only applies to docker/podman runners.
 
 What happens:
   1. The Docker image rebuild starts immediately, in the BACKGROUND, under a

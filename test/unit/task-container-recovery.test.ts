@@ -9,6 +9,13 @@ import { buildTaskGitMounts } from '../../src/capture/git-mounts';
 import type { SandboxConfig } from '../../src/capture/claude';
 import type { Runner } from '../../src/runner/types';
 import type { Storage } from '../../src/storage';
+import {
+  ENVIRONMENT_REPLACED_KEY,
+  REASON_CHECKOUT_MISSING,
+  REASON_RESTART_REQUESTED,
+  REASON_TASK_ENV_CHANGED,
+  environmentReplacedJournalLine,
+} from '../../src/task/environment-replaced';
 import type { Task } from '../../src/types';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { pathExists } from '../../src/utils/fs';
@@ -26,6 +33,9 @@ let calls: string[];
 let messages: string[];
 let probeFailure: number | null | Error | undefined;
 let containerRunning: boolean;
+/** What the fake storage was told: task metadata and journal entries. */
+let metadata: Map<string, string>;
+let journal: string[];
 
 function git(argv: string[], cwd: string) {
   const result = Bun.spawnSync(['git', ...argv], {
@@ -88,9 +98,14 @@ beforeEach(async () => {
       }
     },
   } as unknown as Runner;
+  metadata = new Map();
+  journal = [];
   const storage = {
     resolveTask: async () => ({ task }),
     getSessionByTaskId: async () => null,
+    getTaskMetadata: async (_id: string, key: string) => metadata.get(key) ?? null,
+    updateTaskMetadata: async (_id: string, key: string, value: string) => { metadata.set(key, value); },
+    appendJournalEntry: async (_id: string, content: string) => { journal.push(content); },
   } as unknown as Storage;
   deps = {
     getStorage: async () => storage,
@@ -162,6 +177,22 @@ describe('task container pointer recovery', () => {
     expect(calls).toEqual(['stop', 'prepare', 'remove', 'launch']);
   });
 
+  // INVARIANT: a replacement is recorded on the task only once the old
+  // container really stopped. A refused stop (503) replaced nothing, so it
+  // leaves no "Container replaced" journal entry and no next-turn notice; the
+  // retry that does replace it records the reason once.
+  test('a failed stop records no replacement; the successful retry records it once', async () => {
+    await writeFile(join(root, 'lazy.toml'), '[remote]\noffline = true\n');
+    await rm(worktree, { recursive: true });
+    const stop = runner.stopRun;
+    runner.stopRun = async () => false;
+    await expect(ensure()).rejects.toMatchObject({ status: 503 });
+    expect(journal).toEqual([]);
+    expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toBeUndefined();
+    runner.stopRun = stop;
+    await ensure();
+    expect(journal).toEqual([environmentReplacedJournalLine(REASON_CHECKOUT_MISSING)]);
+  });
 
   // INVARIANT: the restore narrates through `restoreProgress` and the launch is
   // announced through `onLaunching` after the files are back, so a caller
@@ -273,6 +304,24 @@ describe('task container and a changed per-task environment', () => {
     expect((await ensure()).alreadyRunning).toBe(false);
     expect(calls).toEqual(['probe', 'stop', 'prepare', 'remove', 'launch']);
     expect(messages).toEqual(["Recreating container: the task's environment variables changed since it was created."]);
+  });
+
+  // INVARIANT: a container Run services / Start container replaces is named on
+  // the TASK — a journal entry for the person, the one-shot line for the agent's
+  // next work turn — because whatever was built or installed in it is gone.
+  test('a replaced container is named on the task with its reason; a reused one is not', async () => {
+    await recordTaskEnvLaunched(root, task.id, 'lazy-recovery', {});
+    await setTaskEnv(root, task.id, { FEATURE_FLAG: 'on' });
+    await ensure();
+    expect(journal).toEqual([environmentReplacedJournalLine(REASON_TASK_ENV_CHANGED)]);
+    expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toBe(REASON_TASK_ENV_CHANGED);
+
+    // What the real launch records (this suite's runner is a fake).
+    await recordTaskEnvLaunched(root, task.id, 'lazy-recovery', { FEATURE_FLAG: 'on' });
+    await ensure();
+    expect(journal).toHaveLength(1);
+    await ensure(true);
+    expect(journal[1]).toBe(environmentReplacedJournalLine(REASON_RESTART_REQUESTED));
   });
 
   // INVARIANT: replacing a container would kill a running turn, so a working task keeps it;

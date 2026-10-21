@@ -58,11 +58,20 @@ The panel takes the shortcuts a terminal user expects:
   from the browser's own menu works too.
 - **Copy** — `Ctrl+C` (`Cmd+C`) *while text is selected*. With nothing selected,
   `Ctrl+C` stays the interrupt and is sent to the running process, as it must be.
+- **Copy from a program** — a program that copies by itself (Claude Code does,
+  when you select text in it and it reports "characters copied") puts the text
+  on your clipboard. When a program takes the mouse, `Shift`-drag (`Option`-drag
+  on macOS) selects text in the terminal instead.
 
-Keyboard paste reads the system clipboard through the browser, so the first
-paste may raise a clipboard permission prompt — and a browser that refuses
-clipboard reads (or a page not served over `localhost`/HTTPS) pastes nothing
-from the keyboard. Right-click paste is unaffected either way.
+A program's full screen — Claude Code's fullscreen view, `vim`, `less` — has
+no terminal scrollback, so there **Page Up** and **Page Down** go to the
+program, which scrolls itself.
+
+The **Paste** button reads the system clipboard through the browser, so it may
+raise a clipboard permission prompt, and a browser that refuses clipboard
+access (or a page not served over `localhost`/HTTPS) pastes nothing from it;
+the keyboard shortcuts and right-click paste are unaffected. A program's copy
+needs the same: an HTTPS or `localhost` page, focused when the copy happens.
 
 ## Running a verification step
 

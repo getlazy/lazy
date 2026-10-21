@@ -305,7 +305,8 @@ async function pairBranchless(root: string, resumeSessionId?: string, autonomous
   });
 
   // Capture conversation from JSONL files via the daemon.
-  // Returns null if no conversation found or if capture failed (daemon unavailable).
+  // Returns null if no conversation was found. With the daemon down it is
+  // written to the recovery directory and stored once the daemon runs.
   const sessionId = await captureConversation(root, beforeSnapshot, 'Pairing');
   if (sessionId) {
     console.log(`\nConversation captured (session ${sessionId.substring(0, 8)}...)`);
@@ -883,6 +884,10 @@ export async function commandPair(args: string[]): Promise<void> {
         ...(claudeSessionId ? { resumeSessionId: claudeSessionId } : {}),
         ...(autonomous ? { autonomous } : {}),
         ...(launcher ? { launcher } : { model: sessionModel }),
+        // A host session gets the SAME lazy tools as the container's: the task's
+        // own MCP token, served through the daemon, never a host-home config
+        // write. See src/supervisor/host-session-mcp.ts.
+        ...(useHost ? { taskMcp: { taskId: task.id, worktreePath, toolset: 'full' as const } } : {}),
         extraEnv: { LAZY_TASK: taskShortId },
       }));
     } finally {

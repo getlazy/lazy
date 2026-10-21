@@ -472,6 +472,12 @@ whoever owns the task's **current turn**. This means:
   when it makes a model or API call — not to the member who started it.
 - Between turns the placeholder is revoked, so calls from such a process fail
   with a 401 until the next turn starts.
+- Starting a turn leaves the container and its services running, even when the
+  new turn's owner holds a different kind of credential (an OAuth token rather
+  than an API key, or the reverse). The agent is handed that turn's placeholder
+  in the form its credential needs. A service keeps the placeholder the
+  container started with, so after such a change its own model calls are refused
+  until the container is next recreated.
 
 ## Human-only, by design
 

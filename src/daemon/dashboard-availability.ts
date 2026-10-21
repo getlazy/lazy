@@ -42,6 +42,17 @@ export function dashboardUrlFromStatus(
   return formatDashboardUrl(status.bindHost, status.webPort);
 }
 
+/**
+ * The `Web:` line value for `lazy daemon status` when no dashboard URL is
+ * served. Managed daemons say so explicitly (`managed` in the payload); an
+ * unmanaged daemon without a URL is a real bind failure.
+ */
+export function webOffLine(status: Pick<DaemonStatus, 'managed'>): string {
+  return status.managed === true
+    ? 'off (Lazy Teams serves the UI)'
+    : 'not bound (degraded — restart after freeing the port)';
+}
+
 /** Same payload, classified for the builder prompt (on vs off vs unreachable). */
 export function dashboardAvailabilityFromStatus(
   status: Pick<DaemonStatus, 'running' | 'webPort' | 'bindHost' | 'dashboardUrl'>,

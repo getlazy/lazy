@@ -29,17 +29,7 @@ import { browserSuiteSkipped, launchBrowser } from '../helpers/cdp-browser';
 const STALE_HEADLINE = 'Landing hub — no changes yet';
 
 async function waitFor(ctx: TestContext, taskId: string): Promise<void> {
-  // `lazy wait` can return while the task still reads `working` (a daemon
-  // wait race outside this suite's subject — raised separately). Waiting
-  // again is what a person would do; only a non-working status ends it.
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const result = await ctx.lazy(['wait', taskId]);
-    if (result.exitCode === 0) return;
-    if (!result.stdout.includes('is now working')) {
-      throw new Error(`wait failed for ${taskId}: ${result.stderr}\n${result.stdout}`);
-    }
-  }
-  throw new Error(`wait for ${taskId} kept returning while the task was still working`);
+  expectSuccess(await ctx.lazy(['wait', taskId]));
 }
 
 async function addCommit(ctx: TestContext, taskId: string, file: string, body: string) {

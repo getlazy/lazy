@@ -59,6 +59,10 @@ function makeCommit(): Commit {
  * assertions guard against a second one reappearing.
  */
 describe('commitDetailHtml', () => {
+  test('renders multiline commit text safely', () => {
+    const html = commitDetailHtml(makeTask(), { ...makeCommit(), message: 'Subject\n\nBody <script>' }, '');
+    expect(html).toContain('<pre class="commit-message-full">Subject\n\nBody &lt;script&gt;</pre>');
+  });
   test('renders light-DOM diff rows, not a shadow-DOM web component', () => {
     const html = commitDetailHtml(makeTask(), makeCommit(), SAMPLE_PATCH);
     // `rv-viewable` rides alongside `rv-file`: a file and a markdown card are

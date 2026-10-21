@@ -14,7 +14,7 @@
  * helpers, used everywhere, is what stops that from being per-site discipline.
  */
 
-import type { ResolvedConfig } from '../config/types';
+import type { ResolvedConfig, RoleTarget } from '../config/types';
 import type { Task } from '../types';
 import { type AgentProfile, profileForAgentName } from '../config/agent-profiles';
 import { roleTargetForProfile } from '../config/default-target';
@@ -32,6 +32,16 @@ import { displayId } from '../task/identity';
  */
 export function harnessForTask(config: ResolvedConfig, task: Task): string {
   return profileForAgentName(config, task.agent_id, `task ${displayId(task)}`).harness;
+}
+
+/**
+ * The target a task's launch runs on — its profile's harness, endpoint and
+ * credential slot, exactly as applyRunnerAgent hands it to the runner. What a
+ * per-turn decision about the launch env (turnCredentialCommandEnv) must read,
+ * so it cannot disagree with the launch.
+ */
+export function agentTargetForTask(config: ResolvedConfig, task: Task): RoleTarget {
+  return roleTargetForProfile(profileForAgentName(config, task.agent_id, `task ${displayId(task)}`));
 }
 
 /**

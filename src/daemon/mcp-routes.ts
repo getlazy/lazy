@@ -30,6 +30,7 @@ import type { Storage } from '../storage/interface';
 import { realignAfterDaemonWrite } from '../utils/worktree-ownership';
 import { INTERNAL_GIT_TOOL_NAME } from '../mcp/types';
 import { runWithGitAuthor } from '../identity/git-author';
+import { isReadOnlyTool } from '../mcp/tool-access';
 
 /**
  * HTTP status a daemon route should answer with for a handler error.
@@ -311,15 +312,20 @@ export async function handleMcpToolCall(
   logger.debug(`MCP tool call: ${toolName} (task=${taskId || 'builder'}, worktree=${worktreePath})`);
 
   // A commit this call makes (lazy_commit, a self-sync's merges, an accept)
-  // is authored by the person who asked for the turn; a turn nobody asked for
-  // falls through to the configured system identity (src/identity/git-author.ts).
+  // is authored by the person who asked for the turn — for a builder session,
+  // the member it belongs to; a turn nobody asked for falls through to the
+  // configured system identity (src/identity/git-author.ts).
   //
   // Inside that, a turn this call LAUNCHES runs as whoever asked for it (see
   // launchScope below): the caller task's turn owner, or the member a builder
   // session belongs to.
   const launch = await launchScope(storage, projectRoot, taskId, toolName, args, ctx.actorPerson ?? null, builderTokenLabel ?? null);
-  return runWithGitAuthor(ctx.actorPerson ?? null, () =>
-    launch(() => dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args)));
+  // A builder call has no task, so no actorPerson; its member scopes the
+  // inner call (a null scope is a pass-through, so exactly one applies).
+  // A read writes no commit, so it needs no lookup.
+  const builderMember = taskId || isReadOnlyTool(toolName) ? null : await builderSessionMember(storage, projectRoot, builderTokenLabel ?? null);
+  return runWithGitAuthor(ctx.actorPerson ?? null, () => runWithGitAuthor(builderMember, () =>
+    launch(() => dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args))));
 }
 
 /**
@@ -345,6 +351,32 @@ async function launchScope(
   const caller = taskId ? await storage.getTask(taskId) : null;
   const origin: LaunchOrigin = caller ? { kind: 'agent', parentTask: displayId(caller) } : { kind: 'builder' };
   return (fn) => runWithLaunchOrigin(origin, fn);
+}
+
+/**
+ * The member a builder session belongs to, found through the label of the MCP
+ * token the daemon authenticated (`builder-<builderId>`) — the same binding
+ * {@link builderLaunchOwnerRequest} relies on, and trusted for the same
+ * reasons. Managed mode only: on a laptop the builder is the daemon's own git
+ * identity already. Null for an unknown label, an ended session, or a session
+ * with no member.
+ */
+export async function builderSessionMember(
+  storage: Storage,
+  projectRoot: string,
+  builderTokenLabel: string | null,
+): Promise<{ email: string } | null> {
+  if (!isManagedMode() || !builderTokenLabel?.startsWith('builder-')) return null;
+  const builderId = builderTokenLabel.slice('builder-'.length);
+  if (!builderId) return null;
+  try {
+    const session = (await storage.listBuilderSessions(projectRoot))
+      .find((s) => s.builderId === builderId && s.state !== 'ended');
+    return session?.memberEmail ? { email: session.memberEmail } : null;
+  } catch (err) {
+    logger.debug(`Could not resolve the member behind builder ${builderId}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 /**
@@ -376,20 +408,17 @@ export async function builderLaunchOwnerRequest(
   args: Record<string, unknown>,
   builderTokenLabel: string | null,
 ): Promise<TurnOwnerRequest | null> {
-  if (!isManagedMode() || !AGENT_TURN_LAUNCHING_TOOLS.has(toolName)) return null;
-  if (!builderTokenLabel?.startsWith('builder-')) return null;
-  const builderId = builderTokenLabel.slice('builder-'.length);
+  if (!AGENT_TURN_LAUNCHING_TOOLS.has(toolName)) return null;
   const ref = typeof args.task_id === 'string' ? args.task_id : '';
-  if (!builderId || !ref) return null;
+  if (!ref) return null;
+  const member = await builderSessionMember(storage, projectRoot, builderTokenLabel);
+  if (!member) return null;
   try {
-    const session = (await storage.listBuilderSessions(projectRoot))
-      .find((s) => s.builderId === builderId && s.state !== 'ended');
-    if (!session?.memberEmail) return null;
     const resolved = await storage.resolveTask(ref);
     if (!resolved.task) return null;
-    return { taskId: resolved.task.id, owner: { email: session.memberEmail, spendable: true } };
+    return { taskId: resolved.task.id, owner: { email: member.email, spendable: true } };
   } catch (err) {
-    logger.debug(`Could not resolve the member behind builder ${builderId} for '${ref}': ${err instanceof Error ? err.message : String(err)}`);
+    logger.debug(`Could not resolve '${ref}' to name the builder's turn owner: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }

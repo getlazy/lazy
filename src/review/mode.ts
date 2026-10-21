@@ -588,6 +588,13 @@ export function reviewOverrideMetadata(o: ReviewSettingsOverrides): Record<strin
   };
 }
 
+export function reviewOverridesApplied(
+  overrides: ReviewSettingsOverrides,
+  metadata: Record<string, string> | undefined | null,
+): boolean {
+  return Object.entries(reviewOverrideMetadata(overrides)).every(([key, value]) => metadata?.[key] === value);
+}
+
 /** What was set, for a confirmation line. Empty string when nothing was. */
 export function describeReviewOverrides(o: ReviewSettingsOverrides): string {
   const parts: string[] = [];

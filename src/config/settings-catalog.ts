@@ -147,6 +147,7 @@ export const SETTINGS_CATALOG: Record<string, SettingEntry> = {
   'agents.*.endpoint': { group: 'agents', label: 'Profile endpoint', summary: 'Where a named profile\'s requests are sent. Paid by the credential each member connects for its endpoint.', kind: 'table', effect: 'on-use' },
   'agents.*.credential': { group: 'agents', label: 'Profile credential', summary: 'The authentication provider for an inline endpoint connection.', kind: 'table', effect: 'on-use' },
   'agents.*.named_endpoint': { group: 'agents', label: 'Profile named endpoint', summary: 'A named endpoint a profile runs against instead of an inline endpoint.', kind: 'table', effect: 'on-use' },
+  'agents.*.reasoning': { group: 'agents', label: 'Profile reasoning', summary: 'false marks a pi profile\'s model as unable to reason, so the task\'s effort is not sent.', kind: 'table', effect: 'next-turn' },
   'agents.*.tiers[].endpoint': { group: 'agents', label: 'Tier endpoint', summary: 'The named endpoint one tier of a tiered profile runs against.', kind: 'table', effect: 'on-use' },
   'agents.*.tiers[].model': { group: 'agents', label: 'Tier model', summary: 'The model one tier of a tiered profile asks for.', kind: 'table', effect: 'on-use' },
   'agents.*.tiers[].threshold_percent': { group: 'agents', label: 'Tier threshold', summary: 'How full a tier\'s usage window may get before requests move to the next tier.', kind: 'table', effect: 'on-use' },

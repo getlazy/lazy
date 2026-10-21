@@ -63,6 +63,12 @@ export interface FakeAgentInvocation {
    */
   pid: number;
   /**
+   * The pid of the process that launched the agent — on the host-process seam,
+   * the task's supervisor (the stand-in for its container). Two turns with the
+   * same `ppid` ran in the same, reused supervisor; a recreated one has a new pid.
+   */
+  ppid: number;
+  /**
    * The environment the agent was actually launched with, as far as the fake
    * records it: the auth-shaped keys (credential slots plus endpoint overrides)
    * always, plus any key a test asked for via `recordAgentEnvKeys`. `null` means
@@ -236,7 +242,7 @@ try {
 
 fs.appendFileSync(
   invocationsPath,
-  JSON.stringify({ argv, ...(typeof recordedStdin === 'string' ? { stdin: recordedStdin } : {}), cwd: process.cwd(), at: Date.now(), pid: process.pid, env: recordedEnv }) + '\n',
+  JSON.stringify({ argv, ...(typeof recordedStdin === 'string' ? { stdin: recordedStdin } : {}), cwd: process.cwd(), at: Date.now(), pid: process.pid, ppid: process.ppid, env: recordedEnv }) + '\n',
 );
 
 function loadScenario() {

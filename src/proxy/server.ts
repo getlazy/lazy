@@ -94,6 +94,7 @@ import { enforceResponseBody } from './enforce';
 import { extractUsage, readBodyTimed, teeUsageStream, type UsageWire } from './usage';
 import { isSseContentType, withSseKeepAlive } from './keepalive';
 import {
+  CLIENT_ABORT_MESSAGE,
   DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
   describeUpstreamFailure,
   isUpstreamTimeout,
@@ -842,10 +843,12 @@ async function forwardCursor(
       ...(bodyOverride === null && hasBody ? { duplex: 'half' } : {}),
       // lazy's own ceiling instead of Bun's hidden one — same rule on every
       // route, so no upstream can be reaped at a number nobody chose.
-      ...upstreamFetchOptions(ctx.upstreamTimeoutSeconds),
+      ...upstreamFetchOptions(ctx.upstreamTimeoutSeconds, req.signal),
     } as RequestInit);
   } catch (err) {
-    const message = describeUpstreamFailure(err, cursorUpstream, ctx.upstreamTimeoutSeconds);
+    const message = req.signal.aborted
+      ? CLIENT_ABORT_MESSAGE
+      : describeUpstreamFailure(err, cursorUpstream, ctx.upstreamTimeoutSeconds);
     ctx.auditQueue.enqueue({ ...base, status: null, error: message, durationMs: Date.now() - ctx.startMs });
     logger.warn(`[proxy] seq=${ctx.seq} cursor upstream ${cursorUpstream} unreachable: ${message}`);
     return new Response(
@@ -1824,7 +1827,7 @@ export function createProxyServer(
           // lazy's own ceiling, replacing Bun's hidden default fetch timeout.
           // Without this a local model that is merely slow to produce its first
           // byte is aborted mid-prefill and reported as an unreachable upstream.
-          ...upstreamFetchOptions(upstreamTimeoutSeconds),
+          ...upstreamFetchOptions(upstreamTimeoutSeconds, req.signal),
         } as RequestInit);
       };
 
@@ -1871,6 +1874,12 @@ export function createProxyServer(
           // Unreachable, or past lazy's own ceiling. Reroute to the next target
           // if one exists, else this is the terminal error (unchanged behavior
           // when no fallback chain).
+          if (req.signal.aborted) {
+            // Client is gone: not an upstream failure, so never fail over.
+            forwardError = CLIENT_ABORT_MESSAGE;
+            if (firstTrigger === null) firstTrigger = 'client_abort';
+            break;
+          }
           forwardError = describeUpstreamFailure(err, target.upstream, upstreamTimeoutSeconds);
           if (firstTrigger === null) firstTrigger = isUpstreamTimeout(err) ? 'timeout' : 'unreachable';
           if (!isLast) {
@@ -1900,10 +1909,26 @@ export function createProxyServer(
                 `[proxy] seq=${currentSeq} primary ${target.upstream} 429 with Retry-After=${wait}s ` +
                   `(≤ ${retryAfterThreshold}s); waiting then retrying primary before failover`,
               );
-              await sleep(wait * 1000);
+              if (!req.signal.aborted) {
+                let onAbort: () => void = () => {};
+                await Promise.race([
+                  sleep(wait * 1000),
+                  new Promise<void>((resolve) => {
+                    onAbort = resolve;
+                    req.signal.addEventListener('abort', onAbort, { once: true });
+                  }),
+                ]);
+                req.signal.removeEventListener('abort', onAbort);
+              }
               try {
                 resp = await doFetch(target);
               } catch (err) {
+                if (req.signal.aborted) {
+                  // Client is gone: not an upstream failure, so never fail over.
+                  forwardError = CLIENT_ABORT_MESSAGE;
+                  if (firstTrigger === null) firstTrigger = 'client_abort';
+                  break;
+                }
                 forwardError = describeUpstreamFailure(err, target.upstream, upstreamTimeoutSeconds);
                 if (firstTrigger === null) firstTrigger = isUpstreamTimeout(err) ? 'timeout' : 'unreachable';
                 if (!isLast) {

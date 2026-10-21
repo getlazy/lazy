@@ -16,7 +16,11 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { DaemonClient, buildDaemonRpcRequest } from '../../src/daemon/client';
-import { writeTeamsLogin, clearTeamsLogin } from '../../src/teams/login';
+import { writeTeamsLogin, clearTeamsLogin, corruptIndexMeansLocal } from '../../src/teams/login';
+import { CredentialIndexParseError } from '../../src/credentials/store';
+import { writeWebPort, generateToken, getDaemonTcpTarget } from '../../src/daemon/lifecycle';
+import { getCredentialIndexPath } from '../../src/daemon/paths';
+import { writeFile } from 'fs/promises';
 
 describe('DaemonClient.create — bound clone (design doc §4.7)', () => {
   let dir: string;
@@ -80,5 +84,53 @@ describe('DaemonClient.create — bound clone (design doc §4.7)', () => {
     // Back to "no daemon reachable" — there is no local daemon in this temp
     // dir either, which is the correct answer once the binding is gone.
     expect(await DaemonClient.create(dir)).toBeNull();
+  });
+
+  test('binding a clone that once ran a local daemon forgets it, so a corrupt index cannot route to it', async () => {
+    // INVARIANT: a Teams-bound clone has no recorded local daemon target.
+    // DaemonClient.create falls back to a recorded local target when the
+    // credential index will not parse, trusting that a bound clone never has
+    // one — so binding must clear it, or a corrupt index silently sends a
+    // bound clone's writes to a stale local store.
+    writeWebPort(dir, 45678);
+    generateToken(dir);
+    expect(getDaemonTcpTarget(dir)).not.toBeNull();
+
+    await writeTeamsLogin(dir, {
+      teamsUrl: 'https://teams.example.com',
+      token: 'lz_cli_token_abc',
+      project: 'acme/lazy-toy',
+      projectId: '42',
+    });
+    expect(getDaemonTcpTarget(dir)).toBeNull();
+
+    await writeFile(getCredentialIndexPath(dir), '{ not json');
+    await expect(DaemonClient.create(dir)).rejects.toBeInstanceOf(CredentialIndexParseError);
+  });
+
+  // INVARIANT: with an unreadable credential index, a clone counts as local
+  // only when a local daemon target is recorded — one rule, shared by the
+  // client and the dispatcher's auto-start gate, so the dispatcher cannot start
+  // a local daemon (writing a fresh target) for what may be a bound clone.
+  test('a corrupt index means local only when a local target is recorded', () => {
+    const parseError = new CredentialIndexParseError('bad json');
+    expect(corruptIndexMeansLocal(dir, parseError)).toBe(false);
+    writeWebPort(dir, 45678);
+    expect(corruptIndexMeansLocal(dir, parseError)).toBe(true);
+    expect(corruptIndexMeansLocal(dir, new Error('other'))).toBe(false);
+  });
+
+  test('a clone bound before login cleared it drops its stale local target on the next command', async () => {
+    await writeTeamsLogin(dir, {
+      teamsUrl: 'https://teams.example.com',
+      token: 'lz_cli_token_abc',
+      project: 'acme/lazy-toy',
+      projectId: '42',
+    });
+    writeWebPort(dir, 45678);
+    expect(getDaemonTcpTarget(dir)).not.toBeNull();
+
+    expect(await DaemonClient.create(dir)).not.toBeNull();
+    expect(getDaemonTcpTarget(dir)).toBeNull();
   });
 });

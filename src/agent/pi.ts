@@ -72,6 +72,9 @@ const LAUNCH_BINARY = new PiPackaging().binaryName();
  */
 export const LAZY_PI_PROVIDER_ENV = 'LAZY_PI_PROVIDER';
 
+/** `off` when the profile wrote `reasoning = false`: models.json then declares the model non-reasoning. */
+export const LAZY_PI_REASONING_ENV = 'LAZY_PI_REASONING';
+
 /** The pi providers lazy's proxy can front today. */
 export const PI_SUPPORTED_PROVIDERS = ['anthropic', 'ollama', 'openai'] as const;
 export type PiProvider = (typeof PI_SUPPORTED_PROVIDERS)[number];

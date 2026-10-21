@@ -76,11 +76,13 @@ import {
   protectionDetailRow,
   serveDetailRow,
   taskTurnsSectionHtml,
+  latestExchangeHtml,
   taskCommitsSectionHtml,
   taskRaisedSectionHtml,
   taskPromptSectionHtml,
   getTaskStatus,
   type TaskChunkOrder,
+  type TaskTurnsView,
 } from './templates';
 import {
   taskTabStripHtml,
@@ -160,6 +162,8 @@ export interface TaskPageInput {
   baseBranch?: string;
   serve?: TaskServeState | null;
   chunkOrder?: TaskChunkOrder;
+  /** Turns tab: the conversation (default) or the raw chunks (`?view=chunks`). */
+  turnsView?: TaskTurnsView;
   shell?: ShellAvailability | null;
   controls?: ServicesCardControls;
   activity?: ReviewActivity | null;
@@ -814,6 +818,7 @@ function tabBodyHtml(input: TaskPageInput): string {
           comments: input.comments,
           journal: input.journal,
           duplicatedCodes: input.duplicatedCodes,
+          view: input.turnsView ?? 'conversation',
         }, input.markdown);
         return turns.trim() ? turns : emptyTab('No turns yet.');
       });
@@ -916,6 +921,9 @@ function tabBodyHtml(input: TaskPageInput): string {
         // The ANSWER, from the one resolver — never the turns for this page to
         // re-derive finality from.
         final: buildShowFinal(input.turns),
+        // The answer lands where the question was asked: the latest
+        // feedback and the agent's reply to it, on this tab.
+        latestExchangeHtml: latestExchangeHtml(task, session, input.turns, input.duplicatedCodes, input.markdown),
       });
     }
   }

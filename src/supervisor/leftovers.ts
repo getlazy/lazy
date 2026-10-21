@@ -30,7 +30,7 @@
 import type { AgentResponse } from '../types';
 import type { Agent } from '../agent/interface';
 import type { AgentActivityStream } from '../agent/activity-stream';
-import { listUncommittedPaths } from '../git/operations';
+import { listUncommittedPaths, readWorktreeMergeState, isMidMerge, describeMergeState } from '../git/operations';
 import { log, logError, logWarn } from './log';
 import { execWithWatchdog } from './watchdog';
 import commitLeftoversTemplate from '../prompts/commit-leftovers.md' with { type: 'text' };
@@ -63,6 +63,24 @@ export async function detectUncommittedPaths(worktreePath: string): Promise<stri
     );
   }
   return paths;
+}
+
+/**
+ * What a turn's END records as left uncommitted. A worktree parked MID-MERGE
+ * records nothing (`null`): its dirty paths are the merge's conflicts, not work
+ * about to be dropped, and accept / `show` / `status` already report that state
+ * via `describeMergeState`. Ordinary dirty-worktree reporting is unchanged.
+ * `midMerge` lets the caller tell "mid-merge" from "scan failed" (both null).
+ */
+export async function detectTurnEndLeftovers(
+  worktreePath: string,
+): Promise<{ paths: string[] | null; midMerge: boolean }> {
+  const mergeState = await readWorktreeMergeState(worktreePath);
+  if (isMidMerge(mergeState)) {
+    log(`[leftovers] Turn ending mid-merge, not recording uncommitted paths: ${describeMergeState(mergeState)}`);
+    return { paths: null, midMerge: true };
+  }
+  return { paths: await detectUncommittedPaths(worktreePath), midMerge: false };
 }
 
 /** Render the detected paths for a prompt or a message, capped and counted. */

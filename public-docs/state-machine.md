@@ -258,7 +258,7 @@ Two things that look similar are not that:
 A task that reads `working(not-alive)` for more than a minute or so is a bug
 worth reporting. Include the `liveness` and `session` parts of
 `lazy show <task> --json` and the output of
-`lazy daemon logs <short-id> --no-follow -n 20000`, where `<short-id>` is the
+`lazy daemon logs <short-id> -n 20000`, where `<short-id>` is the
 first 8 characters of the task's `id` in that JSON (daemon log lines name tasks
 that way).
 

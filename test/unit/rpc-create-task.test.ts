@@ -19,6 +19,7 @@ import {
 } from '../../src/daemon/rpc-handlers';
 import { enableInProcessTestMode } from '../helpers/in-process-test-mode';
 import { pinConfig } from '../helpers/pin-config';
+import { initGitRepo } from '../helpers/git-repo';
 
 enableInProcessTestMode();
 
@@ -28,6 +29,8 @@ describe('createTask RPC', () => {
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'lazy-rpc-create-'));
+    // INVARIANT: writing RPC tests pin local identity so the developer's global git config cannot decide the result.
+    await initGitRepo(root);
     await writeFile(
       join(root, 'lazy.toml'),
       `[storage]\nbackend = "external"\nexternal_path = "${join(root, 'store')}"\n`,

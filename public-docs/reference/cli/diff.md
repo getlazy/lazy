@@ -26,7 +26,7 @@ Examples:
   lazy diff abc123                    # Summary of all changes vs upstream
   lazy diff abc123 --full             # Full diff vs upstream
   lazy diff abc123 --region task:fix-x --full   # Just that region's files
-  lazy diff abc123 --turn latest      # Diff for the most recent turn
+  lazy diff abc123 --turn latest      # Diff for the most recent work turn
   lazy diff abc123 --turn 1           # Diff for turn 1
   lazy diff abc123 --lines 10..50     # Show only lines 10-50 of diff output
   lazy diff abc123 --full --lines 1..100  # First 100 lines of full diff

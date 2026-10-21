@@ -107,8 +107,9 @@ When the project runs under Lazy Teams, each task's Services card has an
 to the task, so the service opens from any browser signed in to Teams as a
 member of the project — not only on the machine running it — with WebSockets
 and hot reload passing through. The service gets a host name of its own under
-the install's services host (`<task>--<service>--p<project>.<services host>`),
-so, as with `lazy url`, every task keeps its own cookie jar. What an install
+the install's services host — the task, the port, the project and the team, then
+a short id (`fix-login-3000-web-acme-k3x73f9a1c2e.<services host>`) — so the
+address can be read and shared, and as with `lazy url`, every task keeps its own cookie jar. What an install
 needs for that name to resolve is in
 [Self-hosting Lazy Teams](self-hosting-lazy-teams.md#reaching-a-tasks-running-services).
 
@@ -117,14 +118,47 @@ the `lazy url` command is not shown there: under Teams, `lazy.localhost` names
 belong to the project's own machine and answer nowhere else. An install with
 no services host shows no address and says what an operator must set up.
 
-Opening a service that nothing is serving — the task's environment is down, or
-nothing listens on the port — takes you to the task's **Services** tab, which
-says what is running and offers **Run services**, which starts the task's
-environment first if it is down and shows each step as it happens.
+Opening a declared service that is not answering yet — the task's environment
+is down, or nothing listens on the port — shows a page that says whether
+something is bringing it up and how long it has waited, checks again every few
+seconds and opens the service as soon as it answers. When nothing is starting
+it, the page offers **Run services**, which starts the task's environment first
+if it is down and shows each step as it happens.
 
 A server started inside a task's container must listen on all interfaces
 (`0.0.0.0`), not only on the container's loopback, to be reachable through the
 published port — `BINDING=0.0.0.0 bin/rails server`, `vite --host`, and so on.
+
+### Previewing a task's app or files in Teams
+
+- **A preview a reviewer can open:** copy the address beside **Open** on the
+  task's Services card and share it. Anyone who is a member of the project can
+  open it from their own browser; if they are not signed in, Teams' sign-in
+  comes first and then takes them to the service.
+- **The task's changes:** the task's **Changes** tab shows every file the task
+  changed, as a diff (see
+  [Changes](lazy-teams-task-review.md#changes-diff)).
+- **The task's files themselves:** the task's **Shell** tab opens a terminal in
+  the task's environment, where you can look at any file in its worktree (see
+  [Shell](lazy-teams-task-review.md#shell-working-inside-the-tasks-environment)).
+- **The worktree in a browser:** serve it as a service. Declare a port in the
+  project's `lazy.toml` and set
+  the project's Start services command (on the project's configuration page,
+  **Configure services**) to a static file server, for example:
+
+  ```toml
+  [serve]
+  ports = [8000]
+  ```
+
+  with Start services set to `python3 -m http.server 8000 --bind 0.0.0.0`
+  (the command runs in the worktree, and needs Python in the task's image).
+  **Run services** on the task starts it, and **Open** browses the worktree.
+  The command runs in every task's environment, so a project that already has a
+  dev server usually serves that instead.
+
+`lazy url` and `lazy forward` open ports on the machine running the project,
+which is what they are for on a solo install; under Teams, use the service link.
 
 ### Links in the pull request
 
@@ -269,4 +303,10 @@ machine instead, which is the right thing for git and host editors.
 If the task's container is not running, `lazy shell` starts it first and says so
 — which also means the container is created fresh, picking up the current
 `[serve]`.
+
+## The product at a commit, without a task
+
+The same services, links and shell are available for the default branch, any
+other branch, or a specific commit, with no task involved — see
+[Running the product at any commit](running-a-commit.md).
 

@@ -5,6 +5,8 @@ import { readFile, writeFile, unlink, mkdtemp, mkdir } from 'fs/promises';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectError, expectFailure, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { installFakeDocker } from '../helpers/fake-docker';
+import { calculateImageInputsHash, calculateImageInputManifest, IMAGE_TAG } from '../../src/capture/claude';
 
 describe('lazy upgrade', () => {
   let ctx: TestContext;
@@ -503,4 +505,52 @@ describe('lazy upgrade', () => {
     expectSuccess(upgradeResult);
     expectOutput(upgradeResult, 'Upgrade complete');
   });
+
+  // INVARIANT: a background build that fails while still in flight aborts the upgrade before anything is stopped. Failing after the stops would interrupt tasks for an upgrade that cannot finish.
+  test('--force: a slow failing build aborts before the stop step', async () => {
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { LAZY_MOCK_BUILD_FAIL: 'Container build failed with exit code 1', LAZY_MOCK_BUILD_DELAY_MS: '400' },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain('Upgrade aborted');
+    expect(result.stdout).not.toContain('No running containers to stop');
+    expect(result.stdout).not.toContain('Restarting daemon');
+  });
+});
+
+describe('lazy upgrade --images with a failing docker build', () => {
+  let ctx: TestContext;
+
+  afterEach(async () => {
+    await ctx.cleanup();
+  });
+
+  // INVARIANT: a failed --images rebuild leaves the current image in place and exits non-zero. Removing the image before building turned a failed build into no image at all.
+  test('keeps the existing image and exits non-zero', async () => {
+    const proofDir = await mkdtemp(join(tmpdir(), 'lazy-upgrade-images-fail-'));
+    const docker = await installFakeDocker(proofDir);
+    ctx = await setupTestLazy({ fakeClaude: true });
+    const configPath = join(ctx.root, 'lazy.toml');
+    const before = await readFile(configPath, 'utf-8');
+    const onDocker = before.replace('type = "dangerously-host-process-without-any-isolation"', 'type = "docker"');
+    if (onDocker === before) throw new Error('could not restore [runner] type = "docker" in the generated lazy.toml');
+    await writeFile(configPath, onDocker);
+    const ref = `lazy-runner:${IMAGE_TAG}`;
+    await docker.seedImage(ref, {
+      dockerfileHash: await calculateImageInputsHash(ctx.root, true),
+      inputs: await calculateImageInputManifest(ctx.root, true),
+    });
+    await docker.failBuilds();
+
+    const result = await ctx.lazy(['upgrade', '--images'], {
+      env: { PATH: `${docker.binDir}:${process.env.PATH ?? ''}` },
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain('Image refresh complete');
+    const calls = await docker.invocations();
+    expect(calls.some(c => c.startsWith('build'))).toBe(true);
+    expect(calls.some(c => c.startsWith('rmi'))).toBe(false);
+    expect(calls.some(c => c.startsWith('image inspect') && c.includes(ref))).toBe(true);
+  }, 120_000);
 });

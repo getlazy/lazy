@@ -2,7 +2,7 @@
 
 Captured dialogues with the project's builder (**Builders** in the navigation bar, address `/builders`). The page is read-only: conversations are recorded as they happen and listed here. The badge on the navigation entry counts conversations captured or extended since you last opened this page in this browser. To bring in older conversations, see [Importing conversations](../../conversation-import.md).
 
-![The Builders page with its search box and an empty list](../../images/dashboard/builders.png)
+![The Builders page: a search box and a list with one builder conversation, showing its id, start and end time, turn counts and title](../../images/dashboard/builders.png)
 
 ## Regions
 
