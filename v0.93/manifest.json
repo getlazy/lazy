@@ -1,0 +1,3054 @@
+{
+  "version": "v0.93",
+  "pages": [
+    {
+      "path": "accept-check",
+      "source": "accept-check.md",
+      "file": "accept-check/index.html",
+      "title": "The accept check",
+      "anchors": [
+        "the-accept-check",
+        "the-defect",
+        "half-one-the-check",
+        "where-it-runs-and-why",
+        "what-a-refusal-looks-like",
+        "the-override",
+        "cost",
+        "half-two-reverted-protected-files",
+        "related"
+      ]
+    },
+    {
+      "path": "agent-container",
+      "source": "agent-container.md",
+      "file": "agent-container/index.html",
+      "title": "The agent container",
+      "anchors": [
+        "the-agent-container",
+        "the-default-image",
+        "giving-your-project-its-own-image",
+        "when-dockerfilelazy-does-not-build",
+        "scripts-that-call-node",
+        "the-headless-browser",
+        "when-the-image-is-built",
+        "watching-rebuilding-and-cancelling-the-build",
+        "resetting-a-machines-docker-storage",
+        "rebuilding",
+        "when-an-agent-cannot-start",
+        "what-the-container-can-and-cannot-change-in-git",
+        "git-hooks-do-not-run-on-lazys-own-git"
+      ]
+    },
+    {
+      "path": "architecture/agents-and-proxy",
+      "source": "architecture/agents-and-proxy.md",
+      "file": "architecture/agents-and-proxy/index.html",
+      "title": "Agents, the proxy and credentials",
+      "anchors": [
+        "agents-the-proxy-and-credentials",
+        "what-the-proxy-does",
+        "placeholder-tokens",
+        "per-harness",
+        "the-credential-store",
+        "how-usage-limits-are-read"
+      ]
+    },
+    {
+      "path": "architecture/daemon-and-state",
+      "source": "architecture/daemon-and-state.md",
+      "file": "architecture/daemon-and-state/index.html",
+      "title": "The daemon and its clients",
+      "anchors": [
+        "the-daemon-and-its-clients",
+        "the-store",
+        "what-the-daemon-also-does"
+      ]
+    },
+    {
+      "path": "architecture/forges",
+      "source": "architecture/forges.md",
+      "file": "architecture/forges/index.html",
+      "title": "Forges",
+      "anchors": [
+        "forges",
+        "when-a-pull-request-exists",
+        "what-lazy-reads",
+        "what-lazy-writes",
+        "where-an-accept-merges"
+      ]
+    },
+    {
+      "path": "architecture/index",
+      "source": "architecture/index.md",
+      "file": "architecture/index/index.html",
+      "title": "Architecture",
+      "anchors": [
+        "architecture"
+      ]
+    },
+    {
+      "path": "architecture/tasks-in-git",
+      "source": "architecture/tasks-in-git.md",
+      "file": "architecture/tasks-in-git/index.html",
+      "title": "Git integration",
+      "anchors": [
+        "git-integration",
+        "worktrees-and-branches",
+        "the-task-tree",
+        "sync",
+        "accept"
+      ]
+    },
+    {
+      "path": "architecture/what-runs-where",
+      "source": "architecture/what-runs-where.md",
+      "file": "architecture/what-runs-where/index.html",
+      "title": "What runs where",
+      "anchors": [
+        "what-runs-where",
+        "on-the-host",
+        "in-a-task-container",
+        "what-a-container-can-reach",
+        "agents-always-run-in-containers",
+        "lazy-teams"
+      ]
+    },
+    {
+      "path": "artifacts",
+      "source": "artifacts.md",
+      "file": "artifacts/index.html",
+      "title": "Task artifacts",
+      "anchors": [
+        "task-artifacts",
+        "dashboard",
+        "why-this-exists",
+        "artifacts-are-data-never-guidance",
+        "delivery-materialized-into-the-worktree",
+        "publishing-back",
+        "bounds",
+        "names",
+        "origin",
+        "surfaces",
+        "lazy-teams",
+        "events"
+      ]
+    },
+    {
+      "path": "builder-scratch-dir",
+      "source": "builder-scratch-dir.md",
+      "file": "builder-scratch-dir/index.html",
+      "title": "Builder scratch dir",
+      "anchors": [
+        "builder-scratch-dir",
+        "why-it-exists",
+        "the-boundary-builder--human-never-builder--agent",
+        "container-builder-contract",
+        "it-is-captured-into-the-project-store",
+        "what-capture-does-and-does-not-do",
+        "finding-it",
+        "lifecycle",
+        "overriding-the-location"
+      ]
+    },
+    {
+      "path": "cluster-tasks",
+      "source": "cluster-tasks.md",
+      "file": "cluster-tasks/index.html",
+      "title": "Cluster tasks",
+      "anchors": [
+        "cluster-tasks",
+        "creating-one",
+        "what-the-driver-does",
+        "how-many-children-run-at-once",
+        "how-many-rounds-one-child-may-have",
+        "protected-files-are-decided-once-at-the-cluster",
+        "children-run-your-end-of-work-rules",
+        "it-keeps-its-own-branch-current",
+        "children-it-cannot-finish",
+        "which-agent-the-children-run-on",
+        "watching-it",
+        "stopping-and-resuming",
+        "if-a-clusters-turn-is-killed",
+        "cluster-tasks-and-the-lazy-loop-command",
+        "what-a-cluster-does-not-do"
+      ]
+    },
+    {
+      "path": "comparing-runs",
+      "source": "comparing-runs.md",
+      "file": "comparing-runs/index.html",
+      "title": "Comparing runs: lazy clone --same-base",
+      "anchors": [
+        "comparing-runs-lazy-clone---same-base",
+        "what---same-base-does",
+        "options",
+        "when-the-starting-commit-is-gone"
+      ]
+    },
+    {
+      "path": "conversation-import",
+      "source": "conversation-import.md",
+      "file": "conversation-import/index.html",
+      "title": "Importing Claude Code conversations",
+      "anchors": [
+        "importing-claude-code-conversations",
+        "builders-one-conversation-however-many-session-files",
+        "who-had-the-conversation",
+        "live-capture-two-paths-both-automatic",
+        "capture-never-shortens-a-conversation",
+        "what-is-deliberately-not-captured",
+        "local-command-transcripts",
+        "cleaning-up-conversations-stored-before-this-filter-existed",
+        "other-sessions-lazy-does-not-capture",
+        "one-shots-never-become-your-resume-target",
+        "where-a-one-shot-runs",
+        "how-long-a-one-shot-may-run",
+        "purging-housekeeping-conversations-captured-before-the-marker",
+        "when-live-capture-is-not-running",
+        "what-a-builder-session-tells-you-when-its-capture-failed",
+        "one-surface-lazy-import-conversation",
+        "where-it-looks-multi-root-discovery",
+        "bulk-import-never-writes-silently",
+        "recovery-is-the-same-flow",
+        "using-what-is-stored",
+        "in-the-browser",
+        "turning-part-of-a-conversation-into-a-task",
+        "asking-instead-of-reading-lazy-ask-conversation-id",
+        "transcripts-too-large-for-one-pass",
+        "onboarding-lazy-init-offers-to-inherit-history"
+      ]
+    },
+    {
+      "path": "credentials",
+      "source": "credentials.md",
+      "file": "credentials/index.html",
+      "title": "Credentials",
+      "anchors": [
+        "credentials",
+        "quick-start",
+        "commands",
+        "storing-a-credential",
+        "when-a-stored-credential-takes-effect",
+        "named-credentials",
+        "where-credentials-are-stored",
+        "if-a-stored-credential-goes-bad",
+        "precedence-the-environment-always-wins",
+        "which-credential-does-your-project-actually-need",
+        "when-something-is-wrong",
+        "the-credential-store-says-a-credential-is-stored-but-it-could-not-be-loaded",
+        "agent-api-keys",
+        "running-codex-on-a-chatgpt-subscription",
+        "services-and-background-processes-in-a-task-container",
+        "human-only-by-design"
+      ]
+    },
+    {
+      "path": "deploying-lazy-teams-digitalocean",
+      "source": "deploying-lazy-teams-digitalocean.md",
+      "file": "deploying-lazy-teams-digitalocean/index.html",
+      "title": "Deploying Lazy Teams on DigitalOcean with Kamal",
+      "anchors": [
+        "deploying-lazy-teams-on-digitalocean-with-kamal",
+        "which-path-is-for-you",
+        "what-you-need",
+        "1-prepare-the-droplet",
+        "firewall-for-a-private-install",
+        "2-prepare-your-laptop",
+        "verify-secrets-before-deploy",
+        "3-configure-kamal",
+        "building-from-source-maintainers",
+        "4-choose-an-access-method",
+        "option-a-ssh-tunnel-default--not-exposed",
+        "option-b-tailscale",
+        "option-c-public-https-with-lets-encrypt",
+        "5-deploy",
+        "6-smoke-checks",
+        "upgrading",
+        "backing-up-and-moving-off-the-box",
+        "what-this-guide-cannot-verify-for-you",
+        "getting-help"
+      ]
+    },
+    {
+      "path": "explanation/daemon-and-proxy",
+      "source": "explanation/daemon-and-proxy.md",
+      "file": "explanation/daemon-and-proxy/index.html",
+      "title": "The daemon, the task container and the proxy",
+      "anchors": [
+        "the-daemon-the-task-container-and-the-proxy",
+        "why-it-exists",
+        "the-daemon-owns-state",
+        "the-task-container",
+        "the-proxy-and-credential-injection",
+        "how-it-shows-up",
+        "limits"
+      ]
+    },
+    {
+      "path": "explanation/lazy-teams",
+      "source": "explanation/lazy-teams.md",
+      "file": "explanation/lazy-teams/index.html",
+      "title": "Lazy Teams",
+      "anchors": [
+        "lazy-teams",
+        "why-it-exists",
+        "how-it-works",
+        "how-it-shows-up-per-surface",
+        "whose-work-and-whose-credentials",
+        "limits"
+      ]
+    },
+    {
+      "path": "explanation/review-and-accept",
+      "source": "explanation/review-and-accept.md",
+      "file": "explanation/review-and-accept/index.html",
+      "title": "Review and accept",
+      "anchors": [
+        "review-and-accept",
+        "why-it-exists",
+        "review-modes",
+        "what-accept-checks-first",
+        "the-merge-is-the-commit-point",
+        "in-each-surface",
+        "limits"
+      ]
+    },
+    {
+      "path": "explanation/tasks-and-turns",
+      "source": "explanation/tasks-and-turns.md",
+      "file": "explanation/tasks-and-turns/index.html",
+      "title": "Tasks and turns",
+      "anchors": [
+        "tasks-and-turns",
+        "why-it-exists",
+        "the-pieces",
+        "who-starts-a-turn",
+        "how-feedback-reaches-the-agent",
+        "in-each-surface",
+        "limits"
+      ]
+    },
+    {
+      "path": "explanation/the-builder",
+      "source": "explanation/the-builder.md",
+      "file": "explanation/the-builder/index.html",
+      "title": "The builder",
+      "anchors": [
+        "the-builder",
+        "why-it-exists",
+        "how-it-works",
+        "what-it-can-and-cannot-do",
+        "the-builder-is-not-a-cluster-task",
+        "in-each-surface",
+        "limits"
+      ]
+    },
+    {
+      "path": "getting-started",
+      "source": "getting-started.md",
+      "file": "getting-started/index.html",
+      "title": "Getting started: your first task",
+      "anchors": [
+        "getting-started-your-first-task",
+        "what-you-need",
+        "1-install-lazy",
+        "2-set-lazy-up-in-your-repository",
+        "3-create-and-start-a-task",
+        "4-wait-for-it-and-look-at-the-work",
+        "5-give-feedback-or-accept",
+        "doing-it-by-hand",
+        "where-to-go-next"
+      ]
+    },
+    {
+      "path": "how-to/back-up-and-restore",
+      "source": "how-to/back-up-and-restore.md",
+      "file": "how-to/back-up-and-restore/index.html",
+      "title": "How to back up and restore your store",
+      "anchors": [
+        "how-to-back-up-and-restore-your-store",
+        "dashboard",
+        "cli",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "how-to/create-and-start-a-task",
+      "source": "how-to/create-and-start-a-task.md",
+      "file": "how-to/create-and-start-a-task/index.html",
+      "title": "How to create and start a task",
+      "anchors": [
+        "how-to-create-and-start-a-task",
+        "dashboard",
+        "cli",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "how-to/give-feedback",
+      "source": "how-to/give-feedback.md",
+      "file": "how-to/give-feedback/index.html",
+      "title": "How to give feedback to a task",
+      "anchors": [
+        "how-to-give-feedback-to-a-task",
+        "how-notes-reach-the-agent",
+        "dashboard",
+        "cli",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "how-to/review-and-accept",
+      "source": "how-to/review-and-accept.md",
+      "file": "how-to/review-and-accept/index.html",
+      "title": "How to review and accept a task",
+      "anchors": [
+        "how-to-review-and-accept-a-task",
+        "dashboard",
+        "cli",
+        "protected-files-and-raised-items-at-accept",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "how-to/set-env-and-secrets",
+      "source": "how-to/set-env-and-secrets.md",
+      "file": "how-to/set-env-and-secrets/index.html",
+      "title": "How to set environment variables and secrets",
+      "anchors": [
+        "how-to-set-environment-variables-and-secrets",
+        "dashboard",
+        "cli",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "how-to/upgrade",
+      "source": "how-to/upgrade.md",
+      "file": "how-to/upgrade/index.html",
+      "title": "How to upgrade lazy",
+      "anchors": [
+        "how-to-upgrade-lazy",
+        "dashboard",
+        "cli",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "how-to/use-a-builder",
+      "source": "how-to/use-a-builder.md",
+      "file": "how-to/use-a-builder/index.html",
+      "title": "How to use a builder",
+      "anchors": [
+        "how-to-use-a-builder",
+        "cli",
+        "dashboard",
+        "lazy-teams",
+        "related"
+      ]
+    },
+    {
+      "path": "identity",
+      "source": "identity.md",
+      "file": "identity/index.html",
+      "title": "Who lazy says did it",
+      "anchors": [
+        "who-lazy-says-did-it",
+        "when-lazy-does-not-know-who-you-are",
+        "fixing-it",
+        "what-the-agent-does-is-yours",
+        "on-a-team",
+        "who-authors-the-commits"
+      ]
+    },
+    {
+      "path": "lazy-md",
+      "source": "lazy-md.md",
+      "file": "lazy-md/index.html",
+      "title": "LAZY.md — instructions for agents running lazy tasks",
+      "anchors": [
+        "lazymd--instructions-for-agents-running-lazy-tasks",
+        "what-belongs-in-it",
+        "which-files-get-loaded",
+        "when-it-is-loaded",
+        "what-it-cannot-do"
+      ]
+    },
+    {
+      "path": "lazy-teams-agents",
+      "source": "lazy-teams-agents.md",
+      "file": "lazy-teams-agents/index.html",
+      "title": "Agents in Lazy Teams",
+      "anchors": [
+        "agents-in-lazy-teams",
+        "choosing-an-agent-for-a-task",
+        "the-agents-your-project-offers",
+        "long-prompts",
+        "project-default-agent",
+        "model-and-reasoning-effort",
+        "agent-credentials",
+        "where-endpoints-and-profiles-come-from",
+        "your-claude-credential",
+        "account-team-and-project-credentials",
+        "endpoints-a-project-uses",
+        "tiered-agents-and-builders",
+        "agents-the-project-adds",
+        "automations",
+        "cli-vs-teams"
+      ]
+    },
+    {
+      "path": "lazy-teams-builders",
+      "source": "lazy-teams-builders.md",
+      "file": "lazy-teams-builders/index.html",
+      "title": "Builders in Lazy Teams",
+      "anchors": [
+        "builders-in-lazy-teams",
+        "the-terminal",
+        "create-a-task-from-messages",
+        "files"
+      ]
+    },
+    {
+      "path": "lazy-teams-environment",
+      "source": "lazy-teams-environment.md",
+      "file": "lazy-teams-environment/index.html",
+      "title": "Environment variables, secrets and files",
+      "anchors": [
+        "environment-variables-secrets-and-files",
+        "what-a-task-gets"
+      ]
+    },
+    {
+      "path": "lazy-teams-setup",
+      "source": "lazy-teams-setup.md",
+      "file": "lazy-teams-setup/index.html",
+      "title": "Lazy Teams first-run setup",
+      "anchors": [
+        "lazy-teams-first-run-setup",
+        "what-you-see",
+        "picking-up-where-you-left-off",
+        "after-setup",
+        "what-to-configure-on-the-host",
+        "projects-run-the-version-of-lazy-the-app-does",
+        "continuing-without-email",
+        "inviting-people",
+        "passwords"
+      ]
+    },
+    {
+      "path": "lazy-teams-task-review",
+      "source": "lazy-teams-task-review.md",
+      "file": "lazy-teams-task-review/index.html",
+      "title": "Reviewing tasks in Lazy Teams",
+      "anchors": [
+        "reviewing-tasks-in-lazy-teams",
+        "how-the-page-is-laid-out",
+        "lazys-own-instructions-are-folded-away",
+        "moving-through-a-review-with-the-keyboard",
+        "linking-somebody-to-a-paragraph",
+        "agent-report",
+        "screenshots",
+        "before-the-diff-how-to-verify-what-is-running-what-was-left-alone",
+        "how-to-verify",
+        "the-verify-section",
+        "services",
+        "maintained-files",
+        "changes-diff",
+        "markdown-files-read-as-documents",
+        "diagrams",
+        "reading-the-lines-around-a-change",
+        "ticking-a-file-off",
+        "commenting-on-a-line-and-asking-about-one",
+        "replying-to-a-conversation-on-a-line",
+        "whether-your-note-got-there",
+        "feedback-that-did-not-get-through",
+        "turning-a-discussion-into-a-task",
+        "asking-about-a-section-of-the-walkthrough",
+        "asking-about-a-sentence-of-the-agents-report",
+        "words-you-typed-and-have-not-sent",
+        "questions-and-notes-from-the-agent",
+        "the-raised-queue",
+        "clusters",
+        "what-is-still-outstanding-on-your-review",
+        "protected-files",
+        "give-feedback",
+        "asking-about-the-task-and-replying-to-an-answer",
+        "starting-resuming-and-reopening",
+        "deciding-accept-reject-or-close",
+        "more-to-do-with-this-task",
+        "submit-opening-a-pull-request",
+        "submit-on-a-repository-lazy-teams-hosts",
+        "reparent-moving-a-task-under-a-different-parent",
+        "sync-bringing-the-parents-work-in",
+        "turns",
+        "comments",
+        "journal",
+        "reviews",
+        "stats",
+        "one-task-or-everything-under-it",
+        "what-the-page-will-not-claim",
+        "shell-working-inside-the-tasks-environment",
+        "your-own-environment",
+        "what-carries-over-to-the-agent",
+        "who-pays-and-who-is-named",
+        "taking-turns-with-the-agent",
+        "related",
+        "ids-in-text-are-links"
+      ]
+    },
+    {
+      "path": "lazy-toml",
+      "source": "lazy-toml.md",
+      "file": "lazy-toml/index.html",
+      "title": "lazy.toml Configuration Reference",
+      "anchors": [
+        "lazytoml-configuration-reference",
+        "if-lazytoml-doesnt-parse",
+        "which-settings-need-a-reload-or-a-restart",
+        "models",
+        "modelsroles--the-default-profile-per-role",
+        "agentsname--named-agent-profiles",
+        "two-profiles-two-upstreams-one-project",
+        "spreading-work-across-models-by-tier",
+        "tiered-profiles--use-a-tier-until-it-says-no",
+        "the-builder-on-a-tiered-profile",
+        "rejected-spellings",
+        "endpointsname--named-endpoints",
+        "session",
+        "data",
+        "storage",
+        "git",
+        "output",
+        "agent",
+        "how-a-turn-is-guarded",
+        "review",
+        "every-review-setting-is-resolved-per-task",
+        "builder",
+        "chattiness",
+        "serve",
+        "server",
+        "runner",
+        "remote",
+        "offline-modes",
+        "auto_approve-on-protected-branches",
+        "github-specific-options",
+        "github-enterprise-server",
+        "gitlab-specific-options",
+        "what-auto_push--false-covers",
+        "docker",
+        "build_inputs--keeping-the-image-in-step-with-your-lockfiles",
+        "run_args--extra-docker-run-arguments-for-task-containers",
+        "credentials",
+        "running-on-ollama",
+        "proxy",
+        "there-is-no-off-switch",
+        "token-accounting--lazy-stats-tokens",
+        "response-latency--lazy-stats-latency",
+        "which-tool-filled-the-context--lazy-stats-tools",
+        "reading-the-trail-record-by-record--lazy-stats-audit",
+        "smart-routing--proxyfallback-failover-chain",
+        "proxypolicy--mechanistic-enforcement",
+        "outbound-request-plugins-are-not-configured-here",
+        "documents",
+        "docs",
+        "mounts",
+        "features",
+        "worktree",
+        "permissions",
+        "resolving-a-conflict-task",
+        "protection",
+        "automation",
+        "maintained-files-automationmaintain",
+        "reactive-automations-automationreact",
+        "automationpre_accept",
+        "per-turn-hooks--pre_turn--post_turn",
+        "the-accept-check--accept_check",
+        "checks-deprecated",
+        "memory",
+        "limits",
+        "cluster",
+        "usage_pause",
+        "daemon",
+        "auto-resume-fast-lane-and-slow-lane",
+        "inspecting-and-reaping-daemons-across-projects",
+        "surviving-a-daemon-restart-running-agents-and-builders"
+      ]
+    },
+    {
+      "path": "lfs-guard",
+      "source": "lfs-guard.md",
+      "file": "lfs-guard/index.html",
+      "title": "The git LFS guard",
+      "anchors": [
+        "the-git-lfs-guard",
+        "the-defect",
+        "layer-1-the-start-time-preflight",
+        "layer-2-the-accept-time-guard",
+        "how-detection-works",
+        "scope-and-limits"
+      ]
+    },
+    {
+      "path": "link",
+      "source": "link.md",
+      "file": "link/index.html",
+      "title": "lazy link — adopt a pull request or branch as a task",
+      "anchors": [
+        "lazy-link--adopt-a-pull-request-or-branch-as-a-task",
+        "what-you-can-pass",
+        "the-description-lazy-writes-for-you",
+        "after-you-link",
+        "what-linked-does-not-do"
+      ]
+    },
+    {
+      "path": "low-high-loop",
+      "source": "low-high-loop.md",
+      "file": "low-high-loop/index.html",
+      "title": "The low-high loop",
+      "anchors": [
+        "the-low-high-loop",
+        "why",
+        "mechanism",
+        "configuration"
+      ]
+    },
+    {
+      "path": "managed-config",
+      "source": "managed-config.md",
+      "file": "managed-config/index.html",
+      "title": "Managed mode: which parts of lazy.toml a shared host honours",
+      "anchors": [
+        "managed-mode-which-parts-of-lazytoml-a-shared-host-honours",
+        "why-override-some-keys-and-refuse-others",
+        "unclassified-keys-fail-closed",
+        "finding-out-why-your-config-is-being-ignored",
+        "how-a-host-becomes-managed",
+        "code-from-the-repository",
+        "the-classification-in-full",
+        "refused",
+        "overridden",
+        "respected-with-a-containment-guard",
+        "respected",
+        "what-lives-where",
+        "when-the-host-owns-the-config-file"
+      ]
+    },
+    {
+      "path": "mcp-tools",
+      "source": "mcp-tools.md",
+      "file": "mcp-tools/index.html",
+      "title": "MCP tools for agents and builders",
+      "anchors": [
+        "mcp-tools-for-agents-and-builders",
+        "reading-the-task-tree",
+        "working-on-tasks",
+        "reading-a-tasks-pullmerge-request"
+      ]
+    },
+    {
+      "path": "memory",
+      "source": "memory.md",
+      "file": "memory/index.html",
+      "title": "Shared memory",
+      "anchors": [
+        "shared-memory",
+        "in-the-browser",
+        "why-lazy-owns-this",
+        "when-the-index-cant-be-read",
+        "compaction",
+        "why-llm-first-with-a-mechanical-fallback",
+        "seeing-what-is-injected",
+        "memory-vs-journal-vs-claudemd--agentsmd",
+        "record-shape",
+        "the-200-character-description-limit-is-an-authoring-rule",
+        "who-can-write-agents-are-read-only",
+        "mcp-tools",
+        "importing-existing-harness-memory",
+        "storage"
+      ]
+    },
+    {
+      "path": "pairing",
+      "source": "pairing.md",
+      "file": "pairing/index.html",
+      "title": "Pairing",
+      "anchors": [
+        "pairing",
+        "where-the-session-runs",
+        "the---host-escape-hatch",
+        "tools-the-paired-session-gets",
+        "cursor-and-codex-pairing",
+        "pi-pairing",
+        "ending-a-session"
+      ]
+    },
+    {
+      "path": "pi-agent",
+      "source": "pi-agent.md",
+      "file": "pi-agent/index.html",
+      "title": "Running tasks with the Pi coding agent",
+      "anchors": [
+        "running-tasks-with-the-pi-coding-agent",
+        "switching-to-pi",
+        "upstreams-and-models",
+        "pi-on-a-managed-installation",
+        "thinking-effort",
+        "credentials",
+        "lazy-tools",
+        "read-only-turns",
+        "project-trust",
+        "sessions-and-pairing",
+        "container-image"
+      ]
+    },
+    {
+      "path": "playground",
+      "source": "playground.md",
+      "file": "playground/index.html",
+      "title": "The playground",
+      "anchors": [
+        "the-playground",
+        "using-it-on-your-laptop",
+        "using-it-on-lazy-teams",
+        "the-starter-tasks"
+      ]
+    },
+    {
+      "path": "protected-branches",
+      "source": "protected-branches.md",
+      "file": "protected-branches/index.html",
+      "title": "Protected branches and human approvals",
+      "anchors": [
+        "protected-branches-and-human-approvals",
+        "turning-it-on-one-command-zero-branch-listing",
+        "how-you-find-out-it-exists",
+        "seeing-a-gate-before-it-bites",
+        "what-a-protected-accept-looks-like",
+        "the-builders-review-survives-the-refusal",
+        "ci-and-scripting",
+        "approving-the-prmr-counts",
+        "in-lazy-teams-pressing-accept-is-the-approval",
+        "enrolling-the-passphrase-lazy-system-passphrase",
+        "what-this-does-not-close",
+        "advanced-protecting-additional-branches",
+        "the-default-branch-is-an-implicit-entry",
+        "protected-tasks-gating-work-on-the-way-out",
+        "stale-entries-fail-open--loudly",
+        "the-lazy-protect-command",
+        "what-the-config-editing-does-and-does-not-preserve",
+        "mechanics",
+        "a-separate-gate-on-the-same-path",
+        "what-this-does-not-do",
+        "submitting-a-subtask-for-review"
+      ]
+    },
+    {
+      "path": "proxy-jit-credentials",
+      "source": "proxy-jit-credentials.md",
+      "file": "proxy-jit-credentials/index.html",
+      "title": "Just-in-time credential injection",
+      "anchors": [
+        "just-in-time-credential-injection",
+        "the-flow",
+        "attribution-comes-from-the-token-not-from-the-agent",
+        "per-target-credentials-are-data",
+        "what-the-proxy-forwards",
+        "usage-limit-readings",
+        "failure-semantics",
+        "lifetime",
+        "cursor",
+        "codex",
+        "oauth-token-refresh",
+        "scope"
+      ]
+    },
+    {
+      "path": "proxy-plugins",
+      "source": "proxy-plugins.md",
+      "file": "proxy-plugins/index.html",
+      "title": "Proxy request plugins",
+      "anchors": [
+        "proxy-request-plugins",
+        "installing-a-plugin",
+        "the-module-shape",
+        "the-contract",
+        "failure-posture-loud-at-load-open-at-run",
+        "trust-and-scope",
+        "measure-before-you-keep-one"
+      ]
+    },
+    {
+      "path": "raised-items",
+      "source": "raised-items.md",
+      "file": "raised-items/index.html",
+      "title": "Raised items",
+      "anchors": [
+        "raised-items",
+        "a-blocking-item-is-one-of-the-ways-a-turn-ends",
+        "raising",
+        "write-them-behavior-first",
+        "the-accept-gate",
+        "cli",
+        "mcp",
+        "unblock",
+        "per-task-triage",
+        "cross-task-listing",
+        "recurrence",
+        "promotion-hints",
+        "what-to-do-at-review",
+        "contrasted-with-the-other-channels",
+        "who-decided",
+        "how-an-item-is-labelled-in-the-web-ui",
+        "review-surfaces"
+      ]
+    },
+    {
+      "path": "reference/cli/accept",
+      "source": "reference/cli/accept.md",
+      "file": "reference/cli/accept/index.html",
+      "title": "lazy accept",
+      "anchors": [
+        "lazy-accept"
+      ]
+    },
+    {
+      "path": "reference/cli/active",
+      "source": "reference/cli/active.md",
+      "file": "reference/cli/active/index.html",
+      "title": "lazy active",
+      "anchors": [
+        "lazy-active"
+      ]
+    },
+    {
+      "path": "reference/cli/artifact",
+      "source": "reference/cli/artifact.md",
+      "file": "reference/cli/artifact/index.html",
+      "title": "lazy artifact",
+      "anchors": [
+        "lazy-artifact"
+      ]
+    },
+    {
+      "path": "reference/cli/ask",
+      "source": "reference/cli/ask.md",
+      "file": "reference/cli/ask/index.html",
+      "title": "lazy ask",
+      "anchors": [
+        "lazy-ask"
+      ]
+    },
+    {
+      "path": "reference/cli/auth",
+      "source": "reference/cli/auth.md",
+      "file": "reference/cli/auth/index.html",
+      "title": "lazy auth",
+      "anchors": [
+        "lazy-auth"
+      ]
+    },
+    {
+      "path": "reference/cli/blocked",
+      "source": "reference/cli/blocked.md",
+      "file": "reference/cli/blocked/index.html",
+      "title": "lazy blocked",
+      "anchors": [
+        "lazy-blocked"
+      ]
+    },
+    {
+      "path": "reference/cli/branch",
+      "source": "reference/cli/branch.md",
+      "file": "reference/cli/branch/index.html",
+      "title": "lazy branch",
+      "anchors": [
+        "lazy-branch"
+      ]
+    },
+    {
+      "path": "reference/cli/browse",
+      "source": "reference/cli/browse.md",
+      "file": "reference/cli/browse/index.html",
+      "title": "lazy browse",
+      "anchors": [
+        "lazy-browse"
+      ]
+    },
+    {
+      "path": "reference/cli/builder",
+      "source": "reference/cli/builder.md",
+      "file": "reference/cli/builder/index.html",
+      "title": "lazy builder",
+      "anchors": [
+        "lazy-builder"
+      ]
+    },
+    {
+      "path": "reference/cli/chat",
+      "source": "reference/cli/chat.md",
+      "file": "reference/cli/chat/index.html",
+      "title": "lazy chat",
+      "anchors": [
+        "lazy-chat"
+      ]
+    },
+    {
+      "path": "reference/cli/clone",
+      "source": "reference/cli/clone.md",
+      "file": "reference/cli/clone/index.html",
+      "title": "lazy clone",
+      "anchors": [
+        "lazy-clone"
+      ]
+    },
+    {
+      "path": "reference/cli/close",
+      "source": "reference/cli/close.md",
+      "file": "reference/cli/close/index.html",
+      "title": "lazy close",
+      "anchors": [
+        "lazy-close"
+      ]
+    },
+    {
+      "path": "reference/cli/comment",
+      "source": "reference/cli/comment.md",
+      "file": "reference/cli/comment/index.html",
+      "title": "lazy comment",
+      "anchors": [
+        "lazy-comment"
+      ]
+    },
+    {
+      "path": "reference/cli/completion",
+      "source": "reference/cli/completion.md",
+      "file": "reference/cli/completion/index.html",
+      "title": "lazy completion",
+      "anchors": [
+        "lazy-completion"
+      ]
+    },
+    {
+      "path": "reference/cli/config",
+      "source": "reference/cli/config.md",
+      "file": "reference/cli/config/index.html",
+      "title": "lazy config",
+      "anchors": [
+        "lazy-config"
+      ]
+    },
+    {
+      "path": "reference/cli/conversations",
+      "source": "reference/cli/conversations.md",
+      "file": "reference/cli/conversations/index.html",
+      "title": "lazy conversations",
+      "anchors": [
+        "lazy-conversations"
+      ]
+    },
+    {
+      "path": "reference/cli/create",
+      "source": "reference/cli/create.md",
+      "file": "reference/cli/create/index.html",
+      "title": "lazy create",
+      "anchors": [
+        "lazy-create"
+      ]
+    },
+    {
+      "path": "reference/cli/customize",
+      "source": "reference/cli/customize.md",
+      "file": "reference/cli/customize/index.html",
+      "title": "lazy customize",
+      "anchors": [
+        "lazy-customize"
+      ]
+    },
+    {
+      "path": "reference/cli/customize-proxy-plugin",
+      "source": "reference/cli/customize-proxy-plugin.md",
+      "file": "reference/cli/customize-proxy-plugin/index.html",
+      "title": "lazy customize proxy-plugin",
+      "anchors": [
+        "lazy-customize-proxy-plugin"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon",
+      "source": "reference/cli/daemon.md",
+      "file": "reference/cli/daemon/index.html",
+      "title": "lazy daemon",
+      "anchors": [
+        "lazy-daemon"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon-auto-budget",
+      "source": "reference/cli/daemon-auto-budget.md",
+      "file": "reference/cli/daemon-auto-budget/index.html",
+      "title": "lazy daemon auto-budget",
+      "anchors": [
+        "lazy-daemon-auto-budget"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon-config",
+      "source": "reference/cli/daemon-config.md",
+      "file": "reference/cli/daemon-config/index.html",
+      "title": "lazy daemon config",
+      "anchors": [
+        "lazy-daemon-config"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon-health",
+      "source": "reference/cli/daemon-health.md",
+      "file": "reference/cli/daemon-health/index.html",
+      "title": "lazy daemon health",
+      "anchors": [
+        "lazy-daemon-health"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon-logs",
+      "source": "reference/cli/daemon-logs.md",
+      "file": "reference/cli/daemon-logs/index.html",
+      "title": "lazy daemon logs",
+      "anchors": [
+        "lazy-daemon-logs"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon-reload",
+      "source": "reference/cli/daemon-reload.md",
+      "file": "reference/cli/daemon-reload/index.html",
+      "title": "lazy daemon reload",
+      "anchors": [
+        "lazy-daemon-reload"
+      ]
+    },
+    {
+      "path": "reference/cli/daemon-resume-queue",
+      "source": "reference/cli/daemon-resume-queue.md",
+      "file": "reference/cli/daemon-resume-queue/index.html",
+      "title": "lazy daemon resume-queue",
+      "anchors": [
+        "lazy-daemon-resume-queue"
+      ]
+    },
+    {
+      "path": "reference/cli/dashboard",
+      "source": "reference/cli/dashboard.md",
+      "file": "reference/cli/dashboard/index.html",
+      "title": "lazy dashboard",
+      "anchors": [
+        "lazy-dashboard"
+      ]
+    },
+    {
+      "path": "reference/cli/describe",
+      "source": "reference/cli/describe.md",
+      "file": "reference/cli/describe/index.html",
+      "title": "lazy describe",
+      "anchors": [
+        "lazy-describe"
+      ]
+    },
+    {
+      "path": "reference/cli/diff",
+      "source": "reference/cli/diff.md",
+      "file": "reference/cli/diff/index.html",
+      "title": "lazy diff",
+      "anchors": [
+        "lazy-diff"
+      ]
+    },
+    {
+      "path": "reference/cli/doctor",
+      "source": "reference/cli/doctor.md",
+      "file": "reference/cli/doctor/index.html",
+      "title": "lazy doctor",
+      "anchors": [
+        "lazy-doctor"
+      ]
+    },
+    {
+      "path": "reference/cli/document",
+      "source": "reference/cli/document.md",
+      "file": "reference/cli/document/index.html",
+      "title": "lazy document",
+      "anchors": [
+        "lazy-document"
+      ]
+    },
+    {
+      "path": "reference/cli/edit",
+      "source": "reference/cli/edit.md",
+      "file": "reference/cli/edit/index.html",
+      "title": "lazy edit",
+      "anchors": [
+        "lazy-edit"
+      ]
+    },
+    {
+      "path": "reference/cli/env",
+      "source": "reference/cli/env.md",
+      "file": "reference/cli/env/index.html",
+      "title": "lazy env",
+      "anchors": [
+        "lazy-env"
+      ]
+    },
+    {
+      "path": "reference/cli/env-clear",
+      "source": "reference/cli/env-clear.md",
+      "file": "reference/cli/env-clear/index.html",
+      "title": "lazy env clear",
+      "anchors": [
+        "lazy-env-clear"
+      ]
+    },
+    {
+      "path": "reference/cli/env-list",
+      "source": "reference/cli/env-list.md",
+      "file": "reference/cli/env-list/index.html",
+      "title": "lazy env list",
+      "anchors": [
+        "lazy-env-list"
+      ]
+    },
+    {
+      "path": "reference/cli/env-ls",
+      "source": "reference/cli/env-ls.md",
+      "file": "reference/cli/env-ls/index.html",
+      "title": "lazy env ls",
+      "anchors": [
+        "lazy-env-ls"
+      ]
+    },
+    {
+      "path": "reference/cli/env-rm",
+      "source": "reference/cli/env-rm.md",
+      "file": "reference/cli/env-rm/index.html",
+      "title": "lazy env rm",
+      "anchors": [
+        "lazy-env-rm"
+      ]
+    },
+    {
+      "path": "reference/cli/env-set",
+      "source": "reference/cli/env-set.md",
+      "file": "reference/cli/env-set/index.html",
+      "title": "lazy env set",
+      "anchors": [
+        "lazy-env-set"
+      ]
+    },
+    {
+      "path": "reference/cli/env-unset",
+      "source": "reference/cli/env-unset.md",
+      "file": "reference/cli/env-unset/index.html",
+      "title": "lazy env unset",
+      "anchors": [
+        "lazy-env-unset"
+      ]
+    },
+    {
+      "path": "reference/cli/fix",
+      "source": "reference/cli/fix.md",
+      "file": "reference/cli/fix/index.html",
+      "title": "lazy fix",
+      "anchors": [
+        "lazy-fix"
+      ]
+    },
+    {
+      "path": "reference/cli/forward",
+      "source": "reference/cli/forward.md",
+      "file": "reference/cli/forward/index.html",
+      "title": "lazy forward",
+      "anchors": [
+        "lazy-forward"
+      ]
+    },
+    {
+      "path": "reference/cli/import-conversation",
+      "source": "reference/cli/import-conversation.md",
+      "file": "reference/cli/import-conversation/index.html",
+      "title": "lazy import-conversation",
+      "anchors": [
+        "lazy-import-conversation"
+      ]
+    },
+    {
+      "path": "reference/cli/index",
+      "source": "reference/cli/index.md",
+      "file": "reference/cli/index/index.html",
+      "title": "CLI reference",
+      "anchors": [
+        "cli-reference"
+      ]
+    },
+    {
+      "path": "reference/cli/init",
+      "source": "reference/cli/init.md",
+      "file": "reference/cli/init/index.html",
+      "title": "lazy init",
+      "anchors": [
+        "lazy-init"
+      ]
+    },
+    {
+      "path": "reference/cli/journal",
+      "source": "reference/cli/journal.md",
+      "file": "reference/cli/journal/index.html",
+      "title": "lazy journal",
+      "anchors": [
+        "lazy-journal"
+      ]
+    },
+    {
+      "path": "reference/cli/link",
+      "source": "reference/cli/link.md",
+      "file": "reference/cli/link/index.html",
+      "title": "lazy link",
+      "anchors": [
+        "lazy-link"
+      ]
+    },
+    {
+      "path": "reference/cli/list",
+      "source": "reference/cli/list.md",
+      "file": "reference/cli/list/index.html",
+      "title": "lazy list",
+      "anchors": [
+        "lazy-list"
+      ]
+    },
+    {
+      "path": "reference/cli/login",
+      "source": "reference/cli/login.md",
+      "file": "reference/cli/login/index.html",
+      "title": "lazy login",
+      "anchors": [
+        "lazy-login"
+      ]
+    },
+    {
+      "path": "reference/cli/logout",
+      "source": "reference/cli/logout.md",
+      "file": "reference/cli/logout/index.html",
+      "title": "lazy logout",
+      "anchors": [
+        "lazy-logout"
+      ]
+    },
+    {
+      "path": "reference/cli/loop",
+      "source": "reference/cli/loop.md",
+      "file": "reference/cli/loop/index.html",
+      "title": "lazy loop",
+      "anchors": [
+        "lazy-loop"
+      ]
+    },
+    {
+      "path": "reference/cli/memory",
+      "source": "reference/cli/memory.md",
+      "file": "reference/cli/memory/index.html",
+      "title": "lazy memory",
+      "anchors": [
+        "lazy-memory"
+      ]
+    },
+    {
+      "path": "reference/cli/messages",
+      "source": "reference/cli/messages.md",
+      "file": "reference/cli/messages/index.html",
+      "title": "lazy messages",
+      "anchors": [
+        "lazy-messages"
+      ]
+    },
+    {
+      "path": "reference/cli/pair",
+      "source": "reference/cli/pair.md",
+      "file": "reference/cli/pair/index.html",
+      "title": "lazy pair",
+      "anchors": [
+        "lazy-pair"
+      ]
+    },
+    {
+      "path": "reference/cli/playground",
+      "source": "reference/cli/playground.md",
+      "file": "reference/cli/playground/index.html",
+      "title": "lazy playground",
+      "anchors": [
+        "lazy-playground"
+      ]
+    },
+    {
+      "path": "reference/cli/protect",
+      "source": "reference/cli/protect.md",
+      "file": "reference/cli/protect/index.html",
+      "title": "lazy protect",
+      "anchors": [
+        "lazy-protect"
+      ]
+    },
+    {
+      "path": "reference/cli/raised",
+      "source": "reference/cli/raised.md",
+      "file": "reference/cli/raised/index.html",
+      "title": "lazy raised",
+      "anchors": [
+        "lazy-raised"
+      ]
+    },
+    {
+      "path": "reference/cli/redo",
+      "source": "reference/cli/redo.md",
+      "file": "reference/cli/redo/index.html",
+      "title": "lazy redo",
+      "anchors": [
+        "lazy-redo"
+      ]
+    },
+    {
+      "path": "reference/cli/refactor",
+      "source": "reference/cli/refactor.md",
+      "file": "reference/cli/refactor/index.html",
+      "title": "lazy refactor",
+      "anchors": [
+        "lazy-refactor"
+      ]
+    },
+    {
+      "path": "reference/cli/regions",
+      "source": "reference/cli/regions.md",
+      "file": "reference/cli/regions/index.html",
+      "title": "lazy regions",
+      "anchors": [
+        "lazy-regions"
+      ]
+    },
+    {
+      "path": "reference/cli/reject",
+      "source": "reference/cli/reject.md",
+      "file": "reference/cli/reject/index.html",
+      "title": "lazy reject",
+      "anchors": [
+        "lazy-reject"
+      ]
+    },
+    {
+      "path": "reference/cli/reopen",
+      "source": "reference/cli/reopen.md",
+      "file": "reference/cli/reopen/index.html",
+      "title": "lazy reopen",
+      "anchors": [
+        "lazy-reopen"
+      ]
+    },
+    {
+      "path": "reference/cli/reparent",
+      "source": "reference/cli/reparent.md",
+      "file": "reference/cli/reparent/index.html",
+      "title": "lazy reparent",
+      "anchors": [
+        "lazy-reparent"
+      ]
+    },
+    {
+      "path": "reference/cli/report",
+      "source": "reference/cli/report.md",
+      "file": "reference/cli/report/index.html",
+      "title": "lazy report",
+      "anchors": [
+        "lazy-report"
+      ]
+    },
+    {
+      "path": "reference/cli/resume",
+      "source": "reference/cli/resume.md",
+      "file": "reference/cli/resume/index.html",
+      "title": "lazy resume",
+      "anchors": [
+        "lazy-resume"
+      ]
+    },
+    {
+      "path": "reference/cli/revert",
+      "source": "reference/cli/revert.md",
+      "file": "reference/cli/revert/index.html",
+      "title": "lazy revert",
+      "anchors": [
+        "lazy-revert"
+      ]
+    },
+    {
+      "path": "reference/cli/review",
+      "source": "reference/cli/review.md",
+      "file": "reference/cli/review/index.html",
+      "title": "lazy review",
+      "anchors": [
+        "lazy-review"
+      ]
+    },
+    {
+      "path": "reference/cli/rework",
+      "source": "reference/cli/rework.md",
+      "file": "reference/cli/rework/index.html",
+      "title": "lazy rework",
+      "anchors": [
+        "lazy-rework"
+      ]
+    },
+    {
+      "path": "reference/cli/scratch",
+      "source": "reference/cli/scratch.md",
+      "file": "reference/cli/scratch/index.html",
+      "title": "lazy scratch",
+      "anchors": [
+        "lazy-scratch"
+      ]
+    },
+    {
+      "path": "reference/cli/search",
+      "source": "reference/cli/search.md",
+      "file": "reference/cli/search/index.html",
+      "title": "lazy search",
+      "anchors": [
+        "lazy-search"
+      ]
+    },
+    {
+      "path": "reference/cli/shell",
+      "source": "reference/cli/shell.md",
+      "file": "reference/cli/shell/index.html",
+      "title": "lazy shell",
+      "anchors": [
+        "lazy-shell"
+      ]
+    },
+    {
+      "path": "reference/cli/show",
+      "source": "reference/cli/show.md",
+      "file": "reference/cli/show/index.html",
+      "title": "lazy show",
+      "anchors": [
+        "lazy-show"
+      ]
+    },
+    {
+      "path": "reference/cli/start",
+      "source": "reference/cli/start.md",
+      "file": "reference/cli/start/index.html",
+      "title": "lazy start",
+      "anchors": [
+        "lazy-start"
+      ]
+    },
+    {
+      "path": "reference/cli/stats",
+      "source": "reference/cli/stats.md",
+      "file": "reference/cli/stats/index.html",
+      "title": "lazy stats",
+      "anchors": [
+        "lazy-stats"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-audit",
+      "source": "reference/cli/stats-audit.md",
+      "file": "reference/cli/stats-audit/index.html",
+      "title": "lazy stats audit",
+      "anchors": [
+        "lazy-stats-audit"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-budget",
+      "source": "reference/cli/stats-budget.md",
+      "file": "reference/cli/stats-budget/index.html",
+      "title": "lazy stats budget",
+      "anchors": [
+        "lazy-stats-budget"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-latency",
+      "source": "reference/cli/stats-latency.md",
+      "file": "reference/cli/stats-latency/index.html",
+      "title": "lazy stats latency",
+      "anchors": [
+        "lazy-stats-latency"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-limits",
+      "source": "reference/cli/stats-limits.md",
+      "file": "reference/cli/stats-limits/index.html",
+      "title": "lazy stats limits",
+      "anchors": [
+        "lazy-stats-limits"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-timings",
+      "source": "reference/cli/stats-timings.md",
+      "file": "reference/cli/stats-timings/index.html",
+      "title": "lazy stats timings",
+      "anchors": [
+        "lazy-stats-timings"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-tokens",
+      "source": "reference/cli/stats-tokens.md",
+      "file": "reference/cli/stats-tokens/index.html",
+      "title": "lazy stats tokens",
+      "anchors": [
+        "lazy-stats-tokens"
+      ]
+    },
+    {
+      "path": "reference/cli/stats-tools",
+      "source": "reference/cli/stats-tools.md",
+      "file": "reference/cli/stats-tools/index.html",
+      "title": "lazy stats tools",
+      "anchors": [
+        "lazy-stats-tools"
+      ]
+    },
+    {
+      "path": "reference/cli/status",
+      "source": "reference/cli/status.md",
+      "file": "reference/cli/status/index.html",
+      "title": "lazy status",
+      "anchors": [
+        "lazy-status"
+      ]
+    },
+    {
+      "path": "reference/cli/stop",
+      "source": "reference/cli/stop.md",
+      "file": "reference/cli/stop/index.html",
+      "title": "lazy stop",
+      "anchors": [
+        "lazy-stop"
+      ]
+    },
+    {
+      "path": "reference/cli/submit",
+      "source": "reference/cli/submit.md",
+      "file": "reference/cli/submit/index.html",
+      "title": "lazy submit",
+      "anchors": [
+        "lazy-submit"
+      ]
+    },
+    {
+      "path": "reference/cli/sync",
+      "source": "reference/cli/sync.md",
+      "file": "reference/cli/sync/index.html",
+      "title": "lazy sync",
+      "anchors": [
+        "lazy-sync"
+      ]
+    },
+    {
+      "path": "reference/cli/system",
+      "source": "reference/cli/system.md",
+      "file": "reference/cli/system/index.html",
+      "title": "lazy system",
+      "anchors": [
+        "lazy-system"
+      ]
+    },
+    {
+      "path": "reference/cli/system-agent",
+      "source": "reference/cli/system-agent.md",
+      "file": "reference/cli/system-agent/index.html",
+      "title": "lazy system agent",
+      "anchors": [
+        "lazy-system-agent"
+      ]
+    },
+    {
+      "path": "reference/cli/system-build",
+      "source": "reference/cli/system-build.md",
+      "file": "reference/cli/system-build/index.html",
+      "title": "lazy system build",
+      "anchors": [
+        "lazy-system-build"
+      ]
+    },
+    {
+      "path": "reference/cli/system-eject-dockerfile",
+      "source": "reference/cli/system-eject-dockerfile.md",
+      "file": "reference/cli/system-eject-dockerfile/index.html",
+      "title": "lazy system eject-dockerfile",
+      "anchors": [
+        "lazy-system-eject-dockerfile"
+      ]
+    },
+    {
+      "path": "reference/cli/system-export-dockerfile",
+      "source": "reference/cli/system-export-dockerfile.md",
+      "file": "reference/cli/system-export-dockerfile/index.html",
+      "title": "lazy system export-dockerfile",
+      "anchors": [
+        "lazy-system-export-dockerfile"
+      ]
+    },
+    {
+      "path": "reference/cli/system-guest-init-script",
+      "source": "reference/cli/system-guest-init-script.md",
+      "file": "reference/cli/system-guest-init-script/index.html",
+      "title": "lazy system guest-init-script",
+      "anchors": [
+        "lazy-system-guest-init-script"
+      ]
+    },
+    {
+      "path": "reference/cli/system-machine",
+      "source": "reference/cli/system-machine.md",
+      "file": "reference/cli/system-machine/index.html",
+      "title": "lazy system machine",
+      "anchors": [
+        "lazy-system-machine"
+      ]
+    },
+    {
+      "path": "reference/cli/system-offline",
+      "source": "reference/cli/system-offline.md",
+      "file": "reference/cli/system-offline/index.html",
+      "title": "lazy system offline",
+      "anchors": [
+        "lazy-system-offline"
+      ]
+    },
+    {
+      "path": "reference/cli/system-online",
+      "source": "reference/cli/system-online.md",
+      "file": "reference/cli/system-online/index.html",
+      "title": "lazy system online",
+      "anchors": [
+        "lazy-system-online"
+      ]
+    },
+    {
+      "path": "reference/cli/system-passphrase",
+      "source": "reference/cli/system-passphrase.md",
+      "file": "reference/cli/system-passphrase/index.html",
+      "title": "lazy system passphrase",
+      "anchors": [
+        "lazy-system-passphrase"
+      ]
+    },
+    {
+      "path": "reference/cli/system-repair-commits",
+      "source": "reference/cli/system-repair-commits.md",
+      "file": "reference/cli/system-repair-commits/index.html",
+      "title": "lazy system repair-commits",
+      "anchors": [
+        "lazy-system-repair-commits"
+      ]
+    },
+    {
+      "path": "reference/cli/system-runner-image",
+      "source": "reference/cli/system-runner-image.md",
+      "file": "reference/cli/system-runner-image/index.html",
+      "title": "lazy system runner-image",
+      "anchors": [
+        "lazy-system-runner-image"
+      ]
+    },
+    {
+      "path": "reference/cli/system-source-id",
+      "source": "reference/cli/system-source-id.md",
+      "file": "reference/cli/system-source-id/index.html",
+      "title": "lazy system source-id",
+      "anchors": [
+        "lazy-system-source-id"
+      ]
+    },
+    {
+      "path": "reference/cli/system-status",
+      "source": "reference/cli/system-status.md",
+      "file": "reference/cli/system-status/index.html",
+      "title": "lazy system status",
+      "anchors": [
+        "lazy-system-status"
+      ]
+    },
+    {
+      "path": "reference/cli/system-store-backup",
+      "source": "reference/cli/system-store-backup.md",
+      "file": "reference/cli/system-store-backup/index.html",
+      "title": "lazy system store-backup",
+      "anchors": [
+        "lazy-system-store-backup"
+      ]
+    },
+    {
+      "path": "reference/cli/system-store-backups",
+      "source": "reference/cli/system-store-backups.md",
+      "file": "reference/cli/system-store-backups/index.html",
+      "title": "lazy system store-backups",
+      "anchors": [
+        "lazy-system-store-backups"
+      ]
+    },
+    {
+      "path": "reference/cli/system-store-check",
+      "source": "reference/cli/system-store-check.md",
+      "file": "reference/cli/system-store-check/index.html",
+      "title": "lazy system store-check",
+      "anchors": [
+        "lazy-system-store-check"
+      ]
+    },
+    {
+      "path": "reference/cli/system-store-restore",
+      "source": "reference/cli/system-store-restore.md",
+      "file": "reference/cli/system-store-restore/index.html",
+      "title": "lazy system store-restore",
+      "anchors": [
+        "lazy-system-store-restore"
+      ]
+    },
+    {
+      "path": "reference/cli/tag",
+      "source": "reference/cli/tag.md",
+      "file": "reference/cli/tag/index.html",
+      "title": "lazy tag",
+      "anchors": [
+        "lazy-tag"
+      ]
+    },
+    {
+      "path": "reference/cli/unblock",
+      "source": "reference/cli/unblock.md",
+      "file": "reference/cli/unblock/index.html",
+      "title": "lazy unblock",
+      "anchors": [
+        "lazy-unblock"
+      ]
+    },
+    {
+      "path": "reference/cli/untag",
+      "source": "reference/cli/untag.md",
+      "file": "reference/cli/untag/index.html",
+      "title": "lazy untag",
+      "anchors": [
+        "lazy-untag"
+      ]
+    },
+    {
+      "path": "reference/cli/upgrade",
+      "source": "reference/cli/upgrade.md",
+      "file": "reference/cli/upgrade/index.html",
+      "title": "lazy upgrade",
+      "anchors": [
+        "lazy-upgrade"
+      ]
+    },
+    {
+      "path": "reference/cli/url",
+      "source": "reference/cli/url.md",
+      "file": "reference/cli/url/index.html",
+      "title": "lazy url",
+      "anchors": [
+        "lazy-url"
+      ]
+    },
+    {
+      "path": "reference/cli/wait",
+      "source": "reference/cli/wait.md",
+      "file": "reference/cli/wait/index.html",
+      "title": "lazy wait",
+      "anchors": [
+        "lazy-wait"
+      ]
+    },
+    {
+      "path": "reference/cli/watch",
+      "source": "reference/cli/watch.md",
+      "file": "reference/cli/watch/index.html",
+      "title": "lazy watch",
+      "anchors": [
+        "lazy-watch"
+      ]
+    },
+    {
+      "path": "reference/dashboard/builders",
+      "source": "reference/dashboard/builders.md",
+      "file": "reference/dashboard/builders/index.html",
+      "title": "Builders screen",
+      "anchors": [
+        "builders-screen",
+        "regions",
+        "a-conversation"
+      ]
+    },
+    {
+      "path": "reference/dashboard/clusters",
+      "source": "reference/dashboard/clusters.md",
+      "file": "reference/dashboard/clusters/index.html",
+      "title": "Clusters screen",
+      "anchors": [
+        "clusters-screen",
+        "regions"
+      ]
+    },
+    {
+      "path": "reference/dashboard/inbox",
+      "source": "reference/dashboard/inbox.md",
+      "file": "reference/dashboard/inbox/index.html",
+      "title": "Inbox screen",
+      "anchors": [
+        "inbox-screen",
+        "regions"
+      ]
+    },
+    {
+      "path": "reference/dashboard/index",
+      "source": "reference/dashboard/index.md",
+      "file": "reference/dashboard/index/index.html",
+      "title": "Dashboard",
+      "anchors": [
+        "dashboard",
+        "opening-it",
+        "screens"
+      ]
+    },
+    {
+      "path": "reference/dashboard/overview",
+      "source": "reference/dashboard/overview.md",
+      "file": "reference/dashboard/overview/index.html",
+      "title": "Dashboard screen",
+      "anchors": [
+        "dashboard-screen",
+        "regions"
+      ]
+    },
+    {
+      "path": "reference/dashboard/raised",
+      "source": "reference/dashboard/raised.md",
+      "file": "reference/dashboard/raised/index.html",
+      "title": "Raised items screen",
+      "anchors": [
+        "raised-items-screen",
+        "regions",
+        "an-item"
+      ]
+    },
+    {
+      "path": "reference/dashboard/review-queue",
+      "source": "reference/dashboard/review-queue.md",
+      "file": "reference/dashboard/review-queue/index.html",
+      "title": "Review queue",
+      "anchors": [
+        "review-queue",
+        "regions"
+      ]
+    },
+    {
+      "path": "reference/dashboard/scratch",
+      "source": "reference/dashboard/scratch.md",
+      "file": "reference/dashboard/scratch/index.html",
+      "title": "Scratch screen",
+      "anchors": [
+        "scratch-screen",
+        "regions",
+        "a-file"
+      ]
+    },
+    {
+      "path": "reference/dashboard/search",
+      "source": "reference/dashboard/search.md",
+      "file": "reference/dashboard/search/index.html",
+      "title": "Search screen",
+      "anchors": [
+        "search-screen",
+        "regions",
+        "command-palette"
+      ]
+    },
+    {
+      "path": "reference/dashboard/settings",
+      "source": "reference/dashboard/settings.md",
+      "file": "reference/dashboard/settings/index.html",
+      "title": "Settings screen",
+      "anchors": [
+        "settings-screen",
+        "memories",
+        "services",
+        "doctor"
+      ]
+    },
+    {
+      "path": "reference/dashboard/task",
+      "source": "reference/dashboard/task.md",
+      "file": "reference/dashboard/task/index.html",
+      "title": "Task page",
+      "anchors": [
+        "task-page",
+        "header",
+        "tabs",
+        "status-bar"
+      ]
+    },
+    {
+      "path": "reference/dashboard/tasks",
+      "source": "reference/dashboard/tasks.md",
+      "file": "reference/dashboard/tasks/index.html",
+      "title": "Tasks screen",
+      "anchors": [
+        "tasks-screen",
+        "regions",
+        "new-task",
+        "link-a-branch-or-pr"
+      ]
+    },
+    {
+      "path": "reference/teams/account-settings",
+      "source": "reference/teams/account-settings.md",
+      "file": "reference/teams/account-settings/index.html",
+      "title": "Account settings",
+      "anchors": [
+        "account-settings",
+        "tabs",
+        "profile"
+      ]
+    },
+    {
+      "path": "reference/teams/builders",
+      "source": "reference/teams/builders.md",
+      "file": "reference/teams/builders/index.html",
+      "title": "Builders",
+      "anchors": [
+        "builders",
+        "section-tabs",
+        "header-and-introduction",
+        "starting-your-builder",
+        "your-builder",
+        "search-transcripts",
+        "builders-list",
+        "a-builders-page",
+        "resuming-a-builder",
+        "continuing-from-a-summary"
+      ]
+    },
+    {
+      "path": "reference/teams/clusters",
+      "source": "reference/teams/clusters.md",
+      "file": "reference/teams/clusters/index.html",
+      "title": "Clusters",
+      "anchors": [
+        "clusters",
+        "header-and-explainer",
+        "cluster-cards",
+        "when-there-are-no-clusters"
+      ]
+    },
+    {
+      "path": "reference/teams/dashboard",
+      "source": "reference/teams/dashboard.md",
+      "file": "reference/teams/dashboard/index.html",
+      "title": "Dashboard",
+      "anchors": [
+        "dashboard",
+        "top-bar",
+        "header",
+        "your-teams",
+        "your-projects"
+      ]
+    },
+    {
+      "path": "reference/teams/index",
+      "source": "reference/teams/index.md",
+      "file": "reference/teams/index/index.html",
+      "title": "Lazy Teams screens",
+      "anchors": [
+        "lazy-teams-screens",
+        "navigation",
+        "account-and-team",
+        "project",
+        "project-settings"
+      ]
+    },
+    {
+      "path": "reference/teams/members",
+      "source": "reference/teams/members.md",
+      "file": "reference/teams/members/index.html",
+      "title": "Members",
+      "anchors": [
+        "members",
+        "header",
+        "invite-someone",
+        "member-list",
+        "pending-invitations"
+      ]
+    },
+    {
+      "path": "reference/teams/memory",
+      "source": "reference/teams/memory.md",
+      "file": "reference/teams/memory/index.html",
+      "title": "Memory",
+      "anchors": [
+        "memory",
+        "section-tabs",
+        "actions",
+        "introduction-and-summary",
+        "records",
+        "a-records-page",
+        "new-record"
+      ]
+    },
+    {
+      "path": "reference/teams/messages",
+      "source": "reference/teams/messages.md",
+      "file": "reference/teams/messages/index.html",
+      "title": "Messages",
+      "anchors": [
+        "messages",
+        "filters-and-bulk-action",
+        "summary",
+        "inbox",
+        "state-legend",
+        "a-messages-page"
+      ]
+    },
+    {
+      "path": "reference/teams/project-environment",
+      "source": "reference/teams/project-environment.md",
+      "file": "reference/teams/project-environment/index.html",
+      "title": "Project environment",
+      "anchors": [
+        "project-environment",
+        "introduction",
+        "entries",
+        "add-an-entry"
+      ]
+    },
+    {
+      "path": "reference/teams/project-machine",
+      "source": "reference/teams/project-machine.md",
+      "file": "reference/teams/project-machine/index.html",
+      "title": "Project machine",
+      "anchors": [
+        "project-machine",
+        "header",
+        "services",
+        "docker-storage",
+        "resources",
+        "memory"
+      ]
+    },
+    {
+      "path": "reference/teams/project-overview",
+      "source": "reference/teams/project-overview.md",
+      "file": "reference/teams/project-overview/index.html",
+      "title": "Project overview",
+      "anchors": [
+        "project-overview",
+        "top-bar",
+        "header",
+        "quick-actions",
+        "notices",
+        "needs-you",
+        "activity"
+      ]
+    },
+    {
+      "path": "reference/teams/project-settings",
+      "source": "reference/teams/project-settings.md",
+      "file": "reference/teams/project-settings/index.html",
+      "title": "Project settings",
+      "anchors": [
+        "project-settings",
+        "tabs",
+        "in-force-now",
+        "change-defaults-for-new-tasks",
+        "not-editable-yet",
+        "automations",
+        "default-branch",
+        "download-your-data"
+      ]
+    },
+    {
+      "path": "reference/teams/raised",
+      "source": "reference/teams/raised.md",
+      "file": "reference/teams/raised/index.html",
+      "title": "Raised by agents",
+      "anchors": [
+        "raised-by-agents",
+        "navigation-badges",
+        "gate-filters",
+        "state-filters",
+        "summary",
+        "recurring-items",
+        "queue",
+        "an-items-page"
+      ]
+    },
+    {
+      "path": "reference/teams/review-queue",
+      "source": "reference/teams/review-queue.md",
+      "file": "reference/teams/review-queue/index.html",
+      "title": "Review queue",
+      "anchors": [
+        "review-queue",
+        "header",
+        "the-queue"
+      ]
+    },
+    {
+      "path": "reference/teams/run",
+      "source": "reference/teams/run.md",
+      "file": "reference/teams/run/index.html",
+      "title": "Run",
+      "anchors": [
+        "run",
+        "what-to-run",
+        "runs",
+        "a-runs-page",
+        "pull-latest",
+        "remove"
+      ]
+    },
+    {
+      "path": "reference/teams/search",
+      "source": "reference/teams/search.md",
+      "file": "reference/teams/search/index.html",
+      "title": "Search",
+      "anchors": [
+        "search",
+        "search-box",
+        "command-palette",
+        "query-syntax",
+        "type-filters",
+        "results",
+        "errors"
+      ]
+    },
+    {
+      "path": "reference/teams/task",
+      "source": "reference/teams/task.md",
+      "file": "reference/teams/task/index.html",
+      "title": "Task",
+      "anchors": [
+        "task",
+        "header",
+        "banners",
+        "tabs",
+        "the-conversation-view",
+        "action-area"
+      ]
+    },
+    {
+      "path": "reference/teams/tasks",
+      "source": "reference/teams/tasks.md",
+      "file": "reference/teams/tasks/index.html",
+      "title": "Tasks",
+      "anchors": [
+        "tasks",
+        "header",
+        "status-filters",
+        "the-list",
+        "new-task",
+        "link-a-branch"
+      ]
+    },
+    {
+      "path": "reference/teams/team",
+      "source": "reference/teams/team.md",
+      "file": "reference/teams/team/index.html",
+      "title": "Team",
+      "anchors": [
+        "team",
+        "header",
+        "projects",
+        "members",
+        "related-lists"
+      ]
+    },
+    {
+      "path": "renaming-tasks",
+      "source": "renaming-tasks.md",
+      "file": "renaming-tasks/index.html",
+      "title": "Renaming a task",
+      "anchors": [
+        "renaming-a-task",
+        "what-changes-and-what-does-not",
+        "rules"
+      ]
+    },
+    {
+      "path": "resurrection-guard",
+      "source": "resurrection-guard.md",
+      "file": "resurrection-guard/index.html",
+      "title": "The deleted-file resurrection guard",
+      "anchors": [
+        "the-deleted-file-resurrection-guard",
+        "the-defect",
+        "how-a-base-gets-that-stale",
+        "what-the-guard-checks",
+        "when-it-fires",
+        "stacked-children-after-an-accept",
+        "scope-and-limits"
+      ]
+    },
+    {
+      "path": "review",
+      "source": "review.md",
+      "file": "review/index.html",
+      "title": "lazy review — agent review of a task's work",
+      "anchors": [
+        "lazy-review--agent-review-of-a-tasks-work",
+        "when-this-reviewer-runs-at-all",
+        "the-review-that-starts-itself",
+        "the-verdict-is-one-of-three-words",
+        "what-the-reviewer-is",
+        "how-long-a-review-may-take-and-how-to-stop-one",
+        "reviews-stay-on-the-task"
+      ]
+    },
+    {
+      "path": "review-paradigm",
+      "source": "review-paradigm.md",
+      "file": "review-paradigm/index.html",
+      "title": "The review paradigm — what lazy does by default, and why",
+      "anchors": [
+        "the-review-paradigm--what-lazy-does-by-default-and-why",
+        "what-a-review-is-for",
+        "three-modes",
+        "settings-are-inherited-not-just-defaulted",
+        "reading-the-review-line",
+        "the-gate-when-a-review-actually-holds-a-merge",
+        "why-the-default-is-the-fast-one",
+        "what-still-holds-in-every-mode",
+        "migrating-from-agent-low_high_loop",
+        "when-tokens-are-still-the-constraint",
+        "what-lazy-records-so-you-can-judge-the-trade"
+      ]
+    },
+    {
+      "path": "review-regions",
+      "source": "review-regions.md",
+      "file": "review-regions/index.html",
+      "title": "Review regions",
+      "anchors": [
+        "review-regions",
+        "what-a-region-is",
+        "regions-are-a-partition",
+        "signing-off-a-region",
+        "who-set-them",
+        "where-regions-come-from",
+        "who-wrote-each-line-the-subtask-blame-gutter",
+        "using-regions",
+        "on-the-command-line",
+        "on-the-web",
+        "in-lazy-teams",
+        "for-agents",
+        "what-regions-do-not-do",
+        "when-a-region-says-something-odd"
+      ]
+    },
+    {
+      "path": "running-a-commit",
+      "source": "running-a-commit.md",
+      "file": "running-a-commit/index.html",
+      "title": "Running the product at any commit",
+      "anchors": [
+        "running-the-product-at-any-commit",
+        "where-to-find-it-in-lazy-teams",
+        "what-a-run-checks-out",
+        "in-the-dashboard",
+        "running-services",
+        "pull-latest-and-changes-made-in-a-run",
+        "environment-secrets-and-files",
+        "what-a-runs-environment-holds--and-what-it-does-not"
+      ]
+    },
+    {
+      "path": "search",
+      "source": "search.md",
+      "file": "search/index.html",
+      "title": "Searching tasks",
+      "anchors": [
+        "searching-tasks",
+        "searching-in-a-browser",
+        "three-matching-modes",
+        "when-a-regex-query-is-refused",
+        "quote-the-whole-query",
+        "query-language",
+        "substring-or-exact",
+        "matching-a-task-code-task",
+        "tags",
+        "name-is-the-spelling-lazy-prints",
+        "quote-a-multi-word-tag",
+        "empty-tag-results-explain-themselves",
+        "searching-by-id",
+        "result-order",
+        "from-a-hit-to-the-thing-it-hit",
+        "examples",
+        "related"
+      ]
+    },
+    {
+      "path": "self-hosting-lazy-teams",
+      "source": "self-hosting-lazy-teams.md",
+      "file": "self-hosting-lazy-teams/index.html",
+      "title": "Self-hosting Lazy Teams",
+      "anchors": [
+        "self-hosting-lazy-teams",
+        "what-you-need",
+        "quick-install-pull-and-go",
+        "first-boot-takes-a-minute-or-two",
+        "the-direct-port-is-local-only",
+        "automatic-https",
+        "behind-your-own-reverse-proxy",
+        "signing-in-through-your-proxys-login",
+        "behind-an-authenticating-proxy",
+        "set-it-up",
+        "what-the-token-is-and-what-happens-when-it-ends",
+        "git-to-hosted-repositories",
+        "rotating-the-signing-key",
+        "limits",
+        "check-it-from-your-machine",
+        "other-proxies",
+        "serving-over-plain-http",
+        "which-hostnames-the-install-answers-to",
+        "sign-in-and-git-rate-limits",
+        "outgoing-email-optional",
+        "private-repositories-and-forge-connections",
+        "if-a-repository-cannot-be-cloned",
+        "where-data-lives",
+        "automatic-backup-before-every-upgrade",
+        "restoring-a-backup",
+        "automatic-store-backup-before-every-roll",
+        "keeping-the-fleet-on-your-own-filesystem",
+        "adopting-an-existing-store",
+        "before-you-start",
+        "1-stop-the-local-daemon",
+        "2-adopt-it",
+        "what-it-refuses-and-why",
+        "3-verify-in-teams",
+        "4-never-run-a-local-daemon-against-the-original-again",
+        "working-on-the-project-afterwards",
+        "renaming-a-project-or-a-team",
+        "hosting-repositories-on-the-install",
+        "recovering-commits-a-push-replaced",
+        "limits-on-git-requests",
+        "task-turns",
+        "confirming-it-on-your-server",
+        "a-server-without-kvm",
+        "why-the-local-backend-cannot-run-turns-in-the-container",
+        "reaching-a-tasks-running-services",
+        "example-task-services-behind-ngrok-with-google-oauth",
+        "what-a-service-host-can-and-cannot-reach",
+        "how-the-pieces-fit-together",
+        "smolvm-default-one-project-per-microvm",
+        "run-it-as-an-unprivileged-user-in-the-kvm-group-never-as-root",
+        "services-on-the-hosts-public-address-are-reachable-from-projects",
+        "local-no-microvms",
+        "your-docker-socket-stays-on-your-host",
+        "environment-reference",
+        "changing-a-microvms-size",
+        "checking-the-host-is-not-overcommitted",
+        "seeing-what-a-projects-machine-is-doing",
+        "what-an-upgrade-does",
+        "stopping-every-project-at-once",
+        "building-from-source-development",
+        "which-build-is-running",
+        "verifying-the-install",
+        "deploy-from-your-workstation",
+        "upgrading",
+        "kamal-and-cloud-deployment",
+        "getting-help",
+        "agents-and-credentials",
+        "diagnosing-a-builder-that-is-slow-to-start-or-fails"
+      ]
+    },
+    {
+      "path": "serve-ports",
+      "source": "serve-ports.md",
+      "file": "serve-ports/index.html",
+      "title": "Reaching a task's dev server",
+      "anchors": [
+        "reaching-a-tasks-dev-server",
+        "naming-services",
+        "the-url-is-a-name-taskservicelazylocalhost",
+        "--direct-for-curl-and-scripts",
+        "under-lazy-teams",
+        "previewing-a-tasks-app-or-files-in-teams",
+        "links-in-the-pull-request",
+        "when-nothing-is-listening",
+        "what-the-host-port-is-and-why-it-isnt-3000",
+        "changing-serve-takes-effect-on-the-next-container",
+        "one-off-ports-lazy-forward",
+        "working-inside-the-tasks-environment",
+        "the-product-at-a-commit-without-a-task"
+      ]
+    },
+    {
+      "path": "slack-rooms",
+      "source": "slack-rooms.md",
+      "file": "slack-rooms/index.html",
+      "title": "Lazy Teams Slack rooms",
+      "anchors": [
+        "lazy-teams-slack-rooms",
+        "operator-setup",
+        "project-rooms",
+        "what-must-be-running",
+        "more-than-one-copy-of-lazy-in-one-slack-workspace",
+        "adding-the-app-level-token",
+        "members",
+        "one-channel-per-piece-of-work-threads-for-the-rest",
+        "when-slack-goes-quiet"
+      ]
+    },
+    {
+      "path": "start-here",
+      "source": "start-here.md",
+      "file": "start-here/index.html",
+      "title": "Start here",
+      "anchors": [
+        "start-here",
+        "install",
+        "where-to-go-next"
+      ]
+    },
+    {
+      "path": "state-machine",
+      "source": "state-machine.md",
+      "file": "state-machine/index.html",
+      "title": "The task state machine",
+      "anchors": [
+        "the-task-state-machine",
+        "statuses",
+        "a-parent-task-is-told-when-its-subtask-list-changes",
+        "allowed-transitions",
+        "who-moves-a-task",
+        "humans-and-builders-and-agents-over-mcp",
+        "the-agent",
+        "the-daemon-on-its-own",
+        "how-a-turn-ends",
+        "work-left-uncommitted-when-the-turn-ends",
+        "a-declaration-is-about-a-sha-and-it-can-go-stale",
+        "only-one-turn-runs-at-a-time",
+        "accept-and-the-merging-status",
+        "working-but-not-alive",
+        "waiting-on-subtasks",
+        "agent-reported-progress",
+        "agent-failure-classification",
+        "the-taxonomy",
+        "retry-pacing",
+        "what-stop-means",
+        "seeing-what-is-being-retried",
+        "watchdog-kills",
+        "crashes-restarts-and-recovery",
+        "detection",
+        "when-the-daemon-restarts",
+        "what-is-recorded",
+        "circuit-breaker",
+        "auto-resume",
+        "feedback-is-redelivered-after-a-crash",
+        "three-crash-scenarios",
+        "a-turn-nobody-read",
+        "manual-recovery"
+      ]
+    },
+    {
+      "path": "store-backups",
+      "source": "store-backups.md",
+      "file": "store-backups/index.html",
+      "title": "Store backups before every upgrade",
+      "anchors": [
+        "store-backups-before-every-upgrade",
+        "when-a-backup-is-taken",
+        "where-and-how-many",
+        "when-a-backup-fails",
+        "taking-one-by-hand",
+        "restoring-a-backup",
+        "a-store-that-is-a-mount-point",
+        "a-restore-refuses-a-link-in-the-backup"
+      ]
+    },
+    {
+      "path": "surface-asymmetries",
+      "source": "surface-asymmetries.md",
+      "file": "surface-asymmetries/index.html",
+      "title": "Surface asymmetries: CLI vs MCP",
+      "anchors": [
+        "surface-asymmetries-cli-vs-mcp",
+        "the-governing-rule-tight-mcp-lax-cli",
+        "1-agent-ownership-gating-writes-only",
+        "lazy_journal-is-ungated-lazy_comment-is-gated--deliberately",
+        "the-journal-contract-precisely",
+        "the-annotation-tools-stop-at-direct-subtasks--including-not-itself",
+        "2-two-step-confirmation-codes-mcp-only-friction",
+        "3-mcp-never-auto-starts-work",
+        "pinned-clones-only-a-human-or-the-builder-lifts-the-pin",
+        "4-human-only-commands-with-no-mcp-equivalent",
+        "system-messages-agents-may-post-only-the-humans-side-may-dismiss-or-mark-read",
+        "5-read-only-turns",
+        "6-lazy_internal_git-is-validated-but-never-advertised",
+        "7-presentation-flags-have-no-mcp-analogue",
+        "8-unblock-always-carries-feedback-resume-is-the-no-feedback-path",
+        "9-start-creates-nothing--on-either-surface",
+        "10-review-settings-are-on-both-surfaces",
+        "11-asking-a-conversation-one-polymorphic-cli-id-a-separate-mcp-tool",
+        "12-artifacts-attach-and-read-over-mcp-remove-on-human-surfaces",
+        "13-machine-one-shots-have-no-mcp-tool-at-all",
+        "14-the-tasks-agent-mcp-and-cli-listings-both-carry-it",
+        "15-depth-scoping---levels-on-three-cli-listings-on-two-mcp-tools",
+        "16-protected-file-approval-exists-only-at-accept",
+        "17-raised-items-agent-raises-humanbuilder-resolves",
+        "17a-declaring-a-task-done-is-agent-only-and-it-is-its-own-tool",
+        "accept---allow-queued-comments-has-no-mcp-parameter",
+        "accept---allow-review-issues-is-cli-only",
+        "lazy_edits-review-settings-are-refused-on-the-callers-own-task",
+        "18-turn-reports-and-file-justifications-agent-writes-human-reads",
+        "19---allow-broken-is-cli-only",
+        "20-choosing-a-subtasks-agent-is-not-gated-by-who-is-asking",
+        "21-signing-in-to-the-web-dashboard-is-human-only",
+        "22-the-web-shell-is-human-only--no-mcp-surface",
+        "23-dashboard-url-cli-command-mcp-field--no-dedicated-tool",
+        "24-re-describing-a-linked-task-is-cli-only",
+        "25-review-regions-everyone-reads-them-only-people-annotate-them-and-which-source-answers",
+        "26-promoting-a-discussion-into-a-task-is-web-only",
+        "27-promoting-a-conversation-into-a-task-has-no-mcp-tool",
+        "28-lazy-ask--lazy-review-block-lazy_ask--lazy_review-return-immediately",
+        "29-syncing-a-task-that-is-running-only-that-tasks-own-agent",
+        "30-on-a-shared-host-an-operator-credential-cannot-take-a-human-action",
+        "31-logging-a-machine-in-to-lazy-teams-is-human-only",
+        "32-editing-a-comment-is-a-human-surface-agents-post-a-follow-up-instead",
+        "33-usage-limit-readings-each-caller-sees-only-what-its-own-person-may-see",
+        "token-statistics-detail-for-your-own-work-model-aggregates-for-everyone",
+        "34-getting-past-the-usage-pause-a-person-or-the-builder-one-task-at-a-time",
+        "35-a-pull-request-into-a-parent-tasks-branch-a-person-may-ask-an-agent-may-not",
+        "36-reading-a-prmr-agents-read-through-lazy-with-no-forge-token",
+        "37-the-machine-and-its-image-build-watched-by-people-not-agents",
+        "when-you-find-an-asymmetry-that-is-not-listed-here"
+      ]
+    },
+    {
+      "path": "system-messages",
+      "source": "system-messages.md",
+      "file": "system-messages/index.html",
+      "title": "System messages",
+      "anchors": [
+        "system-messages",
+        "what-a-message-is",
+        "lifecycle-append-only-never-deleted",
+        "surfaces",
+        "why-agents-may-post-but-not-dismiss",
+        "environment-blockers-agents-cannot-fix",
+        "boundary-not-lazys-own-diagnosis-channel",
+        "built-in-producers"
+      ]
+    },
+    {
+      "path": "task-env",
+      "source": "task-env.md",
+      "file": "task-env/index.html",
+      "title": "Per-task environment variables",
+      "anchors": [
+        "per-task-environment-variables",
+        "when-this-is-the-right-tool",
+        "the-security-model",
+        "keep-the-value-out-of-your-shell-history",
+        "lifetime-set-once-cleared-when-the-task-ends",
+        "a-running-agent-keeps-the-environment-it-launched-with",
+        "reserved-names",
+        "env-files",
+        "runner-support",
+        "troubleshooting"
+      ]
+    },
+    {
+      "path": "teams-bound-clone-agents",
+      "source": "teams-bound-clone-agents.md",
+      "file": "teams-bound-clone-agents/index.html",
+      "title": "Claude Code against a Lazy Teams project",
+      "anchors": [
+        "claude-code-against-a-lazy-teams-project",
+        "the-primary-way-your-builder-on-the-server",
+        "the-secondary-way-your-own-claude-code-on-your-machine",
+        "what-works",
+        "what-refuses-and-says-so"
+      ]
+    },
+    {
+      "path": "teams-login",
+      "source": "teams-login.md",
+      "file": "teams-login/index.html",
+      "title": "Logging a machine in to Lazy Teams",
+      "anchors": [
+        "logging-a-machine-in-to-lazy-teams",
+        "cloning-a-hosted-project",
+        "how-git-gets-the-login",
+        "logging-in",
+        "what-a-bound-clone-can-do",
+        "your-builder-from-a-bound-clone",
+        "working-on-a-tasks-branch-on-your-own-machine",
+        "which-project-this-clone-is",
+        "when-the-project-or-team-is-renamed",
+        "seeing-where-a-machine-and-a-clone-point",
+        "logging-out",
+        "where-the-login-is-kept",
+        "the-tokens-this-creates",
+        "approving-from-the-browser",
+        "human-only-deliberately",
+        "display-name",
+        "alternative-email-addresses"
+      ]
+    },
+    {
+      "path": "token-budgets",
+      "source": "token-budgets.md",
+      "file": "token-budgets/index.html",
+      "title": "Token budgets",
+      "anchors": [
+        "token-budgets",
+        "what-it-shows",
+        "planning-with-it",
+        "who-sees-what"
+      ]
+    },
+    {
+      "path": "troubleshooting",
+      "source": "troubleshooting.md",
+      "file": "troubleshooting/index.html",
+      "title": "Troubleshooting",
+      "anchors": [
+        "troubleshooting",
+        "doctors-cleanup-flags",
+        "sessions-start-with-a-lot-of-the-context-window-already-used",
+        "the-daemon-wont-start",
+        "the-daemon-runs-but-stops-doing-work",
+        "daemon-is-not-running-while-a-daemon-clearly-is",
+        "the-daemon-is-alive-but-nothing-is-happening",
+        "the-daemon-answers-but-work-has-stopped-lazy-daemon-health",
+        "what-stopping-the-daemon-costs",
+        "where-one-tasks-pieces-live",
+        "lazytoml-wont-parse",
+        "no-model-credential",
+        "a-codex-task-answers-then-cant-touch-any-file",
+        "one-cursor-task-fails-auth-while-others-work",
+        "cursor-keeps-reconnecting-without-doing-work",
+        "a-turn-fails-with-e2big-argument-list-too-long",
+        "lazy-pair-refuses-to-run-on-my-machine",
+        "lazy-pair-or-lazy-chat-asks-me-to-login",
+        "gh-isnt-logged-into-my-github-enterprise-server-host",
+        "every-command-fails-to-acquire-the-storage-lock",
+        "when-the-daemon-holds-the-lock",
+        "when-the-holder-is-alive-but-never-lets-go",
+        "accept-fails-with-indexlock-file-exists",
+        "could-not-register-the-lazy-mcp-tools--refusing-to-run-it",
+        "refusing-to-serve-lazy-mcp-tools--configured-for-a-different-task",
+        "a-lazy-tool-fails-then-every-later-tool-says-connection-closed",
+        "claude-mcp-list-says--connected-but-the-agent-has-no-tools",
+        "run-lazy-doctor-task-id-from-the-host",
+        "turns-catch-this-by-themselves",
+        "redacted-in-logs-and-audit-records",
+        "a-builder-fails-while-its-container-image-is-building",
+        "the-environment-that-runs-this-projects-tasks-isnt-working",
+        "script-not-found-builder-or-a-selfcheck-with-no-output",
+        "lazy-sync--lazy-unblock-sits-silent-for-minutes-after-an-upgrade",
+        "the-fix-isnt-working-after-lazy-upgrade",
+        "detected-dubious-ownership-in-repository-at-",
+        "lazy-sync-warns-that-the-local-and-remote-parent-branch-differ",
+        "a-colleague-pushed-to-my-tasks-branch",
+        "a-task-lists-hundreds-of-commits-it-never-made",
+        "the-daemon-cant-fetch-from-the-remote",
+        "documentation-links",
+        "missing-git-pointers-inside-a-task-container"
+      ]
+    },
+    {
+      "path": "turn-reports",
+      "source": "turn-reports.md",
+      "file": "turn-reports/index.html",
+      "title": "Structured turn reports",
+      "anchors": [
+        "structured-turn-reports",
+        "lazy_report",
+        "the-presentation-walkthrough",
+        "optional-screenshots",
+        "keep--skip-justifications",
+        "related"
+      ]
+    },
+    {
+      "path": "tutorials/dashboard",
+      "source": "tutorials/dashboard.md",
+      "file": "tutorials/dashboard/index.html",
+      "title": "Take your first task from creation to accept in the dashboard",
+      "anchors": [
+        "take-your-first-task-from-creation-to-accept-in-the-dashboard",
+        "prerequisites",
+        "1-open-the-dashboard",
+        "2-create-and-start-a-task",
+        "3-watch-it-work",
+        "4-look-at-what-it-did",
+        "5-give-feedback-optional",
+        "6-accept",
+        "what-next"
+      ]
+    },
+    {
+      "path": "tutorials/lazy-teams",
+      "source": "tutorials/lazy-teams.md",
+      "file": "tutorials/lazy-teams/index.html",
+      "title": "Take your first task from creation to accept in Lazy Teams",
+      "anchors": [
+        "take-your-first-task-from-creation-to-accept-in-lazy-teams",
+        "prerequisites",
+        "1-sign-in",
+        "2-open-a-project",
+        "3-create-and-start-a-task",
+        "4-review-the-work",
+        "5-give-feedback-optional",
+        "6-accept",
+        "what-next"
+      ]
+    },
+    {
+      "path": "upgrade-image-rebuild",
+      "source": "upgrade-image-rebuild.md",
+      "file": "upgrade-image-rebuild/index.html",
+      "title": "How lazy upgrade rebuilds the container image",
+      "anchors": [
+        "how-lazy-upgrade-rebuilds-the-container-image",
+        "the-sequence",
+        "why-this-is-safe",
+        "running-builder-sessions",
+        "builds-have-no-time-limit",
+        "related",
+        "when-else-the-image-gets-rebuilt",
+        "the-base-image-a-custom-dockerfile-builds-from"
+      ]
+    },
+    {
+      "path": "web-review",
+      "source": "web-review.md",
+      "file": "web-review/index.html",
+      "title": "Web review surface",
+      "anchors": [
+        "web-review-surface",
+        "signing-in",
+        "command-palette",
+        "the-dashboard-has-its-own-hostname",
+        "task-apps-are-subdomains-and-stay-a-separate-jar",
+        "the-task-page",
+        "clusters",
+        "settings",
+        "routes",
+        "linking-to-a-task-from-a-builder-or-agent",
+        "the-nav-counts",
+        "creating-a-task",
+        "linking-a-branch-or-pr",
+        "agent-review-from-the-task-page",
+        "editing-a-task",
+        "acting-on-a-task",
+        "large-changes",
+        "staying-up-to-date-without-losing-your-place",
+        "since-you-last-looked",
+        "the-loop",
+        "the-screenshots-card",
+        "the-verify-tab",
+        "what-the-stats-tab-means",
+        "this-task-or-the-whole-subtree",
+        "the-four-tiles",
+        "where-the-time-went",
+        "tokens",
+        "tools",
+        "no-costs",
+        "the-services-card",
+        "start-container",
+        "start-services",
+        "services-restart-after-every-turn",
+        "navigating-a-long-review",
+        "times",
+        "when-an-accept-is-refused",
+        "the-daemon-owns-the-remedy-the-page-only-renders-it",
+        "the-passphrase-is-a-human-surface-deliberately",
+        "a-refused-accept-never-eats-what-you-typed",
+        "a-review-in-progress-belongs-to-the-task-not-to-the-tab",
+        "two-intents-ask-vs-comment",
+        "unblock-from-the-same-box",
+        "asks",
+        "promoting-a-discussion-into-a-task",
+        "comments",
+        "delivery-state-is-always-stated",
+        "anchoring-to-the-agents-prose",
+        "withdrawing-retracted-not-deleted",
+        "ordering-asks-first",
+        "design-decisions-worth-knowing",
+        "comments-are-their-own-storage-entity",
+        "the-message-is-saved-before-anything-is-attempted",
+        "the-post-returns-before-the-agent-answers",
+        "current-review-is-the-one-place-a-turn-ends",
+        "the-sticky-status-bar",
+        "one-diff-renderer-shared-by-both-pages",
+        "the-view-toolbar-and-side-by-side",
+        "mermaid-diagrams-in-diffs-and-markdown",
+        "threads-survive-a-re-diff-even-when-their-line-moves",
+        "security-posture",
+        "managed-mode-no-dashboard-at-all",
+        "known-limits",
+        "copying-markdown"
+      ]
+    },
+    {
+      "path": "web-shell",
+      "source": "web-shell.md",
+      "file": "web-shell/index.html",
+      "title": "Web shell",
+      "anchors": [
+        "web-shell",
+        "opening-a-shell",
+        "pair-and-chat",
+        "copy-and-paste",
+        "running-a-verification-step",
+        "starting-the-container",
+        "when-a-shell-cannot-be-opened",
+        "what-a-shell-can-reach",
+        "access-and-security"
+      ]
+    }
+  ],
+  "assets": [
+    "images/dashboard/builders.png",
+    "images/dashboard/clusters.png",
+    "images/dashboard/inbox.png",
+    "images/dashboard/overview.png",
+    "images/dashboard/raised.png",
+    "images/dashboard/review-queue.png",
+    "images/dashboard/scratch.png",
+    "images/dashboard/search.png",
+    "images/dashboard/settings.png",
+    "images/dashboard/task.png",
+    "images/dashboard/tasks.png",
+    "images/explanation/accept-refusals.png",
+    "images/explanation/cluster-progress.png",
+    "images/explanation/clusters-page.png",
+    "images/explanation/protected-badges.png",
+    "images/explanation/protected-file-approve.png",
+    "images/explanation/raised-decide.png",
+    "images/explanation/raised-list.png",
+    "images/explanation/reviews-tab.png",
+    "images/explanation/self-review-turns.png",
+    "images/explanation/task-page.png",
+    "images/explanation/task-statuses.png",
+    "images/how-to/dashboard-builder-transcript.png",
+    "images/how-to/dashboard-comments.png",
+    "images/how-to/dashboard-current-review.png",
+    "images/how-to/dashboard-dialog-accept.png",
+    "images/how-to/dashboard-dialog-ask.png",
+    "images/how-to/dashboard-dialog-reject.png",
+    "images/how-to/dashboard-dialog-unblock.png",
+    "images/how-to/dashboard-new-task.png",
+    "images/how-to/dashboard-protected-file.png",
+    "images/how-to/dashboard-raised.png",
+    "images/how-to/dashboard-task-backlog.png",
+    "images/how-to/dashboard-task-blocked.png",
+    "images/how-to/dashboard-task-complete.png",
+    "images/how-to/dashboard-task-working.png",
+    "images/how-to/teams-new-task.png",
+    "images/teams-topics/agents-new-task-picker.png",
+    "images/teams-topics/agents-project-default.png",
+    "images/teams-topics/builders-terminal.png",
+    "images/teams-topics/login-device-approval.png",
+    "images/teams-topics/review-accept.png",
+    "images/teams-topics/review-changes.png",
+    "images/teams-topics/review-current.png",
+    "images/teams-topics/setup-account.png",
+    "images/teams-topics/setup-checks.png",
+    "images/teams-topics/setup-finish.png",
+    "images/teams-topics/setup-installation.png",
+    "images/teams-topics/slack-integrations.png",
+    "images/teams-topics/slack-link.png",
+    "images/teams-topics/slack-tokens.png",
+    "images/teams-topics/task-environment.png",
+    "images/teams-topics/teams-services-open-link.png",
+    "images/teams/teams-account-settings.png",
+    "images/teams/teams-builders.png",
+    "images/teams/teams-clusters.png",
+    "images/teams/teams-dashboard.png",
+    "images/teams/teams-members.png",
+    "images/teams/teams-memory.png",
+    "images/teams/teams-messages.png",
+    "images/teams/teams-project-environment.png",
+    "images/teams/teams-project-machine.png",
+    "images/teams/teams-project-overview.png",
+    "images/teams/teams-project-settings.png",
+    "images/teams/teams-raised.png",
+    "images/teams/teams-review-queue.png",
+    "images/teams/teams-run-list.png",
+    "images/teams/teams-run-page.png",
+    "images/teams/teams-run-pull-confirm.png",
+    "images/teams/teams-search.png",
+    "images/teams/teams-task-turns-phone.png",
+    "images/teams/teams-task-turns.png",
+    "images/teams/teams-task.png",
+    "images/teams/teams-tasks.png",
+    "images/teams/teams-team.png",
+    "images/topics/artifacts-tab.png",
+    "images/topics/builders.png",
+    "images/topics/changes-tab.png",
+    "images/topics/inbox.png",
+    "images/topics/memory-settings.png",
+    "images/topics/regions-tab.png",
+    "images/topics/reviews-tab.png",
+    "images/topics/scratch.png",
+    "images/topics/search.png",
+    "images/topics/services-tab.png",
+    "images/topics/tasks-list.png",
+    "images/topics/token-budget.png",
+    "images/tutorials/dashboard-accept-dialog.png",
+    "images/tutorials/dashboard-current-review.png",
+    "images/tutorials/dashboard-home.png",
+    "images/tutorials/dashboard-new-task.png",
+    "images/tutorials/dashboard-task-accepted.png",
+    "images/tutorials/dashboard-task-blocked.png",
+    "images/tutorials/dashboard-task-working.png",
+    "images/tutorials/dashboard-unblock-dialog.png",
+    "images/tutorials/teams-accept.png",
+    "images/tutorials/teams-new-task.png",
+    "images/tutorials/teams-sign-in.png",
+    "images/tutorials/teams-task-blocked.png",
+    "images/tutorials/teams-task-working.png"
+  ],
+  "unresolvedLinks": [],
+  "redirects": [
+    {
+      "from": "lazy-agent-design",
+      "to": "architecture/index"
+    },
+    {
+      "from": "lazy-report-example-20260523",
+      "to": "reference/cli/report"
+    },
+    {
+      "from": "legacy-mcp-config-purge",
+      "to": "credentials"
+    }
+  ],
+  "problems": []
+}

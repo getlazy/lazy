@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running tasks with the Pi coding agent — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../search.js" data-root="../"></script>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.93</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#how-to-guides">How-to guides</a> › <span aria-current="page">Running tasks with the Pi coding agent</span></nav>
+<h1 id="running-tasks-with-the-pi-coding-agent"><a class="anchor" href="#running-tasks-with-the-pi-coding-agent" aria-hidden="true">#</a>Running tasks with the Pi coding agent</h1>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#switching-to-pi">Switching to Pi</a></li><li><a href="#upstreams-and-models">Upstreams and models</a></li><li><a href="#pi-on-a-managed-installation">Pi on a managed installation</a></li><li><a href="#thinking-effort">Thinking effort</a></li><li><a href="#credentials">Credentials</a></li><li><a href="#lazy-tools">Lazy tools</a></li><li><a href="#read-only-turns">Read-only turns</a></li><li><a href="#project-trust">Project trust</a></li><li><a href="#sessions-and-pairing">Sessions and pairing</a></li><li><a href="#container-image">Container image</a></li></ul></details></nav>
+<p>Lazy can run task agents on <a href="https://pi.dev" rel="noopener noreferrer">Pi</a> (<code>pi</code>, the Pi coding agent
+CLI) as an alternative to Claude Code. Pi is a first-class task agent: turns,
+session resume across turns, <code>lazy ask</code>, merge-conflict turns, pairing, the
+<code>lazy_*</code> tool set, and the audit proxy all work the same way they do for other
+agents.</p>
+<h2 id="switching-to-pi"><a class="anchor" href="#switching-to-pi" aria-hidden="true">#</a>Switching to Pi</h2>
+<pre><code class="language-bash">lazy system agent           # readiness view: profiles, harness, upstream, auth
+lazy system agent set pi    # project default
+lazy create --agent pi --goal &quot;…&quot;  # or per task; then `lazy start &lt;task&gt;`
+</code></pre>
+<p>The built-in <code>pi</code> profile runs a local Ollama (see below), so this needs Ollama
+running with that model pulled — no API key, and nothing hosted.</p>
+<p><code>pi</code> here is the name of the built-in <a href="../lazy-toml/#agentsname--named-agent-profiles">agent
+profile</a> whose harness is Pi.
+Subtasks, clones, redo and rework inherit the profile of the task they came
+from, exactly as with other agents.</p>
+<h2 id="upstreams-and-models"><a class="anchor" href="#upstreams-and-models" aria-hidden="true">#</a>Upstreams and models</h2>
+<p>Pi itself can talk to many model providers. Under lazy, every byte of agent
+traffic leaves through lazy&#39;s audit proxy, so where a Pi task&#39;s traffic goes is
+decided by its profile&#39;s <code>endpoint</code>.</p>
+<p><strong>Out of the box, Pi runs on your own machine.</strong> The built-in <code>pi</code> profile
+points at a local Ollama — <code>http://localhost:11434</code>, model <code>qwen3.8:latest</code> —
+and spends no credential at all. Pi is lazy&#39;s local-model agent, so
+<code>lazy create --agent pi --goal &quot;…&quot;</code> does not quietly bill a hosted provider. You need
+Ollama running with that model pulled:</p>
+<pre><code class="language-bash">ollama pull qwen3.8:latest
+</code></pre>
+<p>Everything else is a profile you declare:</p>
+<ul>
+<li><p><strong>A different Ollama, or a different local model</strong> — the same shape as the
+built-in, with your address and model:</p>
+<pre><code class="language-toml">[agents.remote-ollama-pi]
+harness = &quot;pi&quot;
+model = &quot;qwen3:32b&quot;
+endpoint = &quot;http://ollama.lan:11434&quot;
+credential = &quot;none&quot;
+</code></pre>
+<p>Then <code>lazy create --agent remote-ollama-pi --goal &quot;…&quot;</code> and <code>lazy start</code> it, or make it the project
+default with <code>lazy system agent set remote-ollama-pi</code>. Because the upstream
+is a property of the profile, one project can run some Pi tasks on one server
+and others somewhere else at the same time.</p>
+</li>
+<li><p><strong>Anthropic</strong> — available, but never the default, because it spends your
+Anthropic credential. Note the <code>endpoint</code> line: a profile that omits it
+inherits Pi&#39;s default (the local Ollama), so it is what keeps this one on
+Anthropic:</p>
+<pre><code class="language-toml">[agents.anthropic-pi]
+harness = &quot;pi&quot;
+model = &quot;claude-opus-5-5&quot;
+endpoint = &quot;https://api.anthropic.com&quot;
+credential = &quot;anthropic&quot;
+</code></pre>
+</li>
+<li><p><strong>OpenAI</strong> — a profile pointed at <code>api.openai.com</code> runs Pi&#39;s OpenAI provider
+instead, over the OpenAI wire:</p>
+<pre><code class="language-toml">[agents.openai-pi]
+harness = &quot;pi&quot;
+model = &quot;gpt-6-sol&quot;
+endpoint = &quot;https://api.openai.com&quot;
+credential = &quot;openai&quot;
+</code></pre>
+<p>The key comes from <code>lazy auth set openai</code> (or <code>OPENAI_API_KEY</code> in the
+daemon&#39;s environment), and the turn is proxied and audited exactly like an
+Anthropic one.</p>
+</li>
+<li><p><strong>OpenRouter</strong> — a profile pointed at <code>openrouter.ai</code> runs the same OpenAI
+provider against OpenRouter, billed to <code>lazy auth set openrouter</code> (or
+<code>OPENROUTER_API_KEY</code>). OpenRouter&#39;s model ids are used as they are, slash
+and all:</p>
+<pre><code class="language-toml">[agents.openrouter-pi]
+harness = &quot;pi&quot;
+model = &quot;anthropic/claude-sonnet-4.5&quot;
+endpoint = &quot;https://openrouter.ai/api&quot;
+credential = &quot;openrouter&quot;
+</code></pre>
+</li>
+</ul>
+<p>Those two wires are all Pi speaks under lazy, and the endpoint&#39;s hostname
+decides which one a profile gets: <code>api.openai.com</code> and <code>openrouter.ai</code> put Pi
+on the OpenAI wire, any other host on the Anthropic one. So a self-hosted
+gateway, or any host lazy does not know by name, runs Pi&#39;s Anthropic-wire
+provider — point such a profile at the upstream&#39;s Anthropic-compatible path. A
+gateway that speaks only the OpenAI API is not reachable from Pi. There
+is no Pi-specific model syntax: models and upstreams are chosen through lazy&#39;s
+normal configuration, never per prompt. On an Anthropic profile a model name
+carrying a Pi provider prefix (<code>openai/gpt-4o</code>) is rejected, because it is not
+an Anthropic model.</p>
+<p>A profile with an explicit <code>endpoint</code> runs under a custom Pi provider, which
+only offers the models it declares — so such a profile is required to set
+<code>model</code>, and config load rejects it otherwise. A task-level model override still
+works: lazy declares both the profile&#39;s model and the turn&#39;s own on every turn.</p>
+<p>Lazy pins Pi&#39;s provider endpoints to the proxy on every turn (via Pi&#39;s own
+<code>models.json</code> override mechanism, written into the task&#39;s sandbox home), so a
+Pi task cannot dial a model provider directly.</p>
+<p><strong>A Pi profile pointed at a hosted provider bills the same credential Claude
+Code turns do</strong>, including a Claude subscription token: lazy presents it to the
+upstream in the full form that kind of credential requires, so such a Pi task is
+not treated as some other kind of traffic. The default local profile bills
+nothing — a local model server takes no key, and lazy does not send it one.</p>
+<p><strong>A Pi profile that omits <code>endpoint</code> uses the local Ollama.</strong> A block like
+<code>[agents.my-pi] harness = &quot;pi&quot;, model = &quot;claude-opus-5-5&quot;</code> means Ollama, which
+does not have that model. Lazy warns at startup when a profile pairs a harness default upstream
+with a recognizably Anthropic model, naming the profile and the
+<code>endpoint = &quot;https://api.anthropic.com&quot;</code> line that puts it back. It warns rather
+than refuses: only you can say which service you meant.</p>
+<p><strong>If the model and the profile disagree, the turn stops instead of retrying.</strong>
+Giving a task a model its profile&#39;s upstream does not have — an Anthropic model
+name on a profile pointed at Ollama, or a model you never pulled — gets a <code>404</code>
+from that upstream. Lazy reports it as a configuration failure naming both
+halves, and the traffic view (<code>lazy net</code>) carries a line saying which upstream
+has no such model. The fix is either a model that upstream serves, or a profile
+whose <code>endpoint</code> points at the server that has it.</p>
+<p><strong>A slow local model is allowed to be slow.</strong> A large model that is still
+loading, queued behind other sessions on the same GPU, or prefilling a very
+large prompt can take minutes before it emits its first byte, and lazy waits:
+the proxy&#39;s ceiling is half an hour by default, and it keeps the connection to
+the agent alive while the model thinks. If your upstream legitimately needs
+longer, raise <code>[proxy] upstream_timeout</code> (seconds; <code>0</code> waits indefinitely). When
+the proxy does give up it says so in those words — naming the upstream, the
+ceiling that fired and the setting that changes it — rather than reporting a
+network failure. Pi itself gets the same grace on the client side: lazy raises
+Pi&#39;s own request idle timeout (five minutes by default) to sit above the proxy&#39;s
+ceiling with an extra minute of headroom, so the client cannot give up before
+the proxy does. Raising <code>[proxy] upstream_timeout</code> moves both together.</p>
+<h2 id="pi-on-a-managed-installation"><a class="anchor" href="#pi-on-a-managed-installation" aria-hidden="true">#</a>Pi on a managed installation</h2>
+<p>On an installation that <a href="../managed-config/">manages configuration for you</a> —
+Lazy Teams is one — a repository is not allowed to choose an agent profile&#39;s
+<code>endpoint</code>, because that endpoint receives the installation&#39;s model credential.
+Every example on this page that sets <code>endpoint</code> is therefore something to keep
+out of a managed project&#39;s <code>lazy.toml</code>: committing one does not take effect —
+the profile stays in the file but is not available, and <code>lazy doctor</code> (and
+on Lazy Teams the Configuration page) names it with the reason.</p>
+<p>That leaves the built-in <code>pi</code> profile and its local Ollama, so Pi runs there
+only if whoever operates the installation runs an Ollama the project&#39;s daemon
+can reach. If they do not, <strong>creating</strong> a Pi task is refused — not just starting
+one — so you are told before you have a task that nothing will run, and the
+message points at the operator rather than at your <code>lazy.toml</code>. Pick an agent
+the installation does provide, or ask them for a model server.</p>
+<p>The create-time refusal is deliberately narrow. It applies only where
+configuration is managed for you, and only when the upstream actively refuses
+the connection: if the probe is merely slow or cannot answer, the task is
+created and the launch check remains the backstop, as it has always been. On
+your own machine nothing is refused at create time at all — an Ollama you have
+not started yet is a normal thing to create a task against.</p>
+<h2 id="thinking-effort"><a class="anchor" href="#thinking-effort" aria-hidden="true">#</a>Thinking effort</h2>
+<p>A task&#39;s effort (<code>lazy create --effort high</code>, or <code>[agent] effort</code> in
+lazy.toml) sets how hard a Pi turn thinks: lazy&#39;s <code>low</code>, <code>medium</code>, <code>high</code>,
+<code>xhigh</code> and <code>max</code> are passed to Pi as its own thinking levels, and lazy declares
+the model as reasoning-capable so the level actually applies rather than being
+dropped.</p>
+<p>What the top two levels do depends on the upstream, because Pi maps its levels
+onto each provider&#39;s own controls: on an Anthropic-wire upstream (Anthropic, a
+local or hosted Ollama, a gateway) <code>xhigh</code> and <code>max</code> arrive as themselves, while
+on an OpenAI or OpenRouter profile — where the provider&#39;s scale stops one step
+lower — a <code>max</code> task runs at <code>xhigh</code>. A model that cannot reason at all simply
+answers without thinking; on a legacy OpenAI model that rejects the reasoning
+parameter outright, the turn fails with that provider&#39;s error, and the fix is a
+model that supports reasoning.</p>
+<p>Lazy also raises the output-token ceiling it declares for Anthropic-wire Pi
+profiles, because on that wire thinking is funded out of the same budget as the
+answer — without the headroom, a high-effort turn can spend nearly all of it
+thinking and get cut off mid-answer.</p>
+<p>Pi turns run with its own startup network activity disabled (<code>PI_OFFLINE</code>,
+<code>PI_SKIP_VERSION_CHECK</code>, <code>PI_TELEMETRY</code>): no update check, no model-catalog
+refresh, no telemetry, so nothing leaves the task container outside lazy&#39;s
+proxy. This is not an offline model: the turn&#39;s model traffic is unaffected and
+goes to the profile&#39;s upstream through the proxy as usual.</p>
+<h2 id="credentials"><a class="anchor" href="#credentials" aria-hidden="true">#</a>Credentials</h2>
+<p>Pi has no API key of its own. Its turns run on the same credentials lazy
+already manages:</p>
+<ul>
+<li>Anthropic — <code>lazy auth set anthropic</code> (or the environment the daemon runs in),</li>
+<li>hosted Ollama — <code>lazy auth set ollama</code>; local Ollama needs no credential,</li>
+<li>OpenAI — <code>lazy auth set openai</code>; OpenRouter — <code>lazy auth set openrouter</code>
+(named by the profile&#39;s <code>credential</code> key, which every endpoint must carry).</li>
+</ul>
+<p><code>lazy system agent set-key pi</code> is refused by design — there is nothing
+pi-specific to store. As with every agent, the task container only ever holds
+a per-launch placeholder; real credentials stay with the daemon and are
+attached per request at the proxy.</p>
+<h2 id="lazy-tools"><a class="anchor" href="#lazy-tools" aria-hidden="true">#</a>Lazy tools</h2>
+<p>Pi has no built-in MCP support. Lazy bridges its tool server into Pi with a
+small Pi extension written into the task&#39;s sandbox home on every turn, so a Pi
+task gets the full <code>lazy_*</code> tool set (read-only on <code>lazy ask</code> turns), with the
+same per-task scoping as other agents.</p>
+<h2 id="read-only-turns"><a class="anchor" href="#read-only-turns" aria-hidden="true">#</a>Read-only turns</h2>
+<p>Pi has no plan mode and no permission prompts. On <code>lazy ask</code> (and other
+read-only turns) lazy disables Pi&#39;s write-capable built-in tools (<code>bash</code>,
+<code>edit</code>, <code>write</code>) and the lazy tool server withholds its write tools, so the
+agent can read code and task state but not change anything.</p>
+<h2 id="project-trust"><a class="anchor" href="#project-trust" aria-hidden="true">#</a>Project trust</h2>
+<p>Pi can load extensions, skills, and system-prompt overrides from a <code>.pi/</code>
+directory inside a repository. Lazy always launches Pi with that loading
+disabled (<code>--no-approve</code>): a task branch is agent-writable, and a checked-in
+<code>.pi/extensions/</code> must never execute on checkout. <code>AGENTS.md</code> context files
+still load normally.</p>
+<h2 id="sessions-and-pairing"><a class="anchor" href="#sessions-and-pairing" aria-hidden="true">#</a>Sessions and pairing</h2>
+<p>Pi sessions persist in the task&#39;s sandbox and resume across turns. When a turn
+dies partway — a crash, a watchdog kill, a model error — the session id it was
+using is kept, so the resumed turn (automatic or <code>lazy unblock</code>) continues that
+same conversation with its history instead of re-sending the prompt from
+scratch. <code>lazy pair</code>
+on a Pi task launches Pi interactively inside the task container, resuming the
+task&#39;s session with its history when it has one (otherwise a fresh session
+starts, and pairing says which). When the session ends, every session file it
+wrote is captured into lazy&#39;s conversation store — searchable with
+<code>lazy search</code> — and the end-of-session AI summary is synthesized from that
+transcript, the same as for Claude Code. This holds for any profile whose
+harness is Pi, not only the built-in <code>pi</code> profile. See
+<a href="../pairing/#pi-pairing">Pairing</a> for the details.</p>
+<h2 id="container-image"><a class="anchor" href="#container-image" aria-hidden="true">#</a>Container image</h2>
+<p>The default <code>lazy-runner</code> image has Pi installed, alongside every other agent
+lazy can run in a container. A custom <code>Dockerfile.lazy</code> that starts
+<code>FROM lazy-runner</code> has it too. One built on another base adds Pi&#39;s install
+line itself — <code>lazy</code> prints it when the image is missing the binary. The install is pinned to a specific Pi version that lazy&#39;s
+integration was verified against.</p>
+
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../slack-rooms/"><span>Previous</span>Lazy Teams Slack rooms</a><a class="next" href="../troubleshooting/"><span>Next</span>Troubleshooting</a></nav>
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch" open><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/" aria-current="page">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<details class="branch"><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch"><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
+</body>
+</html>

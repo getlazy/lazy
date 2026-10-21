@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shared memory — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../search.js" data-root="../"></script>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.93</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#reference">Reference</a> › <span aria-current="page">Shared memory</span></nav>
+<h1 id="shared-memory"><a class="anchor" href="#shared-memory" aria-hidden="true">#</a>Shared memory</h1>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#why-lazy-owns-this">Why lazy owns this</a></li><li><a href="#compaction">Compaction</a></li><li><a href="#memory-vs-journal-vs-claudemd--agentsmd">Memory vs journal vs CLAUDE.md / AGENTS.md</a></li><li><a href="#record-shape">Record shape</a></li><li><a href="#who-can-write-agents-are-read-only">Who can write: agents are read-only</a></li><li><a href="#mcp-tools">MCP tools</a></li><li><a href="#importing-existing-harness-memory">Importing existing harness memory</a></li><li><a href="#storage">Storage</a></li></ul></details></nav>
+<p>Lazy owns a shared memory store: many small, named records of <strong>curated,
+cross-task knowledge</strong> — who the user is, guidance they gave and why,
+project constraints that aren&#39;t derivable from the code, and pointers to
+external resources.</p>
+<p>A compact index of every record (one line each: name, type, description) is
+auto-injected into <strong>builder and agent launches</strong>. Bodies are read on demand.
+Once the store grows, <code>lazy memory compact</code> replaces that index with a smaller
+<em>derived</em> summary — see <a href="#compaction">Compaction</a>.</p>
+<h3 id="in-the-browser"><a class="anchor" href="#in-the-browser" aria-hidden="true">#</a>In the browser</h3>
+<p><img src="../images/topics/memory-settings.png" alt="Settings → Memories on the dashboard: Live, All, New record and Compact buttons, the injected-context size line, and a table of three records with type and description" loading="lazy"></p>
+<p>The daemon&#39;s web UI serves the same store under <strong>Settings → Memories</strong> (the
+dashboard&#39;s address is printed by <code>lazy daemon status</code>):</p>
+<ul>
+<li><strong><code>/settings/memory</code></strong> — the live index, one row per record. <code>?all=1</code> includes
+removed records (tombstones; the write history is kept). <code>/memory</code> redirects
+here.</li>
+<li><strong><code>/memory/new</code></strong> and <strong><code>/memory/&lt;name&gt;</code></strong> — create, read, and edit a
+record. These are the same writes as <code>lazy memory save</code> / <code>lazy memory rm</code>:
+a human surface, so they may write. Task agents stay read-only.</li>
+<li><strong><code>/memory/compact</code></strong> — the current compact (exactly the derived summary
+injected into launches), its size against <code>[memory] warn_bytes</code>, and whether
+any records have been written or removed since it. <strong>Run compact</strong> uses the
+same modes as <code>lazy memory compact</code> (<code>auto</code>, mechanical, llm) and streams progress so a
+model call is never a silent wait. Clearing the compact is always safe:
+injection falls back to the full index.</li>
+</ul>
+<p>The pages work with JavaScript turned off. Lazy Teams offers the same pages
+under a project&#39;s <strong>Settings → Memory</strong> tab — list, read, create, edit, remove, and run or
+clear the compact, with the same size figures and the same list of records the
+compact does not cover — writing to the same store, so it reads the same either
+way. Any team member can write there; people viewing as someone else cannot.</p>
+<p>Every write names who made it. The record page and its write history show the
+person — on a laptop, the git identity the daemon runs with; in Lazy Teams, the
+signed-in member — and fall back to the role (<code>human</code>) for older records.</p>
+<p>In Lazy Teams, an <strong>Auto</strong> or <strong>LLM</strong> compact runs a model on the Claude account
+of the member who pressed <strong>Run compact</strong>, and is refused if they have not
+connected one; <strong>Mechanical</strong> runs no model and needs no account. The page
+shows each step while the compact runs.</p>
+<pre><code class="language-bash">lazy memory list                     # the index
+lazy memory show deploy-checklist # one record in full
+lazy memory save &lt;name&gt; -t project -d &quot;one line&quot;   # create or update
+lazy memory rm &lt;name&gt;                # tombstone (history preserved)
+lazy memory history [&lt;name&gt;]         # who wrote what, when
+lazy memory compact                  # regenerate the injected summary
+lazy search &#39;in:memories &quot;credentials&quot;&#39;            # search bodies
+</code></pre>
+<h2 id="why-lazy-owns-this"><a class="anchor" href="#why-lazy-owns-this" aria-hidden="true">#</a>Why lazy owns this</h2>
+<p>Claude Code has its own memory feature that writes markdown files into the
+harness&#39;s memory directory. In lazy, that directory lives <strong>inside each
+builder&#39;s own projects directory</strong>. As a result that memory is:</p>
+<ul>
+<li>never shared between builders,</li>
+<li>cleaned up along with the builder&#39;s directory,</li>
+<li>invisible to agents and to other machines,</li>
+<li>outside lazy state entirely (not in storage, not searchable, not backed up).</li>
+</ul>
+<p>Lazy memory replaces it: storage-backed, actor-attributed, searchable, and injected where it&#39;s
+actually needed. Builder and agent prompts explicitly redirect from the harness
+feature to <code>lazy_memory_*</code> — the harness feature cannot be disabled, so the
+prompts tell the model not to use it.</p>
+<h3 id="when-the-index-cant-be-read"><a class="anchor" href="#when-the-index-cant-be-read" aria-hidden="true">#</a>When the index can&#39;t be read</h3>
+<p>A storage failure while building the index <strong>never blocks a launch</strong>. Instead the
+memory section is replaced with an explicit marker — <code>MEMORY INDEX UNAVAILABLE (&lt;error&gt;)</code> — that tells the model records may exist and to retry on demand with
+<code>lazy_memory_recall</code> / <code>lazy_search</code>, and the underlying error is logged loudly.
+This is deliberately <em>not</em> the same as the empty-section case: rendering nothing
+would say &quot;this project has no recorded knowledge&quot;, turning an unreadable store
+into apparent absence of knowledge. Every agent launch and the builder behave
+identically here.</p>
+<h2 id="compaction"><a class="anchor" href="#compaction" aria-hidden="true">#</a>Compaction</h2>
+<p>Every record&#39;s index line is injected into every launch, so the injected context
+grows with the store. <code>lazy memory compact</code> bounds it <strong>without touching the
+records</strong>:</p>
+<pre><code class="language-bash">lazy memory compact               # auto: LLM summary, mechanical fallback
+lazy memory compact --mechanical  # code-only; no model needed
+lazy memory compact --llm         # require the model path (fails if unavailable)
+lazy memory compact --show        # print the current compact and what it covers
+lazy memory compact --clear       # drop it; injection returns to the full index
+lazy doctor                       # injected size vs the budget, staleness, remedy
+</code></pre>
+<p>A run prints what it is about to do <em>before</em> the model call — the record count,
+when the last compact was generated, which generator and model it will use —
+because an LLM round-trip is otherwise several silent seconds.</p>
+<p>Five rules define the feature:</p>
+<ol>
+<li><p><strong>The compact is derived; records are never modified.</strong> Compaction reads the
+records and writes one separate, overwritable artifact. No description
+rewrites, no truncation, no deletions — curation-by-mutilation is exactly what
+this avoids. <code>lazy memory show</code> is byte-identical before and after, and
+compaction records no write history because it is not a write to the records.</p>
+</li>
+<li><p><strong>Injection is the compact <em>plus</em> everything newer.</strong> A record created or
+updated after the compact was generated is injected as its <strong>live index
+line</strong>, and that line supersedes whatever the compact says about it. The
+watermark is the set of <code>name</code> + <code>revision</code> pairs the compact covered — a
+revision, not a timestamp, so it is immune to clock skew and a
+delete→revive cycle correctly reads as &quot;new&quot;. A record <em>removed</em> since
+compaction is called out too (&quot;Removed since that summary&quot;), so a session
+never reads a stale summary claim as current.</p>
+</li>
+<li><p><strong>Recompaction always regenerates from the records</strong>, never from the previous
+compact. There is no compounding lossy compression: every generation is one
+summarization step away from the source of truth.</p>
+</li>
+<li><p><strong>Size is a warning, never an error — and the diagnosis lives in
+<code>lazy doctor</code>.</strong> Whenever the memory context is assembled (builder launch,
+agent launch), a context over <code>[memory] warn_bytes</code> (default 4096) logs one
+generic line — <em>&quot;Injected memory context is over the advisory size threshold.
+Run <code>lazy doctor</code> for details.&quot;</em> — and nothing more. Doctor is the single
+&quot;check engine light&quot; surface, so it owns the whole diagnosis: the actual size
+against the threshold, whether a compact exists and how stale it is (records
+written/removed since its watermark), and the remedy. The remedy is
+conditional: <code>lazy memory compact</code> when the compact is <em>behind</em> the records,
+otherwise curate the records or raise <code>warn_bytes</code> — recommending a recompact
+of an already-current compact would send you in a circle. The builder&#39;s
+section also carries a short in-prompt pointer to <code>lazy doctor</code> (the builder
+can act on it; agents are read-only, so telling them would be noise); it
+carries no sizes or remedy of its own. Nothing is ever truncated and no launch
+is ever blocked.</p>
+<p>The size that is reported is measured on the section <em>without</em> that in-prompt
+note, so the number deciding &quot;over threshold&quot; is the same number doctor and
+<code>lazy memory compact</code> quote.</p>
+</li>
+<li><p><strong>Compaction must never grow the injected context.</strong> Shrinking injection is
+the only thing compaction exists to do, so a candidate that would make it
+bigger is rejected: nothing is written, any existing compact stays in place
+and stays injected, and the command exits non-zero after printing both sizes
+and what actually helps. The comparison is made on the <strong>assembled body</strong> —
+the summary plus the compact&#39;s own explanatory preamble plus any newer
+records injected alongside it — versus that same body with no compact, since
+that is what a prompt really pays for. A consequence
+worth knowing: the preamble is a fixed cost, and one-line descriptions are
+already dense, so a small or already-tight store <em>cannot</em> be compacted below
+its plain index — mechanical compaction only starts paying for itself at
+roughly fifty-plus records. There the honest answer is rejection plus
+&quot;curate the records, or raise <code>warn_bytes</code>&quot;, not a compact that costs more
+than it saves.</p>
+</li>
+</ol>
+<p>Names stay referenceable: <code>lazy_memory_recall(name=…)</code> reads bodies on demand,
+so a summary that failed to mention a record would <strong>orphan</strong> it. Any name the
+LLM omits is appended verbatim as an index line and reported — repair, not
+rejection.</p>
+<h3 id="why-llm-first-with-a-mechanical-fallback"><a class="anchor" href="#why-llm-first-with-a-mechanical-fallback" aria-hidden="true">#</a>Why LLM-first with a mechanical fallback</h3>
+<p>The index is already one line per record, so mechanical tightening can only
+recover the repeated <code>(type)</code> token — real compression requires a reader that can
+merge overlapping knowledge into themes. So the default (<code>auto</code>) asks a model,
+and falls back to the mechanical generator — grouping by type, every name and
+description verbatim, lossless — on <strong>any</strong> failure: no credential, offline mode,
+a non-zero exit, empty output. Compaction is optional infrastructure; it must
+never be the reason a project cannot compact its memory. The fallback reason is
+always printed, never silent. Two extra guards: an LLM summary that would not
+shrink the injected context is discarded in favor of the mechanical result, and
+<code>--llm</code> (an explicit demand) fails loudly rather than quietly doing something
+else — including here, where a non-shrinking LLM summary is rejected outright
+instead of being silently replaced by a mechanical compact nobody asked for.</p>
+<h3 id="seeing-what-is-injected"><a class="anchor" href="#seeing-what-is-injected" aria-hidden="true">#</a>Seeing what is injected</h3>
+<p><code>lazy memory compact --show</code> prints the artifact <em>and its coverage</em>: when it was
+generated, by whom, which generator and model, how many records it covers, the
+injected size both with it and without it, the summary text itself, and then the
+catch-up picture — every record written or updated since the watermark (injected
+as its live index line, superseding the summary) and every name removed since.
+When nothing is outstanding it says so explicitly, so &quot;is my newest memory
+actually reaching sessions?&quot; is answerable without launching anything.</p>
+<h2 id="memory-vs-journal-vs-claudemd--agentsmd"><a class="anchor" href="#memory-vs-journal-vs-claudemd--agentsmd" aria-hidden="true">#</a>Memory vs journal vs CLAUDE.md / AGENTS.md</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>scope</th>
+<th>injected into prompts?</th>
+<th>who writes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>CLAUDE.md / AGENTS.md</strong></td>
+<td>how to work in this repo</td>
+<td>read by the agent harness automatically</td>
+<td>humans, in git</td>
+</tr>
+<tr>
+<td><strong>Journal</strong> (<code>lazy journal</code>)</td>
+<td>one task</td>
+<td><strong>entry text, never</strong> — the agent&#39;s prompt gets a one-line count of new entries and reads them on demand</td>
+<td>humans, builder, agents</td>
+</tr>
+<tr>
+<td><strong>Memory</strong> (<code>lazy memory</code>)</td>
+<td>the project, across tasks</td>
+<td>yes — the index, on every launch</td>
+<td>humans, builder</td>
+</tr>
+</tbody></table>
+<p>The journal is the <em>raw per-task record</em> (&quot;chose K=3 because…&quot;, &quot;stubbed retry&quot;).
+Memory is <em>curated cross-task knowledge</em> that future sessions should start with.
+A journal entry that turns out to matter beyond its task is a candidate for a
+memory record — promoting it is a deliberate act, not automatic.</p>
+<h2 id="record-shape"><a class="anchor" href="#record-shape" aria-hidden="true">#</a>Record shape</h2>
+<table>
+<thead>
+<tr>
+<th>field</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>name</code></td>
+<td>kebab-case slug; the record&#39;s identity. Saving an existing name <strong>supersedes</strong> it</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>one line — this is what the injected index shows (max 200 chars <strong>when you author it</strong>; see below)</td>
+</tr>
+<tr>
+<td><code>type</code></td>
+<td><code>user</code> · <code>feedback</code> · <code>project</code> · <code>reference</code></td>
+</tr>
+<tr>
+<td><code>body</code></td>
+<td>the actual knowledge (markdown)</td>
+</tr>
+</tbody></table>
+<p>Types mirror the harness categories so imported records keep their meaning:</p>
+<ul>
+<li><code>user</code> — who the user is (role, expertise, preferences)</li>
+<li><code>feedback</code> — guidance they&#39;ve given about how to work, <strong>with the why</strong></li>
+<li><code>project</code> — goals and constraints not derivable from code or git history</li>
+<li><code>reference</code> — pointers to external resources (dashboards, tickets, docs)</li>
+</ul>
+<h3 id="the-200-character-description-limit-is-an-authoring-rule"><a class="anchor" href="#the-200-character-description-limit-is-an-authoring-rule" aria-hidden="true">#</a>The 200-character description limit is an <em>authoring</em> rule</h3>
+<p><code>lazy memory save</code> and <code>lazy_memory_save</code> reject a description longer than 200
+characters: when you&#39;re writing a record, keeping the injected line short is
+free — put the detail in the body.</p>
+<p>The <strong>import path does not enforce it</strong>. Harness records were written by another
+tool under another contract, so they are stored <em>verbatim</em>, however long their
+description is — never rejected, never truncated. Rejecting would discard the
+curated knowledge the import exists to rescue; truncating would mangle it.
+After an import, lazy prints a hint naming any records over the limit so you can
+tighten them at your leisure — curation is a separate act from intake.</p>
+<p>Rendering adapts to the data rather than the data to the renderer: the index is
+one line per record, so a stored description&#39;s whitespace is collapsed <em>at
+render time</em> and long lines render in full.</p>
+<p>The one exception is the <code>lazy memory list</code> <strong>table</strong>, where a long description
+would wrap across terminal lines and make the table unscannable. There the
+description column is elided with a trailing <code>…</code> to whatever width the terminal
+leaves (piped output assumes 120 columns), and the footer says so when anything
+was shortened. This is display only — nothing stored changes, nothing that feeds
+injection is affected (the index renders descriptions in full, and a compact is
+derived from the records, never from this table), and <code>lazy memory show &lt;name&gt;</code>
+always prints the description verbatim.</p>
+<p>Every write is attributed (<code>human</code> from the CLI, <code>builder</code> over MCP, <code>system</code>
+for the import) and appended to an immutable history. <code>lazy memory rm</code> is a
+<strong>tombstone</strong>: the record leaves the index, but its history survives, and a
+later save under the same name revives it as a new revision.</p>
+<h2 id="who-can-write-agents-are-read-only"><a class="anchor" href="#who-can-write-agents-are-read-only" aria-hidden="true">#</a>Who can write: agents are read-only</h2>
+<p><strong>Task agents cannot write memory.</strong> <code>lazy_memory_save</code> is rejected
+server-side when the caller has a task id — the same ownership-gate mechanism
+that confines agents to their own subtree, not prompt guidance.</p>
+<p>The reason is a security boundary: memory records are injected into <em>every</em>
+future builder and agent session. An agent-writable shared store would be a
+prompt-injection channel into every session that follows — one compromised or
+confused agent could plant instructions that every later run reads as trusted
+project knowledge.</p>
+<p>Agents still <strong>read</strong> freely:</p>
+<ul>
+<li><code>lazy_memory_recall()</code> — the index; <code>lazy_memory_recall(name=…)</code> — one record</li>
+<li><code>lazy_search(query=&quot;in:memories &lt;text&gt;&quot;)</code> — search bodies</li>
+</ul>
+<p>If an agent learns something memory-worthy, it says so in its final summary and
+the human or builder decides.</p>
+<h2 id="mcp-tools"><a class="anchor" href="#mcp-tools" aria-hidden="true">#</a>MCP tools</h2>
+<table>
+<thead>
+<tr>
+<th>tool</th>
+<th>builder</th>
+<th>agent</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>lazy_memory_save</code></td>
+<td>✅</td>
+<td>❌ rejected server-side</td>
+</tr>
+<tr>
+<td><code>lazy_memory_recall</code></td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><code>lazy_search</code> <code>in:memories</code></td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+</tbody></table>
+<h2 id="importing-existing-harness-memory"><a class="anchor" href="#importing-existing-harness-memory" aria-hidden="true">#</a>Importing existing harness memory</h2>
+<p>One-time migration from the Claude Code harness memory files:</p>
+<pre><code class="language-bash">lazy doctor --import-memory        # previews, confirms, then imports
+lazy doctor --import-memory --yes  # non-interactive
+</code></pre>
+<p>It scans the shared <code>~/.claude/projects/&lt;encoded-cwd&gt;/memory/</code> directory <strong>and
+every builder&#39;s own projects directory</strong>, dedupes by
+record name (newest copy wins), and imports what lazy doesn&#39;t already have.
+Imported records are attributed to <code>system</code> — lazy performed the write, and the
+harness format doesn&#39;t record who authored the file.</p>
+<p>It is <strong>mechanistic</strong>: records come in as they were written. No authoring-side
+validation is applied at intake — in particular the 200-character description
+limit is not enforced and nothing is ever truncated (see above).</p>
+<p>It is idempotent: records already present are skipped, so later human edits are
+never clobbered by a re-run. <code>lazy doctor</code> reports when on-disk harness memory
+has no lazy counterpart and points at the command; it never writes silently.</p>
+<p><code>lazy init</code> also offers this import during onboarding, alongside the
+conversation-import offer, so adopting lazy on an existing repo inherits its
+memory in one step — see
+<a href="../conversation-import/#onboarding-lazy-init-offers-to-inherit-history">conversation-import.md</a>.
+That offer is a prompt too: skipped under <code>--non-interactive</code>, never silent, and
+declining just prints the <code>lazy doctor --import-memory</code> hint.</p>
+<h2 id="storage"><a class="anchor" href="#storage" aria-hidden="true">#</a>Storage</h2>
+<p>Memory lives in lazy&#39;s store like every other entity — records plus an
+append-only write history. With file storage that is <code>memories.json</code> and
+<code>memory-history.json</code> under the storage root; use <code>lazy memory</code> or the web UI
+rather than editing those files directly.</p>
+<p>The compact is stored separately as a single overwritable slot
+(<code>memory-compact.json</code> with file storage) with no history: it is derived state,
+so overwriting it destroys nothing — every run regenerates it from the same
+records. Deleting it is always safe; injection
+falls back to the full index.</p>
+
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../system-messages/"><span>Previous</span>System messages</a><a class="next" href="../token-budgets/"><span>Next</span>Token budgets</a></nav>
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch"><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<details class="branch" open><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/" aria-current="page">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch"><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
+</body>
+</html>

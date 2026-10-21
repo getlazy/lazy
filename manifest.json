@@ -1,5 +1,5 @@
 {
-  "version": "v0.92",
+  "version": "v0.93",
   "pages": [
     {
       "path": "accept-check",
@@ -2046,7 +2046,9 @@
         "your-builder",
         "search-transcripts",
         "builders-list",
-        "a-builders-page"
+        "a-builders-page",
+        "resuming-a-builder",
+        "continuing-from-a-summary"
       ]
     },
     {
@@ -2219,7 +2221,12 @@
       "file": "reference/teams/run/index.html",
       "title": "Run",
       "anchors": [
-        "run"
+        "run",
+        "what-to-run",
+        "runs",
+        "a-runs-page",
+        "pull-latest",
+        "remove"
       ]
     },
     {
@@ -2247,6 +2254,7 @@
         "header",
         "banners",
         "tabs",
+        "the-conversation-view",
         "action-area"
       ]
     },
@@ -2360,6 +2368,22 @@
       ]
     },
     {
+      "path": "running-a-commit",
+      "source": "running-a-commit.md",
+      "file": "running-a-commit/index.html",
+      "title": "Running the product at any commit",
+      "anchors": [
+        "running-the-product-at-any-commit",
+        "where-to-find-it-in-lazy-teams",
+        "what-a-run-checks-out",
+        "in-the-dashboard",
+        "running-services",
+        "pull-latest-and-changes-made-in-a-run",
+        "environment-secrets-and-files",
+        "what-a-runs-environment-holds--and-what-it-does-not"
+      ]
+    },
+    {
       "path": "search",
       "source": "search.md",
       "file": "search/index.html",
@@ -2470,12 +2494,14 @@
         "the-url-is-a-name-taskservicelazylocalhost",
         "--direct-for-curl-and-scripts",
         "under-lazy-teams",
+        "previewing-a-tasks-app-or-files-in-teams",
         "links-in-the-pull-request",
         "when-nothing-is-listening",
         "what-the-host-port-is-and-why-it-isnt-3000",
         "changing-serve-takes-effect-on-the-next-container",
         "one-off-ports-lazy-forward",
-        "working-inside-the-tasks-environment"
+        "working-inside-the-tasks-environment",
+        "the-product-at-a-commit-without-a-task"
       ]
     },
     {
@@ -2586,7 +2612,7 @@
         "9-start-creates-nothing--on-either-surface",
         "10-review-settings-are-on-both-surfaces",
         "11-asking-a-conversation-one-polymorphic-cli-id-a-separate-mcp-tool",
-        "12-artifacts-attach-and-read-over-mcp-remove-only-at-a-terminal",
+        "12-artifacts-attach-and-read-over-mcp-remove-on-human-surfaces",
         "13-machine-one-shots-have-no-mcp-tool-at-all",
         "14-the-tasks-agent-mcp-and-cli-listings-both-carry-it",
         "15-depth-scoping---levels-on-three-cli-listings-on-two-mcp-tools",
@@ -2960,6 +2986,7 @@
     "images/teams-topics/slack-link.png",
     "images/teams-topics/slack-tokens.png",
     "images/teams-topics/task-environment.png",
+    "images/teams-topics/teams-services-open-link.png",
     "images/teams/teams-account-settings.png",
     "images/teams/teams-builders.png",
     "images/teams/teams-clusters.png",
@@ -2973,7 +3000,12 @@
     "images/teams/teams-project-settings.png",
     "images/teams/teams-raised.png",
     "images/teams/teams-review-queue.png",
+    "images/teams/teams-run-list.png",
+    "images/teams/teams-run-page.png",
+    "images/teams/teams-run-pull-confirm.png",
     "images/teams/teams-search.png",
+    "images/teams/teams-task-turns-phone.png",
+    "images/teams/teams-task-turns.png",
     "images/teams/teams-task.png",
     "images/teams/teams-tasks.png",
     "images/teams/teams-team.png",
@@ -2982,6 +3014,7 @@
     "images/topics/changes-tab.png",
     "images/topics/inbox.png",
     "images/topics/memory-settings.png",
+    "images/topics/regions-tab.png",
     "images/topics/reviews-tab.png",
     "images/topics/scratch.png",
     "images/topics/search.png",

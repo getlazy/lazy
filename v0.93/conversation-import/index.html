@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Importing Claude Code conversations — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../search.js" data-root="../"></script>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.93</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#how-to-guides">How-to guides</a> › <span aria-current="page">Importing Claude Code conversations</span></nav>
+<h1 id="importing-claude-code-conversations"><a class="anchor" href="#importing-claude-code-conversations" aria-hidden="true">#</a>Importing Claude Code conversations</h1>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#builders-one-conversation-however-many-session-files">Builders: one conversation, however many session files</a></li><li><a href="#live-capture-two-paths-both-automatic">Live capture: two paths, both automatic</a></li><li><a href="#one-surface-lazy-import-conversation">One surface: lazy import-conversation</a></li><li><a href="#recovery-is-the-same-flow">Recovery is the same flow</a></li><li><a href="#using-what-is-stored">Using what is stored</a></li><li><a href="#onboarding-lazy-init-offers-to-inherit-history">Onboarding: lazy init offers to inherit history</a></li></ul></details></nav>
+<p>Lazy stores conversations — the reasoning, exploration, and decisions from
+interactive Claude Code sessions — as persisted development context alongside
+task data. Sessions for a lazy project are captured <strong>live</strong> (see below). This
+page covers importing <em>other</em> Claude Code history into the store: sessions that
+predate lazy, or that recovery left behind.</p>
+<p>Adopting lazy on a repo that already has Claude Code history should mean
+inheriting that history as builder memory — not starting from scratch.</p>
+<h2 id="builders-one-conversation-however-many-session-files"><a class="anchor" href="#builders-one-conversation-however-many-session-files" aria-hidden="true">#</a>Builders: one conversation, however many session files</h2>
+<p>Claude Code rolls a long session into a fresh session file when it compacts
+the context and when a session is resumed, and <code>/clear</code> starts a fresh one too.
+Lazy lists and opens <strong>Builders</strong>, not session files: a Builder runs from a
+start or <code>/clear</code> to the next <code>/clear</code>, and compaction and resume continue
+it. Lazy joins the files by the links Claude Code writes into them, so
+<code>lazy conversations</code>, <code>lazy conversations show</code>, search, <code>lazy ask</code>,
+the dashboard&#39;s <strong>Builders</strong> page and the conversation MCP tools each
+show one entry per Builder, with every message across its files. A Builder&#39;s
+id is the session id of its first file; any of its session ids (or a unique
+prefix) opens it. A builder you started from the dashboard shows its state as a
+badge on its Builder once that builder has stopped at least once (the session
+it is in is recorded when it stops).</p>
+<p>Conversations imported before this existed are grouped the same way, with no
+re-import. A compaction captured before then may still show as two Builders;
+<code>lazy import-conversation --all --yes</code> re-reads the session files still on disk
+and joins them. Captured builder scratch files record the Builder that last wrote
+them.</p>
+<h3 id="who-had-the-conversation"><a class="anchor" href="#who-had-the-conversation" aria-hidden="true">#</a>Who had the conversation</h3>
+<p>In Lazy Teams, each member has their own builder. Project members can read
+captured Builders belonging to other members, but reading a conversation does
+not grant permission to attach to or control someone else&#39;s builder.</p>
+<p>New captures from a registered builder retain its owner&#39;s email address, and
+Teams uses that address for human message labels instead of calling every
+author “You”. Older or imported history without a known owner is labelled
+“Human (unknown)”; Lazy does not assume the reader or importer wrote it.</p>
+<h2 id="live-capture-two-paths-both-automatic"><a class="anchor" href="#live-capture-two-paths-both-automatic" aria-hidden="true">#</a>Live capture: two paths, both automatic</h2>
+<p>Nothing needs importing for sessions that happen while lazy is running — they
+are captured as they go:</p>
+<ul>
+<li><strong>The builder&#39;s own session</strong> is captured by the in-container builder
+supervisor, on a timer while the session runs and again on exit. That covers
+what the builder can see from inside its container, and nothing else.</li>
+<li><strong>Every other Claude session for the project</strong> runs on the <em>host</em>: any <code>claude</code>
+you run in the repo yourself. The daemon sweeps the Claude projects dirs once a
+minute and captures those. It is cheap by construction — discovery is <code>readdir</code><ul>
+<li><code>stat</code> plus one small head-read per session, and a session is parsed only
+when it is new or has changed since the last pass.</li>
+</ul>
+</li>
+</ul>
+<h3 id="capture-never-shortens-a-conversation"><a class="anchor" href="#capture-never-shortens-a-conversation" aria-hidden="true">#</a>Capture never shortens a conversation</h3>
+<p>The same session exists in several projects dirs, and a stale copy can be
+touched — mounted, refreshed — without gaining a byte. Storing such a copy would
+replace a conversation with an earlier snapshot of itself, so a capture whose
+messages are a strict prefix of what is already stored (same message uuids,
+position for position, fewer of them) is refused, and the refusal is logged. This is deliberately
+narrow: a conversation that genuinely <em>diverged</em> is still stored, because there
+the on-disk copy is the truth.</p>
+<h3 id="what-is-deliberately-not-captured"><a class="anchor" href="#what-is-deliberately-not-captured" aria-hidden="true">#</a>What is deliberately NOT captured</h3>
+<p>Lazy runs its own machine-generated <code>claude -p</code> one-shots — the PR/commit
+fidelity summaries on every accept, <code>lazy report</code>, and LLM memory compaction.
+These are housekeeping, not conversations, and would drown real builder
+conversations in <code>lazy conversations</code> and search. They are <strong>never</strong> captured,
+by either path.</p>
+<p>They are identified by a marker that lazy&#39;s one-shot runner prepends to the
+prompt, so the session JSONL carries it durably. Detection is structural — marked at the source, not sniffed from prompt wording —
+so a real conversation that merely <em>discusses</em> the marker is still captured.</p>
+<h4 id="local-command-transcripts"><a class="anchor" href="#local-command-transcripts" aria-hidden="true">#</a>Local-command transcripts</h4>
+<p>Running a built-in slash command — <code>/clear</code>, <code>/model</code>, <code>/compact</code>, <code>/login</code>, <code>/effort</code> —
+makes Claude Code write three kinds of message into the session log: a fixed
+caveat telling the model to ignore what follows, the command invocation itself,
+and whatever the command printed. Nobody said any of it, so none of it is
+conversation, and it is dropped when a session is read.</p>
+<p>Two things follow. A session made of nothing but local commands — the usual
+shape, because <code>/clear</code> opens a fresh log and typing <code>/clear</code> again ends it — has
+no content left and is never stored at all. A real conversation that merely
+<em>starts</em> with a <code>/clear</code> is stored as it always was, minus the boilerplate, so
+its one-line summary is the first thing you actually said instead of the caveat.</p>
+<p>The line is drawn at &quot;did a human type it&quot;. A command whose arguments carry your
+own words (<code>/compact keep the focus on last night&#39;s run</code>) is kept, and so is any
+message that merely quotes one of these wrappers while discussing it. Matching is
+on Claude Code&#39;s own tags, never on the caveat&#39;s wording, so a reworded caveat
+means a message is kept rather than silently dropped.</p>
+<p>An <code>/effort</code> invocation with a setting such as <code>high</code> is also omitted: choosing
+a reasoning level is a setting change, not a conversation message. Background
+agent completion notifications are omitted as well; they are generated by the
+agent harness, not typed by a human. Builder titles and transcripts apply the
+same filtering to previously captured history without rewriting the original
+stored messages.</p>
+<p><strong>Only Claude Code&#39;s own built-in commands count as boilerplate.</strong> Your project&#39;s
+slash commands are kept, even when you invoke one with no arguments — <code>/deploy</code>
+on its own stays in the transcript. Claude Code writes a custom command exactly
+the way it writes <code>/clear</code>, so there is no way to tell them apart by shape, and
+the invocation is usually the line that explains why the next fifty messages
+happened. If a built-in ever turns up in a transcript, that is the same rule
+erring the safe way: lazy keeps anything it does not recognise.</p>
+<p>One thing is <em>not</em> filtered: <code>/context</code> writes its report as an ordinary message
+with no wrapper around it, so there is nothing to match on that a human could not
+also have typed, and those still appear.</p>
+<h5 id="cleaning-up-conversations-stored-before-this-filter-existed"><a class="anchor" href="#cleaning-up-conversations-stored-before-this-filter-existed" aria-hidden="true">#</a>Cleaning up conversations stored before this filter existed</h5>
+<p>Filtering happens as a session is read, so conversations captured earlier still
+carry the boilerplate — they still list the caveat where your first sentence
+should be. <code>lazy doctor</code> warns when it finds any, and one flag cleans them:</p>
+<pre><code>lazy doctor --clean-local-command-conversations              # lists, changes nothing
+lazy doctor --clean-local-command-conversations --dry-run    # lists and stops
+lazy doctor --clean-local-command-conversations --yes        # applies
+</code></pre>
+<p>It prints every conversation it would touch — short session ID, start time, how
+many scaffolding messages it would drop, the summary it has today and the one it
+would get — and then, on a terminal, asks; the default is <strong>no</strong>, and a non-TTY
+is told to re-run with <code>--yes</code>. Nothing runs on its own, ever.</p>
+<p>Each conversation is put back through today&#39;s reader, so the result is exactly
+what importing that session fresh would produce: the scaffolding messages go, the
+summary becomes the first thing you actually said, and everything else — your
+messages, the assistant&#39;s replies, the token totals — is untouched.</p>
+<p><strong>On its own it deletes nothing.</strong> Some stored rows are nothing <em>but</em>
+scaffolding (a caveat and a <code>/clear</code>, with no conversation around it) — a
+listing entry with no conversation behind it. Those are listed so you can see
+how many there are, and then left exactly as they are.</p>
+<p>If you want them gone, ask for it explicitly:</p>
+<pre><code>lazy doctor --clean-local-command-conversations --delete-empty-local-command-conversations
+</code></pre>
+<p>Only rows whose <em>every</em> stored message is scaffolding are deleted; a
+conversation with one real message in it is cleaned, never removed. The flag is
+never implied by <code>--yes</code>, and the deletion is confirmed separately from the
+cleanup — approving the rewrite is not approving a delete. Each row is listed
+first with its short session ID and start time, on a terminal the question
+defaults to <strong>no</strong>, and without a terminal and without <code>--yes</code> the command
+refuses rather than guessing.</p>
+<p>Deletion is permanent as far as lazy is concerned, and one thing is worth
+knowing before you say yes: a deleted row is <strong>not</strong> brought back by <code>lazy doctor --reimport-conversations</code> even if its raw Claude JSONL is still on disk,
+because today&#39;s reader drops that session as empty — which is the whole reason
+it is not worth keeping.</p>
+<h3 id="other-sessions-lazy-does-not-capture"><a class="anchor" href="#other-sessions-lazy-does-not-capture" aria-hidden="true">#</a>Other sessions lazy does not capture</h3>
+<p>The end-of-pairing session summary (<code>lazy pair</code>) carries the same marker, even
+though it goes through a supervised turn rather than a machine one-shot — its output
+already lands on the task as a turn, so capturing the session too is noise.</p>
+<p>Deliberately-skipped one-shots never count as uncaptured, so the <code>lazy doctor</code>
+capture check below does not go red after every accept.</p>
+<h3 id="one-shots-never-become-your-resume-target"><a class="anchor" href="#one-shots-never-become-your-resume-target" aria-hidden="true">#</a>One-shots never become your resume target</h3>
+<p>Lazy also ignores its own one-shots when working out which Claude session a
+builder, <code>lazy pair</code> or <code>lazy chat</code> launch was running, and when <code>lazy watch</code>
+picks the session to follow. Without that, a housekeeping summary fired by an
+accept during your builder session could become the newest session file and be
+offered as the <code>lazy builder --resume &lt;id&gt;</code> target — reopening the housekeeping
+conversation instead of yours. Files lazy cannot read, or that carry no marker,
+are treated as real sessions: a redundant capture costs nothing, while losing
+your resume target costs the session.</p>
+<h3 id="where-a-one-shot-runs"><a class="anchor" href="#where-a-one-shot-runs" aria-hidden="true">#</a>Where a one-shot runs</h3>
+<p>Every machine one-shot runs in a <strong>throwaway container</strong> from the project&#39;s
+agent image — the same isolation as a supervised task turn (proxy, placeholder
+credentials, audit log). Nothing agent-shaped runs on the host.</p>
+<ul>
+<li>Accept&#39;s merge-description summary and memory compaction get <strong>no repository
+mount at all</strong>, so they cannot write to the branch being merged.</li>
+<li><code>lazy ask</code> and <code>lazy report</code> get the project root mounted <strong>read-only</strong>, so
+the agent can read the tree but cannot write into it.</li>
+</ul>
+<p>Session state lands in a lazy-owned agent state directory (the <code>.claude</code> tree
+for Claude Code, <code>.cursor</code> for Cursor) at
+<code>~/.lazy/oneshot/&lt;project-slug&gt;/&lt;config-dir&gt;</code>, mounted into the container — not
+your real <code>~/.claude</code> or <code>~/.cursor</code>, and not the daemon directory that holds
+lazy&#39;s tokens and credentials. The directory is stable per project, so one-shots
+do not leave a new <code>~/.claude/projects/</code> entry behind each time. Set
+<code>LAZY_ONESHOT_BASE_DIR</code> to relocate the base for every project at once. Write
+tools are disallowed.</p>
+<p>Docker must be available — a one-shot fails loud with actionable guidance if the
+runner cannot launch a container; there is no silent fallback to a host spawn.</p>
+<h3 id="how-long-a-one-shot-may-run"><a class="anchor" href="#how-long-a-one-shot-may-run" aria-hidden="true">#</a>How long a one-shot may run</h3>
+<p>Every machine one-shot is bounded: a run is killed after ten minutes with an
+error that says so. A one-shot is a single model call — one prompt, one answer,
+no tools to wait on — so ten minutes only ever elapses on a call that is never
+going to answer, which is what an unreachable proxy or API endpoint looks like
+from the inside. The bound keeps an accept from hanging in <code>merging</code> and keeps
+<code>lazy report</code>, <code>lazy ask</code> and <code>lazy memory compact</code> from hanging your terminal.</p>
+<p>A timed-out run&#39;s container is removed, so it cannot linger. Each command then
+handles the failure the way it handles missing authentication: memory compaction
+falls back to mechanical compaction (and in <code>--llm</code> mode fails while naming that
+alternative), a <code>lazy report</code> map unit is listed as a failed unit and the digest
+is composed without it, and a <code>lazy ask</code> excerpt becomes a warning on an answer
+built from the rest. A timeout in a <em>reduce</em> pass — the single call that
+composes the final answer — fails the command, because there is nothing left to
+degrade to.</p>
+<h3 id="purging-housekeeping-conversations-captured-before-the-marker"><a class="anchor" href="#purging-housekeeping-conversations-captured-before-the-marker" aria-hidden="true">#</a>Purging housekeeping conversations captured before the marker</h3>
+<p>Conversations stored <em>before</em> the marker shipped carry no marker, so nothing
+removes them automatically. <code>lazy doctor --purge-housekeeping-conversations</code>
+is the <strong>one-time</strong> cleanup for them:</p>
+<pre><code>lazy doctor --purge-housekeeping-conversations          # lists, deletes nothing
+lazy doctor --purge-housekeeping-conversations --yes    # deletes
+</code></pre>
+<p>Without <code>--yes</code> it prints every conversation it classified — short session ID,
+start time, which kind of one-shot it is, and why it was classified — and
+deletes nothing. On a TTY it then asks for confirmation, defaulting to <strong>no</strong>;
+a non-TTY is told to re-run with <code>--yes</code>. Deletion is not recoverable from lazy
+(Claude Code prunes the raw JSONL on disk over time), so read the list.</p>
+<p>This is the only place in lazy that classifies a conversation by sniffing
+prompt wording. That is acceptable
+<em>here</em> because the command is explicit, human-reviewed, and
+one-time, where at capture time — running forever, on every sweep tick — it
+would not be. Every rule is anchored at the very start of the conversation&#39;s
+single user message, so a real conversation that quotes a lazy prompt is never
+matched.</p>
+<p>A caveat worth knowing: because these conversations have no marker on disk,
+<code>lazy doctor --reimport-conversations</code> will re-import them if their raw JSONL is
+still present. Purge is about cleaning up the store, not about rewriting what is
+on disk.</p>
+<h3 id="when-live-capture-is-not-running"><a class="anchor" href="#when-live-capture-is-not-running" aria-hidden="true">#</a>When live capture is not running</h3>
+<p>If the daemon is not running, its host-side sweep is not running either — the
+sessions stay on disk until a daemon is up or you import them manually.
+<code>lazy doctor</code> fails (not warns) when it finds sessions from the last 24 hours
+that never reached the store, because that means live capture is broken <em>now</em>:</p>
+<pre><code>✗ Conversation capture is live
+  3 conversation(s) written in the last 24h (most recent 41m ago) are on disk
+  but never reached the store — live capture is not running.
+</code></pre>
+<p>Sessions written in the last few minutes are treated as in flight, not as
+failures — the sweep may simply not have ticked yet.</p>
+<p>A builder or <code>lazy pair</code> session that ends while the daemon is down is not
+lost: lazy keeps a copy under <code>.lazy/recovery/conversations/</code> and tells you so,
+and the daemon stores it automatically the next time it runs. Files there that
+are not valid recovery files are renamed to <code>*.invalid</code> and never stored.</p>
+<h3 id="what-a-builder-session-tells-you-when-its-capture-failed"><a class="anchor" href="#what-a-builder-session-tells-you-when-its-capture-failed" aria-hidden="true">#</a>What a builder session tells you when its capture failed</h3>
+<p>The first path runs on a 30-second timer inside the builder&#39;s container, where
+its only voice is a log file you are not watching. So when a builder session
+ends, it prints on your terminal what went wrong — once, after the Claude Code
+interface is gone:</p>
+<pre><code>Conversation capture failed during this session — some or all of this session&#39;s
+history may not be in the lazy store, and `lazy upgrade` may not be able to
+resume it:
+  [builder] Incremental capture failed: Unable to connect. Is the computer able
+  to access the url? [ConnectionRefused]
+Check `lazy daemon status`, then `lazy doctor` for details.
+`lazy doctor --reimport-conversations` can re-import from the session files on disk.
+</code></pre>
+<p>Each <em>distinct</em> reason is listed once, however many times it recurred. Beyond
+the first five the report says how many more it is not showing rather than
+truncating silently, and the full list is in that session&#39;s supervisor log.</p>
+<p>Reasons carry the machine detail as well as the prose — the error code, and the
+underlying error when one was wrapped. Without it the most common failure of all
+reads as &quot;unable to connect&quot; with no address and no reason, which is not enough
+to tell a wrong port from an unreachable host.</p>
+<h2 id="one-surface-lazy-import-conversation"><a class="anchor" href="#one-surface-lazy-import-conversation" aria-hidden="true">#</a>One surface: <code>lazy import-conversation</code></h2>
+<p><code>lazy import-conversation</code> is the single surface for bringing Claude Code
+history into the store, per-session or in bulk.</p>
+<pre><code class="language-bash">lazy import-conversation              # Preview + import all new sessions
+lazy import-conversation --yes        # Import all new sessions, no prompt
+lazy import-conversation --list       # List available sessions
+lazy import-conversation bc77e1b1     # Import one session (id can be shortened)
+lazy import-conversation --all        # Re-import everything (incl. already imported)
+lazy import-conversation --show-imported     # Show already-imported conversations
+lazy import-conversation --show bc77e1b1     # Show a full conversation transcript
+</code></pre>
+<h3 id="where-it-looks-multi-root-discovery"><a class="anchor" href="#where-it-looks-multi-root-discovery" aria-hidden="true">#</a>Where it looks (multi-root discovery)</h3>
+<p>Discovery spans <strong>every</strong> Claude projects dir for this repo:</p>
+<ul>
+<li>the shared <code>~/.claude/projects/&lt;encoded-repo&gt;/</code> dir, and</li>
+<li>each builder&#39;s own isolated projects dir, under lazy&#39;s data directory.</li>
+</ul>
+<p>When the same session appears in several dirs (seeding copies a session into
+each isolation dir), the most complete copy is used (largest size, newest
+mtime). This means a session that only ever lived in an isolation dir is still
+importable — both in bulk and by session-id.</p>
+<p>Not to be confused with <code>lazy builder --resume &lt;id&gt; --import</code>, which is a
+different operation entirely: it decides which projects dir a <em>builder launch</em>
+mounts (adopting a session that has never run under builder isolation), and
+writes nothing to lazy&#39;s store. Importing a conversation here never affects which
+sessions <code>/resume</code> lists, and adopting a session there never imports it.</p>
+<h3 id="bulk-import-never-writes-silently"><a class="anchor" href="#bulk-import-never-writes-silently" aria-hidden="true">#</a>Bulk import never writes silently</h3>
+<p>Running <code>lazy import-conversation</code> with no session-id previews what would be
+imported and asks for confirmation before writing:</p>
+<pre><code>Found 5 session(s) on disk; 3 missing from the store, 2 already imported.
+Import 3 conversation(s) into the store?
+</code></pre>
+<p>Pass <code>--yes</code> to skip the prompt (for non-interactive callers). On a non-TTY
+without <code>--yes</code>, it prints what it <em>would</em> do and writes nothing. Naming an
+explicit session-id, or passing <code>--all</code>, imports directly — the argument/flag
+is itself explicit intent.</p>
+<p>Import is idempotent: sessions already in the store are skipped, and empty or
+unparseable JSONL shells are skipped rather than stored as content-free stubs.
+Lazy&#39;s machine-generated one-shots are excluded from discovery entirely, so no
+import path can resurrect them; when any are present the count is reported
+(<code>ignored 2 machine-generated lazy one-shot(s)</code>) rather than passed over in
+silence, and naming one explicitly says so instead of &quot;session not found&quot;.</p>
+<h2 id="recovery-is-the-same-flow"><a class="anchor" href="#recovery-is-the-same-flow" aria-hidden="true">#</a>Recovery is the same flow</h2>
+<p><code>lazy doctor --reimport-conversations</code> is an alias for the bulk path of
+<code>lazy import-conversation</code> — same multi-root discovery, dedupe, preview, and
+confirmation. It exists as a recovery entry point for stranded builder
+conversations (sessions that are on disk but never reached
+the store). The <code>lazy doctor</code> health sweep also <em>detects</em> conversations
+on disk but not in the store — a warning for old ones, a failure for recent ones
+(see <a href="#when-live-capture-is-not-running">When live capture is not running</a>) — and points at this command; detection is
+report-only and never writes.</p>
+<pre><code class="language-bash">lazy doctor --reimport-conversations          # Preview, then confirm
+lazy doctor --reimport-conversations --yes    # Recover without prompting
+</code></pre>
+<h2 id="using-what-is-stored"><a class="anchor" href="#using-what-is-stored" aria-hidden="true">#</a>Using what is stored</h2>
+<p>Claude Code&#39;s own retention ages old sessions out of <code>/resume</code>; lazy&#39;s store
+keeps them. Browse them from the terminal:</p>
+<pre><code class="language-bash">lazy conversations                              # list (newest first)
+lazy conversations search &quot;design decision&quot;       # search message content
+lazy conversations show 4f8c2a1b                  # read one in full
+</code></pre>
+<p><code>lazy builder list</code> shows the same table; <code>lazy show &lt;builder-id&gt;</code> still
+works too. For structured search across the whole project,
+<code>lazy search --conversations</code> and <code>lazy search &#39;in:conversations &lt;text&gt;&#39;</code> also
+reach conversation bodies.</p>
+<h3 id="in-the-browser"><a class="anchor" href="#in-the-browser" aria-hidden="true">#</a>In the browser</h3>
+<p><img src="../images/topics/builders.png" alt="The dashboard Builders page with its search box and one captured builder conversation listed with its id, start and end, turn counts and title" loading="lazy"></p>
+<p>The daemon&#39;s web UI serves the same Builders under <strong>Builders</strong> in the nav
+(the dashboard&#39;s address is printed by <code>lazy daemon status</code>; old
+<code>/conversations</code> links redirect):</p>
+<ul>
+<li><strong><code>/builders</code></strong> — every Builder, newest first: its id, start and end, how
+many turns came from you and from the builder, and its title. The search box takes the same pattern <code>lazy conversations search</code>
+does and shows the matching passages inline, so you can tell from the results
+which Builder you meant before opening it. A pattern the engine
+rejects — a typo, or one that takes too long to evaluate — is named on
+the page; the box keeps what you typed.</li>
+<li><strong><code>/builders/&lt;id&gt;</code></strong> — one Builder, read as a dialogue across all its
+session files.
+Long transcripts are paged 40 messages at a time with <strong>Earlier</strong> / <strong>Later</strong>
+links. A short id works here too, as long as it is unique; an ambiguous one is
+refused rather than resolved to a guess.</li>
+</ul>
+<p>Conversations are captured, never authored here: nothing you do on these pages
+edits a transcript. The one thing they let you <em>create</em> is a task, from part of
+a transcript — see below. Everything works with JavaScript turned off. Lazy
+Teams shows the same for a project under <strong>Builders</strong>: the list, with your
+running builder first and each builder&#39;s run state as a badge, and a page per
+builder with its whole transcript, the files it left in scratch and — when it
+is yours and running — its terminal with <strong>Stop</strong> and <strong>End</strong>. A builder you
+have just started is listed as soon as its transcript is first captured (within
+about half a minute), but without its run badge until the run has stopped once;
+until then the run itself is offered on its own as <strong>Running now</strong>. Old <strong>Transcripts</strong>
+links redirect. There the badge rides the <strong>Builders</strong> nav entry, and the mark
+it counts against is kept per member on the server.</p>
+<p>The <strong>Builders</strong> nav entry carries a badge counting Builders that grew since
+you last opened the listing. That mark lives in your browser rather than
+in the store — conversations have no read state — so each browser counts for
+itself; see <a href="../web-review/#the-nav-counts">the nav counts</a>.</p>
+<h3 id="turning-part-of-a-conversation-into-a-task"><a class="anchor" href="#turning-part-of-a-conversation-into-a-task" aria-hidden="true">#</a>Turning part of a conversation into a task</h3>
+<p>Decisions get made in a builder session and then have to be typed out again as a
+task. They don&#39;t. Promote the exchange instead — in the browser or from the
+terminal — and you get a <strong>backlog task seeded with those messages, verbatim</strong>,
+which you edit before anything is created.</p>
+<p>You always name a <strong>range of messages</strong>, never the whole conversation: a session
+runs to hundreds of messages across unrelated topics, so a task seeded from all
+of it says everything and means nothing. Messages are numbered from 1, and both
+surfaces show the numbers.</p>
+<p>In the browser, open the conversation and use <strong>Start here</strong> on the first
+message of the exchange and <strong>End here</strong> on the last. The selected run is
+highlighted and a form appears with:</p>
+<ul>
+<li><strong>Goal</strong> — the first sentence of what <em>you</em> said in that range</li>
+<li><strong>Code</strong> — derived from the goal; edit it or clear it</li>
+<li><strong>Parent task</strong> — a task id or code to file the new task under; leave it empty
+for a top-level task</li>
+<li><strong>Prompt</strong> — the selected messages verbatim, plus a line saying which
+conversation and which messages they came from</li>
+</ul>
+<p><strong>In Lazy Teams</strong>, the same <strong>Start here</strong> / <strong>End here</strong> links are on a
+conversation, and the form is the same four fields with one difference: they
+start <strong>empty</strong>, and each says what it falls back to. Leave a field alone and
+that default is used — the goal from what you said, a code from the goal, the
+prompt from the messages themselves — so promoting there is two clicks and a
+button. Type in a field only to override it. Teams also cannot warn you about an
+overlap up front the way the single-project browser does; it tells you which
+other task shares those messages once the new one is created.</p>
+<p>From the terminal:</p>
+<pre><code>lazy conversations show 3f9a01b2          # message numbers are in the transcript
+lazy conversations promote 3f9a01b2 --from 12 --to 18
+</code></pre>
+<p>That prompts for the goal, code and parent, then opens <code>$EDITOR</code> on the seeded
+prompt. Everything that can fail — an unknown session id, a range the transcript
+does not have, a range already promoted — is checked <em>before</em> the editor opens,
+so you never type a brief and lose it to a validation error. <code>--goal</code>, <code>--code</code>
+and <code>--parent</code> set fields up front; <code>--yes</code> takes the seeded text unedited
+(scripts and non-interactive shells get this automatically).</p>
+<p><strong>The new task is created in the backlog and never started</strong> — promoting writes
+the task down, starting the work stays your call.</p>
+<p><strong>Promoted twice? You&#39;ll see it.</strong> Each promoted task records which conversation
+and which messages it came from, so the transcript page lists what has already
+been promoted out of it, and a selection that overlaps an earlier one says so
+before you submit. Promoting the <em>exact same</em> range twice is refused, naming the
+task that already exists. A long conversation legitimately yields several tasks,
+so overlapping ranges are allowed — just never by accident.</p>
+<h3 id="asking-instead-of-reading-lazy-ask-conversation-id"><a class="anchor" href="#asking-instead-of-reading-lazy-ask-conversation-id" aria-hidden="true">#</a>Asking instead of reading: <code>lazy ask &lt;conversation-id&gt;</code></h3>
+<p>When you want an answer rather than the whole transcript, use <code>lazy ask</code>:</p>
+<pre><code>lazy conversations                                # find the session id
+lazy ask 4f8c2a1b -m &quot;what did we decide about retention?&quot;
+lazy ask 4f8c2a1b                                   # no -m: opens $EDITOR
+lazy ask 4f8c2a1b -m &quot;...&quot; --json                   # structured answer
+</code></pre>
+<p><code>lazy ask</code> takes either kind of id: a task id asks that task&#39;s live agent (see
+<code>lazy ask --help</code>), a conversation session id — full, or any unique prefix —
+asks the stored transcript. An ambiguous prefix is an error, never a silent pick.</p>
+<p><strong>Nothing is written back.</strong> A conversation is immutable history and an ask is a
+read of it: no turn, no comment, and the ask&#39;s own <code>claude -p</code> session is marked
+as a machine one-shot so it is never captured as a <em>new</em> conversation. The
+answer goes to stdout and that is all. The agent is locked down to match — it
+gets no Bash, Write or Edit, so it can only read the transcript it was handed.</p>
+<p>Agents and the builder get the same thing as <code>lazy_conversation_ask</code>
+(<code>session_id</code> + <code>question</code>). Prefer it over <code>lazy_conversation_read</code> when you
+want one fact rather than the whole transcript — a long conversation read in
+full can overflow the caller&#39;s own context.</p>
+<h3 id="transcripts-too-large-for-one-pass"><a class="anchor" href="#transcripts-too-large-for-one-pass" aria-hidden="true">#</a>Transcripts too large for one pass</h3>
+<p>Each pass reads at most 96 KiB of transcript, which keeps every call well inside
+the model&#39;s context window and lets the passes run in parallel. A transcript
+over that budget is therefore split at <strong>message boundaries</strong>
+into consecutive excerpts: each is read for what bears on the question, and a
+final pass writes one answer from those findings. <code>--json</code> reports <code>chunks</code> and
+<code>relevantChunks</code> so you can see it happened.</p>
+<p>Every degradation is reported rather than absorbed. An excerpt that fails to
+read, a single message too large to pass whole, findings that did not fit in the
+final pass — each comes back as a warning (on stderr, or in <code>warnings</code> under
+<code>--json</code>). If <em>every</em> excerpt fails, the ask fails; you never get a confident
+answer built from silently-dropped input.</p>
+<h2 id="onboarding-lazy-init-offers-to-inherit-history"><a class="anchor" href="#onboarding-lazy-init-offers-to-inherit-history" aria-hidden="true">#</a>Onboarding: <code>lazy init</code> offers to inherit history</h2>
+<p>When you run <code>lazy init</code> on a repo that already has Claude Code history, init
+detects it and offers to inherit it. This is deliberately <strong>one</strong> step, not two
+disjoint prompt blocks — adopting lazy on an existing repo should feel like a
+single &quot;inherit your history?&quot; question, covering both kinds of history the
+harness leaves behind:</p>
+<ul>
+<li><strong>conversations</strong> — past sessions, imported as builder memory (see above)</li>
+<li><strong>harness memory files</strong> — <code>&lt;projects-root&gt;/&lt;encoded-cwd&gt;/memory/*.md</code>,
+imported as lazy shared memory records (see <a href="../memory/">memory.md</a>)</li>
+</ul>
+<pre><code>This repo already has Claude Code history from before lazy.
+  Found 4 existing Claude Code session(s) for this repo.
+  Found 3 Claude Code harness memory record(s) with no lazy counterpart.
+  Lazy can import both, so you inherit your project&#39;s history instead of
+  starting from scratch.
+  Import 4 conversation(s) as builder memory? [Y/n]
+  Import 3 memory record(s) into lazy shared memory? [Y/n]
+</code></pre>
+<p>Each half of the offer appears only when there is something to import, so a repo
+with sessions but no harness memory sees exactly one prompt.</p>
+<p>Detection stays cheap for both: the per-builder isolation dirs don&#39;t exist yet at
+init, so it&#39;s a single scan of <code>~/.claude/projects</code> for dirs matching this repo,
+plus a <code>readdir</code> of each match&#39;s <code>memory/</code> subdir. The memory count is filtered
+against the store, so re-running init never re-offers records lazy already holds.</p>
+<p>Both offers are prompts — skipped under <code>--non-interactive</code>, never a silent
+write. Detection and import are best-effort: a hiccup in either prints a
+<code>(Skipped Claude Code history import: …)</code> note and never fails init. If you
+decline, you can import later with <code>lazy import-conversation</code> and
+<code>lazy doctor --import-memory</code> respectively.</p>
+
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../pairing/"><span>Previous</span>Pairing</a><a class="next" href="../teams-login/"><span>Next</span>Logging a machine in to Lazy Teams</a></nav>
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch" open><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/" aria-current="page">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<details class="branch"><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch"><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
+</body>
+</html>
