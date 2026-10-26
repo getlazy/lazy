@@ -190,6 +190,9 @@ export class ManagedConfigRefusedError extends Error {
 
 // ── The classification ────────────────────────────────────────────────────
 
+const SMOLVM_OVERRIDDEN_WHY =
+  'the fleet runs agents on its own container runner, never a repository\'s smolvm machine, and a repository may not name a host binary to execute';
+
 export type ManagedDisposition = 'respected' | 'overridden' | 'refused';
 
 export interface ManagedRule {
@@ -673,6 +676,45 @@ export const MANAGED_POLICY: Record<string, ManagedRule> = {
     guard: containedPath('[docker] dockerfile'),
   },
   'docker.build_inputs': { disposition: 'respected' },
+  // `[smolvm]` only matters to `[runner] type = "smolvm"`, which runner.type
+  // above never lets a repository pick here; reset anyway, so nothing a clone
+  // brought can name a binary the host would run.
+  'smolvm.binary': {
+    disposition: 'overridden',
+    why: SMOLVM_OVERRIDDEN_WHY,
+    apply: (c) => { c.smolvm.binary = ''; },
+    effective: () => '',
+  },
+  'smolvm.image': {
+    disposition: 'overridden',
+    why: SMOLVM_OVERRIDDEN_WHY,
+    apply: (c) => { c.smolvm.image = ''; },
+    effective: () => '',
+  },
+  'smolvm.cpus': {
+    disposition: 'overridden',
+    why: SMOLVM_OVERRIDDEN_WHY,
+    apply: (c) => { c.smolvm.cpus = 4; },
+    effective: () => 4,
+  },
+  'smolvm.memory_mib': {
+    disposition: 'overridden',
+    why: SMOLVM_OVERRIDDEN_WHY,
+    apply: (c) => { c.smolvm.memory_mib = 8192; },
+    effective: () => 8192,
+  },
+  'smolvm.storage_gib': {
+    disposition: 'overridden',
+    why: SMOLVM_OVERRIDDEN_WHY,
+    apply: (c) => { c.smolvm.storage_gib = 64; },
+    effective: () => 64,
+  },
+  'smolvm.allow_cidrs': {
+    disposition: 'overridden',
+    why: SMOLVM_OVERRIDDEN_WHY,
+    apply: (c) => { c.smolvm.allow_cidrs = []; },
+    effective: () => [],
+  },
   'docker.run_args': { disposition: 'respected' },
   'worktree.include': {
     disposition: 'respected',

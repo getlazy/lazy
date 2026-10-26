@@ -160,6 +160,47 @@ describe('daemon-owned builder session: release leaves nothing spendable', () =>
     }, 180_000);
   }
 
+  // INVARIANT: one member runs several builders at once, and each launch holds
+  // its OWN container, placeholder grant and daemon MCP token — nothing keyed
+  // by the member. Stopping one revokes only its own resources and leaves the
+  // other running and spendable. A shared key would let one builder's release
+  // revoke the other's credential (a 401 mid-turn) or MCP channel.
+  test('two builders run at once with separate containers, grants and MCP tokens; stopping one leaves the other', async () => {
+    const one = await rpc('startBuilderSession', {}) as BuilderSession;
+    const two = await rpc('startBuilderSession', {}) as BuilderSession;
+    expect(two.id).not.toBe(one.id);
+    expect(two.builderId).not.toBe(one.builderId);
+    expect(two.containerName).not.toBe(one.containerName);
+    expect([one.state, two.state]).toEqual(['running', 'running']);
+
+    const launches = (await docker.invocations()).filter(l => l.includes('--name lazy-builder-') && l.includes(' -d '));
+    expect(launches).toHaveLength(2);
+    const placeholderOf = (launch: string) => launch.match(/-e (?:ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=(\S+)/)?.[1];
+    const mcpConfigOf = (launch: string) => /-v (\S+):\/lazy-builder\/daemon-mcp\.json:ro/.exec(launch)?.[1];
+    const [p1, p2] = [placeholderOf(launches[0]!), placeholderOf(launches[1]!)];
+    expect(p1 && p2 && p1 !== p2).toBe(true);
+    const [c1, c2] = [mcpConfigOf(launches[0]!)!, mcpConfigOf(launches[1]!)!];
+    expect(c1).not.toBe(c2);
+    const mcpToken = async (path: string) => JSON.stringify(JSON.parse(await readFile(path, 'utf-8')));
+    const tokenTwo = await mcpToken(c2);
+    expect(await mcpToken(c1)).not.toBe(tokenTwo);
+    expect((await builderGrants()).map(g => g.token)).toEqual(expect.arrayContaining([p1, p2]));
+
+    await rpc('stopBuilderSession', { id: one.id });
+
+    const rows = await rpc('storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(rows.find(r => r.id === one.id)?.state).toBe('stopped');
+    expect(rows.find(r => r.id === two.id)?.state).toBe('running');
+    expect(await docker.containers()).toContain(two.containerName!);
+    expect(await docker.containers()).not.toContain(one.containerName!);
+    const grants = (await builderGrants()).map(g => g.token);
+    expect(grants).not.toContain(p1);
+    expect(grants).toContain(p2!);
+    expect(await mcpToken(c2)).toBe(tokenTwo);
+    expect(await rpc('attachSession', { id: two.id })).toMatchObject({ sessionId: two.id });
+  }, 180_000);
+
+
   // INVARIANT: stop and end never overwrite a session a concurrent start has
   // relaunched. Neither holds the start mutex, and the graceful stop is a
   // ten-second window; a start that finds the container dead in it recovers
@@ -173,13 +214,13 @@ describe('daemon-owned builder session: release leaves nothing spendable', () =>
 
       // The race, every time: inside the graceful-stop window the container
       // dies (removed outright: the fake's `ps` still lists an exited
-      // container) and a real concurrent start runs to completion.
+      // container) and a real concurrent rejoin of this session runs to completion.
       const startScript = join(proofDir, 'start-during-stop.ts');
       const relaunched = join(proofDir, 'relaunched.json');
       await writeFile(startScript, `
 import { DaemonClient } from ${JSON.stringify(join(REPO_ROOT, 'src/daemon/client.ts'))};
 const row = await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(token)})
-  .rpc('startBuilderSession', ${JSON.stringify(ctx.root)}, {});
+  .rpc('startBuilderSession', ${JSON.stringify(ctx.root)}, { id: ${JSON.stringify(first.id)} });
 await Bun.write(${JSON.stringify(relaunched)}, JSON.stringify(row));
 `);
       const once = join(proofDir, 'start-fired');

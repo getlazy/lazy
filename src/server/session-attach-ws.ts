@@ -35,7 +35,7 @@ import type { RpcAuthResult } from '../daemon/rpc-auth';
 import { rpcAuthErrorMessage } from '../daemon/rpc-auth';
 import type { WebSocketUpgrader, UpgradeOutcome } from './ws';
 import { decodePathSegment } from './task-urls';
-import { createShellRelayHandler, clampDim, refusal, SHELL_CMD, type ShellSocketData } from './shell-ws';
+import { createShellRelayHandler, clampDim, refusal, SHELL_CMD, tryResumeUpgrade, endDetachedTerminals, type ShellSocketData } from './shell-ws';
 import { parseShellSessionMode, planPairOrChatExec, type PairExecPlan } from './shell-pair';
 import {
   resolveSessionAttachTarget,
@@ -175,6 +175,15 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       if (target.kind === 'run' && requestedMode !== null && requestedMode !== 'shell') {
         return refusal(400, `A run is entered with a shell, not in "${requestedMode}" mode.`);
       }
+
+      // A reattach after a dropped connection goes back to the terminal it
+      // names, which is still running — before the claim and the planning
+      // below, which would refuse it (it still holds both) or start another.
+      // The owner carries the person, so only whoever opened it gets it back.
+      const owner = `attach:${target.kind}:${sessionId}:${requestedMode ?? ''}:${caller?.email ?? ''}`;
+      const resumed = tryResumeUpgrade(req, server, url, owner, { freshOnMiss: target.kind === 'builder' });
+      if (resumed) return resumed;
+      if (requestedMode === 'pair' || requestedMode === 'chat') endDetachedTerminals(owner);
 
       // A member's task terminal needs nothing running beforehand: its
       // container is its own, created below.
@@ -437,6 +446,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
         socketPath: '',
         container: execTarget,
         binary: target.binary,
+        ...(target.kind !== 'builder' && target.engineSocket ? { engineSocket: target.engineSocket } : {}),
         cols,
         rows,
         exec: null,
@@ -444,6 +454,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
         env,
         attach: target.kind === 'builder',
         onClose,
+        resumeOwner: owner,
         // A member's open terminal keeps every turn off the task, so a
         // forgotten one is closed (./terminal-idle.ts).
         ...(target.kind === 'task' && multiMember ? { limits: deps.memberTerminalLimits ?? { idleMs: MEMBER_TERMINAL_IDLE_MS, maxMs: MEMBER_TERMINAL_MAX_MS } } : {}),

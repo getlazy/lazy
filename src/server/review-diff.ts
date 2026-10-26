@@ -27,6 +27,8 @@ import {
 } from './mermaid';
 import { shortHash } from './viewed-cards';
 import { unquoteGitPath } from '../git/quote-path';
+import { imagePreviewFor } from '../review/image-preview';
+import { imagePreviewHtml, imageStatHtml } from './review-image';
 export { unquoteGitPath };
 import { escapeHtml, scriptJson } from './escape';
 import type { FileLineAttribution, LineAttributionRun } from '../regions';
@@ -59,6 +61,12 @@ export interface DiffFile {
   deletions: number;
   /** True for binary files and other patches with no textual hunks. */
   binary: boolean;
+  /** The patch created the file (`new file mode`) — there is no pre-image. */
+  added?: boolean;
+  /** The patch deleted the file (`deleted file mode`) — there is no post-image. */
+  deleted?: boolean;
+  /** The `index <old>..<new>` blob ids — what identifies a change with no hunks (a binary file). */
+  blobIds?: string;
   /**
    * When this card is a filtered presentation snippet of a larger file
    * change, the FULL file's add/del totals. The header then reads
@@ -330,6 +338,15 @@ export function parseUnifiedDiff(diffText: string): DiffFile[] {
       current.binary = true;
       continue;
     }
+    // Extended headers, before the first hunk only: a hunk line always starts
+    // with ' ', '+' or '-', so these spellings cannot be content.
+    if (!hunk) {
+      if (raw.startsWith('new file mode')) { current.added = true; continue; }
+      if (raw.startsWith('deleted file mode')) { current.deleted = true; continue; }
+      if (raw.startsWith('index ')) { current.blobIds = raw.slice(6).split(' ')[0]; continue; }
+      // A binary rename has no ---/+++ lines to name the pre-image.
+      if (raw.startsWith('rename from ')) { current.oldPath = unquoteGitPath(raw.slice(12)); continue; }
+    }
 
     const m = HUNK_RE.exec(raw);
     if (m) {
@@ -459,6 +476,13 @@ export interface RenderDiffOptions {
    * historical commit and gets none — a dead button is worse than no button.
    */
   allowExpand?: boolean;
+  /**
+   * Where image files' bytes are served for this task (`/api/review/:id/blob`).
+   * Set, an image file shows its before/after pictures (src/server/review-image.ts);
+   * omitted — a historical commit, whose refs are not the task diff's — it keeps
+   * the plain binary notice.
+   */
+  imageBlobUrl?: string;
   /**
    * Presented views of a file, by path — the file as the thing it IS rather
    * than as changed lines. Markdown is the first (src/server/review-markdown.ts)
@@ -619,6 +643,7 @@ export function renderReviewDiff(
     allowComments = true,
     allowViewed = true,
     allowExpand = false,
+    imageBlobUrl,
     presentedPanes,
     showDecision = true,
     assignSectionId = true,
@@ -631,6 +656,8 @@ export function renderReviewDiff(
   const out: string[] = [];
   for (const file of files) {
     const fileId = fileSectionId(file.path);
+    const image = imageBlobUrl ? imagePreviewFor(file) : null;
+    const imageOnly = image !== null && file.hunks.length === 0;
     const violation = violations.get(file.path);
     const partialStats =
       file.fullAdditions !== undefined &&
@@ -665,8 +692,10 @@ export function renderReviewDiff(
         `<button type="button" class="rv-file-toggle rv-vw-toggle" aria-expanded="true" aria-label="Collapse file" hidden>&#9662;</button>` +
         `<span class="rv-file-path">${escapeHtml(file.path)}</span>` +
         (violation && showDecision ? violationDecision(taskId, file.path, violation) : '') +
-        `<span class="rv-stat rv-stat-add">+${file.additions}</span>` +
-        `<span class="rv-stat rv-stat-del">-${file.deletions}</span>` +
+        (imageOnly
+          ? imageStatHtml(image)
+          : `<span class="rv-stat rv-stat-add">+${file.additions}</span>` +
+            `<span class="rv-stat rv-stat-del">-${file.deletions}</span>`) +
         // Partial snippet cards name the full-file total so `+1 −0` is never
         // mistaken for "this file only added one line". Expand updates the
         // visible counts in place; the "of" clause stays put.
@@ -678,6 +707,11 @@ export function renderReviewDiff(
         `</header>`,
     );
 
+    if (image && imageBlobUrl) out.push(imagePreviewHtml(image, imageBlobUrl));
+    if (imageOnly) {
+      out.push('</section>');
+      continue;
+    }
     if (file.binary) {
       out.push('<p class="rv-binary">Binary file — not shown.</p></section>');
       continue;
@@ -954,6 +988,9 @@ export function violationDecision(
  */
 function fileContentHash(file: DiffFile): string {
   const parts: string[] = [];
+  // A file with no hunks (a binary image) would otherwise hash the same
+  // whatever its bytes, so a retaken screenshot kept an old "Viewed" tick.
+  if (file.hunks.length === 0 && file.blobIds) parts.push(`blob:${file.blobIds}`);
   for (const h of file.hunks) {
     parts.push(h.header);
     for (const l of h.lines) parts.push(`${l.kind}:${l.content}`);

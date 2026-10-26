@@ -34,7 +34,8 @@ import {
   type SandboxSessionSummary,
 } from './pair-bridge';
 import { createContainerPairLauncher, stopOrphanedContainerPair } from './pair-container';
-import { createRunnerFromType } from '../../runner';
+import { createRunner, createRunnerFromType } from '../../runner';
+import { containerCliOf } from '../../runner/container-cli';
 import { hostRunnerRemovedMessage, isHostRunnerType } from '../../runner/host-runner-gate';
 import { isBlockedStatus } from '../../types';
 import { theme } from '../../render/theme';
@@ -494,7 +495,7 @@ export async function commandPair(args: string[]): Promise<void> {
       // Clearing the lock alone was the old behaviour, and it left the actual
       // problem in place: the in-container agent that died without cleanup is
       // still running, still holding the session the next pair wants to resume.
-      const stopped = await stopOrphanedContainerPair(task.id, worktreePath);
+      const stopped = await stopOrphanedContainerPair(task.id, worktreePath, root);
       if (stopped) {
         console.log(`Signalled the in-container pairing session for task ${theme.taskId(displayId(task))}.`);
       }
@@ -596,8 +597,13 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error(noTaskHint);
       process.exit(1);
     }
-    const taskRunner = createRunnerFromType(taskRunnerType);
+    // smolvm needs its project (its client is the relay script to the
+    // project's machine), so it is created from the root, not the type.
     const useHost = hostRequested;
+    // --host touches no container, so it never sets up the machine's relay.
+    const taskRunner = taskRunnerType === 'smolvm'
+      ? (useHost ? null : await createRunner(root, 'smolvm'))
+      : createRunnerFromType(taskRunnerType);
 
     // Host pairing is a claude-code capability, and only ever was: the host
     // launcher builds its argv with interactiveClaudeArgs, which is hardcoded to
@@ -616,7 +622,7 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error("task's agent, so it would open the wrong agent against this task's work.");
       console.error('');
       console.error('What works instead:');
-      if (taskRunner.usesSandbox()) {
+      if (taskRunnerType === 'smolvm' || taskRunner?.usesSandbox()) {
         console.error(`  lazy pair ${displayId(task)}                 # pair in the task's container, where ${taskHarness} runs`);
       } else {
         console.error(`  lazy start ${displayId(task)} --runner docker  # give the task a container to pair in`);
@@ -869,8 +875,8 @@ export async function commandPair(args: string[]): Promise<void> {
             profile: taskAgentId,
             model: sessionModel,
             runnerType: taskRunnerType,
-            containerName: taskRunner.runNameForTask(taskShortId),
-            binary: taskRunnerType === 'podman' ? 'podman' : 'docker',
+            containerName: taskRunner!.runNameForTask(taskShortId),
+            binary: containerCliOf(taskRunner!),
             tty: isTTY(),
             claudeSessions,
             extraEnv: { LAZY_TASK: taskShortId },
@@ -1043,7 +1049,11 @@ Keep the summary concise and factual.`);
 
         const sandboxPath = join(worktreePath, SANDBOX_DIR);
         const pairConfig = await loadConfig(root);
-        const binary = (pairConfig.runner.type === 'docker' || pairConfig.runner.type === 'podman') ? pairConfig.runner.type : 'docker';
+        // The task's own engine: on smolvm the relay client to its machine,
+        // never this host's Docker.
+        const binary = taskRunnerType === 'smolvm'
+          ? containerCliOf(taskRunner ?? await createRunner(root, 'smolvm'))
+          : (pairConfig.runner.type === 'docker' || pairConfig.runner.type === 'podman') ? pairConfig.runner.type : 'docker';
         const response = await runClaude(summaryPrompt, {
           worktreePath,
           sandboxPath,

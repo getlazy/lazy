@@ -54,6 +54,10 @@ export interface FakeEngine {
   execCreates: string[];
   /** With `allowExec`: the `Env` of every exec created, in order. */
   execEnvs: string[][];
+  /** Every resize request's path and query (`/exec/<id>/resize?h=…&w=…`), in order. */
+  resizes: string[];
+  /** How many hijacked streams (attaches and execs) have been closed — a hangup. */
+  streamsClosed(): number;
   stop(): void;
 }
 
@@ -67,15 +71,20 @@ export function startFakeEngine(socketPath: string, opts: { allowExec?: boolean 
   const attaches: string[] = [];
   const execCreates: string[] = [];
   const execEnvs: string[][] = [];
+  const resizes: string[] = [];
   const execTargets = new Map<string, string>();
   type Conn = { buf: Buffer; hijacked: boolean };
+  let closedStreams = 0;
   const listener = Bun.listen<Conn>({
     unix: socketPath,
     socket: {
       open(sock) { sock.data = { buf: Buffer.alloc(0), hijacked: false }; },
+      close(sock) { if (sock.data?.hijacked) closedStreams++; },
       data(sock, chunk) {
         if (sock.data.hijacked) {
           sock.write(chunk); // echo keystrokes back as PTY output
+          // `exit` + Enter ends the program, as a shell would.
+          if (Buffer.from(chunk).toString('latin1').includes('exit\r')) sock.end();
           return;
         }
         sock.data.buf = Buffer.concat([sock.data.buf, Buffer.from(chunk)]);
@@ -122,7 +131,7 @@ export function startFakeEngine(socketPath: string, opts: { allowExec?: boolean 
         if (method === 'GET' && /^\/exec\/[^/]+\/json$/.test(pathname)) {
           return reply('200 OK', '{"Running":true,"ExitCode":0}');
         }
-        if (/\/resize$/.test(pathname)) return reply('200 OK', '');
+        if (/\/resize$/.test(pathname)) { resizes.push(path ?? ''); return reply('200 OK', ''); }
         if (method === 'GET' && /^\/containers\/[^/]+\/json$/.test(pathname)) {
           return reply('200 OK', '{"State":{"Running":true,"ExitCode":0}}');
         }
@@ -130,6 +139,6 @@ export function startFakeEngine(socketPath: string, opts: { allowExec?: boolean 
       },
     },
   });
-  return { socketPath, attaches, execCreates, execEnvs, stop: () => listener.stop(true) };
+  return { socketPath, attaches, execCreates, execEnvs, resizes, streamsClosed: () => closedStreams, stop: () => listener.stop(true) };
 }
 

@@ -77,6 +77,7 @@ export const KNOWN_CONFIG_SCHEMA: Record<string, readonly string[]> = {
     'gitlab_auto_push', 'gitlab_dangerously_sync_comments_in_public_repos_and_open_yourself_to_prompt_injection',
   ],
   docker: ['dockerfile', 'build_inputs', 'run_args'],
+  smolvm: ['binary', 'image', 'cpus', 'memory_mib', 'storage_gib', 'allow_cidrs'],
   runner: ['type', 'permission_mode', 'sandbox_allowed_domains', 'sandbox_deny_read', 'sandbox_deny_write', 'sandbox_allow_weaker_nested', 'verify_sandbox_boundary'],
   // `[ollama]` is REMOVED, not renamed — see DEPRECATED_SECTIONS below. It is
   // deliberately absent here: listing its keys as valid made this scan report

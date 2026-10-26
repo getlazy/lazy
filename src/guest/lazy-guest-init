@@ -1184,6 +1184,9 @@ setsid sh -c 'exit_file="$1"; start_file="$2"; cg_procs="$3"; cg_base_file="$4";
 
 waited=0
 while [ "$waited" -lt "$TIMEOUT" ]; do
+  # Whether dockerd had ALREADY exited is noted before asking it: checking
+  # after a failed ask raced a dockerd that answered and exited in between.
+  exited_before_ask=""; [ -f "$DOCKERD_EXIT" ] && exited_before_ask=1
   if docker_answers; then
     : >"$MARKER"
     emit ready yes
@@ -1213,8 +1216,8 @@ while [ "$waited" -lt "$TIMEOUT" ]; do
     [ "$RESET_RESULT" != failed ] || exit 1
     exit 0
   fi
-  # dockerd already exited: waiting out the timeout cannot help.
-  [ -f "$DOCKERD_EXIT" ] && break
+  # dockerd had already exited before that ask: waiting cannot help.
+  [ -n "$exited_before_ask" ] && break
   waited=$((waited + 1))
   sleep 1
 done
@@ -1225,6 +1228,7 @@ tail -n 10 "$DOCKERD_LOG" >&2 2>/dev/null || true
 emit ready no
 emit reason dockerd-timeout
 [ -z "$RESET_RESULT" ] || emit reset_result "$RESET_RESULT"
+[ -z "$RESET_REASON" ] || emit reset_reason "$RESET_REASON"
 emit data_root "$DATA_ROOT"
 emit storage_driver "$STORAGE_DRIVER"
 exit 1

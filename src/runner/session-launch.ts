@@ -20,6 +20,8 @@ import type { Session } from '../types';
 import { loadConfig } from '../config/loader';
 import { bridgeSessionForRunnerSwitch } from '../cli/commands/pair-bridge';
 import { logger } from '../utils/logger';
+import { recordRecreationIfRunning, RECORDED_ENVIRONMENT_EXIT_KEY } from '../task/environment-replaced';
+import type { Runner } from './types';
 
 /**
  * Bridge the agent session across a runner boundary (if one is being crossed)
@@ -110,15 +112,24 @@ export function mustRecreateForContainerAgent(
  * we just removed, and the next launch must re-stamp for whoever it creates.
  */
 export async function removeTaskRun(
-  runner: { removeRun(runName: string): Promise<void> },
+  runner: Pick<Runner, 'removeRun'> & Partial<Pick<Runner, 'usesSandbox' | 'isRunning' | 'getRunInfo' | 'probeRunInfo'>>,
   storage: Storage,
   session: {
     id: string;
     container_name: string | null;
     container_agent_id?: string | null;
+    task_id?: string;
   } | null | undefined,
   containerName: string,
 ): Promise<void> {
+  if (session?.task_id && runner.usesSandbox && runner.isRunning) {
+    await recordRecreationIfRunning(storage, session.task_id, null, {
+      usesSandbox: () => runner.usesSandbox!(),
+      isRunning: name => runner.isRunning!(name),
+      getRunInfo: runner.getRunInfo?.bind(runner),
+      probeRunInfo: runner.probeRunInfo?.bind(runner),
+    }, containerName);
+  }
   if (session?.container_name) {
     await storage.updateSessionContainerName(session.id, null);
     // Keep the caller's copy consistent with the store: several launch paths
@@ -127,4 +138,11 @@ export async function removeTaskRun(
     session.container_agent_id = null;
   }
   await runner.removeRun(containerName);
+  if (session?.task_id && runner.usesSandbox?.()) {
+    // All replacement launches tear down here first. The removed environment's
+    // fingerprint must not suppress loss of its successor with the same name,
+    // even when that successor disappears before the first live probe.
+    // Keep the pending notice and durable history; only retire deduplication.
+    await storage.updateTaskMetadata(session.task_id, RECORDED_ENVIRONMENT_EXIT_KEY, '');
+  }
 }

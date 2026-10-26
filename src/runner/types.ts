@@ -140,6 +140,7 @@ export interface RunInfo {
   running: boolean;
   exitCode: number;
   finishedAt: string | null;
+  oomKilled?: boolean;
 }
 
 /** Handle for following a run's output in real-time. */

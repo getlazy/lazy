@@ -25,6 +25,7 @@
 import { escapeHtml } from './review-diff';
 import { XTERM_JS_PATH, XTERM_FIT_JS_PATH, XTERM_CSS_PATH } from './xterm';
 import { containerEnsureClientScript } from './container-ensure-client';
+import { TERMINAL_RECONNECT_JS } from './terminal-reconnect';
 
 /**
  * Render the Watch button and its (hidden) output panel for a task.
@@ -62,6 +63,7 @@ export function watchPanelHtml(taskId: string, offered: boolean): string {
 export function watchClientScript(): string {
   return containerEnsureClientScript() + `<script>
 (() => {
+${TERMINAL_RECONNECT_JS}
   if (window.__lzWatchWired) return;
   window.__lzWatchWired = true;
 
@@ -219,35 +221,78 @@ export function watchClientScript(): string {
         }
       }
       setStatus('Connecting…', false);
+      reconnectAttempt = 0;
+      openSocket();
+    }
 
+    // A dropped stream is simply opened again (src/server/terminal-reconnect.ts):
+    // it replays its recent lines itself, so the screen is cleared first.
+    let reconnectAttempt = 0;
+    let reconnectTimer = null;
+    let sawEnd = false;
+    function openSocket() {
+      sawEnd = false;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       // data-lz-watch-task holds the URL-ESCAPED segment — interpolate raw; a
       // second escape turns %20 into %2520, a different address.
       const url = proto + '//' + location.host + '/tasks/' + taskId + '/watch/ws';
-      ws = new WebSocket(url);
-      ws.binaryType = 'arraybuffer';
-      ws.onopen = () => setStatus('Connected', true);
-      ws.onmessage = (ev) => {
+      const socket = ws = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
+      let socketOpened = false;
+      socket.onopen = () => { socketOpened = true; if (ws === socket) { reconnectAttempt = 0; setStatus('Connected', true); } };
+      socket.onmessage = (ev) => {
+        if (ws !== socket) return;
         if (typeof ev.data === 'string') {
           let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
           if (msg.type === 'ready') setStatus('Watching', true);
           else if (msg.type === 'idle') setStatus('Task is idle (' + msg.status + ')', true);
-          else if (msg.type === 'ended') setStatus('Task is no longer running (' + msg.status + ')', false);
-          else if (msg.type === 'error') { term.write('\\r\\n[error: ' + msg.message + ']\\r\\n'); }
+          else if (msg.type === 'ended') { sawEnd = true; setStatus('Task is no longer running (' + msg.status + ')', false); }
+          else if (msg.type === 'error') { sawEnd = true; term.write('\\r\\n[error: ' + msg.message + ']\\r\\n'); }
         } else {
           term.write(new Uint8Array(ev.data));
         }
       };
-      ws.onclose = () => {
-        if (!closedByUser) { setStatus('Disconnected — connection dropped', false); reconnectBtn.textContent = 'Reconnect'; reconnectBtn.hidden = false; }
-        else setStatus('Disconnected', false);
+      socket.onclose = (ev) => {
+        if (ws !== socket) return;
         ws = null;
+        if (closedByUser) { setStatus('Disconnected', false); return; }
+        const outcome = lzCloseOutcome({ code: ev.code, ended: sawEnd, resumable: false, restartable: true });
+        if (outcome !== 'reconnect') {
+          if (!sawEnd) setStatus(lzFinalCloseMessage(ev.code), false);
+          return;
+        }
+        if (!socketOpened) {
+          // Refused before it opened: a signed-out page stops here.
+          lzSignedOut().then((signedOut) => {
+            if (closedByUser) return;
+            if (signedOut) { setStatus('You are signed out — sign in again to watch', false); return; }
+            scheduleWatchReconnect();
+          });
+          return;
+        }
+        scheduleWatchReconnect();
       };
-      ws.onerror = () => setStatus('Connection error', false);
     }
+    function scheduleWatchReconnect() {
+      setStatus('Connection lost — reconnecting…', false);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (closedByUser) return;
+        term.reset();
+        openSocket();
+      }, lzReconnectDelay(reconnectAttempt++));
+    }
+    window.addEventListener('online', () => {
+      if (!reconnectTimer || closedByUser) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      term.reset();
+      openSocket();
+    });
 
     function disconnect() {
       closedByUser = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       if (ws) { try { ws.close(); } catch (e) { /* already closing or closed */ } ws = null; }
     }
 

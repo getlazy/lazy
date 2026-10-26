@@ -83,6 +83,9 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'awaitClaimedTurn',
   'watchProxyActivity',
   'servePorts',
+  // ENVIRONMENT-ONLY: opens loopback tunnels to a smolvm machine's published
+  // services port (src/vm/solo-routes.ts) and answers their addresses. No row.
+  'smolvmServiceBindings',
   // Which task or run a Lazy Teams service host label names (src/serve/teams-host.ts).
   'resolveServiceHost',
   'serve.getStartServicesCmd',
@@ -149,9 +152,13 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'reviewRegions',
   'reviewLineAttribution',
   'reviewFileLines',
+  // One image of a task's diff, as bytes, for the before/after preview.
+  'diffBlob',
   'reviewComments',
   'reviewGetDraft',
   'identity',
+  // Would this daemon refuse a per-task runner (smolvm in managed mode)? A read.
+  'runnerAllowed',
   // Latest proxy usage-limit reading per credential — an in-memory read.
   'usageLimits',
   // Which tier a tiered builder is answering on — in-memory plus config.

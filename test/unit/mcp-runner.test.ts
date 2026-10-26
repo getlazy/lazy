@@ -13,6 +13,18 @@ import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 
+
+/** Teams' environment: managed, a foreign docker host, and a vendored smolvm. */
+async function inManagedMode<T>(fn: () => Promise<T>): Promise<T> {
+  const keys = ['LAZY_MANAGED', 'LAZY_FOREIGN_DOCKER_HOST', 'LAZY_SMOLVM_BINARY'] as const;
+  const prior = keys.map((k) => process.env[k]);
+  process.env.LAZY_MANAGED = '1';
+  process.env.LAZY_FOREIGN_DOCKER_HOST = '1';
+  process.env.LAZY_SMOLVM_BINARY = '/opt/lazy/smolvm/smolvm';
+  try { return await fn(); }
+  finally { keys.forEach((k, i) => { if (prior[i] === undefined) delete process.env[k]; else process.env[k] = prior[i]; }); }
+}
+
 describe('MCP runner override', () => {
   let testDir: string;
   let storage: Storage;
@@ -41,6 +53,15 @@ describe('MCP runner override', () => {
     const handlers = createAllHandlers(ctx);
     await expect(handlers.get('lazy_create')!({ goal: 'Host task', runner: 'host' }))
       .rejects.toThrow('Host-process runner is no longer supported');
+  });
+
+  test('lazy_create with runner: smolvm is refused in managed mode before any write', async () => {
+    // INVARIANT: Teams never runs the smolvm runner; a per-task override is refused and nothing is stored.
+    const handlers = createAllHandlers(ctx);
+    await inManagedMode(async () => { await expect(handlers.get('lazy_create')!({ goal: 'VM task', runner: 'smolvm' }))
+      .rejects.toThrow(/not available on Lazy Teams/); });
+    const list = await handlers.get('lazy_list')!({});
+    expect((list as any).count).toBe(0);
   });
 
   test('lazy_create with runner: container maps to docker', async () => {

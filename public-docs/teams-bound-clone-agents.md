@@ -8,8 +8,8 @@ project with Claude Code. They are not equals.
 ## The primary way: your builder on the server
 
 Run `lazy builder` in the bound clone, or open the **Builders** page in your
-browser. Your builder runs on the Teams install, next to the project, and your
-terminal attaches to it. This is the full experience:
+browser. Your builders run on the Teams install, next to the project — as many
+as you start — and your terminal attaches to one. This is the full experience:
 
 - it is a real builder session of the project, with the builder instructions
   lazy assembles for it;
@@ -21,7 +21,7 @@ terminal attaches to it. This is the full experience:
 
 If you want Claude Code working on a Teams project, start here.
 
-![The Builders page, where your builder on the server is listed and opened](images/teams/teams-builders.png)
+![The Builders page, where your builders on the server are listed and opened](images/teams/teams-builders.png)
 
 ## The secondary way: your own Claude Code on your machine
 

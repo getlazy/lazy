@@ -46,6 +46,7 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { resolveTaskDiffContext } from './task-diff-context';
 import { RpcError } from './rpc-error';
+import { withLaunchIdempotency } from './launch-idempotency';
 import { buildIdLinkIndex, type IdLinkTarget } from '../task/id-links';
 import {
   admitInteractiveSession,
@@ -141,7 +142,8 @@ import { credentialLabel, requiredCredentials, requiredProviders } from '../cred
 import { locateProfileCredential } from '../agent/credentials';
 import type { DaemonCredentialEntry } from './auth-env';
 import { createStorage, resolveStorePath, type Storage, type StorageBackend } from '../storage';
-import { StoreRestoreInProgressError } from '../utils/storage-lock';
+import type { StoreLockHold } from './daemon-health-rows';
+import { StorageLockHeldError, StoreRestoreInProgressError, UnjudgeableStorageLockError } from '../utils/storage-lock';
 import { assertNoRestoreInProgress } from '../storage/store-backup';
 import { setTaskEnv, unsetTaskEnv, clearTaskEnv, listTaskEnvKeys } from './task-env';
 import { setTaskFiles, listTaskFilePaths, clearTaskFiles, deliverTaskFiles, retiredTaskFilePaths } from './task-files';
@@ -156,7 +158,9 @@ import type { SpanRecord } from '../tracing/types';
 import { withRootSpan, contextFromTraceparent } from '../tracing';
 import type { TaskTarget, Actor, ActorInput, ActorRef, Turn, FileViolation } from '../types';
 import type { RunnerType } from '../config/types';
-import { VALID_EFFORT_LEVELS } from '../config/types';
+import { smolvmRefusedInManagedMode } from '../runner/host-runner-gate';
+import { resolveRunnerType } from '../config/types';
+import { VALID_EFFORT_LEVELS, isContainerRunnerType } from '../config/types';
 import { DEFAULT_ONESHOT_EFFORT } from '../oneshot/types';
 import { parentTaskIdOf, targetBranchOf, collectSubtreeIds, pruneTasksToDepth } from '../task-target';
 import { buildTaskTree, collectActiveTasks } from '../task/tree';
@@ -185,10 +189,11 @@ import { violationRecordsByFile } from '../protection/outstanding';
 import { executeSearch, SearchPatternError, QueryParseError } from '../search';
 import { findRecordedCommit } from '../task/recorded-commit';
 import { getCommitPatch, getCommitIdentities, type CommitIdentity } from '../git/operations';
-import { getDiffStat, getDiffFull, getDiffNumstat, getDiffPathSets, getFileAtCommit, getMergeBase, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch, countNewCommits } from '../git/operations';
+import { getDiffStat, getDiffFull, getDiffNumstat, getDiffPathSets, getFileAtCommit, getRegularBlobAtRef, getMergeBase, getRemoteDefaultBranch, branchExists, recoverMissingWorktreeWithFetch, countNewCommits } from '../git/operations';
 import { resolveCommitScanBase } from '../task/session-commits';
-import { validateFileLinesRequest, sliceFileLines } from '../review/file-lines';
-import { readWorktreeFileNoFollow } from '../review/worktree-read';
+import { validateFileLinesRequest, sliceFileLines, isSafeDiffPath } from '../review/file-lines';
+import { readWorktreeFileNoFollow, readWorktreeBytesNoFollow } from '../review/worktree-read';
+import { MAX_IMAGE_PREVIEW_BYTES, classifyImageBlob, imageTypeForPath } from '../review/image-preview';
 import { getNewNotesSince, resolveNotesCutoff } from '../task/turn-context';
 import { formatDate } from '../utils/format';
 import { gitDiffPaths, resolveTaskDirectDiff, type TaskDirectDiffPlan } from '../task-diff-base';
@@ -233,7 +238,8 @@ import { resolveAgentIdForStorageCreateTask } from '../agent/task-agent';
 import { effectiveProjectSettings, readProjectSettings, resolveProjectModel, updateProjectSettings } from './project-settings';
 import { taskLaunchIdentityView } from '../task/launch-identity-view';
 import { assertAgentProfileRunnable, assertKnownAgentProfile } from './agent-profile-check';
-import type { ProjectSettings } from '../storage/types';
+import type { ProjectSettings, BuilderSession } from '../storage/types';
+import { BuilderSessionStateConflictError } from '../storage/interface';
 import { readAuditRecords } from '../proxy/audit-log';
 import { unresolvedCredentialFailures, type CredentialFailure } from '../proxy/credential-health';
 import { credentialUsageKey, currentCredentialFailures, failurePredatesCredential } from './current-credential-failures';
@@ -298,9 +304,71 @@ export { RpcError };
 let daemonStorage: Storage | null = null;
 
 /**
+ * The FileStorage underneath {@link daemonStorage}: the one object whose
+ * close() gives the store's lock back. Only closeAllStorage reaches it.
+ */
+let daemonOwnedStorage: Storage | null = null;
+
+/**
+ * Whether this daemon holds its store's lock for its life, as the daemon knows
+ * it (for `lazy daemon health`, which compares it with what the lock FILE says).
+ */
+export function daemonStoreLockHold(): StoreLockHold {
+  if (!daemonOwnedStorage) {
+    // Not open: still opening (or not tried yet), or the open FAILED — which is
+    // a daemon that cannot work, never just a warning.
+    const failed = storeUnavailable;
+    return failed
+      ? { openFailed: { error: failed.error, since: failed.since, restartFixes: failed.restartFixes ?? true } }
+      : 'not-open';
+  }
+  // Reaches past the Storage interface for `.lock`, as getOrCreateStorage's acquire does.
+  // The LIFELONG hold, never `held` (depth > 0): a write in flight raises the
+  // depth after the base hold is lost, and a sample taken then must not read OK.
+  const lock = (daemonOwnedStorage as unknown as { lock?: { lifelongHeld?: boolean } }).lock;
+  return lock?.lifelongHeld ? 'held' : 'released';
+}
+
+/**
+ * Give the store's lock back synchronously, for a process that opened the
+ * daemon's storage but will never run the daemon's shutdown — the test-only
+ * in-process fallback in `resolveStorage`, from its `exit` handler (where only
+ * sync work runs). Its borrowers' close() is a no-op, so without this every
+ * such process exits leaving `.storage-lock` naming its dead pid.
+ */
+export function releaseDaemonStoreLockSync(): void {
+  const lock = (daemonOwnedStorage as unknown as { lock?: { releaseAll?: () => void } } | null)?.lock;
+  lock?.releaseAll?.();
+}
+
+/**
+ * The daemon's storage as every caller borrows it: close() is a no-op.
+ *
+ * The daemon holds the store's lock for its whole life, and closing the
+ * FileStorage is what releases it. But code that runs both in the daemon and
+ * outside it closes whatever it was handed — every MCP tool handler ends in
+ * `finally { storage.close() }`, which is right for a short-lived handle and
+ * was releasing the DAEMON's lock on the first `lazy_*` call of any agent turn.
+ * Writes went on working (each one re-takes the lock for itself), so the only
+ * signs were a `.storage-lock` that came and went with each write and a
+ * "Storage lock" health check failing for the daemon's life — while, between
+ * writes, nothing kept a second daemon off the store. The owner closes through
+ * closeAllStorage; a borrower's close() cannot reach the lock.
+ */
+function borrowedStorage(storage: Storage): Storage {
+  return new Proxy(storage, {
+    get(target, prop) {
+      if (prop === 'close') return async () => {};
+      const value = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
  * In-flight initialization promise. Memoized so concurrent first-callers (e.g.
  * the web handler, the proxy, and a reconcile tick all racing at startup) share
- * ONE createStorage()+lock.acquire() instead of each spinning up its own Storage
+ * ONE createStorage()+lock.acquireForLife() instead of each spinning up its own Storage
  * instance and contending for the filesystem lock. Without this, the proxy path
  * would initialize a second Storage that fights the daemon's own for the lock —
  * the single-writer violation behind the "Failed to acquire storage lock"
@@ -323,10 +391,10 @@ let daemonProjectRoot: string | null = null;
  * `storeUnavailable` so a fleet can recognise the wedge and restart the
  * project cleanly instead of waiting for a human (see {@link storeAvailability}).
  */
-let storeUnavailable: { since: number; error: string } | null = null;
+let storeUnavailable: { since: number; error: string; restartFixes?: boolean } | null = null;
 
 /** Whether this daemon has its store: null when it does (or has not tried yet). */
-export function storeAvailability(): { since: number; error: string } | null {
+export function storeAvailability(): { since: number; error: string; restartFixes?: boolean } | null {
   return storeUnavailable ? { ...storeUnavailable } : null;
 }
 
@@ -373,6 +441,10 @@ export async function getOrCreateStorage(): Promise<Storage> {
     const stage = (name: string) => {
       storeOpening = { stage: name, startedAt: storeOpening?.startedAt ?? Date.now() };
     };
+    // Set when the open failed for a reason a restart does not remove (a live
+    // holder elsewhere, a restore that owns the store). Classified on the
+    // ORIGINAL error: the restore branch below rethrows a fuller one.
+    let causeOutlivesRestart = false;
     daemonStorageInit = (async () => {
       logger.debug('Initializing daemon storage...');
       stage('loading the config');
@@ -389,12 +461,14 @@ export async function getOrCreateStorage(): Promise<Storage> {
         // All FileStorage.withLock() calls become re-entrant within this process.
         storeLockPath = (storage as unknown as { lock?: { path?: string } }).lock?.path ?? null;
         stage('acquiring the storage lock');
-        await (storage as any).lock?.acquire?.();
+        await (storage as any).lock?.acquireForLife?.();
       } catch (err) {
         // A restore owns the store — its marker appeared after startDaemon's own
         // check. The lock refused BEFORE touching the lock file (whose holder may
         // be a host pid this side would judge stale); say what the restore left
         // where, in full, which is what the operator needs.
+        causeOutlivesRestart = err instanceof StorageLockHeldError || err instanceof UnjudgeableStorageLockError ||
+          err instanceof StoreRestoreInProgressError;
         if (err instanceof StoreRestoreInProgressError) {
           await assertNoRestoreInProgress(await resolveStorePath(root));
         }
@@ -410,7 +484,8 @@ export async function getOrCreateStorage(): Promise<Storage> {
       // published to the feed. See src/daemon/parent-child-tap.ts.
       // The new-task environment seed sits outermost too: a task gets it
       // before createTask returns, so before any surface can launch it.
-      const tapped = tapTaskEnvSeed(tapParentChildChanges(tapStorageEvents(storage)), root);
+      const tapped = borrowedStorage(tapTaskEnvSeed(tapParentChildChanges(tapStorageEvents(storage)), root));
+      daemonOwnedStorage = storage;
       daemonStorage = tapped;
       storeUnavailable = null;
       storeOpening = null;
@@ -435,6 +510,10 @@ export async function getOrCreateStorage(): Promise<Storage> {
       storeUnavailable = {
         since: storeUnavailable?.since ?? Date.now(),
         error: err instanceof Error ? err.message : String(err),
+        // A live holder elsewhere, or a restore that owns the store, is still
+        // there after a restart; anything else (an unreadable store, an
+        // opening that hung) a fresh daemon may well get past.
+        restartFixes: !causeOutlivesRestart,
       };
       throw err;
     });
@@ -491,7 +570,7 @@ async function awaitStoreOpen(init: Promise<Storage>): Promise<Storage> {
         `(stuck ${Math.round((Date.now() - opening.startedAt) / 1000)}s ${opening.stage}). ` +
         `Something the daemon reads to open its store is not answering — send the daemon ` +
         `SIGUSR2 to log what it is waiting on, then restart it.`;
-      storeUnavailable = { since: storeUnavailable?.since ?? opening.startedAt, error };
+      storeUnavailable = { since: storeUnavailable?.since ?? opening.startedAt, error, restartFixes: true };
       reject(new Error(error));
     }, storeOpenDeadlineMs);
     (timer as { unref?: () => void }).unref?.();
@@ -510,13 +589,15 @@ export async function closeAllStorage(): Promise<void> {
   if (daemonStorage) {
     logger.debug('Closing daemon storage...');
     try {
-      await daemonStorage.close();
+      // The owned instance: the borrowed one's close() is a no-op.
+      await daemonOwnedStorage?.close();
       logger.debug('Daemon storage closed');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.warn(`Error closing daemon storage: ${msg}`);
     }
     daemonStorage = null;
+    daemonOwnedStorage = null;
   }
   // Clear the init memo too, so a subsequent start (e.g. a teardown/retry in the
   // same process during tests) re-initializes cleanly instead of returning a
@@ -753,6 +834,7 @@ async function dispatchRpc(
     case 'ensureTaskContainer': return handleEnsureTaskContainer(projectRoot, params);
     case 'ensureTaskWorktree': return handleEnsureTaskWorktree(projectRoot, params);
     case 'servePorts': return handleServePorts(projectRoot, params);
+    case 'smolvmServiceBindings': return handleSmolvmServiceBindings(projectRoot, params);
     case 'resolveServiceHost': return handleResolveServiceHost(projectRoot, params);
     case 'serve.getStartServicesCmd': return handleGetStartServicesCmd(projectRoot);
     case 'setTeamsLinks': return handleSetTeamsLinks(params);
@@ -858,6 +940,9 @@ async function dispatchRpc(
     // what every CLI command asks BEFORE opening an editor, so that a refusal
     // can never discard feedback a human already typed.
     case 'identity': return handleIdentity(projectRoot);
+    // Read-only: would THIS daemon refuse a per-task runner? Asked by `lazy create`
+    // before it stores anything, since only the daemon knows it is managed.
+    case 'runnerAllowed': return { refusal: runnerRefusal(params.runner) };
     // Read-only: is each named branch protected? Lazy Teams' hosted git asks
     // before letting a member push a non-task branch (src/daemon/branch-protection.ts).
     case 'branchProtection':
@@ -893,6 +978,7 @@ async function dispatchRpc(
     case 'reviewRegions': return handleReviewRegions(projectRoot, params);
     case 'reviewLineAttribution': return handleReviewLineAttribution(projectRoot, params);
     case 'reviewFileLines': return handleReviewFileLines(projectRoot, params);
+    case 'diffBlob': return handleDiffBlob(projectRoot, params);
     case 'reviewPresentations': return handleReviewPresentations(projectRoot, params);
     case 'reviewProseAnchors': return handleReviewProseAnchors(params);
     case 'reviewComments': return handleReviewComments(projectRoot, params);
@@ -2184,6 +2270,83 @@ export async function handleFileLines(projectRoot: string, params: Record<string
   };
 }
 
+
+/**
+ * One image of a task's diff, as bytes — the data behind the Changes view's
+ * before/after pictures (src/review/image-preview.ts).
+ *
+ * Resolved exactly like {@link handleFileLines}, from the same
+ * `resolveTaskDiffContext` the diff itself is rendered with: `base` is the
+ * pre-image (the merge base of a three-dot diff), `head` the post-image read
+ * from the worktree, which is what the diff shows when it is dirty, falling
+ * back to HEAD. The refusals are that handler's too, plus three of its own:
+ *  - a path not in this diff, on that side, is a 404;
+ *  - a symlink, on either side, is a 415 — never followed, never its target text;
+ *  - a blob over MAX_IMAGE_PREVIEW_BYTES is a 413, refused before it is read;
+ *  - bytes that are not the image their extension names are a 415.
+ *
+ * Params: taskId, path (post-image name for `head`, pre-image for `base`),
+ * side ('base' | 'head').
+ */
+export async function handleDiffBlob(projectRoot: string, params: Record<string, unknown>) {
+  const taskId = requireString(params, 'taskId');
+  const path = requireNonBlankString(params, 'path');
+  if (params.side !== 'base' && params.side !== 'head') {
+    throw new RpcError(400, "side must be 'base' or 'head'");
+  }
+  const side = params.side;
+  if (!isSafeDiffPath(path)) throw new RpcError(400, `Refusing unsafe path: ${path}`);
+  if (!imageTypeForPath(path)) throw new RpcError(415, `Not an image file type: ${path}`);
+
+  const { task, worktreePath, fromRef, useTwoDotDiff, direct } =
+    await resolveTaskDiffContext(await getOrCreateStorage(), projectRoot, taskId);
+  const restrict = gitDiffPaths(direct);
+  const pathSets = restrict.empty
+    ? { newPaths: [] as string[], oldPaths: [] as string[] }
+    : await getDiffPathSets(fromRef, 'HEAD', worktreePath, useTwoDotDiff, restrict.paths);
+  const allowed = side === 'base' ? pathSets.oldPaths : pathSets.newPaths;
+  if (!allowed.includes(path)) {
+    throw new RpcError(404, `Not part of this task's diff on the ${side} side: ${path}`);
+  }
+
+  let read: Awaited<ReturnType<typeof getRegularBlobAtRef>> | Awaited<ReturnType<typeof readWorktreeBytesNoFollow>>;
+  try {
+    if (side === 'head') {
+      read = await readWorktreeBytesNoFollow(worktreePath, path, MAX_IMAGE_PREVIEW_BYTES);
+      if (read.kind === 'outside') {
+        throw new RpcError(400, `Refusing to read path outside the worktree: ${path}`);
+      }
+      if (read.kind === 'missing') {
+        read = await getRegularBlobAtRef('HEAD', path, worktreePath, MAX_IMAGE_PREVIEW_BYTES);
+      }
+    } else {
+      const oldRef = useTwoDotDiff ? fromRef : await getMergeBase(fromRef, 'HEAD', worktreePath);
+      read = await getRegularBlobAtRef(oldRef, path, worktreePath, MAX_IMAGE_PREVIEW_BYTES);
+    }
+  } catch (err) {
+    if (err instanceof RpcError) throw err;
+    throw new RpcError(500, `Failed to read ${path}: ${err instanceof Error ? err.message : err}`);
+  }
+  if (read.kind === 'missing') throw new RpcError(404, `File not found on the ${side} side: ${path}`);
+  if (read.kind === 'notRegular') {
+    throw new RpcError(415, `Not previewed: ${path} is a symlink or not a regular file.`);
+  }
+  if (read.kind === 'tooLarge') {
+    throw new RpcError(413,
+      `Too large to preview: ${path} is ${read.size} bytes, the limit is ${MAX_IMAGE_PREVIEW_BYTES}.`);
+  }
+  if (read.kind !== 'content') throw new RpcError(500, `Unexpected read result for ${path}`);
+  const verdict = classifyImageBlob(path, read.bytes);
+  if (!verdict.ok) throw new RpcError(verdict.status, verdict.error);
+  return {
+    taskId: shortId(task.id),
+    path,
+    side,
+    contentType: verdict.contentType,
+    size: read.bytes.length,
+    contentBase64: Buffer.from(read.bytes).toString('base64'),
+  };
+}
 // --- Wait ---
 
 /**
@@ -3139,7 +3302,13 @@ export async function handleStartTask(projectRoot: string, params: Record<string
   return withRootSpan('lazy.start', parentCtx, {
     'lazy.command': 'start',
     'lazy.task_id': startParams.taskId,
-  }, () => launchTask(projectRoot, startParams));
+  }, async () => withLaunchIdempotency(await getOrCreateStorage(), 'startTask', params, () => launchTask(projectRoot, startParams)));
+}
+
+/** The managed-mode refusal for a client-sent runner, judged on its resolved type. */
+function runnerRefusal(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  return smolvmRefusedInManagedMode(resolveRunnerType(raw) ?? raw);
 }
 
 // --- Edit Task ---
@@ -3220,7 +3389,7 @@ export async function handleUnblockTask(projectRoot: string, params: Record<stri
   };
 
   logger.info(`Unblocking task ${unblockParams.taskId.substring(0, 8)}`);
-  return launchUnblockTask(projectRoot, unblockParams);
+  return withLaunchIdempotency(await getOrCreateStorage(), 'unblockTask', params, () => launchUnblockTask(projectRoot, unblockParams));
 }
 
 // --- Ask Task (read-only Q&A against the session) ---
@@ -3237,7 +3406,7 @@ export async function handleAskTask(projectRoot: string, params: Record<string, 
   };
 
   logger.info(`Asking task ${askParams.taskId.substring(0, 8)}`);
-  return launchAskTask(projectRoot, askParams);
+  return withLaunchIdempotency(await getOrCreateStorage(), 'askTask', params, () => launchAskTask(projectRoot, askParams));
 }
 
 // --- Review Task (read-only review turn in a NEW session) ---
@@ -3443,6 +3612,45 @@ export async function handleEnsureTaskWorktree(projectRoot: string, params: Reco
 // --- Published ports ---
 
 /**
+ * `smolvmServiceBindings` — a smolvm run's published ports as HOST addresses:
+ * the service tunnels the daemon opens to the project machine's one published
+ * port (src/vm/solo-routes.ts). A CLI process asks here, because a tunnel it
+ * opened itself would close with the command that printed its URL. Opens
+ * loopback listeners and writes no row.
+ */
+export async function handleSmolvmServiceBindings(projectRoot: string, params: Record<string, unknown>, deps: SmolvmRunnerCheckDeps = {}) {
+  const runName = requireString(params, 'runName');
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(runName)) throw new RpcError(400, `Not a container name: ${JSON.stringify(runName)}`);
+  // Only for smolvm: creating a smolvm runner sets up a relay and machine
+  // state, which must never happen as a side effect for a docker project.
+  if (!(await runsOnSmolvm(projectRoot, runName, deps))) {
+    throw new RpcError(400, `${runName} does not run on the smolvm runner; its service ports are published on this machine directly.`);
+  }
+  const runner = await createRunner(projectRoot, 'smolvm');
+  return { bindings: await runner.getRunPortBindings(runName) };
+}
+
+/**
+ * Whether `runName` is on the smolvm runner: the project's runner, or the
+ * recorded runner of the task session that container belongs to (a per-task
+ * runner override).
+ */
+export interface SmolvmRunnerCheckDeps {
+  loadConfig?: (root: string) => Promise<{ runner: { type: string } }>;
+  getStorage?: () => Promise<Pick<Storage, 'listTasks' | 'getSessionByTaskId'>>;
+}
+export async function runsOnSmolvm(projectRoot: string, runName: string, deps: SmolvmRunnerCheckDeps = {}): Promise<boolean> {
+  if ((await (deps.loadConfig ?? loadConfig)(projectRoot)).runner.type === 'smolvm') return true;
+  const storage = await (deps.getStorage ?? getOrCreateStorage)();
+  for (const task of await storage.listTasks()) {
+    if (task.runner_type !== 'smolvm') continue;
+    const session = await storage.getSessionByTaskId(task.id);
+    if (session?.container_name === runName && session.runner_type === 'smolvm') return true;
+  }
+  return false;
+}
+
+/**
  * `servePorts` — where a task's declared `[serve]` services are reachable.
  *
  * The same state `lazy url` prints, over RPC, for a client that is not this
@@ -3502,7 +3710,7 @@ export async function handleServePorts(projectRoot: string, params: Record<strin
   const logBytes = optionalNumber(params, 'servicesLogBytes');
   let servicesRun: ServicesRunState | null = null;
   if (state.containerRunning && optionalBoolean(params, 'includeServicesRun') === true) {
-    servicesRun = await readServicesRunState(containerBinaryFor(state.runnerType), state.containerName, undefined,
+    servicesRun = await readServicesRunState(await containerBinaryFor(projectRoot, state.runnerType), state.containerName, undefined,
       logBytes !== undefined ? { logBytes } : {})
       .then((run) => run && linkProcessesToServices(run, services))
       .catch((err) => {
@@ -4372,7 +4580,7 @@ export async function handleResumeTask(projectRoot: string, params: Record<strin
   };
 
   logger.info(`Resuming task ${resumeParams.taskId.substring(0, 8)}`);
-  return resumeTask(projectRoot, resumeParams);
+  return withLaunchIdempotency(await getOrCreateStorage(), 'resumeTask', params, () => resumeTask(projectRoot, resumeParams));
 }
 
 // --- Sync Task ---
@@ -5487,7 +5695,7 @@ export async function handleGetAgentLaunchEnv(
   // container is handed the proxy's `host.docker.internal` spelling, a host
   // process its loopback one.
   const surface: LaunchSurface =
-    config.runner.type === 'docker' || config.runner.type === 'podman' ? 'container' : 'host';
+    isContainerRunnerType(config.runner.type) ? 'container' : 'host';
 
   const authEnvVars = targetEnvVars(
     proxyUrl ? { ...target, proxyUrl, primaryUpstream: config.proxy.upstream } : target,
@@ -6344,6 +6552,12 @@ export async function handleStorageCall(
   // a Mac clone whose lazy.toml defined [agents.claude-complex] wrote it onto a
   // Teams task whose daemon had never had it, and the task only failed — as
   // "Unknown agent profile" — when it launched.
+  // A runner a client SENDS is judged by this daemon too: the CLI's create
+  // stores its --runner through this write, and a managed daemon refuses smolvm.
+  if (method === 'updateTaskRunnerType') {
+    const refusal = runnerRefusal(args.runnerType);
+    if (refusal) throw new RpcError(400, refusal);
+  }
   if (method === 'updateTaskAgent') {
     await assertKnownAgentProfile(projectRoot, typeof args.agentId === 'string' ? args.agentId : String(args.agentId));
   }
@@ -6505,8 +6719,30 @@ export async function handleBuilderStorageCall(
     const runs = await storage.listBuilderSessions(projectRoot);
     const run = tokenLabel ? runs.find((row) => `builder-${row.builderId}` === tokenLabel) : null;
     params = { ...params, args: { ...args, conversation: { ...conversation, memberEmail: run?.memberEmail ?? null } } };
+    const result = await handleStorageCall(projectRoot, params);
+    await recordRunConversation(storage, run ?? null, (conversation as { sessionId?: unknown }).sessionId);
+    return result;
   }
   return handleStorageCall(projectRoot, params);
+}
+
+/**
+ * A RUNNING builder's capture names the conversation it is writing now, so the
+ * run is joined to its Builder before it ever stops: Resume on that Builder
+ * then finds this run instead of starting a second container on the same
+ * conversation, and the Builders page can say what the run is working on.
+ * Guarded on the run still being this launch (state + builder id); a run that
+ * moved on meanwhile is left to whoever moved it.
+ */
+async function recordRunConversation(storage: Storage, run: BuilderSession | null, sessionId: unknown): Promise<void> {
+  if (!run || run.state !== 'running' || typeof sessionId !== 'string' || !sessionId) return;
+  if (run.agentSessionId === sessionId) return;
+  try {
+    await storage.updateBuilderSession(run.id, { agentSessionId: sessionId }, 'running', run.builderId);
+  } catch (err) {
+    if (err instanceof BuilderSessionStateConflictError) return;
+    logger.warn(`Could not record conversation ${sessionId} on builder run ${run.id}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** `show`'s `launchIdentity`: null (logged) when the config cannot resolve it. */

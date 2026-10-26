@@ -1,4 +1,5 @@
 import type { RunnerType } from '../config/types';
+import { isManagedMode } from '../config/managed-mode';
 
 /**
  * Build-time flag — see src/cli/editor.ts. Inline `typeof LAZY_RELEASE_BUILD`
@@ -75,4 +76,23 @@ export function assertHostRunnerConfigAllowed(context?: string): void {
  */
 export function isRemovedHostRunnerInput(input: string): boolean {
   return REMOVED_HOST_RUNNER_INPUTS.has(input.trim().toLowerCase());
+}
+
+/**
+ * The smolvm runner is solo-only. In managed (Teams) mode the fleet owns the
+ * runner: lazy.toml's `[runner] type` is overridden, but a PER-TASK override
+ * (create/start/edit, CLI or MCP) would otherwise reach the smolvm runner,
+ * which skips the foreign-docker-host refusal Teams relies on and would run
+ * the fleet's own vendored smolvm. Refused wherever a runner type is resolved
+ * or stored.
+ */
+export function smolvmRefusedInManagedMode(type: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  if (type !== 'smolvm' || !isManagedMode(env)) return null;
+  return 'The smolvm runner is not available on Lazy Teams: Teams runs every task on the runner it manages. ' +
+    'Drop the per-task runner override (or choose docker).';
+}
+
+export function assertRunnerAllowedInManagedMode(type: string, env: NodeJS.ProcessEnv = process.env): void {
+  const refusal = smolvmRefusedInManagedMode(type, env);
+  if (refusal) throw new Error(refusal);
 }

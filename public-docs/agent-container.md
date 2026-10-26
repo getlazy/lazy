@@ -5,6 +5,27 @@ whose agents need tools the default image does not have, or who is diagnosing an
 agent that cannot start: what the default image contains, how to give your
 project its own image, and when lazy rebuilds it.
 
+## A container lasts across turns
+
+A task keeps its container between turns. A failed agent, a timeout, or Stop
+ends the turn without replacing the container. Services and files outside the
+task's checkout stay there for the next turn. This applies in Lazy Teams and
+when running lazy on your own machine.
+
+Accepting, rejecting or closing the task cleans up its container. Explicitly
+restarting the environment, changing its agent, environment variables or image,
+and daemon upgrades or restarts can also replace it. An out-of-memory kill or
+an external container stop can end it independently of lazy.
+
+Before creating a replacement, lazy records the loss in the task's journal and
+tells the next work turn. For an exited container, the record includes its exit
+code, whether Docker reported an out-of-memory kill, and when it exited, when
+those facts are available. Lazy Teams also keeps an **Environment replaced**
+notice on the task page after the agent has seen it.
+
+Keep data you need beyond the task in durable storage: container files outside
+the checkout do not survive environment replacement or task cleanup.
+
 ## The default image
 
 A project with no `[docker] dockerfile` in its `lazy.toml` and no `Dockerfile.lazy`

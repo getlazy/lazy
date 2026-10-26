@@ -5,7 +5,8 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { remoteAttachUrl, localTerminalSize } from '../../src/teams/session-terminal';
+import { remoteAttachUrl, localTerminalSize, runRemoteTerminal } from '../../src/teams/session-terminal';
+import { PassThrough } from 'stream';
 import { parseShellServerMessage, shellClientMessage, parseShellClientMessage } from '../../src/server/shell-protocol';
 
 describe('remoteAttachUrl', () => {
@@ -56,5 +57,31 @@ describe('the client half of shell-protocol', () => {
     for (const raw of ['nope', '[]', '{"type":"exit","code":1.5}', '{"type":"ready"}', '{"type":"status"}', '{"type":"other"}']) {
       expect(parseShellServerMessage(raw).ok).toBe(false);
     }
+  });
+});
+
+describe('runRemoteTerminal', () => {
+  // INVARIANT: a person leaving the terminal says so before closing
+  // (`{type:"end"}`), so the daemon ends it at once — a close WITHOUT it is a
+  // dropped connection, which the daemon holds for minutes for a reconnect
+  // this client never makes.
+  test('detaching sends `end` before closing', async () => {
+    const sent: unknown[] = [];
+    let socket: { onopen?: () => void } | null = null;
+    class FakeWs {
+      binaryType = '';
+      onopen?: () => void; onmessage?: unknown; onerror?: unknown; onclose?: unknown;
+      constructor() { socket = this; }
+      send(data: unknown) { sent.push(data); }
+      close() { sent.push('<close>'); }
+    }
+    const stdin = new PassThrough() as unknown as NodeJS.ReadStream;
+    const stdout = new PassThrough() as unknown as NodeJS.WriteStream;
+    const done = runRemoteTerminal({ url: 'ws://x', token: 't', io: { stdin, stdout }, webSocket: FakeWs as unknown as typeof WebSocket });
+    socket!.onopen!();
+    (stdin as unknown as PassThrough).end();
+    expect((await done).kind).toBe('detached');
+    const texts = sent.filter((s) => typeof s === 'string');
+    expect(texts.slice(-2)).toEqual([shellClientMessage({ type: 'end' }), '<close>']);
   });
 });

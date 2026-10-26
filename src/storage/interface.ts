@@ -111,29 +111,6 @@ export interface NewTaskInitialState {
 import type { WaitIntervalStart, WaitIntervalFilter } from './wait-intervals';
 
 /**
- * The typed refusal of `createBuilderSession`: a rival active session exists
- * for the same member on the same PROJECT (§5.7). Lives beside the contract
- * it documents, not inside one backend — every Storage implementation throws
- * it for the same condition, and callers match on the class rather than on
- * one backend's import. The check and the insert run in the same locked
- * critical section, so the claim row a start writes before launching its
- * container is also what excludes a rival — two concurrent starts cannot both
- * register for the same member, and a start racing a raw storage-proxy call
- * is refused the same way. `rivalId` names the row that won; callers that
- * want it as a session re-read `getActiveBuilderSessionForMember` (the loser
- * of a start returns it).
- */
-export class BuilderSessionActiveError extends Error {
-  constructor(readonly rivalId: string, state: string) {
-    super(
-      `Builder session ${rivalId} is still active for this member (state '${state}') — ` +
-      `one session per member per project; resume or end it before starting another.`,
-    );
-    this.name = 'BuilderSessionActiveError';
-  }
-}
-
-/**
  * The typed refusal of `updateBuilderSession(id, patch, expectedState)`: the
  * row's state at WRITE time — read in the same locked critical section as
  * the write — was not the state the caller expected. Someone moved the row
@@ -1532,12 +1509,10 @@ export interface Storage {
    * the container yet — `state: 'starting'` is the expected initial value,
    * moved to `'running'` once the container is confirmed up.
    *
-   * Refuses (BuilderSessionActiveError) when the same member already has an
-   * active (non-`ended`) session on the same project — the write-side of the
-   * "one session per member per project" rule (§5.7). The check and the
-   * insert run inside one storage lock, so a start's claim row is both the
-   * record that prevents an orphaned container and the exclusion that keeps
-   * a rival start out. `getActiveBuilderSessionForMember` is the read-side.
+   * A member may register any number of sessions on a project (several
+   * builders at once, as on a laptop); only a duplicate `id` is refused. The
+   * claim row a start writes before launching is what keeps its container
+   * from ever outrunning its record.
    */
   createBuilderSession(session: BuilderSession): Promise<BuilderSession>;
 
@@ -1545,10 +1520,10 @@ export interface Storage {
   getBuilderSession(id: string): Promise<BuilderSession | null>;
 
   /**
-   * The live (non-`ended`) session for a given project + member, or null.
-   * This is what `startBuilderSession` consults for the "one session per
-   * member per project" rule (§5.7) — a second start for the same member
-   * finds and resumes/reattaches this row rather than registering a second one.
+   * The member's OLDEST not-`ended` session on a project, or null. A member
+   * may hold several at once, so this is not "their" session: the daemon never
+   * decides anything by it, and a client that must name one session lists them
+   * (`listBuilderSessions`) and asks the member when there is more than one.
    */
   getActiveBuilderSessionForMember(
     projectRoot: string,

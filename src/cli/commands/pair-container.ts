@@ -32,6 +32,7 @@
  */
 
 import { readFile, rm } from 'fs/promises';
+import { containerCliForType } from '../../runner/container-cli';
 import { resolveInteractiveLaunch, launchEnvOverlay } from '../../credentials/interactive-auth';
 import { profileNameForAgent } from '../../config/agent-profiles';
 import { pairPidFilePath, pairInContainerCmd } from '../../supervisor/pair';
@@ -139,7 +140,7 @@ export async function stopInContainerPair(opts: {
  *
  * @returns true if a pidfile was found (and a stop was therefore attempted).
  */
-export async function stopOrphanedContainerPair(taskId: string, worktreePath: string): Promise<boolean> {
+export async function stopOrphanedContainerPair(taskId: string, worktreePath: string, root: string): Promise<boolean> {
   const pidFile = pairPidFilePath(worktreePath);
   try {
     const pid = (await readFile(pidFile, 'utf-8')).trim();
@@ -157,7 +158,7 @@ export async function stopOrphanedContainerPair(taskId: string, worktreePath: st
   try {
     const ensured = await queryEnsureTaskContainer({ taskId });
     await stopInContainerPair({
-      binary: ensured.runnerType === 'podman' ? 'podman' : 'docker',
+      binary: await containerCliForType(root, ensured.runnerType),
       containerName: ensured.containerName,
       worktreePath,
     });
@@ -226,7 +227,9 @@ export function createContainerPairLauncher(opts: {
       // the session, named the container, and started it.
       containerName = ensured.containerName;
       runnerType = ensured.runnerType;
-      binary = ensured.runnerType === 'podman' ? 'podman' : 'docker';
+      // The runner's own client: on smolvm, the relay script to the project's
+      // machine — a bare `docker` would reach this host's engine instead.
+      binary = await containerCliForType(opts.root, ensured.runnerType);
 
       const { envVars } = await resolveInteractiveLaunch(opts.root, 'lazy pair', {
         // The session runs in the container, so every address it is handed must

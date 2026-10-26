@@ -64,3 +64,17 @@ export function pinDaemonBaseDir(dir: string): () => void {
 export async function removeDaemonBaseDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
+
+/** Keep the daemon's pin through teardown, then restore it even if teardown fails. */
+export async function cleanupPinnedDaemonBaseDir(
+  dir: string | undefined,
+  unpin: (() => void) | undefined,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  try {
+    await cleanup();
+  } finally {
+    unpin?.();
+    if (dir) await removeDaemonBaseDir(dir);
+  }
+}

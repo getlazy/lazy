@@ -183,7 +183,14 @@ export async function probeWorkingRun(
   // Liveness is `isRunning`; the probe only classifies a FALSE (one extra
   // lookup, and only for a run that looks dead): did the runtime answer, and
   // does its answer agree?
-  const alive = await run.runner.isRunning(run.runName);
+  // A runner that cannot tell THROWS rather than guess (the smolvm runner, when
+  // its machine runs but its engine does not answer): that is liveness unknown,
+  // never not-alive.
+  let alive: boolean;
+  try { alive = await run.runner.isRunning(run.runName); }
+  catch (err) {
+    return { run, alive: false, substate: null, livenessUnknown: err instanceof Error ? err.message : String(err) };
+  }
   let info: RunInfo | null | undefined;
   if (!alive && run.runner.probeRunInfo) {
     const answer = await run.runner.probeRunInfo(run.runName);

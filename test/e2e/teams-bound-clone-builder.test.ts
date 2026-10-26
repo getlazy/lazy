@@ -224,9 +224,10 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
   }
 
   // INVARIANT: in a bound clone `lazy builder` launches NOTHING locally: it
-  // starts the member's session on the server through Teams and attaches this
-  // terminal to it, and a second `lazy builder` joins that same session.
-  test('starts a server-side session, attaches through Teams, and a second run joins it', async () => {
+  // starts a session of the member's on the server through Teams and attaches
+  // this terminal to it. A second `lazy builder` starts ANOTHER builder, as on a
+  // laptop, and `lazy builder attach <id>` rejoins an existing one.
+  test('starts a server-side session, attaches through Teams, a second run starts another, attach rejoins', async () => {
     const first = await runAttached(['builder'], 'hello-from-the-laptop', 'hello-from-the-laptop');
     expect(first.exitCode).toBe(0);
 
@@ -247,9 +248,19 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     const launches = (await docker.invocations()).filter((l) => l.includes(' -d ')).length;
     const second = await runAttached(['builder'], 'again', 'again');
     expect(second.exitCode).toBe(0);
-    expect(second.stderr).toContain(`builder session ${session.id}`);
-    expect(engine.attaches).toEqual([session.containerName!, session.containerName!]);
-    expect((await docker.invocations()).filter((l) => l.includes(' -d ')).length).toBe(launches);
+    const after = (await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[])
+      .filter((s) => s.state === 'running');
+    expect(after).toHaveLength(2);
+    const other = after.find((s) => s.id !== session.id)!;
+    expect(second.stderr).toContain(`builder session ${other.id}`);
+    expect(other.containerName).not.toBe(session.containerName);
+    expect((await docker.invocations()).filter((l) => l.includes(' -d ')).length).toBe(launches + 1);
+
+    const rejoined = await runAttached(['builder', 'attach', session.id], 'back', 'back');
+    expect(rejoined.exitCode).toBe(0);
+    expect(rejoined.stderr).toContain(`builder session ${session.id}`);
+    expect(engine.attaches).toEqual([session.containerName!, other.containerName!, session.containerName!]);
+    expect((await docker.invocations()).filter((l) => l.includes(' -d ')).length).toBe(launches + 1);
   }, 240_000);
 
   // INVARIANT: `lazy builder stop` / `end` with no id find the member's own
@@ -275,7 +286,15 @@ describe('lazy builder in a clone bound to Lazy Teams', () => {
     const ended = await run(['builder', 'end']);
     expect({ code: ended.code, err: ended.stderr }).toEqual({ code: 0, err: expect.any(String) });
     expect(await states()).toEqual(['ended']);
-    expect(proxied).toContain('storage:getActiveBuilderSessionForMember');
+    expect(proxied).toContain('storage:listBuilderSessions');
+
+    // With two sessions, no id is a question, never a pick.
+    await runAttached(['builder'], 'a', 'a');
+    await runAttached(['builder'], 'b', 'b');
+    const ambiguous = await run(['builder', 'stop']);
+    expect(ambiguous.code).toBe(1);
+    expect(ambiguous.stderr).toContain('you have 2 builder sessions');
+    expect((await states()).filter((s) => s === 'running')).toHaveLength(2);
   }, 240_000);
 
   // INVARIANT: `lazy pair`, `lazy chat` and `lazy shell` in a bound clone launch nothing

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { init } from './cli/init';
+import { init, INIT_RUNNERS, type InitRunner } from './cli/init';
 import { findLazyRoot, findGitRoot } from './project-paths';
 import { isTTY, promptYesNo } from './cli/editor';
 import { CredentialIndexParseError } from './credentials/store';
@@ -250,10 +250,20 @@ const commandMap: Record<string, {
           process.exit(1);
         }
       }
-      await init(process.cwd(), { skipAuthCheck, skipRemoteCheck, skipCompletionCheck, nonInteractive, externalPath });
+      const runnerIdx = args.indexOf('--runner');
+      let runner: InitRunner | undefined;
+      if (runnerIdx !== -1) {
+        const value = args[runnerIdx + 1];
+        if (!value || !(INIT_RUNNERS as readonly string[]).includes(value)) {
+          console.error(`Error: --runner takes one of: ${INIT_RUNNERS.join(', ')}.`);
+          process.exit(1);
+        }
+        runner = value as InitRunner;
+      }
+      await init(process.cwd(), { skipAuthCheck, skipRemoteCheck, skipCompletionCheck, nonInteractive, externalPath, runner });
     },
     usage: () => {
-      console.log('Usage: lazy init [--external-path PATH] [--skip-auth-check] [--skip-remote-check] [--skip-completion-check]\n');
+      console.log('Usage: lazy init [--external-path PATH] [--runner docker|smolvm] [--skip-auth-check] [--skip-remote-check] [--skip-completion-check]\n');
       console.log('Initialize lazy in the current git repository.\n');
       console.log('Requires an interactive terminal to display warnings and instructions.\n');
       console.log('If a supported remote (GitHub, etc.) is detected, offers to configure it.\n');
@@ -261,6 +271,8 @@ const commandMap: Record<string, {
       console.log('  --external-path PATH      Put the external store here instead of ~/.lazy/<project-name>.');
       console.log('                            Answers the storage prompt, so it also works without a TTY,');
       console.log('                            and rewrites storage.external_path in an existing lazy.toml.');
+      console.log('  --runner docker|smolvm    Set [runner] type. smolvm also writes a [smolvm] section and');
+      console.log('                            says what is still needed. Without it, init asks on a TTY.');
       console.log('  --skip-auth-check         Skip authentication check during init');
       console.log('  --skip-remote-check       Skip remote driver detection during init');
       console.log('  --skip-github-check       Alias for --skip-remote-check');
@@ -601,8 +613,11 @@ const rewritesStoragePath = command === 'init' && args.includes('--external-path
 // one belonging to ANOTHER install, possibly still running — and writes
 // nothing. Probing the surrounding project's `.lazy` would refuse the fleet's
 // adoption preflight on exactly the machines it has to run on.
+//
+// `lazy system smolvm-install` installs into ~/.lazy and is run BEFORE a
+// project exists (the setup page has it ahead of `lazy init`).
 const isProjectFreeSystemQuery =
-  command === 'system' && ['source-id', 'guest-init-script', 'store-check', 'store-backup', 'store-backups', 'store-restore'].includes(args[1] ?? '');
+  command === 'system' && ['source-id', 'guest-init-script', 'smolvm-build-image', 'smolvm-install', 'store-check', 'store-backup', 'store-backups', 'store-restore'].includes(args[1] ?? '');
 
 // `lazy playground` (alias `demo`) is exempt for the same reason, and the failure is not
 // hypothetical either: the command exists to be run by an agent inside its own

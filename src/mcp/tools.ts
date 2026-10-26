@@ -165,7 +165,7 @@ import type { Storage, SearchResult } from '../storage';
 import { VALID_TASK_TYPES, invalidTaskTypeMessage, type Session, type Task, type TaskTarget, type TaskType } from '../types';
 import { resolveTaskDiffBase } from '../task-diff-base';
 import { type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEVELS, type EffortLevel } from '../config/types';
-import { hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../runner/host-runner-gate';
+import { assertRunnerAllowedInManagedMode, hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../runner/host-runner-gate';
 import { agentProfileOrThrow, agentProfilesFor, selectableAgentProfiles } from '../config/agent-profiles';
 import { resolveAgentForNewTaskFromConfig } from '../agent/task-agent';
 import { createRunner } from '../runner';
@@ -1674,6 +1674,7 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
       if (!resolved) {
         throw new Error(`Invalid runner '${runnerArg}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
       }
+      assertRunnerAllowedInManagedMode(resolved);
       runnerType = resolved;
     }
 
@@ -5281,6 +5282,7 @@ export function createStartHandler(ctx: McpToolContext): McpToolHandler {
       if (!resolved) {
         throw new Error(`Invalid runner '${runnerArg}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
       }
+      assertRunnerAllowedInManagedMode(resolved);
       runnerOverride = resolved;
     }
 

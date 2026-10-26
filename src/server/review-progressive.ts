@@ -17,6 +17,7 @@
  *   unasked: its card says how big it is and loads on click. Still listed,
  *   still counted, never dropped.
  */
+import { imageTypeForPath } from '../review/image-preview';
 import type { DiffFileEntry } from '../git/operations';
 import type { ReviewActions } from './review-actions';
 import { escapeHtml, scriptJson } from './escape';
@@ -164,7 +165,7 @@ export function fileListHtml(
     const regionId = opts.fileRegions?.[e.path];
     const regionLabel = regionId ? (opts.regionLabels?.get(regionId) ?? regionId) : '';
     const stat = e.binary
-      ? '<span class="rv-stat">binary</span>'
+      ? (imageTypeForPath(e.path) ? '<span class="rv-stat rv-stat-image">image</span>' : '<span class="rv-stat">binary</span>')
       : `<span class="rv-stat rv-stat-add">+${e.additions}</span> <span class="rv-stat rv-stat-del">-${e.deletions}</span>`;
     return (
       `<tr data-rv-list-file="${escapeHtml(e.path)}">` +

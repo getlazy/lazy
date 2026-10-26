@@ -3,7 +3,7 @@
 This page is generated from `lazy builder --help`.
 
 ```text
-Usage: lazy builder [list | stop [<id>] | end [<id>]] [--resume <id> [--import]] [--no-autonomous] [--yes]
+Usage: lazy builder [list | attach [<id>] | stop [<id>] | end [<id>]] [--resume <id> [--import]] [--no-autonomous] [--yes]
                     [--effort <level>] [--model <id>] [--override-usage-pause]
 
 Launch an interactive Claude Code session with Lazy builder instructions.
@@ -22,11 +22,13 @@ Subcommands:
   list, ls             List captured builder conversations
 
 In a clone logged in to Lazy Teams:
-  Your builder runs on the server; 'lazy builder' attaches this terminal to it
-  (starting it if needed — a second run joins the same session). ctrl-] detaches
+  Your builders run on the server; 'lazy builder' starts another one and
+  attaches this terminal to it (you may run several at once). ctrl-] detaches
   and leaves it running.
-  stop [<id>]          Stop it, keeping its conversation to resume
-  end [<id>]           End it for good
+  attach [<id>]        Reattach to one of yours (relaunching it if stopped)
+  stop [<id>]          Stop one, keeping its conversation to resume
+  end [<id>]           End one for good
+  With several builders, attach/stop/end name the session id.
 
 Resume options:
   --resume <id>        Resume a specific session by Claude session ID

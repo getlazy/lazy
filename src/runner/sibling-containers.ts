@@ -78,6 +78,13 @@ export const SIBLING_REFUSAL_STATUS = 409;
  */
 export const FOREIGN_DOCKER_HOST_ENV = 'LAZY_FOREIGN_DOCKER_HOST';
 
+/**
+ * Which Docker engine a launch goes to: the one this process's environment
+ * points at (`ambient` — Docker Desktop, a native dockerd, a mounted socket),
+ * or the dockerd of the project's own smolvm machine (`smolvm-guest`).
+ */
+export type ContainerDockerHost = 'ambient' | 'smolvm-guest';
+
 /** True when the deployment declared the Docker host to be a foreign one. */
 export function hasForeignDockerHost(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[FOREIGN_DOCKER_HOST_ENV];
@@ -99,7 +106,15 @@ export function hasForeignDockerHost(env: NodeJS.ProcessEnv = process.env): bool
  */
 export function siblingContainerRefusal(
   env: NodeJS.ProcessEnv = process.env,
+  dockerHost: ContainerDockerHost = 'ambient',
 ): string | null {
+  // INVARIANT: the declaration refuses the AMBIENT Docker host only. The smolvm
+  // runner never uses it: it launches on the dockerd of the project's own
+  // smolvm machine, which lazy created with every mount source shared at its
+  // identical path from THIS process's view — so the first translation holds
+  // by construction. (The second, the callback address, is the guest-to-host
+  // forwarder's to provide, independently of this declaration.)
+  if (dockerHost === 'smolvm-guest') return null;
   if (!hasForeignDockerHost(env)) return null;
 
   return (
@@ -169,7 +184,8 @@ export function siblingContainerRefusal(
 export function assertSiblingContainerLaunchSupported(
   what: string,
   env: NodeJS.ProcessEnv = process.env,
+  dockerHost: ContainerDockerHost = 'ambient',
 ): void {
-  const refusal = siblingContainerRefusal(env);
+  const refusal = siblingContainerRefusal(env, dockerHost);
   if (refusal) throw new RpcError(SIBLING_REFUSAL_STATUS, `Cannot ${what}. ${refusal}`);
 }

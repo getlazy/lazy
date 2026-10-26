@@ -17,6 +17,8 @@ import { logger } from '../utils/logger';
 import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { ReviewSettingsOverrides } from '../review/mode';
 import { tryRpc, RpcApplicationError } from './client';
+import { DaemonConnectionLostError } from './heartbeat';
+import { randomUUID } from 'crypto';
 import type { EditTaskResult } from './edit-task';
 import type { CreateTaskResult } from './create-task';
 import {
@@ -567,7 +569,38 @@ function optInFlag(flag: boolean | undefined): true | undefined {
   return flag === true ? true : undefined;
 }
 
+/**
+ * Run one turn-launching RPC under an idempotency key, retrying a DROPPED
+ * connection with the same key (src/daemon/launch-idempotency.ts).
+ *
+ * A launch can run for minutes; when the connection dies mid-way the client
+ * cannot tell whether the turn started. The daemon recognises the repeat by its
+ * key and answers with the original launch, so retrying here is safe — without
+ * a key it would record the feedback again and start a second turn. Only a lost
+ * connection is retried: a refusal is the daemon's answer, and passing it on is
+ * the caller's job.
+ */
+export const LAUNCH_RETRY_DELAYS_MS = [2_000, 4_000];
+export async function launchWithIdempotencyKey<T>(
+  idempotencyKey: string | undefined,
+  call: (key: string) => Promise<T | null>,
+): Promise<T | null> {
+  const key = idempotencyKey ?? `cli-${randomUUID()}`;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call(key);
+    } catch (err) {
+      const delay = LAUNCH_RETRY_DELAYS_MS[attempt];
+      if (!(err instanceof DaemonConnectionLostError) || delay === undefined) throw err;
+      logger.warn(`The daemon dropped the connection mid-launch; asking again with the same request key in ${delay / 1000}s — it will not launch twice.`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 export async function queryStartTask(params: {
+  /** Same key on a retry = the same launch (src/daemon/launch-idempotency.ts). Generated when absent. */
+  idempotencyKey?: string;
   taskId: string;
   modelOverride?: string;
   agentId?: string;
@@ -587,7 +620,8 @@ export async function queryStartTask(params: {
   traceparent?: string;
 }, progress?: ProgressSink): Promise<StartTaskRpcResult> {
   const observers = observersOf(progress);
-  const rpc = await tryRpc<StartTaskRpcResult>('startTask', {
+  const rpc = await launchWithIdempotencyKey(params.idempotencyKey, (idempotencyKey) => tryRpc<StartTaskRpcResult>('startTask', {
+    idempotencyKey,
     taskId: params.taskId,
     modelOverride: params.modelOverride,
     agentId: params.agentId,
@@ -603,7 +637,7 @@ export async function queryStartTask(params: {
     usagePausePastOnce: params.usagePausePastOnce || undefined,
     traceparent: params.traceparent,
     useDefaultImage: optInFlag(params.useDefaultImage),
-  }, observers);
+  }, observers));
   if (rpc) return rpc;
 
   // Test/daemon-self mode: execute directly
@@ -738,6 +772,13 @@ export async function releaseBuilder(builderId: string): Promise<void> {
  * §3.4). The fallback path resolves it directly only because there is no daemon
  * to ask — test and daemon-self mode, where this process IS the writer.
  */
+/** Would the daemon refuse this per-task runner? Daemonless, this process decides. */
+export async function queryRunnerRefusal(runner: string): Promise<string | null> {
+  const rpc = await tryRpc<{ refusal: string | null }>('runnerAllowed', { runner });
+  if (rpc) return rpc.refusal;
+  return (await import('../runner/host-runner-gate')).smolvmRefusedInManagedMode(runner);
+}
+
 export async function queryIdentity(): Promise<IdentityAnswer> {
   const rpc = await tryRpc<IdentityAnswer>('identity', {});
   if (rpc) return rpc;
@@ -853,6 +894,8 @@ export interface UnblockTaskRpcResult {
 }
 
 export async function queryUnblockTask(params: {
+  /** Same key on a retry = the same launch (src/daemon/launch-idempotency.ts). Generated when absent. */
+  idempotencyKey?: string;
   taskId: string;
   message: string;
   modelOverride?: string;
@@ -871,7 +914,8 @@ export async function queryUnblockTask(params: {
   useDefaultImage?: boolean;
 }, progress?: ProgressSink): Promise<UnblockTaskRpcResult> {
   const observers = observersOf(progress);
-  const rpc = await tryRpc<UnblockTaskRpcResult>('unblockTask', {
+  const rpc = await launchWithIdempotencyKey(params.idempotencyKey, (idempotencyKey) => tryRpc<UnblockTaskRpcResult>('unblockTask', {
+    idempotencyKey,
     taskId: params.taskId,
     message: params.message,
     modelOverride: params.modelOverride,
@@ -885,7 +929,7 @@ export async function queryUnblockTask(params: {
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
     useDefaultImage: optInFlag(params.useDefaultImage),
-  }, observers);
+  }, observers));
   if (rpc) return rpc;
 
   // Test/daemon-self mode: execute directly
@@ -931,6 +975,8 @@ export interface AskTaskRpcResult {
 }
 
 export async function queryAskTask(params: {
+  /** Same key on a retry = the same launch (src/daemon/launch-idempotency.ts). Generated when absent. */
+  idempotencyKey?: string;
   taskId: string;
   message: string;
   effortOverride?: string;
@@ -942,7 +988,8 @@ export async function queryAskTask(params: {
   overrideUsagePause?: boolean;
 }, progress?: ProgressSink): Promise<AskTaskRpcResult> {
   const observers = observersOf(progress);
-  const rpc = await tryRpc<AskTaskRpcResult>('askTask', {
+  const rpc = await launchWithIdempotencyKey(params.idempotencyKey, (idempotencyKey) => tryRpc<AskTaskRpcResult>('askTask', {
+    idempotencyKey,
     taskId: params.taskId,
     message: params.message,
     effortOverride: params.effortOverride,
@@ -950,7 +997,7 @@ export async function queryAskTask(params: {
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
     overrideUsagePause: params.overrideUsagePause || undefined,
-  }, observers);
+  }, observers));
   if (rpc) return rpc;
 
   const root = resolveLazyRoot();
@@ -1520,6 +1567,8 @@ export interface ResumeTaskRpcResult {
 }
 
 export async function queryResumeTask(params: {
+  /** Same key on a retry = the same launch (src/daemon/launch-idempotency.ts). Generated when absent. */
+  idempotencyKey?: string;
   taskId: string;
   modelOverride?: string;
   effortOverride?: string;
@@ -1532,7 +1581,8 @@ export async function queryResumeTask(params: {
   useDefaultImage?: boolean;
 }, progress?: ProgressSink): Promise<ResumeTaskRpcResult> {
   const observers = observersOf(progress);
-  const rpc = await tryRpc<ResumeTaskRpcResult>('resumeTask', {
+  const rpc = await launchWithIdempotencyKey(params.idempotencyKey, (idempotencyKey) => tryRpc<ResumeTaskRpcResult>('resumeTask', {
+    idempotencyKey,
     taskId: params.taskId,
     modelOverride: params.modelOverride,
     effortOverride: params.effortOverride,
@@ -1540,7 +1590,7 @@ export async function queryResumeTask(params: {
     usagePauseOverrideEligible: params.usagePauseOverrideEligible,
     usagePausePastOnce: params.usagePausePastOnce || undefined,
     useDefaultImage: optInFlag(params.useDefaultImage),
-  }, observers);
+  }, observers));
   if (rpc) return rpc;
 
   const root = resolveLazyRoot();
@@ -1856,12 +1906,13 @@ function sessionNeedsDaemon(command: string): Error {
 }
 
 /**
- * Start this member's builder session on the server — or, when one is already
- * running for them, return THAT one: a second `lazy builder` from the same
- * member joins the existing session rather than starting another (§5.7).
+ * Start a NEW builder session of this member's on the server — every call
+ * another one, as `lazy builder` on a laptop — or, with `id`, rejoin that
+ * session of theirs (returned while running, relaunched on its own
+ * conversation when stopped).
  */
-export async function rpcStartBuilderSession(): Promise<BuilderSession> {
-  const rpc = await tryRpc<BuilderSession>('startBuilderSession', {});
+export async function rpcStartBuilderSession(id?: string): Promise<BuilderSession> {
+  const rpc = await tryRpc<BuilderSession>('startBuilderSession', { ...(id ? { id } : {}) });
   if (rpc) return rpc;
   throw sessionNeedsDaemon('startBuilderSession');
 }

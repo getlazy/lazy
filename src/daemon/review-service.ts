@@ -22,7 +22,7 @@
  * actually launched.
  */
 
-import { getOrCreateStorage, handleDiff, handleFileLines, RpcError, withLaunchAllowance } from './rpc-handlers';
+import { getOrCreateStorage, handleDiff, handleDiffBlob, handleFileLines, RpcError, withLaunchAllowance } from './rpc-handlers';
 import { launchAskTaskAwaited, launchUnblockTask, acceptTask, syncTask } from './task-lifecycle';
 import type { ProgressEmitter } from './progress';
 import { logger } from '../utils/logger';
@@ -38,7 +38,7 @@ import { resolveOutstandingViolations } from '../protection/outstanding-resolver
 import { mergedViolationRecords } from '../protection/outstanding';
 import { askUnavailableReason, isPendingDelivery, withdrawRefusalReason } from '../server/review-actions';
 import { buildAskContext } from '../task/ask-context';
-import type { ReviewActions, PostReviewCommentInput, PromoteDiscussionResult, ReviewQueueEntry, FileLinesQuery, FileLinesResult } from '../server/review-actions';
+import type { ReviewActions, PostReviewCommentInput, PromoteDiscussionResult, ReviewQueueEntry, FileLinesQuery, FileLinesResult, DiffBlobQuery, DiffBlobResult } from '../server/review-actions';
 import { createPromotedTask } from '../raised/promote-task';
 import { buildDiscussionTaskPrompt, defaultDiscussionGoal, discussionPromoteSeed, type DiscussionPromoteSeed } from '../review/promote-discussion';
 import { validateCode } from '../task/identity';
@@ -286,6 +286,10 @@ export function createReviewActions(projectRoot: string): ReviewActions {
         start: input.start,
         end: input.end,
       })) as FileLinesResult;
+    },
+
+    async getDiffBlob(taskId: string, input: DiffBlobQuery): Promise<DiffBlobResult> {
+      return (await handleDiffBlob(projectRoot, { taskId, path: input.path, side: input.side })) as DiffBlobResult;
     },
 
     async listComments(taskId: string): Promise<ReviewComment[]> {

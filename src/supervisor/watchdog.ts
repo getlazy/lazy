@@ -55,6 +55,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { log } from './log';
 import { spawn } from '../utils/spawn';
+import { registerSupervisorAgent } from '../protocol/supervisor-receipt';
 import { assertArgvBounded } from '../agent/argv-safety';
 import { formatWatchdogMs } from '../utils/watchdog-turn';
 import type { AgentActivityEvent, AgentActivityStream, BackgroundTaskRef } from '../agent/activity-stream';
@@ -390,8 +391,15 @@ export async function execWithWatchdog(
     timeout: 0, // Long-running: this function has its own progress-based guards
   });
   let proc: ReturnType<typeof launch>;
+  let clearAgentReceipt: () => void;
   try {
     proc = launch();
+    try {
+      clearAgentReceipt = registerSupervisorAgent(proc.pid);
+    } catch (error) {
+      proc.kill('SIGKILL');
+      throw new Error(`Could not register agent ${proc.pid} for supervisor crash recovery: ${error instanceof Error ? error.message : String(error)}`);
+    }
   } catch (error) {
     if (promptDir) rmSync(promptDir, { recursive: true, force: true });
     throw error;
@@ -731,6 +739,7 @@ export async function execWithWatchdog(
 
   // Wait for the process, then drain its output on a bounded window.
   await proc.exited;
+  clearAgentReceipt();
 
   const streamsDone = Promise.all([stdoutDone, stderrDone]);
   const drained = await Promise.race([

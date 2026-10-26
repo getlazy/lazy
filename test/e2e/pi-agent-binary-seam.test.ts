@@ -163,11 +163,12 @@ describe('pi turns through the fake-binary seam', () => {
 
     // The flag block PiAgent.buildExecArgs opens with, in order. --no-approve
     // is SECURITY: project trust pinned off so a checked-in .pi/ can never
-    // execute (see src/agent/pi.ts).
+    // execute (see src/agent/pi.ts); --no-mcp keeps pi's built-in MCP client
+    // off so lazy's bridge is the only MCP surface.
     // `ollama` is the CUSTOM Anthropic-wire provider lazy declares, which is
     // what a local endpoint resolves to — and what the built-in `pi` profile
     // now is by default.
-    expect(argv.slice(0, 6)).toEqual(['-p', '--mode', 'json', '--no-approve', '--provider', 'ollama']);
+    expect(argv.slice(0, 7)).toEqual(['-p', '--mode', 'json', '--no-approve', '--no-mcp', '--provider', 'ollama']);
     // The system prompt travels on pi's native flag.
     expect(argv).toContain('--append-system-prompt');
     // A work turn keeps the full toolset.
@@ -331,7 +332,7 @@ describe('pi turns through the fake-binary seam', () => {
     expect(turns.length, 'the fake pi was never launched for the openai turn').toBeGreaterThan(0);
     const argv = turns[0]!.argv;
 
-    expect(argv.slice(0, 6)).toEqual(['-p', '--mode', 'json', '--no-approve', '--provider', 'lazy-openai']);
+    expect(argv.slice(0, 7)).toEqual(['-p', '--mode', 'json', '--no-approve', '--no-mcp', '--provider', 'lazy-openai']);
     expect(argv[argv.indexOf('--model') + 1]).toBe('gpt-5.2');
 
     const env = turns[0]!.env;
@@ -399,7 +400,7 @@ describe('pi turns through the fake-binary seam', () => {
     const turns = await turnInvocations();
     expect(turns.length, 'the fake pi was never launched for the openrouter turn').toBeGreaterThan(0);
     const argv = turns[0]!.argv;
-    expect(argv.slice(0, 6)).toEqual(['-p', '--mode', 'json', '--no-approve', '--provider', 'lazy-openai']);
+    expect(argv.slice(0, 7)).toEqual(['-p', '--mode', 'json', '--no-approve', '--no-mcp', '--provider', 'lazy-openai']);
     expect(argv[argv.indexOf('--model') + 1]).toBe('openai/gpt-4o');
 
     const env = turns[0]!.env;

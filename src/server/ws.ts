@@ -41,6 +41,9 @@ export interface WebSocketUpgrader {
  */
 const OWNER_KEY = '__lzWsOwner';
 
+/** Seconds of silence (pongs included) before a daemon WebSocket is closed. */
+export const WS_IDLE_TIMEOUT_S = 120;
+
 /**
  * Fold several upgraders into the one `Bun.serve` accepts.
  *
@@ -69,6 +72,14 @@ export function composeUpgraders(upgraders: WebSocketUpgrader[]): WebSocketUpgra
       void ownerOf(ws as { data?: unknown })?.handler.close?.(ws as never, code, reason);
     },
     drain(ws: unknown) { void ownerOf(ws as { data?: unknown })?.handler.drain?.(ws as never); },
+    // A terminal can sit idle for hours. Bun closes a socket that moves
+    // nothing for `idleTimeout` seconds, but with `sendPings` it pings an idle
+    // socket first and the peer's pong counts as traffic — so a connected
+    // browser, or a Teams relay (which answers pings and sends its own), is
+    // never reaped, while a peer that vanished is. Stated rather than left to
+    // Bun's defaults, which are these values: test/unit/ws-keepalive.test.ts.
+    idleTimeout: WS_IDLE_TIMEOUT_S,
+    sendPings: true,
   };
 
   return {

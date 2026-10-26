@@ -16,7 +16,7 @@ import type { EffortLevel } from '../config/types';
 import { parentTaskIdOf, taskTarget, branchTarget } from '../task-target';
 import { taskEditability } from '../task-edit-rules';
 import { resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEVELS } from '../config/types';
-import { hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../runner/host-runner-gate';
+import { hostRunnerRemovedMessage, isRemovedHostRunnerInput, smolvmRefusedInManagedMode } from '../runner/host-runner-gate';
 import { assertKnownAgentProfile } from './agent-profile-check';
 import { assertNoModelOnTiered } from '../agent/tiered-model';
 import { loadConfig } from '../config/loader';
@@ -287,9 +287,12 @@ export async function editTask(
     if (isRemovedHostRunnerInput(input.runner)) {
       throw new RpcError(400, hostRunnerRemovedMessage('per-task runner'));
     }
-    if (!resolveRunnerType(input.runner)) {
+    const resolvedRunner = resolveRunnerType(input.runner);
+    if (!resolvedRunner) {
       throw new RpcError(400, `Invalid runner '${input.runner}'. Must be one of: ${RUNNER_ALIAS_HINT}`);
     }
+    const managedRefusal = smolvmRefusedInManagedMode(resolvedRunner);
+    if (managedRefusal) throw new RpcError(400, managedRefusal);
   }
   if (input.model !== undefined && !input.model.trim()) {
     throw new RpcError(400, 'Model name cannot be empty');

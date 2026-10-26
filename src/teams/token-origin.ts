@@ -72,6 +72,20 @@ export function assertTokenIssuedBy(token: string, teamsUrl: string, requireJwt:
   // typed address handed back, and raw text from it could carry terminal escapes.
   const iss = jwtIssuerOrigin(token);
   if (iss !== typed) {
+    // Same host, only the scheme differs: the install is misconfigured behind a
+    // TLS-terminating proxy, not impersonated. Still refused — the check stays
+    // exactly as strict — but the remedy is the operator's, never "use http".
+    if (iss && iss.replace(/^https?:/, '') === typed.replace(/^https?:/, '')) {
+      const remedy = typed.startsWith('https:')
+        ? `Ask the install's operator to set APP_PROTOCOL=https and restart Lazy Teams, then run \`lazy login ${typed}\` again.`
+        : `Run \`lazy login ${iss}\` instead.`;
+      throw new TeamsRequestError(
+        `The login was approved, but the install signed the token for ${iss}, not ${typed}, the address you typed: ` +
+        `its public address is set to ${iss.startsWith('https:') ? 'https' : 'http'}.\n` +
+        `  The token was not kept. ${remedy} ` +
+        `Revoke the new token at Account settings → Git & CLI tokens on your install.`,
+      );
+    }
     const named = iss ?? 'an unknown issuer';
     throw new TeamsRequestError(
       `The login was approved by ${named}, not by ${typed}, the address you typed.\n` +

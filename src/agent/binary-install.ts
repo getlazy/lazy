@@ -476,10 +476,13 @@ async function isRegularFile(path: string): Promise<boolean> {
  * runtime could not answer. Null means "unknown", and callers must not collect.
  */
 export async function listContainerMountSources(
-  dockerBinary: string = 'docker',
+  docker: string | string[] = 'docker',
 ): Promise<string[] | null> {
+  // A command PREFIX is accepted too (e.g. `smolvm machine exec … -- docker`),
+  // for an engine reached through another program.
+  const prefix = typeof docker === 'string' ? [docker] : docker;
   try {
-    const ps = spawn([dockerBinary, 'ps', '--quiet', '--no-trunc'], {
+    const ps = spawn([...prefix, 'ps', '--quiet', '--no-trunc'], {
       stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_QUERY_TIMEOUT_MS,
     });
     const [psOut] = await Promise.all([new Response(ps.stdout).text(), ps.exited]);
@@ -489,7 +492,7 @@ export async function listContainerMountSources(
     if (ids.length === 0) return [];
 
     const inspect = spawn(
-      [dockerBinary, 'inspect', '--format', '{{range .Mounts}}{{println .Source}}{{end}}', ...ids],
+      [...prefix, 'inspect', '--format', '{{range .Mounts}}{{println .Source}}{{end}}', ...ids],
       { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_QUERY_TIMEOUT_MS },
     );
     const [out] = await Promise.all([new Response(inspect.stdout).text(), inspect.exited]);

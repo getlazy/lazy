@@ -1,8 +1,10 @@
 /**
  * Doctor's one "Daemon health" line.
  *
- * Doctor summarises `lazy daemon health` in a single line and points at it;
- * it never repeats a finding one of its own checks already reports.
+ * Doctor summarises `lazy daemon health` in one check and points at it; it
+ * never repeats a finding one of its own checks already reports. A failing
+ * row's own reason and remedy ride in that check, because a client that cannot
+ * run `lazy daemon health` (Lazy Teams) must still say which failure it is.
  */
 
 import { describe, test, expect } from 'bun:test';
@@ -61,5 +63,38 @@ describe("doctor's daemon-health summary line", () => {
     expect(result.ok).toBe(false);
     expect(result.detail).toContain('Proxy answering');
     expect(result.detail).not.toContain("CLI's build");
+  });
+
+  // INVARIANT: a failing summary carries each failing row's own reason and
+  // remedy. Lazy Teams renders this check, not `lazy daemon health`; without
+  // them its notice said only "1 failing: Storage lock" and told the operator
+  // to send a support bundle for a failure a daemon restart fixes.
+  test('a failing row brings its own reason and remedy', async () => {
+    const lock: DaemonHealthRow = {
+      id: 'storage:lock', group: 'storage', name: 'Storage lock', state: 'fail',
+      reason: '/store/.storage-lock is gone: this daemon gave up the lock', remedy: 'Restart the daemon so it takes the lock again',
+      remedyKind: 'restart-daemon',
+    };
+    const result = await checkDaemonHealthSummary('/p', async () => report([OK, lock]));
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('Storage lock: /store/.storage-lock is gone: this daemon gave up the lock');
+    expect(result.detail).toContain('Fix: Restart the daemon so it takes the lock again');
+    // Said once, in the detail — the remedy is generic so no surface repeats it.
+    expect(result.remedy).not.toContain('so it takes the lock again');
+    expect(result.remedy).toContain('Restart the daemon');
+  });
+
+  // INVARIANT: the summary is classified `restart-daemon` only when a restart
+  // fixes EVERY failing row — then Lazy Teams offers its Restart button instead
+  // of "send the support bundle". One row a restart does not fix keeps the
+  // family's conservative `manual`.
+  test('restart-daemon only when a restart fixes every failing row', async () => {
+    const restartable: DaemonHealthRow = { ...OK, state: 'fail', reason: 'down', remedy: 'restart it', remedyKind: 'restart-daemon' };
+    const manual: DaemonHealthRow = { ...OK, id: 'storage:lock', name: 'Storage lock', state: 'fail', reason: 'held by pid 7', remedy: 'stop pid 7' };
+    const fixable = await checkDaemonHealthSummary('/p', async () => report([restartable]));
+    expect(fixable.classification?.remedyKind).toBe('restart-daemon');
+    expect(fixable.classification?.family).toBe('daemon-health');
+    const mixed = await checkDaemonHealthSummary('/p', async () => report([restartable, manual]));
+    expect(mixed.classification).toBeUndefined();
   });
 });

@@ -29,7 +29,8 @@ import { mkdir, readdir, readFile, writeFile } from 'fs/promises';
 import { pathExists } from '../utils/fs';
 import { setupSandbox } from '../utils/sandbox';
 import { loadConfig } from '../config/loader';
-import type { EffortLevel, RunnerType } from '../config/types';
+import { resolveRunnerType, type EffortLevel, type RunnerType } from '../config/types';
+import { assertRunnerAllowedInManagedMode } from '../runner/host-runner-gate';
 import { resolveProjectModel } from './project-settings';
 import { switchTaskAgent, formatAgentSwitchAnnouncement } from './agent-switch';
 import { resolveAndPersistLowHighLoop } from './effort';
@@ -682,6 +683,7 @@ async function launchTaskRun(
   // global config default. A start --runner override is persisted onto the task
   // so the next turn doesn't flip back to the global default.
   if (params.runnerOverride && t.runner_type !== params.runnerOverride) {
+    assertRunnerAllowedInManagedMode(resolveRunnerType(params.runnerOverride) ?? params.runnerOverride); // refused before it is stored
     await storage.updateTaskRunnerType(t.id, params.runnerOverride);
     t = { ...t, runner_type: params.runnerOverride };
   }

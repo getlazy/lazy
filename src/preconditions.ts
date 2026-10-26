@@ -123,6 +123,9 @@ export async function daemonUnreachablePreconditionMessage(unreachable: DaemonUn
   );
 }
 
+/** The test-only fallback in resolveStorage registers its exit-time lock release once per process. */
+let releaseOnExitRegistered = false;
+
 /**
  * Create and initialize storage, THROWING if the daemon is not reachable.
  *
@@ -145,13 +148,21 @@ export async function resolveStorage(): Promise<Storage> {
   // storage singleton (getOrCreateStorage) rather than a fresh FileStorage so
   // that requireStorage and any in-process rpc-fallback handlers share ONE
   // StorageLock: two instances in one process would contend on .storage-lock
-  // (each has its own re-entrancy counter) and deadlock. Safe: each e2e test is
-  // a single CLI subprocess against its own temp project. NOT a production path
-  // — real invocations never set LAZY_TEST and fail fast below.
+  // (each has its own re-entrancy counter) and deadlock. That singleton takes
+  // the store's lock for the life of the process and its borrowers' close() is
+  // a no-op, so the lock is given back on exit: a test runs several of these
+  // CLI subprocesses in turn against one temp project, and each must leave the
+  // store free for the next (and for `lazy doctor`, which reports a leftover
+  // lock as stale). NOT a production path — real invocations never set
+  // LAZY_TEST and fail fast below.
   if (process.env.LAZY_TEST === '1') {
     // Dynamic import avoids a static preconditions ↔ daemon/rpc-handlers cycle.
-    const { initDaemonStorage, getOrCreateStorage } = await import('./daemon/rpc-handlers');
+    const { initDaemonStorage, getOrCreateStorage, releaseDaemonStoreLockSync } = await import('./daemon/rpc-handlers');
     initDaemonStorage(root);
+    if (!releaseOnExitRegistered) {
+      releaseOnExitRegistered = true;
+      process.once('exit', releaseDaemonStoreLockSync);
+    }
     return getOrCreateStorage();
   }
 

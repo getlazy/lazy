@@ -106,6 +106,13 @@ export type ClaudeStep =
       server?: string;
       /** Per-request timeout (default 60s). */
       timeoutMs?: number;
+      /**
+       * Where the server entry comes from: the `--mcp-config` file in argv
+       * (default, how a host pairing session is launched), or
+       * `$HOME/.claude.json`, which is where a supervised turn's MCP setup
+       * writes it (src/mcp/config.ts writeMcpConfig).
+       */
+      configFile?: 'argv' | 'home';
     }
   /** Stop ignoring nothing and exit immediately with this code. */
   | { kind: 'exit'; code: number }
@@ -669,9 +676,15 @@ function writeSessionJsonl(step) {
 // JSON-RPC over the server's stdio, one request in flight at a time.
 async function runMcpCall(step) {
   const { spawn } = require('node:child_process');
-  const at = argv.indexOf('--mcp-config');
-  if (at === -1 || at + 1 >= argv.length) throw new Error(FAKE_LABEL + ': mcp-call needs --mcp-config in argv');
-  const mcpConfigPath = argv[at + 1];
+  let mcpConfigPath;
+  if (step.configFile === 'home') {
+    if (!process.env.HOME) throw new Error(FAKE_LABEL + ': mcp-call with configFile home needs HOME');
+    mcpConfigPath = path.join(process.env.HOME, '.claude.json');
+  } else {
+    const at = argv.indexOf('--mcp-config');
+    if (at === -1 || at + 1 >= argv.length) throw new Error(FAKE_LABEL + ': mcp-call needs --mcp-config in argv');
+    mcpConfigPath = argv[at + 1];
+  }
   const files = {};
   const readTracked = (file) => {
     const content = fs.readFileSync(file, 'utf-8');

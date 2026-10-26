@@ -139,10 +139,20 @@ export interface RoleTarget {
 export type StorageBackendConfig = 'external';
 
 /** Runner types for task execution */
-export type RunnerType = 'docker' | 'podman' | 'dangerously-host-process-without-any-isolation';
+export type RunnerType = 'docker' | 'podman' | 'smolvm' | 'dangerously-host-process-without-any-isolation';
 
 /** All canonical runner type values. */
-export const VALID_RUNNER_TYPES: readonly RunnerType[] = ['docker', 'podman', 'dangerously-host-process-without-any-isolation'] as const;
+export const VALID_RUNNER_TYPES: readonly RunnerType[] = ['docker', 'podman', 'smolvm', 'dangerously-host-process-without-any-isolation'] as const;
+
+/**
+ * Does this runner put agents in containers? `smolvm` does: its containers run
+ * on the dockerd of a per-project smolvm machine, driven by the docker runner's
+ * own code (src/runner/smolvm-runner.ts). Ask this rather than
+ * `=== 'docker' || === 'podman'`, which silently leaves smolvm out.
+ */
+export function isContainerRunnerType(type: string | null | undefined): boolean {
+  return type === 'docker' || type === 'podman' || type === 'smolvm';
+}
 
 /**
  * Friendly CLI/MCP aliases mapped to canonical {@link RunnerType} values.
@@ -153,6 +163,7 @@ export const RUNNER_ALIASES: Readonly<Record<string, RunnerType>> = {
   docker: 'docker',
   container: 'docker',
   podman: 'podman',
+  smolvm: 'smolvm',
 };
 
 /**
@@ -168,7 +179,7 @@ export function resolveRunnerType(input: string): RunnerType | null {
 }
 
 /** Human-readable list of accepted runner aliases, for error messages. */
-export const RUNNER_ALIAS_HINT = 'docker, container, podman';
+export const RUNNER_ALIAS_HINT = 'docker, container, podman, smolvm';
 
 /**
  * Permission posture for HOST execution (host-process runner only; ignored for
@@ -466,6 +477,15 @@ export interface LazyConfig {
     dockerfile?: string;
     build_inputs?: string[];
     run_args?: string[];
+  };
+  /** `[smolvm]`: the per-project machine `[runner] type = "smolvm"` runs containers in. */
+  smolvm?: {
+    binary?: string;
+    image?: string;
+    cpus?: number;
+    memory_mib?: number;
+    storage_gib?: number;
+    allow_cidrs?: string[];
   };
   runner?: RunnerType | {
     type?: RunnerType;
@@ -948,6 +968,24 @@ export interface ResolvedConfig {
      * agent-writable and must never govern container privileges.
      */
     run_args: string[];
+  };
+  /**
+   * The per-project smolvm machine behind `[runner] type = "smolvm"`
+   * (src/vm/smolvm-project-machine.ts). Everything but `binary` is fixed when
+   * the machine is CREATED — smolvm cannot change a machine's shares or egress
+   * afterwards — so a later change is reported with the command to recreate,
+   * never applied silently.
+   */
+  smolvm: {
+    /** Absolute path to the vendored smolvm launcher. Empty: `$LAZY_SMOLVM_BINARY`. */
+    binary: string;
+    /** Absolute path to a lazy daemon image tar (`docker save` form) the machine boots. */
+    image: string;
+    cpus: number;
+    memory_mib: number;
+    storage_gib: number;
+    /** Public CIDRs the machine may reach. Empty: all of public IP space (the shared default). */
+    allow_cidrs: string[];
   };
   runner: {
     type: RunnerType;

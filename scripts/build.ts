@@ -19,6 +19,7 @@ import {
   formatSourceProvenanceLine,
 } from './build-info-content';
 import { computeSourceFingerprint } from '../src/utils/source-id';
+import { requireDockerRelayRuntime } from '../src/vm/docker-relay';
 import {
   verifyAgentBinaryBytes,
   verifyAgentBinarySelfcheckExec,
@@ -26,6 +27,10 @@ import {
 } from '../src/agent/binary-identity';
 
 const projectRoot = join(import.meta.dir, '..');
+
+// Compiled binaries embed the builder's runtime. Refuse before producing a
+// binary whose Unix socket relay silently discards attached Docker output.
+requireDockerRelayRuntime();
 
 // Capture provenance BEFORE writing build-info.ts — the write itself would
 // otherwise mark the tree dirty for the very build we are stamping.
@@ -89,7 +94,7 @@ function bunCompile(args: string[], finalOutfile: string): void {
   const tempDir = mkdtempSync(join(tmpdir(), 'lazy-build-'));
   const tempOutfile = join(tempDir, basename(finalOutfile));
   try {
-    const proc = Bun.spawnSync(['bun', 'build', '--compile', ...RELEASE_DEFINES, ...args, '--outfile', tempOutfile], {
+    const proc = Bun.spawnSync([process.execPath, 'build', '--compile', ...RELEASE_DEFINES, ...args, '--outfile', tempOutfile], {
       cwd: tempDir,
       stdout: 'inherit',
       stderr: 'inherit',

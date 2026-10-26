@@ -386,6 +386,34 @@ export class DockerRunner implements Runner {
     return runName;
   }
 
+  /**
+   * The command-line client this runner drives — `docker`, `podman`, or for
+   * the smolvm runner a script aiming the host's docker CLI at the project's
+   * machine. Every caller that shells out to "the runner's docker" must use
+   * this rather than picking a name by runner type, which would silently reach
+   * a different engine.
+   */
+  get containerCli(): string {
+    return this.binary;
+  }
+
+  /**
+   * The Engine API unix socket a browser terminal streams over, when the
+   * runner owns one; null means "the client's own engine" — whatever socket
+   * the CLI resolves (src/runner/docker-exec-stream.ts).
+   */
+  engineSocketPath(): string | null {
+    return null;
+  }
+
+  /**
+   * Refuse a container launch the Docker host cannot serve (sibling-containers.ts).
+   * The smolvm runner overrides it: its engine is its own machine's.
+   */
+  protected assertContainerLaunchSupported(what: string): void {
+    assertSiblingContainerLaunchSupported(what);
+  }
+
   async checkAvailability(): Promise<void> {
     // FIRST, and before Docker is even probed: a deployment whose Docker host
     // is a foreign filesystem cannot run ANY workload container here.
@@ -400,7 +428,7 @@ export class DockerRunner implements Runner {
     // static and environment-only, so there is nothing to retry — refuse while
     // the task still has its pre-start status and let the caller's 4xx/5xx say
     // why. auto-resume catches this and skips, which is exactly right.
-    assertSiblingContainerLaunchSupported('use the docker runner');
+    this.assertContainerLaunchSupported('use the docker runner');
     await checkDocker(this.binary);
     // Auth is NOT enforced here. The turn credential gate
     // (src/daemon/credential-gate.ts, asked by planTurnCredential before every
@@ -465,7 +493,7 @@ export class DockerRunner implements Runner {
     // path that reached here some other way, so the last thing before the argv
     // is built is still a refusal rather than a container mounted on
     // directories the host daemon invented. See src/runner/sibling-containers.ts.
-    assertSiblingContainerLaunchSupported('start a task turn');
+    this.assertContainerLaunchSupported('start a task turn');
     // Fail hard before launch if the agent's backend is unreachable — never
     // silently fall back to a different backend (AGENTS.md: fail hard).
     await preflightRoleTarget('agent', this.agentTarget());
@@ -537,7 +565,7 @@ export class DockerRunner implements Runner {
     // credential placeholder against a proxy it reaches at host.docker.internal.
     // `lazy report`, `lazy ask` over a stored conversation and memory compaction
     // all come through here — the refusal names them.
-    assertSiblingContainerLaunchSupported('run this in an agent container');
+    this.assertContainerLaunchSupported('run this in an agent container');
     const lazyRoot = this.lazyRoot ?? findLazyRoot();
     if (!lazyRoot) {
       throw new Error('Cannot run a one-shot: not in a lazy project. Run `lazy init` first.');
@@ -1114,6 +1142,29 @@ export class DockerRunner implements Runner {
     }
   }
 
+  /**
+   * Connectivity for any role whose upstream lazy probes — see probesUpstream.
+   * `pinned` alone would skip the LOCAL default (the built-in pi profile's
+   * Ollama), so doctor would say nothing about a stopped server that refuses
+   * every launch, which is the one place diagnosis belongs. Independent of
+   * the container engine, so a runner that skips the engine still asks it.
+   */
+  protected async diagnoseUpstreams(): Promise<HealthCheck[]> {
+    const results: HealthCheck[] = [];
+    for (const role of ['agent', 'builder'] as const) {
+      const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
+      if (!probesUpstream(target)) continue;
+      const check = await checkTargetConnectivity(target);
+      if (check.reachable) {
+        results.push({ state: 'ok', what: `[${role}] ${target.profile} reachable at ${check.endpoint}` });
+      } else {
+        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, problem: `[${role}] ${target.profile} is unreachable`, reason: check.reason });
+      }
+    }
+
+    return results;
+  }
+
   async diagnose(options: DiagnoseOptions = {}): Promise<HealthCheck[]> {
     const results: HealthCheck[] = [];
     const timeout = 10_000;
@@ -1180,20 +1231,7 @@ export class DockerRunner implements Runner {
       results.push(...(await this.diagnoseImageHarnessVersion()));
     }
 
-    // Check connectivity for any role whose upstream lazy probes — see
-    // probesUpstream. `pinned` alone would skip the LOCAL default (the built-in
-    // pi profile's Ollama), so doctor would say nothing about a stopped server
-    // that refuses every launch, which is the one place diagnosis belongs.
-    for (const role of ['agent', 'builder'] as const) {
-      const target = role === 'agent' ? this.agentTarget() : this.builderTarget();
-      if (!probesUpstream(target)) continue;
-      const check = await checkTargetConnectivity(target);
-      if (check.reachable) {
-        results.push({ state: 'ok', what: `[${role}] ${target.profile} reachable at ${check.endpoint}` });
-      } else {
-        results.push({ state: 'fail', what: `[${role}] ${target.profile} reachable`, problem: `[${role}] ${target.profile} is unreachable`, reason: check.reason });
-      }
-    }
+    results.push(...(await this.diagnoseUpstreams()));
 
     return results;
   }

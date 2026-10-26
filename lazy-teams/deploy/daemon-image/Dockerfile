@@ -39,7 +39,7 @@
 # used to compile lazy with an older bun (1.2.21) whose WebSocket client
 # duplicated handshake headers, which broke ActionCable through task services;
 # test/unit/lazy-daemon-image.test.ts keeps the two equal.
-ARG BUN_VERSION=1.3.11
+ARG BUN_VERSION=1.4.3
 ARG DEBIAN_TAG=bookworm-slim
 # Forge CLIs, exact release versions. Bumping one means updating its two rows
 # in the checksum table below; the build refuses a version it has no sha for.

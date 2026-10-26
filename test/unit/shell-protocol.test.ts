@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   parseShellClientMessage,
   shellServerMessage,
+  shellClientMessage,
   MIN_TERM_DIM,
   MAX_TERM_COLS,
   MAX_TERM_ROWS,
@@ -85,5 +86,11 @@ describe('shellServerMessage', () => {
       type: 'error',
       message: 'boom',
     });
+  });
+});
+
+describe('the end control message', () => {
+  test('`end` parses, and round-trips from the client serializer', () => {
+    expect(parseShellClientMessage(shellClientMessage({ type: 'end' }))).toEqual({ ok: true, message: { type: 'end' } });
   });
 });

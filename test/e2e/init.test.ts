@@ -461,3 +461,61 @@ describe('lazy init', () => {
     expect(result.stdout).toContain('--skip-completion-check');
   });
 });
+
+describe('lazy init --runner', () => {
+  let tmpDir: string;
+  afterEach(async () => { if (tmpDir) await rm(tmpDir, { recursive: true, force: true }); });
+
+  // INVARIANT: smolvm is chosen only when asked for: --runner smolvm (or the
+  // TTY prompt), never inferred. init writes what it can and says what is
+  // still needed.
+  test('--runner smolvm writes the runner and a [smolvm] section, and names what is still needed', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+    const result = await runLazy(tmpDir, ['init', '--non-interactive', '--runner', 'smolvm'], { LAZY_SMOLVM_BINARY: '/opt/smolvm/smolvm' });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Set [runner] type = "smolvm"');
+    expect(result.stdout).toContain('[smolvm] image');
+    expect(result.stdout).not.toContain('[smolvm] binary —');
+    const config = await loadConfig(tmpDir);
+    expect(config.runner.type).toBe('smolvm');
+    expect(config.smolvm.binary).toBe('/opt/smolvm/smolvm');
+    expect(config.smolvm.image).toBe('');
+    expect(config.smolvm.cpus).toBe(4);
+  });
+
+  test('without the binary in the environment, both the binary and the image are named as still needed', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+    const result = await runLazy(tmpDir, ['init', '--non-interactive', '--runner', 'smolvm'], { LAZY_SMOLVM_BINARY: undefined });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('[smolvm] binary —');
+    expect(result.stdout).toContain('lazy system smolvm-install');
+  });
+
+  test('non-interactive without --runner leaves the docker runner', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+    const result = await runLazy(tmpDir, ['init', '--non-interactive'], { LAZY_SMOLVM_BINARY: '/opt/smolvm/smolvm' });
+    expect(result.exitCode).toBe(0);
+    expect((await loadConfig(tmpDir)).runner.type).toBe('docker');
+    expect(readFileSync(join(tmpDir, 'lazy.toml'), 'utf-8')).not.toContain('[smolvm]');
+  });
+
+  test('--runner on an already-initialized project says it was not applied', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+    expect((await runLazy(tmpDir, ['init', '--non-interactive'])).exitCode).toBe(0);
+    const result = await runLazy(tmpDir, ['init', '--non-interactive', '--runner', 'smolvm']);
+    expect(result.stdout).toContain('--runner smolvm was not applied');
+    expect((await loadConfig(tmpDir)).runner.type).toBe('docker');
+  });
+
+  test('an unknown runner is refused', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+    const result = await runLazy(tmpDir, ['init', '--non-interactive', '--runner', 'vagrant']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('--runner takes one of: docker, smolvm');
+  });
+});

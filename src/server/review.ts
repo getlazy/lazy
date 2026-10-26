@@ -16,6 +16,7 @@ import { layoutHtml } from './templates';
 import { scriptJson } from './escape';
 import { REVIEW_DRAFT_KEY_JS } from '../review/draft-key';
 import { ESCAPE_HTML_JS } from './escape';
+import { imagePreviewScript } from './review-image';
 import {
   orderPhrase,
   parseSortParam,
@@ -3614,6 +3615,7 @@ export function reviewTaskHtml(
     taskId: seg,
     isMaintainedPath: extras.isMaintainedPath,
     allowExpand: true,
+    imageBlobUrl: `/api/review/${seg}/blob`,
     // The subtask-blame gutter. Passed to BOTH renders (raw and presented) via
     // the shared options, so a presented page cannot annotate half the diff.
     ...(extras.lineAttribution ? { lineAttribution: extras.lineAttribution } : {}),
@@ -3693,7 +3695,8 @@ export function reviewTaskHtml(
   const changesScripts = (hasPresentation
     ? `${changesViewScript()}\n${diffViewScript('#rv-changes', expandUrl)}`
     : diffViewScript('#rv-root', expandUrl)) +
-    (extras.progressive ? `\n${progressiveLoaderScript(`/api/review/${seg}/files`)}` : '');
+    (extras.progressive ? `\n${progressiveLoaderScript(`/api/review/${seg}/files`)}` : '') +
+    `\n${imagePreviewScript()}`;
   const fileListBlock = extras.progressive
     ? fileListHtml(extras.progressive, {
       fileRegions: extras.regions?.fileRegions,
@@ -3937,6 +3940,7 @@ export function reviewFileCardsHtml(
     taskId: seg,
     isMaintainedPath: extras.isMaintainedPath,
     allowExpand: true,
+    imageBlobUrl: `/api/review/${seg}/blob`,
     ...(extras.lineAttribution ? { lineAttribution: extras.lineAttribution } : {}),
   };
   const out: Record<string, string> = {};

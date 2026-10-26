@@ -1,4 +1,5 @@
 import { requireLaunchModel } from '../agent/launch-model';
+import { agentBinaryMountSources } from '../vm/smolvm-engines';
 import type { AgentExecArgs } from '../agent/interface';
 import { createHash, randomUUID } from 'crypto';
 import { throttleNotes, type PhaseNotify } from '../daemon/progress';
@@ -147,7 +148,6 @@ import {
   agentBinaryContentIdOfFile,
   agentBinaryPointerPath,
   installVersionedAgentBinary,
-  listContainerMountSources,
   pruneAgentBinaries,
   resolveInstalledAgentBinary,
   updateAgentBinaryPointer,
@@ -1899,7 +1899,7 @@ async function buildImageWithTags(
  * The image does not embed lazy-agent — it is bind-mounted at launch from a
  * content-addressed install in ~/.lazy/bin. When that file is a bare Bun
  * runtime, tagging a fresh image still strands every builder; prove the mount
- * works before a tag moves (skipped when no verified agent binary exists yet).
+ * works after the build (skipped when no verified agent binary exists yet).
  */
 async function selfcheckImage(ref: string, binary: string): Promise<void> {
   const binDir = join(getHome(), '.lazy', 'bin');
@@ -2606,7 +2606,10 @@ export async function extractEmbeddedAgentBinary(
  */
 async function collectStaleAgentBinaries(binDir: string, currentPath: string): Promise<void> {
   try {
-    const referenced = await listContainerMountSources();
+    // Every engine that may mount ~/.lazy/bin — the host's and each solo smolvm
+    // machine's. Unknown (a machine this process cannot ask, an engine that
+    // does not answer) deletes nothing.
+    const referenced = await agentBinaryMountSources();
     const removed = await pruneAgentBinaries(binDir, { keep: [currentPath], referenced });
     if (removed.length > 0) {
       logger.debug(`Removed ${removed.length} superseded agent binary file(s) from ${binDir}`);
@@ -2623,7 +2626,7 @@ async function collectStaleAgentBinaries(binDir: string, currentPath: string): P
  * Get the per-user lazy bin directory (~/.lazy/bin/).
  * Agent binaries are per-user operational state, not per-project.
  */
-function getUserBinDir(): string {
+export function getUserBinDir(): string {
   return join(getHome(), '.lazy', 'bin');
 }
 
@@ -3352,6 +3355,7 @@ export interface ContainerInfo {
   running: boolean;
   exitCode: number;
   finishedAt: string | null; // ISO timestamp or null if still running
+  oomKilled?: boolean;
 }
 
 /**
@@ -3361,7 +3365,7 @@ export interface ContainerInfo {
 export async function getContainerInfo(containerName: string, binary: string = 'docker'): Promise<ContainerInfo | null> {
   try {
     const proc = spawn(
-      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
+      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}} {{.State.OOMKilled}}'],
       { stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }
     );
     const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
@@ -3374,13 +3378,14 @@ export async function getContainerInfo(containerName: string, binary: string = '
     const running = parts[0] === 'true';
     const containerExitCode = parseInt(parts[1], 10);
     // FinishedAt is "0001-01-01T00:00:00Z" when never finished (still running or never started)
-    const finishedAt = parts.slice(2).join(' ');
+    const finishedAt = parts[2]!;
     const isZeroTime = finishedAt.startsWith('0001-01-01');
 
     return {
       running,
       exitCode: containerExitCode,
       finishedAt: isZeroTime ? null : finishedAt,
+      ...(parts[3] != null ? { oomKilled: parts[3] === 'true' } : {}),
     };
   } catch {
     return null;
@@ -3418,7 +3423,7 @@ export async function probeContainerInfo(
   let proc;
   try {
     proc = spawn(
-      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}}'],
+      [binary, 'inspect', containerName, '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.FinishedAt}} {{.State.OOMKilled}}'],
       { stdout: 'pipe', stderr: 'pipe', timeout: timeoutMs },
     );
   } catch (err) {
@@ -3449,7 +3454,7 @@ export async function probeContainerInfo(
     if (parts.length < 3) {
       return { kind: 'no-answer', reason: `${lookup} printed something unexpected: ${stdout.trim() || '(nothing)'}` };
     }
-    const finishedAt = parts.slice(2).join(' ');
+    const finishedAt = parts[2]!;
     return {
       kind: 'answered',
       info: {
@@ -3457,6 +3462,7 @@ export async function probeContainerInfo(
         exitCode: parseInt(parts[1]!, 10),
         // "0001-01-01T00:00:00Z" means never finished (still running or never started).
         finishedAt: finishedAt.startsWith('0001-01-01') ? null : finishedAt,
+        ...(parts[3] != null ? { oomKilled: parts[3] === 'true' } : {}),
       },
     };
   } catch (err) {
@@ -3515,12 +3521,12 @@ export function acceptGateContainerNameForTask(taskShortId: string): string {
  * agent starts (dev servers, databases, stray orphans) survives turn
  * boundaries. The container is the boundary — everything dies with the
  * container when the task reaches a terminal state (accept/reject/close) or
- * is stopped.
+ * a person explicitly replaces the environment. Stopping a turn preserves it.
  *
  * Exit code protocol:
  *   0  — turn completed successfully → restart supervisor
- *   42 — stop command received → exit wrapper cleanly
- *   other — unexpected error → exit wrapper with that code
+ *   42 — stop command received → restart supervisor, keep the environment
+ *   other — failed turn or supervisor crash → report, back off and restart
  */
 /**
  * Where the task's protocol dir is mounted INSIDE the supervisor container.
@@ -3612,17 +3618,40 @@ export function buildSupervisorWrapperScript(
     '  done',
     '}',
     'child_pid=""',
-    'trap \'[ -n "$child_pid" ] && kill $child_pid 2>/dev/null; wait; exit\' TERM INT',
+    'trap \'[ -n "$child_pid" ] && kill $child_pid 2>/dev/null; wait; exit 0\' TERM INT',
+    'backoff=1',
     'while true; do',
+    '  # Acknowledge Stop only between supervisors, after crash recovery settled.',
+    '  # Hold here until the caller has removed the stopped turn\'s queued command.',
+    `  while [ -f "${protocolDir}/agent-stop-request" ]; do`,
+    `    cat "${protocolDir}/agent-stop-request" > "${protocolDir}/agent-stop-ack"`,
+    '    sleep 1 &',
+    '    child_pid=$!',
+    '    wait $child_pid',
+    '    child_pid=""',
+    '  done',
+    `  rm -f "${protocolDir}/agent-stop-ack"`,
     ...(adoptArgs ? [`  adopt ${adoptArgs}`] : []),
     `  lazy-agent --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" &`,
     '  child_pid=$!',
+    `  echo "$child_pid" > "${protocolDir}/supervisor.pid"`,
     '  wait $child_pid',
     '  rc=$?',
+    `  lazy-agent supervisor-exit --protocol-dir "${protocolDir}" --pid "$child_pid" --exit-code "$rc"`,
     '  child_pid=""',
-    '  # 0 = turn done, restart. 42 = stop command, exit. Other = error, exit.',
-    '  if [ $rc -ne 0 ] && [ $rc -ne 42 ]; then exit $rc; fi',
-    '  if [ $rc -eq 42 ]; then exit 0; fi',
+    '  # A turn owns the agent, never the environment (including stop / 42).',
+    '  # A broken binary must not spin hot or take services down with it.',
+    '  if [ $rc -ne 0 ] && [ $rc -ne 42 ]; then',
+    '    echo "lazy: supervisor exited $rc; keeping environment, retrying in ${backoff}s" >&2',
+    '    sleep "$backoff" &',
+    '    child_pid=$!',
+    '    wait $child_pid',
+    '    child_pid=""',
+    '    [ "$backoff" -ge 30 ] || backoff=$((backoff * 2))',
+    '    [ "$backoff" -le 30 ] || backoff=30',
+    '  else',
+    '    backoff=1',
+    '  fi',
     'done',
   ].join('\n');
 }

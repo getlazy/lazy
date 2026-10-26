@@ -34,6 +34,7 @@ import { logger } from '../utils/logger';
 import { mustRecreateForTaskEnv } from './task-env';
 import {
   recordRecreation,
+  recordRecreationIfRunning,
   REASON_CHECKOUT_MISSING,
   REASON_GIT_POINTERS_BROKEN,
   REASON_RESTART_REQUESTED,
@@ -151,6 +152,9 @@ async function ensureTaskContainerClaimed(
 
   const worktreeMissing = !await pathExists(worktreePath);
   let containerRunning = await runner.isRunning(containerName);
+  if (!containerRunning && !params.neverLaunch) {
+    await recordRecreationIfRunning(storage, task.id, null, runner, containerName);
+  }
   if (params.neverLaunch && (!containerRunning || worktreeMissing)) {
     throw new RpcError(409, `Task ${displayId(task)}'s container is not running any more, and bringing one up was not asked for. Run services starts it.`);
   }

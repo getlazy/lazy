@@ -228,6 +228,64 @@ describe('storage rows', () => {
     expect(row.reason).toContain('second process');
   });
 
+  // INVARIANT: every storage-lock failure a daemon restart fixes says so in a
+  // machine-readable way (remedyKind), so Lazy Teams can offer its Restart
+  // instead of a support bundle; a LIVE foreign holder never does, because
+  // restarting the daemon does not stop that holder.
+  test('restart-fixable failures are marked; a live foreign holder is not', () => {
+    expect(buildStorageLockRow({ kind: 'missing', lockPath }, 100, NOW).remedyKind).toBe('restart-daemon');
+    expect(buildStorageLockRow({ kind: 'held', lockPath, pid: 200, acquiredAt: null, verdict: { alive: false, reason: 'no-process' } }, 100, NOW).remedyKind)
+      .toBe('restart-daemon');
+    expect(buildStorageLockRow({ kind: 'held', lockPath, pid: 200, acquiredAt: null, verdict: { alive: true } }, 100, NOW).remedyKind)
+      .toBeUndefined();
+  });
+
+  // INVARIANT: the row says WHICH failure it is from what the daemon knows of
+  // its own hold, not only from the file. The field regression (2026-10-20) was
+  // a daemon that had given its life-long hold up: the file came and went with
+  // each write, so the reason must name the daemon's own release, and a sample
+  // that happens to catch a write in flight must not read as healthy. This test
+  // covers the row given 'released'; that the daemon really REPORTS 'released'
+  // mid-write is proven through the real path in
+  // test/unit/daemon-storage-singleton.test.ts ("a lost lifelong hold reads as
+  // released even while a write holds the lock").
+  test('a daemon that released its life-long hold fails, whatever the file says this instant', () => {
+    const missing = buildStorageLockRow({ kind: 'missing', lockPath }, 100, NOW, 'released');
+    expect(missing.state).toBe('fail');
+    expect(missing.reason).toContain('gave up the lock it holds for its whole life');
+    const midWrite = buildStorageLockRow({ kind: 'held', lockPath, pid: 100, acquiredAt: null, verdict: { alive: true } }, 100, NOW, 'released');
+    expect(midWrite.state).toBe('fail');
+    expect(midWrite.remedyKind).toBe('restart-daemon');
+  });
+
+  test('a store not opened yet is a WARN, not a lost lock', () => {
+    const row = buildStorageLockRow({ kind: 'missing', lockPath }, 100, NOW, 'not-open');
+    expect(row.state).toBe('warn');
+    expect(row.reason).toContain('has not opened its store');
+  });
+
+  // INVARIANT: a store the daemon FAILED to open is a FAIL carrying the open
+  // error — never the "not opened yet" WARN, which would hide a daemon that can
+  // do no work from doctor and Lazy Teams. It is restart-fixable unless the
+  // cause outlives a restart (a live holder elsewhere, a restore in progress).
+  test('a store that failed to open is a FAIL with the open error', () => {
+    const failed = (restartFixes: boolean) =>
+      ({ openFailed: { error: 'EACCES: permission denied, open /store/.storage-lock', since: NOW - 120_000, restartFixes } });
+    const row = buildStorageLockRow({ kind: 'missing', lockPath }, 100, NOW, failed(true));
+    expect(row.state).toBe('fail');
+    expect(row.reason).toContain('could not open its store');
+    expect(row.reason).toContain('EACCES: permission denied');
+    expect(row.remedyKind).toBe('restart-daemon');
+
+    const restore = buildStorageLockRow({ kind: 'missing', lockPath }, 100, NOW, failed(false));
+    expect(restore.state).toBe('fail');
+    expect(restore.remedyKind).toBeUndefined();
+
+    // A live foreign holder keeps its own, more precise row.
+    const held = buildStorageLockRow({ kind: 'held', lockPath, pid: 200, acquiredAt: null, verdict: { alive: true } }, 100, NOW, failed(false));
+    expect(held.remedy).toContain('Do NOT delete');
+  });
+
   test('a backend without a file lock is OK', () => {
     expect(buildStorageLockRow({ kind: 'no-file-lock', backend: 'sqlite' }, 100, NOW).state).toBe('ok');
   });

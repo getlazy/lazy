@@ -29,6 +29,8 @@ import type {
   AcceptResult,
   SyncResult,
   FileLinesQuery,
+  DiffBlobQuery,
+  DiffBlobResult,
   FileLinesResult,
 } from '../server/review-actions';
 import type { ActorInput, FileViolation, ReviewComment, RaisedItem, RaisedItemResolution, RaisedItemResolveAction, PromoteRaisedItemResult, ReviewDraftState, ReviewDraftPatch } from '../types';
@@ -88,6 +90,10 @@ export function createRpcReviewActions(client: DaemonClient, projectRoot: string
 
     async getFileLines(taskId: string, input: FileLinesQuery): Promise<FileLinesResult> {
       return (await call('reviewFileLines', { taskId, ...input })) as FileLinesResult;
+    },
+
+    async getDiffBlob(taskId: string, input: DiffBlobQuery): Promise<DiffBlobResult> {
+      return (await call('diffBlob', { taskId, ...input })) as DiffBlobResult;
     },
 
     async listComments(taskId: string): Promise<ReviewComment[]> {

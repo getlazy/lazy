@@ -21,6 +21,7 @@
 import { escapeHtml } from './review-diff';
 import { XTERM_JS_PATH, XTERM_FIT_JS_PATH, XTERM_CSS_PATH } from './xterm';
 import { containerEnsureClientScript } from './container-ensure-client';
+import { TERMINAL_RECONNECT_JS } from './terminal-reconnect';
 
 /**
  * Why the shell is unavailable, as a code the page can branch on.
@@ -114,7 +115,7 @@ export function shellTabHtml(input: {
     `</div>` +
     `<p class="rv-hint">Pair takes over the agent's session and locks the task until you stop. ` +
     `Chat is a read-only conversation — it does not lock the task or change its model. ` +
-    `A dropped Pair connection ends pairing within 30 seconds so the task cannot stay locked forever.</p>` +
+    `A dropped connection reconnects to the same session by itself; a Pair that cannot reconnect within 5 minutes ends 30 seconds later, so the task cannot stay locked forever.</p>` +
     `<h2>Open sessions</h2>` +
     `<ul class="lz-shell-index" data-lz-shell-index></ul>` +
     `<p class="rv-hint" data-lz-shell-index-empty>None yet. Run a verification step, or open a shell here.</p>`;
@@ -154,6 +155,7 @@ export function shellTabHtml(input: {
 export function shellClientScript(): string {
   return containerEnsureClientScript() + `<script>
 (() => {
+${TERMINAL_RECONNECT_JS}
   if (window.__lzShellWired) return;
   window.__lzShellWired = true;
 
@@ -227,8 +229,10 @@ export function shellClientScript(): string {
       // start that failed. It is labelled for whichever one it is about to do,
       // and it is the ONLY Start control this panel ever shows — the fallback
       // for an auto-start that did not take, not a step in the normal route.
+      // A dropped connection reattaches by itself (src/server/terminal-reconnect.ts);
+      // the button is for a session that really ended with its connection.
       reconnectBtn.hidden = !active.dropped && !active.startFailed;
-      reconnectBtn.textContent = active.startFailed ? 'Start container' : 'Reconnect';
+      reconnectBtn.textContent = active.startFailed ? 'Start container' : 'Open a new session';
     }
 
     // Re-measure a session's terminal and tell its PTY. Called on open, on every
@@ -488,6 +492,9 @@ export function shellClientScript(): string {
       s.closedByUser = false;
       s.dropped = false;
       s.startFailed = null;
+      // A new session: nothing to resume, nothing drawn from it yet.
+      s.resume = null; s.drawn = 0; s.started = false; s.ended = false; s.finished = false;
+      s.reconnecting = false; s.attempt = 0; s.reconnectStartedAt = 0;
       s.status = 'Connecting…';
       s.connected = false;
       refreshStatus();
@@ -554,6 +561,13 @@ export function shellClientScript(): string {
 
       s.status = 'Connecting…';
       refreshStatus();
+      openSocket(s);
+    }
+
+    // One socket to the session. After a drop it carries the session's resume
+    // token and the count of output bytes this terminal drew, so the daemon
+    // sends exactly what was missed (src/server/terminal-hold.ts).
+    function openSocket(s) {
       const cols = s.term.cols || 80, rows = s.term.rows || 24;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       // data-lz-task-id holds the URL-ESCAPED segment — interpolate raw; a
@@ -563,43 +577,123 @@ export function shellClientScript(): string {
         : proto + '//' + location.host + '/tasks/' + taskId +
           '/shell/ws?cols=' + cols + '&rows=' + rows;
       if (s.mode && s.mode !== 'shell') url += '&mode=' + encodeURIComponent(s.mode);
+      if (s.resume) url += '&resume=' + encodeURIComponent(s.resume) + '&offset=' + s.drawn;
       const ws = new WebSocket(url);
       s.ws = ws;
       ws.binaryType = 'arraybuffer';
+      let opened = false;
       ws.onopen = () => {
+        opened = true;
+        if (s.ws !== ws || s.reconnecting) return; // a reattach is back at its ready
         s.status = 'Connected'; s.connected = true; refreshStatus(); refreshIndex();
         sendResize(s); flushPending(s);
         if (active === s) s.term.focus();
       };
       ws.onmessage = (ev) => {
+        if (s.ws !== ws) return;
         if (typeof ev.data === 'string') {
           let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
           if (msg.type === 'ready') {
+            s.started = true;
+            if (msg.resume) s.resume = msg.resume;
+            if (msg.lost) s.term.write('\\r\\n\\x1b[2m[' + msg.lost + ' bytes of output were lost while disconnected]\\x1b[0m\\r\\n');
+            const back = msg.resumed || s.reconnecting;
+            s.reconnecting = false; s.attempt = 0; s.reconnectStartedAt = 0;
             s.status = 'Connected'; s.connected = true; refreshStatus(); refreshIndex();
+            if (back) { sendResize(s); return; }
             // The block goes in only once the exec is actually up, so its
             // announcement lands above its own output and not above an error.
             startRun(s);
             flushPending(s);
           }
-          else if (msg.type === 'exit') { s.term.write('\\r\\n[process exited' + (msg.code != null ? ' (' + msg.code + ')' : '') + ']\\r\\n'); }
-          else if (msg.type === 'error') { s.term.write('\\r\\n[error: ' + msg.message + ']\\r\\n'); }
+          else if (msg.type === 'exit') { s.ended = true; s.term.write('\\r\\n[process exited' + (msg.code != null ? ' (' + msg.code + ')' : '') + ']\\r\\n'); }
+          else if (msg.type === 'error') { s.ended = true; s.term.write('\\r\\n[error: ' + msg.message + ']\\r\\n'); }
         } else {
-          s.term.write(new Uint8Array(ev.data));
+          const bytes = new Uint8Array(ev.data);
+          s.drawn += bytes.length;
+          s.term.write(bytes);
         }
       };
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
+        if (s.ws !== ws) return;
+        s.ws = null;
         s.connected = false;
-        s.status = s.closedByUser ? 'Disconnected' : 'Disconnected — connection dropped';
-        s.dropped = !s.closedByUser;
-        if (s.ws === ws) s.ws = null;
+        if (s.closedByUser || s.finished) {
+          s.status = 'Disconnected';
+        } else {
+          const outcome = lzCloseOutcome({ code: ev.code, ended: s.ended, resumable: !!s.resume, restartable: !s.started });
+          if (outcome === 'reconnect') {
+            if (opened) { scheduleReconnect(s); return; }
+            // Refused before it opened: find out whether the page is signed out.
+            lzSignedOut().then(function (signedOut) {
+              if (s.closedByUser || s.finished) return;
+              if (!signedOut) { scheduleReconnect(s); return; }
+              s.finished = true; s.dropped = true;
+              s.status = 'You are signed out — sign in again to open a terminal';
+              refreshStatus(); refreshIndex();
+            });
+            return;
+          }
+          s.finished = true;
+          // Over for good: the one thing left to offer is a new session.
+          s.dropped = true;
+          if (outcome === 'ended') {
+            s.status = s.ended ? 'Session ended' : lzFinalCloseMessage(ev.code);
+          } else {
+            s.status = 'The connection dropped and this session ended with it';
+          }
+        }
         refreshStatus();
         refreshIndex();
       };
-      ws.onerror = () => { s.status = 'Connection error'; s.connected = false; refreshStatus(); refreshIndex(); };
+    }
+
+    // A dropped connection reattaches by itself: quick tries, then every 30s,
+    // for as long as the daemon holds the session. Typing is paused meanwhile —
+    // nothing typed in the gap is sent.
+    function scheduleReconnect(s) {
+      const now = Date.now();
+      s.reconnecting = true;
+      if (!s.reconnectStartedAt) s.reconnectStartedAt = now;
+      if (!lzKeepTrying({ restartable: false, startedAt: s.reconnectStartedAt, now: now })) {
+        s.finished = true;
+        s.dropped = true;
+        s.status = 'Could not reconnect for 5 minutes — this session has ended';
+      } else {
+        s.status = s.started
+          ? 'Connection lost — reconnecting… (typing is paused)'
+          : 'Could not open the terminal — trying again…';
+        s.reconnectTimer = setTimeout(function () { reconnectNow(s); }, lzReconnectDelay(s.attempt++));
+      }
+      refreshStatus();
+      refreshIndex();
+    }
+
+    function reconnectNow(s) {
+      if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+      s.reconnectTimer = null;
+      if (!s.closedByUser && !s.finished && s.term) openSocket(s);
+    }
+
+    window.addEventListener('online', function () {
+      for (let i = 0; i < sessions.length; i++) if (sessions[i].reconnectTimer) reconnectNow(sessions[i]);
+    });
+    // Leaving the page is the person being done: end every session now rather
+    // than leaving it held for a reconnect that will not come.
+    window.addEventListener('pagehide', function () {
+      for (let i = 0; i < sessions.length; i++) endSession(sessions[i]);
+    });
+
+    function endSession(s) {
+      if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
+      if (s.ws && s.ws.readyState === WebSocket.OPEN) {
+        try { s.ws.send(JSON.stringify({ type: 'end' })); } catch (e) { /* socket closing */ }
+      }
     }
 
     function disconnect(s) {
       s.closedByUser = true;
+      endSession(s);
       if (s.ws) { try { s.ws.close(); } catch (e) {} s.ws = null; }
     }
 

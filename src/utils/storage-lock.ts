@@ -82,6 +82,18 @@ export class StoreRestoreInProgressError extends Error {
   }
 }
 
+/**
+ * The lock could not be acquired because another holder kept it for the whole
+ * retry budget. Same message as ever; the type lets the daemon tell this
+ * (a restart will not help while that holder lives) from other open failures.
+ */
+export class StorageLockHeldError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StorageLockHeldError';
+  }
+}
+
 /** Maximum number of attempts to acquire the lock */
 const MAX_ATTEMPTS = 50;
 
@@ -453,6 +465,20 @@ export class StorageLock {
   get held(): boolean {
     return this.depth > 0;
   }
+
+  /**
+   * Is the hold an owner took for its life with {@link acquireForLife} still
+   * in place? Not the same question as {@link held}: once that base hold is
+   * gone (a borrower's close(), a stray releaseAll()), every `withLock` write
+   * still raises the depth to 1 for its duration, so `held` reads true mid-write
+   * while the lifelong hold is lost. Set only by acquireForLife and cleared
+   * whenever the depth reaches 0 — the base hold sits at the bottom of the
+   * counter, so the depth cannot reach 0 without it being released.
+   */
+  get lifelongHeld(): boolean {
+    return this.lifelong;
+  }
+  private lifelong = false;
   private readonly acquireTimeoutMs: number | undefined;
   private readonly foreignHolder: 'judge' | 'refuse';
   private readonly restoreMarker: 'refuse' | 'ignore';
@@ -551,11 +577,21 @@ export class StorageLock {
       deadline === null
         ? `after ${attempts} attempts`
         : `after ${this.acquireTimeoutMs}ms (${attempts} attempt${attempts === 1 ? '' : 's'})`;
-    throw new Error(
+    throw new StorageLockHeldError(
       `Failed to acquire storage lock ${gaveUp}. ` +
         `Lock file: ${this.lockPath} — ${holder.summary}.\n` +
         holder.advice
     );
+  }
+
+  /**
+   * Acquire the lock as an owner that holds it for its whole life (the
+   * daemon's long-lived Storage). Same as {@link acquire}, and records the base
+   * hold so {@link lifelongHeld} can tell it from a write in flight.
+   */
+  async acquireForLife(): Promise<void> {
+    await this.acquire();
+    this.lifelong = true;
   }
 
   /**
@@ -574,6 +610,7 @@ export class StorageLock {
 
     this.depth--;
     if (this.depth > 0) return;
+    this.lifelong = false;
 
     const holders = StorageLock.inProcessHolders.get(this.lockPath);
     holders?.delete(this);
@@ -602,8 +639,8 @@ export class StorageLock {
 
   /**
    * Give the lock up entirely, whatever the re-entry depth — for an owner that
-   * took it with a bare `acquire()` and holds it for its life (the daemon's
-   * long-lived Storage), on close. Without this a cleanly stopped daemon left
+   * took it with `acquireForLife()` and holds it for its life (the daemon's
+   * long-lived Storage), on close. Clears {@link lifelongHeld} too. Without this a cleanly stopped daemon left
    * `.storage-lock` naming its pid for whoever came next to judge. A no-op
    * for an instance that does not hold it.
    */

@@ -918,7 +918,7 @@ export class RemoteStorage implements Storage {
     // inside its lock. The typed refusal does NOT survive the hop — call()
     // folds RPC errors into a generic Error carrying the message — so a
     // RemoteStorage client cannot match on BuilderSessionStateConflictError
-    // (same reachability shape as BuilderSessionActiveError).
+    // (the same holds for every typed storage refusal).
     return this.call<BuilderSession>('updateBuilderSession', { id, patch, expectedState, expectedBuilderId });
   }
 

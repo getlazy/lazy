@@ -135,6 +135,7 @@ Every key lazy resolves appears below. Non-respected keys carry the reason.
 | `runner.sandbox_deny_read` / `runner.sandbox_deny_write` | Sandbox denials are the fleet's floor and are not negotiated per repository. |
 | `runner.sandbox_allow_weaker_nested` | Permitting a weaker nested sandbox is exactly the escalation a shared host must not accept from a repository. |
 | `runner.verify_sandbox_boundary` | Has no effect. |
+| `smolvm.binary` / `smolvm.image` / `smolvm.cpus` / `smolvm.memory_mib` / `smolvm.storage_gib` / `smolvm.allow_cidrs` | Teams manages its own microVM backend; repository settings cannot choose its runtime, image, machine size or network policy. |
 | `proxy.port` | A fixed port collides across the projects sharing this host. |
 | `proxy.bind` | The bind address decides who else on the host can reach this project's proxy. |
 | `proxy.policy.enforce` | Enforcement is the fleet's posture; a repository turning it off would disable its own tool-call policy. |

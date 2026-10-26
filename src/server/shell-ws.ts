@@ -25,18 +25,21 @@
  */
 
 import type { Server, ServerWebSocket } from 'bun';
+
 import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
 import type { CommitRun } from '../storage/types';
 import { runContainerName } from '../run/identity';
-import type { Runner } from '../runner';
+import type { Runner, RunnerType } from '../runner';
 import type { ShellUnavailableCode } from './shell-ui';
 import { parseShellSessionMode, planPairOrChatExec } from './shell-pair';
 import { logger } from '../utils/logger';
 import { watchTerminalIdle, terminalExpiredMessage, type TerminalLimits, type IdleWatch } from './terminal-idle';
 import { createRunner } from '../runner';
+import { terminalEngineOf as engineOf } from '../runner/container-cli';
 import { taskRef } from '../task/identity';
 import { ExecStream, resolveDockerSocketPath } from '../runner/docker-exec-stream';
+import { OutputLog, TerminalHolds, RESUME_TOKEN_RE, TERMINAL_RESUME_GRACE_MS } from './terminal-hold';
 import type { WebSocketUpgrader, UpgradeOutcome } from './ws';
 import { decodePathSegment } from './task-urls';
 import {
@@ -61,6 +64,8 @@ export interface ShellSocketData {
   socketPath: string;
   container: string;
   binary: string;
+  /** The runner's own Engine API socket (smolvm: this process's relay); unset → the client's engine. */
+  engineSocket?: string;
   cols: number;
   rows: number;
   exec: ExecStream | null;
@@ -96,6 +101,130 @@ export interface ShellSocketData {
    * preparation, which may be a minutes-long image build. Must be idempotent.
    */
   releaseNow?: (() => void) | null;
+  /**
+   * Set by the route: who may reattach to this terminal after a dropped
+   * connection (./terminal-hold.ts) — the route, its target and, on a shared
+   * daemon, the person. Unset: the terminal ends with its socket, as before.
+   */
+  resumeOwner?: string;
+  /** The current token for reattaching, once the terminal is ready. */
+  resumeToken?: string | null;
+  /** The socket the terminal is drawing to now; null while it is detached. */
+  ws?: ServerWebSocket<ShellSocketData> | null;
+  /** Recent output, for a reattaching page to catch up on. */
+  log?: OutputLog;
+  /** The program's exit code once it exited (undefined while it runs). */
+  exitCode?: number | null;
+  /** The page said it is done (`{type:"end"}`): a close ends the terminal. */
+  endRequested?: boolean;
+  /** This side is closing the socket for good (an error, an expiry). */
+  ending?: boolean;
+  /** Ended for good: the exec is closed and everything held released. */
+  ended?: boolean;
+  /** A reattach was claimed at upgrade and its socket has not opened yet. */
+  reattaching?: boolean;
+  /** How many output bytes the reattaching page already drew. */
+  resumeOffset?: number;
+  /** A refusal decided at upgrade, said as an error frame on the open socket. */
+  refusal?: string;
+}
+
+/** Every resumable terminal on this daemon. */
+export const terminalHolds = new TerminalHolds<ShellSocketData>();
+
+/** What a page reads when the terminal it tries to reattach to is gone. */
+export const TERMINAL_ENDED_MESSAGE =
+  `This terminal has ended: it was closed, its program exited, or nothing reconnected to it within ${Math.round(TERMINAL_RESUME_GRACE_MS / 60_000)} minutes. Open a new one.`;
+
+/**
+ * End a terminal for good: stop its watch, close the exec (which HUPs the
+ * program — or, for an attach, detaches from it), forget its token and release
+ * whatever the route held. Idempotent.
+ */
+export function endTerminal(data: ShellSocketData): void {
+  if (data.ended) return;
+  data.ended = true;
+  data.idle?.stop();
+  data.exec?.close();
+  terminalHolds.release(data.resumeToken);
+  data.resumeToken = null;
+  try { data.onClose?.(); } catch { /* lock release is best-effort */ }
+}
+
+/**
+ * Offer a reattach (`?resume=<token>&offset=<n>`) to the terminal it names.
+ * Returns null when the request is not a reattach. Called by each route AFTER
+ * its own authorization and target resolution, with the owner it would give a
+ * new terminal — so a token is only ever claimed back through the same gate,
+ * by the same caller. A token that is unknown, expired, malformed or someone
+ * else's gets the same answer: an `error` frame on an accepted socket, which
+ * the page reads as a real end and stops retrying.
+ */
+export function tryResumeUpgrade(
+  req: Request,
+  server: Server<unknown>,
+  url: URL,
+  owner: string,
+  opts: { freshOnMiss?: boolean } = {},
+): UpgradeOutcome | null {
+  const token = url.searchParams.get('resume');
+  if (token === null) return null;
+  const offset = Number(url.searchParams.get('offset') ?? '0');
+  const claimed = RESUME_TOKEN_RE.test(token) && Number.isSafeInteger(offset) && offset >= 0
+    ? terminalHolds.claim(token, owner)
+    : null;
+  if (!claimed || claimed.value.ended) {
+    // A target that outlives every socket (a builder: an attach, not an
+    // exec) is simply attached to again — its session is still running.
+    if (opts.freshOnMiss) return null;
+    const data = { refusal: TERMINAL_ENDED_MESSAGE, onClose: null } as unknown as ShellSocketData;
+    return server.upgrade(req, { data }) ? 'upgraded' : refusal(426, 'Expected a WebSocket upgrade request.');
+  }
+  const data = claimed.value;
+  data.resumeToken = claimed.token;
+  data.resumeOffset = offset;
+  data.cols = clampDim(url.searchParams.get('cols'), data.cols, MAX_TERM_COLS);
+  data.rows = clampDim(url.searchParams.get('rows'), data.rows, MAX_TERM_ROWS);
+  data.reattaching = true;
+  if (!server.upgrade(req, { data })) {
+    data.reattaching = false;
+    if (!data.ws) terminalHolds.detach(claimed.token);
+    return refusal(426, 'Expected a WebSocket upgrade request.');
+  }
+  return 'upgraded';
+}
+
+/**
+ * A NEW Pair or Chat from the owner of a detached one ends the detached one
+ * first: its page lost the token (a reload while reconnecting), and it would
+ * otherwise hold the lock the new one needs for the whole grace. Ending it
+ * starts the lock's own short grace, which the same person then resumes.
+ */
+export function endDetachedTerminals(owner: string): void {
+  terminalHolds.endWhere(owner, (d) => !d.ws && !d.reattaching);
+}
+
+/** The second half of a reattach: point the terminal at its new socket and catch the page up. */
+function reattach(ws: ServerWebSocket<ShellSocketData>): void {
+  const data = ws.data;
+  data.reattaching = false;
+  const previous = data.ws;
+  data.ws = ws;
+  // Still attached to an old socket the server never saw die (a laptop that
+  // slept): this page takes the terminal over.
+  if (previous && previous !== ws) {
+    try { previous.close(4001, 'reattached elsewhere'); } catch { /* already closed */ }
+  }
+  const { bytes, lost } = data.log?.since(data.resumeOffset ?? 0) ?? { bytes: new Uint8Array(0), lost: 0 };
+  try {
+    ws.send(JSON.stringify({ type: 'ready', container: data.container, resume: data.resumeToken, resumed: true, ...(lost ? { lost } : {}) }));
+    if (bytes.length) ws.sendBinary(bytes);
+    void data.exec?.resize(data.cols, data.rows);
+    if (data.exitCode !== undefined) {
+      ws.send(shellServerMessage({ type: 'exit', code: data.exitCode }));
+      ws.close(1000, 'shell exited');
+    }
+  } catch { /* socket closing */ }
 }
 
 /**
@@ -172,7 +301,7 @@ export function clampDim(value: string | null, fallback: number, max: number): n
  * and the upgrader returns them as the refusal body.
  */
 export type ShellTarget =
-  | { available: true; container: string; binary: string }
+  | { available: true; container: string; binary: string; engineSocket?: string }
   | { available: false; reason: string; code: ShellUnavailableCode };
 
 /**
@@ -213,11 +342,12 @@ export async function resolveShellContainer(
   root: string,
   task: Task,
   session: Session | null,
+  runnerFor: (type: RunnerType | undefined) => Promise<Runner> = (type) => createRunner(root, type),
 ): Promise<ShellTarget> {
   if (!session) {
     return { available: false, code: 'no-session', reason: `Task has no session — start it first.` };
   }
-  const runner = await createRunner(root, session.runner_type ?? task.runner_type ?? undefined);
+  const runner = await runnerFor(session.runner_type ?? task.runner_type ?? undefined);
   if (!runner.usesSandbox()) {
     return {
       available: false,
@@ -226,8 +356,7 @@ export async function resolveShellContainer(
     };
   }
   const container = execContainerName(task, session, runner);
-  const binary = runner.type === 'podman' ? 'podman' : 'docker';
-  return { available: true, container, binary };
+  return { available: true, container, ...engineOf(runner) };
 }
 
 /**
@@ -288,7 +417,7 @@ export async function resolveRunShellTarget(
   if (!(await runner.isRunning(container))) {
     return { available: false, code: 'not-running', reason: `The run's environment is not running.` };
   }
-  return { available: true, container, binary: runner.type === 'podman' ? 'podman' : 'docker' };
+  return { available: true, container, ...engineOf(runner) };
 }
 
 export function refusal(status: number, message: string): Response {
@@ -315,11 +444,27 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
   const handler = {
     async open(ws: ServerWebSocket<ShellSocketData>) {
       const data = ws.data;
+      if (data.refusal) {
+        try {
+          ws.send(shellServerMessage({ type: 'error', message: data.refusal }));
+          ws.close(1008, 'refused');
+        } catch { /* already closed */ }
+        return;
+      }
+      if (data.reattaching) {
+        reattach(ws);
+        return;
+      }
+      data.ws = ws;
+      // From the first byte: the page counts every byte it draws, and a
+      // reattach replays from that count.
+      if (data.resumeOwner) data.log = new OutputLog();
       if (!(await runPreparation(ws))) return;
       let socketPath: string;
       try {
-        socketPath = await resolveDockerSocketPath(data.binary);
+        socketPath = data.engineSocket ?? await resolveDockerSocketPath(data.binary);
       } catch (err) {
+        data.ending = true;
         ws.send(shellServerMessage({ type: 'error', message: err instanceof Error ? err.message : String(err) }));
         ws.close(1011, 'docker socket');
         return;
@@ -333,11 +478,25 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         cols: data.cols,
         rows: data.rows,
         env: data.env,
-        onData: (bytes) => relayTerminalOutput(ws, bytes),
+        // Output goes to whichever socket the terminal is drawing to NOW —
+        // after a reattach, not the one that opened it — and into the log a
+        // reattaching page catches up from.
+        onData: (bytes) => {
+          data.log?.append(bytes);
+          if (data.ws) relayTerminalOutput(data.ws, bytes);
+        },
         onExit: (code) => {
+          data.exitCode = code;
+          const current = data.ws;
+          // Exited while detached: kept until the page comes back to read
+          // that it exited, or the grace runs out.
+          if (!current) {
+            if (!data.resumeToken) endTerminal(data);
+            return;
+          }
           try {
-            ws.send(shellServerMessage({ type: 'exit', code }));
-            ws.close(1000, 'shell exited');
+            current.send(shellServerMessage({ type: 'exit', code }));
+            current.close(1000, 'shell exited');
           } catch { /* already closed */ }
         },
       });
@@ -345,16 +504,33 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
       if (data.limits) {
         const limits = data.limits;
         data.idle = watchTerminalIdle(limits, (reason) => {
+          const current = data.ws;
+          if (!current) {
+            endTerminal(data);
+            return;
+          }
+          data.ending = true;
           try {
-            ws.send(shellServerMessage({ type: 'error', message: terminalExpiredMessage(reason, limits) }));
-            ws.close(4000, reason === 'idle' ? 'idle' : 'max session');
+            current.send(shellServerMessage({ type: 'error', message: terminalExpiredMessage(reason, limits) }));
+            current.close(4000, reason === 'idle' ? 'idle' : 'max session');
           } catch { /* already closed */ }
         });
       }
       try {
         await exec.start();
-        ws.send(shellServerMessage({ type: 'ready', container: data.container }));
+        if (data.resumeOwner && !data.ended) {
+          data.resumeToken = terminalHolds.register(data.resumeOwner, data, () => endTerminal(data));
+        }
+        const current = data.ws;
+        if (current) {
+          current.send(shellServerMessage({ type: 'ready', container: data.container, ...(data.resumeToken ? { resume: data.resumeToken } : {}) }));
+        } else {
+          // The socket closed while the exec was starting; its close already
+          // ended the terminal (nothing was resumable yet).
+          endTerminal(data);
+        }
       } catch (err) {
+        data.ending = true;
         logger.warn(`web-shell exec failed to start: ${err instanceof Error ? err.message : err}`);
         ws.send(shellServerMessage({ type: 'error', message: err instanceof Error ? err.message : String(err) }));
         ws.close(1011, 'exec start');
@@ -362,6 +538,15 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
     },
 
     message(ws: ServerWebSocket<ShellSocketData>, message: string | Buffer) {
+      // A socket another page took the terminal over from says nothing more.
+      if (ws.data.ws && ws.data.ws !== ws) return;
+      if (typeof message === 'string') {
+        const parsed = parseShellClientMessage(message);
+        if (parsed.ok && parsed.message.type === 'end') {
+          ws.data.endRequested = true;
+          return;
+        }
+      }
       const exec = ws.data.exec;
       if (!exec) {
         // Still preparing: keystrokes have nowhere to go, but a resize is kept
@@ -410,11 +595,23 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         }
         return;
       }
+      const data = ws.data;
+      if (data.refusal) return;
+      // The terminal moved to another socket (a reattach took it over).
+      if (data.ws !== ws) return;
+      data.ws = null;
+      if (data.ended || data.reattaching) return;
+      // A dropped connection: the program keeps running for its page to
+      // reattach (./terminal-hold.ts). Everything else ends it — the page
+      // said it is done, this side closed it, the program exited, or it never
+      // became resumable.
+      if (!data.endRequested && !data.ending && data.exitCode === undefined && data.resumeToken && data.exec) {
+        terminalHolds.detach(data.resumeToken);
+        return;
+      }
       // Closing the exec closes the hijacked docker socket, which HUPs the
       // process inside the container — orphan reaping with no bookkeeping.
-      ws.data.idle?.stop();
-      ws.data.exec?.close();
-      try { ws.data.onClose?.(); } catch { /* lock release is best-effort */ }
+      endTerminal(data);
     },
   };
   return handler as unknown as import('bun').WebSocketHandler<unknown>;
@@ -453,18 +650,23 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
         const storage = await deps.getStorage();
         const run = await storage.getCommitRun(runId);
         if (!run) return refusal(404, `Run not found: ${runId}`);
+        const runOwner = `dash:run:${run.id}`;
+        const runResume = tryResumeUpgrade(req, server, url, runOwner);
+        if (runResume) return runResume;
         const target = await resolveRunShellTarget(deps.root, run);
         if (!target.available) return refusal(409, target.reason);
         const runData: ShellSocketData = {
           socketPath: '',
           container: target.container,
           binary: target.binary,
+          engineSocket: target.engineSocket,
           cols,
           rows,
           exec: null,
           cmd: SHELL_CMD,
           env: ['TERM=xterm-256color'],
           onClose: null,
+          resumeOwner: runOwner,
         };
         if (!server.upgrade(req, { data: runData })) return refusal(426, 'Expected a WebSocket upgrade request.');
         return 'upgraded';
@@ -478,11 +680,17 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
       const task = await storage.getTask(taskIdParam);
       if (!task) return refusal(404, `Task not found: ${taskIdParam}`);
       const session = await storage.getSessionByTaskId(task.id);
+      const mode = parseShellSessionMode(url.searchParams.get('mode'));
+
+      // A reattach goes back to the terminal it names — before anything below
+      // that would plan a NEW one (Pair's lock, which the held one still has).
+      const owner = `dash:task:${task.id}:${mode}`;
+      const resumed = tryResumeUpgrade(req, server, url, owner);
+      if (resumed) return resumed;
+      if (mode !== 'shell') endDetachedTerminals(owner);
 
       const resolved = await resolveShellTarget(deps.root, task, session);
       if (!resolved.available) return refusal(409, resolved.reason);
-
-      const mode = parseShellSessionMode(url.searchParams.get('mode'));
 
       let cmd = SHELL_CMD;
       let env = ['TERM=xterm-256color'];
@@ -508,12 +716,14 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
         socketPath: '',
         container: resolved.container,
         binary: resolved.binary,
+        engineSocket: resolved.engineSocket,
         cols,
         rows,
         exec: null,
         cmd,
         env,
         onClose,
+        resumeOwner: owner,
       };
       const ok = server.upgrade(req, { data });
       if (!ok) {

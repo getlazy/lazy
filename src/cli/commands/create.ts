@@ -24,6 +24,7 @@ import { sanitizeUserText } from '../../utils/sanitize-text';
 import { runGit } from '../../utils/git';
 import { normalizeTag } from '../../utils/tags';
 import { getActor } from '../../constants';
+import { queryRunnerRefusal } from '../../daemon/rpc-fallback';
 import {
   inheritCustomImageMetadata,
   maybeOfferWorktreeImageForTask,
@@ -146,6 +147,15 @@ export async function commandCreate(args: string[]): Promise<void> {
   // attribute is refused at creation, and finding that out after the human has
   // written a prompt would throw the prompt away.
   await requireActorIdentity();
+  // Pre-flight before the editor and before any write: only the daemon knows
+  // whether it is managed, where a smolvm runner is refused.
+  if (runnerType) {
+    const refusal = await queryRunnerRefusal(runnerType);
+    if (refusal) {
+      console.error(refusal);
+      process.exit(1);
+    }
+  }
 
   // Also before the editor: in a clone bound to Lazy Teams these settings are
   // refused (no browser page sets them), and finding that out after the prompt

@@ -76,6 +76,7 @@ import { resolveOfflineStatus, formatOfflineExpiry } from '../utils/offline';
 import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../shell/detect';
 import type { ShellInfo } from '../shell/detect';
 import { spawn } from '../utils/spawn';
+import { checkSmolvmSetup, smolvmRunnerSetupFailure } from './smolvm';
 import { isForgeDriver, managedRepositoryHostChecks } from './managed-repository-host';
 import { withholdRefused } from '../config/managed-withhold';
 import { REPOSITORY_PLUGINS_NOT_RUN } from '../config/managed-repo-code';
@@ -1068,15 +1069,28 @@ export async function checkDaemonHealthSummary(
     r.id !== BUILD_MATCH_ROW_ID && r.group !== 'runner' &&
     !(proxyUnavailable && r.id === 'proxy:listening'));
   const { counts } = summarizeRows(rows);
-  const failing = rows.filter(r => r.state === 'fail').map(r => r.name);
+  const failingRows = rows.filter(r => r.state === 'fail');
+  const failing = failingRows.map(r => r.name);
   const warning = rows.filter(r => r.state === 'warn').map(r => r.name);
   if (failing.length > 0) {
+    // Each failing row's own reason and remedy travel with the finding: a
+    // client that cannot run `lazy daemon health` (Lazy Teams) must still be
+    // able to say WHICH failure it is and what fixes it.
+    const each = failingRows.map(r => `${r.name}: ${r.reason}.${r.remedy ? `\n    Fix: ${r.remedy}` : ''}`).join('\n  ');
+    const restartFixesAll = failingRows.every(r => r.remedyKind === 'restart-daemon');
     return {
       ok: false,
       label: 'Daemon health',
       problem: 'The daemon reports failing health checks',
-      detail: `${counts.fail} failing: ${failing.join(', ')}${warning.length ? ` (and ${counts.warn} warning)` : ''} — ${pointer}.`,
-      remedy: 'Run lazy daemon health for each failing check and its remedy.',
+      detail: `${counts.fail} failing: ${failing.join(', ')}${warning.length ? ` (and ${counts.warn} warning)` : ''} — ${pointer}.\n  ${each}`,
+      // Each row's own fix is already in `detail`; repeating it here showed it
+      // twice on every surface that renders both (Teams' notice, the inbox alert).
+      remedy: restartFixesAll
+        ? 'Restart the daemon (lazy daemon restart); the fix for each failing check is listed above.'
+        : 'Follow the fix listed above for each failing check; lazy daemon health shows them all.',
+      // Restarting the daemon is a remedy a client can act on; anything else
+      // keeps the family's conservative `manual`.
+      ...(restartFixesAll ? { classification: { family: 'daemon-health', remedyKind: 'restart-daemon' as const, impact: 'work' as const } } : {}),
     };
   }
   if (warning.length > 0) {
@@ -3801,8 +3815,12 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     try {
       runner = await createRunner(root);
     } catch (err) {
-      if (!(err instanceof ProxyUnavailableError)) throw err;
-      runnerError = err.message;
+      // A smolvm runner that cannot even be set up (its relay socket dir or
+      // state dir) is a finding, never the end of the sweep that explains it.
+      const smolvmRow = runnerType === 'smolvm' ? smolvmRunnerSetupFailure(err) : null;
+      if (smolvmRow) results.push(smolvmRow);
+      else if (!(err instanceof ProxyUnavailableError)) throw err;
+      else runnerError = err.message;
     }
   }
   if (runnerError) {
@@ -3817,6 +3835,13 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
   }
 
   const isContainerRunner = runnerType === 'docker' || runnerType === 'podman';
+
+  // The smolvm runner's host prerequisites, each with its fix. Never in
+  // managed mode: the fleet withholds this runner type, so a Teams sweep has
+  // no smolvm rows (src/doctor/smolvm.ts).
+  if (root && config && runnerType === 'smolvm' && !isManagedMode()) {
+    results.push(...(await checkSmolvmSetup(root, config)));
+  }
 
   // Runner-specific health checks — each runner knows what it needs.
   // DockerRunner checks Docker; PodmanRunner checks Podman; HostProcessRunner checks claude CLI.

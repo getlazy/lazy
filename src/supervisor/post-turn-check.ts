@@ -32,6 +32,7 @@
  */
 
 import { spawn } from '../utils/spawn';
+import { registerSupervisorHook } from '../protocol/supervisor-receipt';
 import { log, logWarn } from './log';
 
 /** Grace period between SIGTERM and SIGKILL (ms). Matches the watchdog. */
@@ -172,6 +173,14 @@ export async function runTurnHookCommand(
     // Disable the spawn wrapper's default 60s timeout for this long-running call.
     timeout: 0,
   });
+  let clearHookReceipt: () => void;
+  try {
+    clearHookReceipt = registerSupervisorHook(proc.pid);
+  } catch (error) {
+    proc.kill('SIGKILL');
+    await proc.exited;
+    throw new Error(`Could not register hook ${proc.pid} for supervisor crash recovery: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   const stdoutSink = { chunks: [] as Buffer[], bytes: 0, truncated: false };
   const stderrSink = { chunks: [] as Buffer[], bytes: 0, truncated: false };
@@ -221,6 +230,7 @@ export async function runTurnHookCommand(
     clearInterval(heartbeat);
     clearTimeout(timeoutTimer);
     if (killTimer) clearTimeout(killTimer);
+    clearHookReceipt();
   }
 
   // Give drains a brief window to flush whatever the pipe buffer still holds,

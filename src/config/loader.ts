@@ -187,6 +187,14 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     build_inputs: [],
     run_args: [],
   },
+  smolvm: {
+    binary: '',
+    image: '',
+    cpus: 4,
+    memory_mib: 8192,
+    storage_gib: 64,
+    allow_cidrs: [],
+  },
   runner: {
     type: 'docker',
     permission_mode: 'sandbox',
@@ -1555,6 +1563,8 @@ export function resolveConfigText(
     );
   }
 
+  validateSmolvmSection(config.smolvm);
+
   // Validate the sandbox deny lists: arrays of non-empty strings (paths).
   for (const key of ['sandbox_deny_read', 'sandbox_deny_write'] as const) {
     const value = config.runner[key];
@@ -2533,4 +2543,36 @@ dockerfile = ""
 # 0 = unlimited.
 # max_turns_without_human = 10
 `;
+}
+
+/**
+ * `[smolvm]`: shape only. Whether the binary and image exist, and whether the
+ * smolvm release is the pinned one, is checked when the runner is created
+ * (src/runner/smolvm-runner.ts) — a project that does not run on smolvm must
+ * not fail to load over a machine it never uses.
+ */
+function validateSmolvmSection(smolvm: ResolvedConfig['smolvm']): void {
+  for (const key of ['binary', 'image'] as const) {
+    const value = smolvm[key];
+    if (typeof value !== 'string' || (value !== '' && !isAbsolute(value))) {
+      throw new Error(
+        `Invalid ${key} in lazy.toml [smolvm] section: expected an absolute path, got ${JSON.stringify(value)}.`,
+      );
+    }
+  }
+  for (const key of ['cpus', 'memory_mib', 'storage_gib'] as const) {
+    const value = smolvm[key];
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+      throw new Error(
+        `Invalid ${key} in lazy.toml [smolvm] section: expected a positive whole number, got ${JSON.stringify(value)}.`,
+      );
+    }
+  }
+  const cidrs = smolvm.allow_cidrs;
+  if (!Array.isArray(cidrs) || cidrs.some((c) => typeof c !== 'string' || !/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(c.trim()))) {
+    throw new Error(
+      'Invalid allow_cidrs in lazy.toml [smolvm] section: expected an array of CIDR strings ' +
+      `(e.g. allow_cidrs = ["1.0.0.0/8"]), got ${JSON.stringify(cidrs)}.`,
+    );
+  }
 }

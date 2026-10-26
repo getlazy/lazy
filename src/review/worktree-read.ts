@@ -1,4 +1,4 @@
-import { lstat, readFile, realpath } from 'fs/promises';
+import { constants, lstat, open, realpath } from 'fs/promises';
 import { basename, dirname, join, sep } from 'path';
 
 /**
@@ -39,6 +39,20 @@ export async function readWorktreeFileNoFollow(
   worktreePath: string,
   relativePath: string,
 ): Promise<WorktreeReadResult> {
+  const located = await locateNoFollow(worktreePath, relativePath);
+  if (located.kind !== 'file') return located;
+  const read = await readOpenedNoFollow(located.resolved, Number.MAX_SAFE_INTEGER);
+  if (read.kind !== 'content') return { kind: 'notRegular' };
+  return { kind: 'content', content: new TextDecoder().decode(read.bytes) };
+}
+
+type Located =
+  | { kind: 'file'; resolved: string; size: number }
+  | { kind: 'notRegular' }
+  | { kind: 'missing' }
+  | { kind: 'outside'; resolved: string };
+
+async function locateNoFollow(worktreePath: string, relativePath: string): Promise<Located> {
   let root: string;
   try {
     root = await realpath(worktreePath);
@@ -76,6 +90,67 @@ export async function readWorktreeFileNoFollow(
     );
   }
   if (!stats.isFile()) return { kind: 'notRegular' };
+  return { kind: 'file', resolved, size: stats.size };
+}
 
-  return { kind: 'content', content: await readFile(resolved, 'utf-8') };
+/** {@link readWorktreeFileNoFollow}'s answer for bytes, bounded before reading. */
+export type WorktreeBytesResult =
+  | { kind: 'content'; bytes: Uint8Array }
+  /** A regular file larger than the caller's limit — not read. */
+  | { kind: 'tooLarge'; size: number }
+  | { kind: 'notRegular' }
+  | { kind: 'missing' }
+  | { kind: 'outside'; resolved: string };
+
+/**
+ * The same no-follow read as {@link readWorktreeFileNoFollow}, returning raw
+ * bytes (an image is not UTF-8) and refusing to read past `maxBytes`.
+ */
+export async function readWorktreeBytesNoFollow(
+  worktreePath: string,
+  relativePath: string,
+  maxBytes: number,
+): Promise<WorktreeBytesResult> {
+  const located = await locateNoFollow(worktreePath, relativePath);
+  if (located.kind !== 'file') return located;
+  if (located.size > maxBytes) return { kind: 'tooLarge', size: located.size };
+  return readOpenedNoFollow(located.resolved, maxBytes);
+}
+
+/**
+ * Read through ONE file handle opened with O_NOFOLLOW | O_NONBLOCK, and judge
+ * the file by `fstat` on that handle — never by the earlier `lstat`. The path
+ * is agent-writable, so between the lstat and the read an agent could swap in
+ * a symlink, a FIFO (a read that hangs) or a device such as /dev/zero (a read
+ * that never ends); the handle is what is read, so what it is decides.
+ */
+export async function readOpenedNoFollow(
+  resolved: string,
+  maxBytes: number,
+): Promise<{ kind: 'content'; bytes: Uint8Array } | { kind: 'tooLarge'; size: number } | { kind: 'notRegular' } | { kind: 'missing' }> {
+  let handle;
+  try {
+    handle = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { kind: 'missing' };
+    // ELOOP: the final component became a symlink since the lstat.
+    if (code === 'ELOOP') return { kind: 'notRegular' };
+    throw new Error(`failed to open ${resolved}: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) return { kind: 'notRegular' };
+    if (stats.size > maxBytes) return { kind: 'tooLarge', size: stats.size };
+    const bytes = new Uint8Array(stats.size);
+    let at = 0;
+    while (at < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, at, bytes.length - at, at);
+      if (bytesRead === 0) break;
+      at += bytesRead;
+    }
+    return { kind: 'content', bytes: at === bytes.length ? bytes : bytes.subarray(0, at) };
+  } finally {
+    await handle.close();
+  }
 }

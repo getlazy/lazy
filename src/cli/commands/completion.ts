@@ -73,7 +73,7 @@ const ALL_TASK_ID_COMMANDS = withAliases([
 // Commands that dispatch to a fixed set of subcommands as their first
 // positional argument (e.g. `lazy system prompts`). Completed from this map.
 const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
-  'system': ['prompts', 'build', 'status', 'source-id', 'agent', 'offline', 'online', 'passphrase', 'export-dockerfile', 'repair-commits', 'store-check', 'store-backup', 'store-backups', 'store-restore', 'runner-image', 'machine', 'guest-init-script'],
+  'system': ['prompts', 'build', 'status', 'source-id', 'agent', 'offline', 'online', 'passphrase', 'export-dockerfile', 'repair-commits', 'store-check', 'store-backup', 'store-backups', 'store-restore', 'runner-image', 'machine', 'guest-init-script', 'smolvm-build-image', 'smolvm-install'],
   'daemon': ['start', 'stop', 'restart', 'status', 'health', 'reload', 'dashboard-url', 'list', 'kill-stray', 'logs', 'auto-budget', 'config', 'resume-queue'],
   'config': ['set', 'get'],
   'memory': ['list', 'show', 'save', 'rm', 'history', 'compact'],
@@ -183,7 +183,8 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
                           '--all', '--apply', '--yes',
                           '--follow', '--build', '--logs', '--lines',
                           '--store', '--from', '--to', '--keep', '--writer-stopped',
-                          '--id', '--run-dir'],
+                          '--id', '--run-dir', '--release-base',
+                          '--smolvm', '--builder-image', '--platform', '--allow-cidrs', '--memory-mib', '--print-builder-image'],
 });
 
 function generateBashScript(): string {

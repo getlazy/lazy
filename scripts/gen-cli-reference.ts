@@ -133,6 +133,22 @@ function summaryOf(usage: string): string {
 }
 
 export function render(pages: CliPage[]): Map<string, string> {
+  // Solo smolvm remains available in CLI help but is deliberately undocumented.
+  // Apply this only when publishing; collection still captures the actual help,
+  // including Teams' separately supported microVM backend.
+  pages = pages
+    .filter((p) => !['system smolvm-build-image', 'system smolvm-install'].includes(p.command))
+    .map((p) => {
+      if (p.command === 'init') {
+        return { ...p, usage: p.usage
+          .replace(' [--runner docker|smolvm]', '')
+          .replace(/^  --runner docker\|smolvm[^\n]*\n +says what is still needed\.[^\n]*\n/gm, '') };
+      }
+      if (p.command === 'system') {
+        return { ...p, usage: p.usage.replace(/^  smolvm-(?:build-image|install) +[^\n]*\n/gm, '') };
+      }
+      return p;
+    });
   const files = new Map<string, string>();
   for (const p of pages) {
     files.set(

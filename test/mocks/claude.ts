@@ -365,8 +365,13 @@ export async function removeLazyImage(
  * looks like the compiled agent (ELF magic + the selfcheck sentinel), because
  * that is what the real one produces.
  */
+/** Where {@link ensureAgentBinary} installs the mock agent (the real one: ~/.lazy/bin). */
+export function getUserBinDir(): string {
+  return join(tmpdir(), 'lazy-test-agent-binary');
+}
+
 export async function ensureAgentBinary(): Promise<string> {
-  const dir = join(tmpdir(), 'lazy-test-agent-binary');
+  const dir = getUserBinDir();
   const path = join(dir, 'lazy-agent');
   await mkdir(dir, { recursive: true });
   const head = '\u007fELF' /* ELF magic */ + AGENT_SELFCHECK_SENTINEL + ' 0.0.0-test';
@@ -1766,4 +1771,9 @@ export function runnerImageRepairDeps(binary: string) {
     canRebuild: async () => false,
     rebuild: async () => undefined,
   };
+}
+
+/** Pure path mapping, mirrored from src/capture/claude.ts (no I/O to mock). */
+export function containerProtocolDir(protocolDir: string): string {
+  return `/lazy-protocol/${protocolDir.replace(/\/+$/, '').split('/').pop()}`;
 }

@@ -3,7 +3,8 @@
  *
  * Everything here was verified against the REAL binary, pi 0.84.4
  * (add-pi-agent, 2026-09-02) — see that task's journal for the captured wire
- * and stream output. Key facts:
+ * and stream output — and re-verified unchanged against pi 1.3.0 when the
+ * install was unpinned (docs/pi-agent-integration.md). Key facts:
  *
  * - Headless mode is `pi -p --mode json` with prompt on closed stdin: stdout is a JSONL event
  *   stream (session header, agent/turn/message lifecycle, tool_execution_*,
@@ -20,8 +21,9 @@
  *   levels and clamps it, so for the custom providers the per-turn models.json
  *   has to declare the model reasoning-capable or every effort collapses to
  *   `off` (src/agent/pi-turn-config.ts).
- * - pi has NO permission prompts, NO plan mode, and NO built-in MCP (all by
- *   design — extensions provide tools). Plan/ask turns therefore run with a
+ * - pi has NO permission prompts and NO plan mode. Since 0.99.0 it has a
+ *   built-in MCP client, which lazy turns OFF (`--no-mcp`, pi 1.0.4+) — lazy's tools
+ *   arrive through an extension instead. Plan/ask turns therefore run with a
  *   read-only builtin toolset (`--tools read,grep,find,ls`), and lazy's MCP
  *   tools arrive via a per-turn extension bridge (src/agent/pi-turn-config.ts).
  * - PROVIDERS: pi talks to 15+ providers, but every byte of lazy agent traffic
@@ -54,7 +56,7 @@ import type { Agent, AgentExecArgs } from './interface';
 import type { AgentActivityEvent, AgentActivityStream } from './activity-stream';
 import { systemPromptArgv } from './argv-safety';
 import { classifyNoModelRefusal, requireLaunchModel } from './launch-model';
-import { PI_INSTALL_HINT, PiPackaging } from './pi-packaging';
+import { PI_INSTALL_HINT, PI_MIN_VERSION, PiPackaging } from './pi-packaging';
 import { piUpstreamExamples } from '../config/agent-profile-advice';
 import {
   classifyCommonFailureSignals,
@@ -458,12 +460,20 @@ export class PiAgent implements Agent {
     // agent-writable. Non-interactive pi already defaults to ignoring them, but
     // a global settings file with defaultProjectTrust: "always" would flip that
     // — the flag closes the hole regardless of home-dir state.
+    //
+    // --no-mcp (pi 1.0.4+, hence PI_MIN_VERSION): pi ships a built-in MCP
+    // client since 0.99.0 that connects every server
+    // in ~/.pi/agent/mcp.json. lazy's tools arrive through its own bridge
+    // extension (unaffected by the flag — VERIFIED against 1.3.0), so the
+    // built-in client could only add servers lazy did not choose, e.g. ones a
+    // previous turn's agent wrote into this HOME.
     const args = [
       'pi',
       '-p',
       '--mode',
       'json',
       '--no-approve',
+      '--no-mcp',
       '--provider',
       PI_PROVIDER_KEY[provider],
     ];
@@ -611,6 +621,16 @@ export class PiAgent implements Agent {
       return { class: 'fatal_auth', reason: 'pi found no usable credential for this provider' };
     }
 
+    // A pi older than 1.0.4 does not know --no-mcp (VERIFIED against 0.84.4:
+    // "Error: Unknown option: --no-mcp", exit 1). Every launch fails the same
+    // way until pi is upgraded, so say that rather than "rejected the flag".
+    if (text.includes('unknown option: --no-mcp')) {
+      return {
+        class: 'fatal_config',
+        reason: `the installed pi is too old for lazy (needs ${PI_MIN_VERSION} or later). ${PI_INSTALL_HINT}`,
+      };
+    }
+
     if (
       text.includes('unknown provider') ||
       text.includes('unknown option') ||
@@ -664,7 +684,8 @@ export class PiAgent implements Agent {
     // --no-approve for the same security reason as supervised turns: the
     // worktree may carry agent-written .pi/ resources, and a pairing human
     // should not have them auto-loaded by saying yes to a generic trust prompt.
-    const args = ['pi', '--no-approve', '--provider', PI_PROVIDER_KEY[resolvePiProvider()]];
+    // --no-mcp for the same reason too: lazy's bridge is the only MCP surface.
+    const args = ['pi', '--no-approve', '--no-mcp', '--provider', PI_PROVIDER_KEY[resolvePiProvider()]];
     if (opts.sessionId) args.push('--session-id', opts.sessionId);
     args.push('--model', requirePiModel(opts.modelId));
     // dangerouslySkipPermissions: pi never prompts; nothing to pass.

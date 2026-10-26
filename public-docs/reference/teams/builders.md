@@ -12,23 +12,24 @@ Two tabs sit above the title: **Builders** (this screen) and **Files**, which li
 
 ## Header and introduction
 
-The title is **Builders**, with the project name above it as a link back to the project overview. A short paragraph explains that a builder runs from when it starts, or from a `/clear`, to the next `/clear`, and that you can open one to read its transcript, promote a passage into a task and see the files it left. It also says your builder runs next to the project: you can open it here, or with `lazy builder` in a clone logged in to the project.
+The title is **Builders**, with the project name above it as a link back to the project overview. A short paragraph explains that a builder runs from when it starts, or from a `/clear`, to the next `/clear`, and that you can open one to read its transcript, promote a passage into a task and see the files it left. It also says your builders run next to the project, as many at once as you start: you can open one here, or with `lazy builder` in a clone logged in to the project.
 
-## Starting your builder
+## Starting a builder
 
-One button starts, reopens or resumes your builder, and its label says which:
-
-| Label | Shown when |
-| --- | --- |
-| **Open your builder** | one of your builders is running |
-| **Resume your builder** | none is running and one of yours is stopped |
-| **Start your builder** | neither |
+**Start a new builder** is always there. Each press starts another builder of yours with a fresh conversation; builders you already have keep running. The project can run a limited number of builders at once across all its members; a start beyond that is refused with a message saying so. Beside the button, a count says how many of yours are running and how many are stopped.
 
 If you are not allowed to open a builder, the button is replaced by a notice that a builder runs on the account of the person using it, so it can only be opened in your own name.
 
-## Your builder
+## Your builders
 
-When one of your runs is not yet carried by a listed builder, a **Your builder** section appears above the list. Its row shows a state badge, when it started, and a note that its transcript is listed below once captured. The row links to the builder's page.
+Every builder of yours that has not ended is listed in **Your builders**, above the list of all builders. Each row shows:
+
+- what it is working on: the title of the conversation it carries, or **New conversation** for a builder whose transcript has not been captured yet;
+- when it started, and how it last ended if it stopped unexpectedly;
+- a state badge (**Running**, **Starting** or **Stopped — resumable**);
+- **Open** and **Stop** while it runs, or **Resume** while it is stopped.
+
+**Open** goes to the builder's terminal. **Stop** stops that builder only and keeps its conversation; **Resume** starts that same builder again. Your other builders are never touched.
 
 ## Search transcripts
 
@@ -43,7 +44,7 @@ Each row is one builder. The row shows the title and a line of details, and link
 Opening a builder shows:
 
 - **Details**: Id, Run, Started, Last activity, Branch, Messages, and Segments when the transcript was stitched from more than one.
-- **Your builder** (only for your own run): the run's state, **Stop** while it runs, **Resume** while it is stopped, and **End**, which asks for confirmation. Ending finishes the run; the transcript is kept, and you can still resume the builder later from the list. While it runs, a terminal is shown here.
+- **Your builder** (only for your own run of this builder): the run's state, **Stop** while it runs, **Resume** while it is stopped, and **End**, which asks for confirmation. Ending finishes the run; the transcript is kept, and you can still resume the builder later from the list. While it runs, a terminal is shown here.
 - **Resume** (your own builder, when it has no run of yours attached): resumes it, as described below.
 - **Create a task from messages**: select the messages you want in the transcript, then choose **Create task**. You can set **Goal**, **Code**, **Parent task** and **Prompt**, and **Create backlog task** makes a task in the backlog without starting it. Empty fields use defaults, as the hints on the page describe.
 - **Transcript**: the messages, paged with **Earlier** and **Later**.
@@ -53,7 +54,7 @@ Opening a builder shows:
 
 **Resume** continues one of your own builders, stopped or ended, in a builder run of yours, like `lazy builder --resume <id>` does on the command line. It runs on your account and spends your credential. The page goes to the start page and then to the running builder.
 
-- **If one of your builders is already running**, Resume asks first: it stops the running builder (its conversation is kept and stays listed) and then resumes the one you picked. Two of your builders never run at once.
+- **Resume opens an additional builder.** Builders of yours that are already running keep running. If the builder you picked is already running in one of yours, Resume opens that one instead of starting it twice.
 - **If the builder's session file is no longer on the server**, Resume says so and starts nothing. The transcript can still be read on its page.
 - **A teammate's builder** has no Resume button: Resume carries over the whole session, including the commands it ran and their output, so it is only for the person who had the conversation. Use **Continue from a summary** instead.
 
@@ -64,5 +65,5 @@ Opening a builder shows:
 - The summary is made from the transcript shown on the builder's page — what each person and the builder wrote — and never from the commands the builder ran or their output.
 - The new builder starts a fresh conversation. It is told the summary is background, and can read the original transcript if it needs more.
 - In offline mode no model runs, so the new builder gets the last messages of the conversation instead, labelled as an excerpt.
-- **If one of your builders is already running**, Continue asks first and stops it (its conversation is kept), as Resume does.
-- A continued builder's page shows **Continued from**, linking to the original; the original's page shows **Continued as**, linking back. The link appears once the new builder's run has been stopped or ended at least once.
+- **Continue opens an additional builder.** Builders of yours that are already running keep running.
+- A continued builder's page shows **Continued from**, linking to the original; the original's page shows **Continued as**, linking back. The link appears once the new builder's conversation has been captured, within about half a minute of it starting.

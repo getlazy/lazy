@@ -31,6 +31,7 @@
  */
 
 import type { ResolvedConfig, RoleName, RoleTarget, RunnerType } from '../config/types';
+import { isContainerRunnerType } from '../config/types';
 import { resolveCredential } from '../credentials/store';
 import { agentSupportsApiKey, agentCredentialProvider, resolveProfileCredential } from '../agent/credentials';
 import { isHostedOllamaEndpoint } from './ollama';
@@ -85,7 +86,7 @@ export function proxyBaseUrlForRunner(
   bind: string,
 ): string {
   const host =
-    runnerType === 'docker' || runnerType === 'podman'
+    isContainerRunnerType(runnerType)
       ? 'host.docker.internal'
       : bind && bind !== '0.0.0.0'
         ? bind

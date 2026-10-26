@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
-import { join, resolve } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import {
   LAZY_DIR,
   LEGACY_DIR,
@@ -11,7 +11,7 @@ import {
 } from '../project-paths';
 import { basename } from 'path';
 import { getHome } from '../utils/home';
-import { getDefaultConfigTemplate } from '../config/loader';
+import { DEFAULT_CONFIG, getDefaultConfigTemplate } from '../config/loader';
 import { createStorage } from '../storage';
 import { isTTY, promptLine, promptChoice, promptYesNo } from './editor';
 import { repoHasCommits } from '../git/operations';
@@ -21,7 +21,7 @@ import { agentDisplayName } from '../agent/registry';
 import { harnessForAgentName } from '../config/agent-profiles';
 import { detectShell, getCompletionSetupCommand } from '../shell/detect';
 import { theme } from '../render/theme';
-import { setSectionBoolean } from '../config/toml-edit';
+import { setSectionBoolean, setSectionNumber, setSectionString } from '../config/toml-edit';
 import { enrollAtInit } from './commands/system-passphrase';
 import { runGit } from '../utils/git';
 import { spawnSyncUnsupervised } from '../utils/spawn';
@@ -57,6 +57,50 @@ interface InitOptions {
    * no flag at all.
    */
   externalPath?: string;
+  /**
+   * The runner to configure. Unset: ask on a TTY (docker by default), and
+   * leave the config's runner alone without one — never auto-detected.
+   */
+  runner?: InitRunner;
+}
+
+/** Runners `lazy init --runner` can set up. */
+export const INIT_RUNNERS = ['docker', 'smolvm'] as const;
+export type InitRunner = typeof INIT_RUNNERS[number];
+
+/**
+ * Point lazy.toml at the smolvm runner: `[runner] type = "smolvm"` and a
+ * `[smolvm]` section with what init can fill in (the binary from
+ * `$LAZY_SMOLVM_BINARY` when set, and the machine's default size). Returns
+ * the new content and what the user still has to provide.
+ */
+export function applySmolvmRunner(content: string, env: Record<string, string | undefined> = process.env): { content: string; missing: string[] } {
+  // A repository's own lazy.toml may already carry [smolvm] values: keep them.
+  let parsed: Record<string, unknown>;
+  try { parsed = Bun.TOML.parse(content) as Record<string, unknown>; }
+  catch (err) {
+    throw new Error(`lazy.toml does not parse, so init cannot set the smolvm runner in it: ${err instanceof Error ? err.message : String(err)}. Fix the file and run \`lazy init --runner smolvm\` again.`);
+  }
+  const existing = (parsed.smolvm ?? {}) as Record<string, unknown>;
+  const has = (key: string) => existing[key] !== undefined && existing[key] !== '';
+  let out = setSectionString(content, 'runner', 'type', 'smolvm');
+  const missing: string[] = [];
+  const envBinary = env.LAZY_SMOLVM_BINARY?.trim() ?? '';
+  if (!has('binary')) {
+    if (envBinary && isAbsolute(envBinary)) out = setSectionString(out, 'smolvm', 'binary', envBinary);
+    else {
+      out = setSectionString(out, 'smolvm', 'binary', '');
+      missing.push('[smolvm] binary — the absolute path to a vendored smolvm launcher (run lazy system smolvm-install to download, verify and set it)');
+    }
+  }
+  if (!has('image')) {
+    out = setSectionString(out, 'smolvm', 'image', '');
+    missing.push('[smolvm] image — a lazy daemon image tar the machine boots (build one with lazy system smolvm-build-image)');
+  }
+  for (const key of ['cpus', 'memory_mib', 'storage_gib'] as const) {
+    if (!has(key)) out = setSectionNumber(out, 'smolvm', key, DEFAULT_CONFIG.smolvm[key]);
+  }
+  return { content: out, missing };
 }
 
 /**
@@ -494,6 +538,10 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // Check for both new and legacy directories
   if (existsSync(lazyPath)) {
     console.log(`Lazy already initialized in ${targetDir}`);
+    if (options.runner) {
+      console.log(`  --runner ${options.runner} was not applied: init only sets the runner of a new project. ` +
+        `Switch it by editing [runner] type in ${CONFIG_FILENAME}.`);
+    }
     // Still reconcile .gitignore. Without this, a project initialized before
     // the blanket `.lazy/` rule can never converge onto it — the enumerated
     // entries were written by init, so init is the thing that must retire them.
@@ -528,6 +576,13 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // --non-interactive is a hidden flag for CI/testing only.
   if (!isTTY() && !options.nonInteractive) {
     console.error('Error: lazy init requires an interactive terminal.');
+    process.exit(1);
+  }
+
+  // A managed host runs agents on its own runner and withholds smolvm.
+  // Refused before anything is written.
+  if (options.runner === 'smolvm' && isManagedMode()) {
+    console.error('Error: --runner smolvm is not available on a managed (Lazy Teams) host; it runs agents on its own container runner.');
     process.exit(1);
   }
 
@@ -578,6 +633,35 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     // would send the daemon to a store the caller never asked for.
     setExternalStoragePath(configPath, storagePath);
     console.log(`Set storage.external_path = "${storagePath}" in ${CONFIG_FILENAME}`);
+  }
+
+  // The runner: an explicit --runner, else a question on a TTY. Without
+  // either, the config's runner is left as it is — smolvm is never chosen
+  // for anyone silently.
+  let runnerChoice = options.runner;
+  if (!runnerChoice && isTTY() && !options.nonInteractive && !isManagedMode()) {
+    const idx = await promptChoice('Which runner should run task containers?', [
+      'docker — Docker Desktop or a local Docker engine (default)',
+      'smolvm — a per-project smolvm microVM; needs only the docker client on this machine',
+    ]);
+    runnerChoice = INIT_RUNNERS[idx] ?? 'docker';
+  }
+  if (runnerChoice === 'smolvm') {
+    const { content, missing } = applySmolvmRunner(readFileSync(configPath, 'utf-8'));
+    writeFileSync(configPath, content);
+    console.log(`Set [runner] type = "smolvm" and added a [smolvm] section to ${CONFIG_FILENAME}`);
+    if (missing.length) {
+      console.log('  Still needed before a task can run:');
+      for (const line of missing) console.log(`    ${line}`);
+    }
+    console.log(`  Then check the setup with: ${theme.command('lazy doctor')}`);
+  } else if (runnerChoice === 'docker') {
+    const content = readFileSync(configPath, 'utf-8');
+    const updated = setSectionString(content, 'runner', 'type', 'docker');
+    if (updated !== content) {
+      writeFileSync(configPath, updated);
+      console.log(`Set [runner] type = "docker" in ${CONFIG_FILENAME}`);
+    }
   }
 
   // Detect remote driver and offer to configure

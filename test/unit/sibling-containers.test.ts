@@ -121,3 +121,22 @@ describe('sibling container launch gate', () => {
       .toThrow(/Cannot run this in an agent container\./);
   });
 });
+
+describe('the refusal is about the ambient Docker host only', () => {
+  // INVARIANT: the smolvm runner's own machine is not a "foreign Docker host".
+  // Lazy created it with every mount source shared at its identical path from
+  // this process's view, so the declaration — which says the AMBIENT engine
+  // cannot see this filesystem — does not apply to it.
+  test('a launch on the project\'s smolvm machine is allowed under the declaration', () => {
+    expect(siblingContainerRefusal(FOREIGN, 'smolvm-guest')).toBeNull();
+    expect(() => assertSiblingContainerLaunchSupported('use the smolvm runner', FOREIGN, 'smolvm-guest')).not.toThrow();
+  });
+
+  // INVARIANT: every other foreign host is still refused — the qualification
+  // is one named engine, never a weakening of the declaration.
+  test('the ambient engine is still refused, and is the default', () => {
+    expect(siblingContainerRefusal(FOREIGN, 'ambient')).not.toBeNull();
+    expect(siblingContainerRefusal(FOREIGN)).not.toBeNull();
+    expect(() => assertSiblingContainerLaunchSupported('use the docker runner', FOREIGN)).toThrow(/Cannot use the docker runner\./);
+  });
+});

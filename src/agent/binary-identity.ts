@@ -199,14 +199,14 @@ export function selfcheckOutputVerdict(
       ok: false,
       reason:
         `selfcheck exited 0 but stdout did not contain '${AGENT_SELFCHECK_SENTINEL}' ` +
-        `(output: ${out || '<empty>'})`,
+        `(stdout: ${out || '<empty>'}, stderr: ${err || '<empty>'}); ` +
+        `execution and output capture could not be verified`,
     };
   }
 
-  const detail = out || err || '<no output>';
   return {
     ok: false,
-    reason: `selfcheck failed (exit ${exitCode ?? 'null'}, output: ${detail})`,
+    reason: `selfcheck failed (exit ${exitCode ?? 'null'}, stdout: ${out || '<empty>'}, stderr: ${err || '<empty>'})`,
   };
 }
 
@@ -247,12 +247,17 @@ export async function verifyAgentBinarySelfcheckInContainer(
   opts: AgentBinaryContainerProbeOptions,
 ): Promise<AgentBinaryVerdict> {
   const dockerBinary = opts.dockerBinary ?? 'docker';
+  // --mount refuses a source absent from the ENGINE's filesystem. With -v,
+  // Docker creates a directory there instead — especially misleading when the
+  // engine lives in a VM and only the host has the verified binary.
+  const sourceField = `source=${agentBinaryPath}`;
+  const sourceCsv = /[,"\r\n]/.test(sourceField) ? `"${sourceField.replace(/"/g, '""')}"` : sourceField;
   let proc;
   try {
     proc = spawn(
       [
         dockerBinary, 'run', '--rm', '--network', 'none',
-        '-v', `${agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
+        '--mount', `type=bind,${sourceCsv},target=/usr/local/bin/lazy-agent,readonly`,
         '--entrypoint', '/usr/local/bin/lazy-agent',
         opts.containerImage,
         'selfcheck',
@@ -270,7 +275,13 @@ export async function verifyAgentBinarySelfcheckInContainer(
     proc.exited,
   ]);
 
-  return selfcheckOutputVerdict(stdout, stderr, exitCode);
+  const verdict = selfcheckOutputVerdict(stdout, stderr, exitCode);
+  if (verdict.ok) return verdict;
+  return {
+    ok: false,
+    reason: `container selfcheck in ${opts.containerImage} via ${dockerBinary}, ` +
+      `binding ${agentBinaryPath} to /usr/local/bin/lazy-agent: ${verdict.reason}`,
+  };
 }
 
 /** True when a probe failed because the container runtime is unavailable. */
@@ -340,15 +351,17 @@ export async function assertAgentBinarySelfcheckForImage(
     return;
   }
 
-  const verdict = await verifyAgentBinaryForContainerLaunch(agentBinaryPath, {
+  // A host exec cannot prove the engine can see this mount or run this image.
+  // Probe the container on Linux too, including Linux-hosted remote engines.
+  const verdict = await verifyAgentBinarySelfcheckInContainer(agentBinaryPath, {
     containerImage: imageRef,
     dockerBinary,
   });
   if (!verdict.ok) {
     throw new Error(
-      `Refusing to tag container image ${imageRef}: the agent binary at ${agentBinaryPath} ` +
-      `would break every builder and task container (${verdict.reason}). ` +
-      `Fix the agent binary before rebuilding the image.`,
+      `Container image ${imageRef} failed its agent self-check: ${verdict.reason}. ` +
+      `Host-side content verification passed. ` +
+      `Check the bind source in the container engine and the self-check's output capture.`,
     );
   }
 }

@@ -253,6 +253,20 @@ describe('lazy doctor', () => {
     expectOutput(result, 'No stale storage lock');
   });
 
+  // INVARIANT: a daemonless test CLI that opened the store gives its lock back
+  // when it exits. It shares the daemon's store singleton, whose borrowers'
+  // close() is a no-op (so an MCP handler cannot release a live daemon's lock);
+  // a process that never runs the daemon's shutdown used to exit leaving
+  // `.storage-lock` naming its dead pid, which the next `lazy doctor` reported
+  // as stale.
+  test('a command that wrote the store leaves no stale lock for the next doctor', async () => {
+    expectSuccess(await ctx.lazy(['create', '--goal', 'Writes the store']));
+    expect(existsSync(join(storageDirFor(ctx.root), '.storage-lock'))).toBe(false);
+    const result = await ctx.lazy(['doctor']);
+    expectOutput(result, 'No stale storage lock');
+    expectOutputExcludes(result, 'storage lock is stale');
+  });
+
   // A wedged storage lock fails EVERY lazy command, so doctor is the only place
   // left to diagnose and clear it from. Per the doctor-single-warning-surface
   // convention, the remedy lives here and nowhere else.

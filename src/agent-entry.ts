@@ -347,6 +347,12 @@ The MCP server is spawned automatically by Claude Code via ~/.claude.json.`);
   } catch (err) {
     reportMcpStartupFailure(err);
   }
+} else if (command === 'supervisor-exit') {
+  // Internal PID-1 wrapper callback. It does no preflight or agent launch: even
+  // a supervisor that died during startup must leave the environment alive.
+  const { reportSupervisorExit } = await import('./protocol/supervisor-receipt');
+  const value = (flag: string) => args[args.indexOf(flag) + 1];
+  reportSupervisorExit(value('--protocol-dir'), Number(value('--pid')), Number(value('--exit-code')));
 } else {
   // Default mode: supervisor
   if (args.includes('--help') || args.includes('-h')) {

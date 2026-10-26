@@ -414,6 +414,11 @@ function printImageRefreshBoundary(): void {
 async function refreshImagesOnly(root: string, dryRun: boolean, timeoutMs: number): Promise<void> {
   const config = await loadConfig(root);
   const isContainerRunner = config.runner.type === 'docker' || config.runner.type === 'podman';
+  if (config.runner.type === 'smolvm') {
+    console.error('Error: `lazy upgrade --images` does not rebuild images on the smolvm runner yet.');
+    console.error('The project\'s machine builds the runner image itself when a task first needs it.');
+    process.exit(1);
+  }
   if (!isContainerRunner) {
     console.error(`Error: \`lazy upgrade --images\` only applies to container runners (docker/podman).`);
     console.error(`The current runner is '${config.runner.type}', which has no container image —`);

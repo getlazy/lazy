@@ -43,6 +43,8 @@ export interface GitResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /** Raw stdout, set only when the caller asked for `binaryStdout`. */
+  stdoutBytes?: Uint8Array;
 }
 
 export interface RunGitOptions {
@@ -85,6 +87,11 @@ export interface RunGitOptions {
    * end-of-string fixup can reach it.
    */
   trim?: boolean;
+  /**
+   * Also return stdout as raw bytes (`stdoutBytes`), undecoded — for a blob
+   * that is not text, such as an image. `stdout` is then empty.
+   */
+  binaryStdout?: boolean;
 }
 
 /**
@@ -282,7 +289,10 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
       ? streamStderr(proc.stderr, options.onStderr)
       : null;
     const result = await proc.exited;
-    const rawStdout = stdoutMode === 'pipe' ? await Bun.readableStreamToText(proc.stdout) : '';
+    const stdoutBytes = stdoutMode === 'pipe' && options.binaryStdout
+      ? new Uint8Array(await Bun.readableStreamToArrayBuffer(proc.stdout))
+      : undefined;
+    const rawStdout = stdoutMode === 'pipe' && !options.binaryStdout ? await Bun.readableStreamToText(proc.stdout) : '';
     // Trimmed unless the caller says its output is content (see `trim` above).
     // stderr is always trimmed: it is a message, never a payload.
     const stdout = options.trim === false ? rawStdout : rawStdout.trim();
@@ -302,7 +312,7 @@ export async function runGit(args: string[], opts?: RunGitOptions | string): Pro
       stderr = await annotateDubiousOwnership(stderr, options.cwd);
     }
 
-    return { stdout, stderr, exitCode };
+    return stdoutBytes ? { stdout, stderr, exitCode, stdoutBytes } : { stdout, stderr, exitCode };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn(`runGit: git command failed with exception: ${message}, args: ${args.join(' ')}`);

@@ -104,6 +104,7 @@ describe('lazy stop on the host-process runner', () => {
       expect(await untilDead(agentPid, 30_000)).toBe(true);
       // And the supervisor with it, which is the part that always worked.
       expect(await until(async () => findSupervisorsForRoot(ctx.root), pids => pids.length === 0, 30_000)).toEqual([]);
+      expect(readSessionJson(ctx.root, taskId)?.container_name).toBeNull();
 
       // THE BLAST RADIUS: a group signal sent at the group the supervisor used to
       // INHERIT would have killed the daemon here.
@@ -151,6 +152,7 @@ describe('lazy stop on the host-process runner', () => {
       expectSuccess(await ctx.lazy(['stop', taskId, '--reason', 'orphaned agent']));
 
       expect(await untilDead(agentPid, 30_000)).toBe(true);
+      expect(readSessionJson(ctx.root, taskId)?.container_name).toBeNull();
     } finally {
       await ctx.cleanup();
     }

@@ -28,7 +28,13 @@ export const DEFAULT_TERM_ROWS = 24;
 
 /** Control messages the browser may send. */
 export type ShellClientMessage =
-  | { type: 'resize'; cols: number; rows: number };
+  | { type: 'resize'; cols: number; rows: number }
+  /**
+   * The person is done with this terminal (closed it, left the page): end it
+   * now. A socket that closes WITHOUT this is a dropped connection, and the
+   * terminal keeps running for its page to reattach (./terminal-hold.ts).
+   */
+  | { type: 'end' };
 
 /**
  * Control messages the daemon sends. `status` narrates preparation that runs
@@ -38,7 +44,12 @@ export type ShellClientMessage =
  */
 export type ShellServerMessage =
   | { type: 'status'; message: string }
-  | { type: 'ready'; container: string }
+  /**
+   * `resume` is the token a page reattaches with after a dropped connection
+   * (./terminal-hold.ts); `resumed` marks the `ready` of a reattach, which is
+   * followed by the output the page missed.
+   */
+  | { type: 'ready'; container: string; resume?: string; resumed?: boolean }
   | { type: 'exit'; code: number | null }
   /** `detail` is what failed underneath — the Teams relay passes it to god mode only. */
   | { type: 'error'; message: string; detail?: string };
@@ -72,6 +83,7 @@ export function parseShellClientMessage(raw: string): ParseResult {
     return { ok: false, error: 'control message is not an object' };
   }
   const msg = parsed as Record<string, unknown>;
+  if (msg.type === 'end') return { ok: true, message: { type: 'end' } };
   if (msg.type === 'resize') {
     if (!isDim(msg.cols, MAX_TERM_COLS) || !isDim(msg.rows, MAX_TERM_ROWS)) {
       return {

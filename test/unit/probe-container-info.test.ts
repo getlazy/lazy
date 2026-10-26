@@ -26,6 +26,15 @@ beforeAll(async () => { dir = await mkdtemp(join(tmpdir(), 'probe-container-'));
 afterAll(async () => { await rm(dir, { recursive: true, force: true }); });
 
 describe('probeContainerInfo', () => {
+  // INVARIANT: an OOM is recorded as such, rather than guessed from exit 137,
+  // which also means an external SIGKILL.
+  test('an exited container includes the runtime OOM flag and finish time', async () => {
+    const bin = await fakeBinary('oom', `echo "false 137 2026-10-22T10:00:00Z true"`);
+    expect(await probeContainerInfo('lazy-x', bin)).toEqual({
+      kind: 'answered', info: { running: false, exitCode: 137, finishedAt: '2026-10-22T10:00:00Z', oomKilled: true },
+    });
+  });
+
   test('a running container is answered with its state', async () => {
     const bin = await fakeBinary('running', `echo "true 0 0001-01-01T00:00:00Z"`);
     expect(await probeContainerInfo('lazy-x', bin)).toEqual({

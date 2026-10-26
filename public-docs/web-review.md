@@ -252,6 +252,7 @@ never a second writer). The dashboard's base URL is printed by
 | `/tasks/:task/review/draft` | POST | Autosave the review in progress — unsent feedback, unsent accept reason, viewed/collapsed ticks (JSON `{ patch }`) |
 | `/api/review/queue` | GET | The queue as JSON, in the order `/review` would show it (`?sort=` accepted) |
 | `/api/review/:task/file-lines` | GET | A line range of one file at the task's diff revisions (`path`, `side`, `start`, `end`) — what the diff's expand controls read; refuses any path that is not part of the diff |
+| `/api/review/:task/blob` | GET | The bytes of one image in the task's diff (`path`, `side` = `base` or `head`) for the before/after pictures — only files of the diff, never a symlink, at most 10 MB, served with the image's own type, `nosniff` and a sandbox CSP |
 | `/api/review/:task/threads` | GET | `{ threads, taskThreads, pending, pendingDelivery, everQueued, everAsked, queued, state }` — what the island polls |
 | `/tasks/:task/review/session` | GET | **410** unless a stored builder-review transcript exists (read-only archive). Start/send are gone. |
 | `/tasks/:task/review/session/start` | POST | **410** — Review with builder cannot be started |
@@ -1755,6 +1756,28 @@ question about a diagram is asked while looking at the diagram, not after
 switching back to the fence and hunting for the right line. It opens the same
 Ask / Add comment box, anchored to the line the fence opens on, with the
 diagram's source as the quote the agent receives.
+
+### Images in diffs
+
+A changed PNG, JPEG, GIF, WebP, AVIF or SVG file is shown as a picture
+instead of "Binary file — not shown":
+
+- **Added** — the new image.
+- **Deleted** — the old image.
+- **Changed** — before and after side by side (stacked on a phone).
+
+Each picture is labelled with its pixel size and file size, and the file's
+header says *image added*, *image deleted* or *image changed* rather than
+`+0 −0`. An SVG also keeps its text diff below the picture. Pictures load only
+when their file is open and scrolled into view, so a diff full of screenshots
+stays fast. The same applies in Lazy Teams, on the Changes tab and the accept
+page.
+
+What is never shown as a picture: a file larger than 10 MB ("Too large to
+preview"), a file whose contents are not the image its name says ("Binary file —
+not shown"), and a symlink. Pictures come only from files this task's diff
+contains, at the same revisions the diff compares, and are drawn as plain
+images — an SVG's scripts never run.
 
 ### Threads survive a re-diff, even when their line moves
 

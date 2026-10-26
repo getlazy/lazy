@@ -91,7 +91,7 @@ test('a failed fresh launch revokes its planned service binding', async () => {
 // INVARIANT: resuming retires the outgoing launch's binding before forgetting its id, and a failed replacement revokes its new binding too. Neither placeholder may outlive that launch.
 test('a failed resume revokes both outgoing and replacement service bindings', async () => {
   const { session, token } = await serviceSession('stopped');
-  await expect(handleStartBuilderSession(root, {})).rejects.toThrow('require the docker/podman runner');
+  await expect(handleStartBuilderSession(root, { id: session.id })).rejects.toThrow('require the docker/podman runner');
   const resumed = await (await getOrCreateStorage()).getBuilderSession(session.id);
   expect(resumed!.builderId).not.toBe(BUILDER_ID);
   expect(resumed!.state).toBe('stopped');

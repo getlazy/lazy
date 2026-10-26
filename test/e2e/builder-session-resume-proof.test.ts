@@ -284,7 +284,7 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     await startDaemonWithFakes();
     await installSupervisorStandIn(await mintUserToken(ALICE_EMAIL, 'Alice'));
 
-    const resumed = await rpc(await mintUserToken(ALICE_EMAIL, 'Alice'), 'startBuilderSession', {}) as BuilderSession;
+    const resumed = await rpc(await mintUserToken(ALICE_EMAIL, 'Alice'), 'startBuilderSession', { id: started.id }) as BuilderSession;
 
     // Same SESSION (the durable identity), new container and new builder id
     // (every launch gets its own — see BuilderSession.builderId).
@@ -339,7 +339,7 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(refusal.message).toContain('Resume');
 
     // Resuming it launches again and clears the recorded death.
-    const resumed = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const resumed = await rpc(alice, 'startBuilderSession', { id: started.id }) as BuilderSession;
     expect(resumed.id).toBe(started.id);
     expect(resumed.state).toBe('running');
     expect(resumed.lastExit ?? null).toBeNull();
@@ -480,7 +480,7 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
 
     const first = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
     await rpc(alice, 'stopBuilderSession', { id: first.id });
-    const second = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const second = await rpc(alice, 'startBuilderSession', { id: first.id }) as BuilderSession;
     expect(second.builderId).not.toBe(first.builderId);
     // Past the first watch's 2s and 5s checks.
     await new Promise((r) => setTimeout(r, 6_000));
@@ -579,7 +579,7 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     const stopped = await rpc(alice, 'stopBuilderSession', { id: started.id }) as BuilderSession;
     expect(stopped.agentSessionId).toBe(CLAUDE_SESSION_ID);
 
-    const again = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const again = await rpc(alice, 'startBuilderSession', { id: started.id }) as BuilderSession;
     expect(again.id).toBe(started.id);
     // The terminal opens: the container is alive and the listing agrees.
     const attach = await rpcStatus(alice, 'attachSession', { id: started.id });
@@ -613,7 +613,7 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     await rm(join(overlay, '.lazy-seeded.json'), { force: true });
     await docker.failWriteProbe();
 
-    await rpc(alice, 'startBuilderSession', {});
+    await rpc(alice, 'startBuilderSession', { id: started.id });
     const relaunch = (await detachedLaunches())[1]!;
     expect(relaunch).not.toContain(':/home/user/.claude/projects');
     expect(relaunch).not.toContain('--resume');
@@ -644,7 +644,7 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(refusal.message).toContain('Could not check whether your builder is running');
     // Start asks the same question: no answer is a refusal, not a relaunch
     // over a live container.
-    const start = await rpcStatus(alice, 'startBuilderSession', {});
+    const start = await rpcStatus(alice, 'startBuilderSession', { id: started.id });
     expect(start.status).toBe(503);
     expect(start.message).toContain('Could not check whether your builder is running');
     // Stop too: no answer is not "already gone", so the row is not recorded
@@ -659,6 +659,58 @@ ${JSON.stringify(process.execPath)} run ${JSON.stringify(script)} "\$1" ${JSON.s
     expect(after.containerName).toBe(started.containerName);
     expect(await docker.containers()).toContain(started.containerName!);
     expect((await docker.invocations()).filter(l => l.startsWith('stop ') || l.startsWith('rm '))).toEqual([]);
+  }, 180_000);
+
+  // INVARIANT: a Teams member runs several builders at once. Each start is a
+  // NEW run with its own container, its own credential binding (the member's
+  // credential, bound under that launch's own builder id) and its own MCP
+  // token; stopping one leaves the other running and reachable. With no id,
+  // attach is the member's one running builder, and a question when there are
+  // several — never a pick made for them.
+  test('a member runs two builders at once, each with its own binding, and stopping one leaves the other', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const one = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    const two = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(two.id).not.toBe(one.id);
+    expect(two.builderId).not.toBe(one.builderId);
+    expect([one.memberEmail, two.memberEmail]).toEqual([ALICE_EMAIL, ALICE_EMAIL]);
+    expect(await docker.containers()).toEqual(expect.arrayContaining([one.containerName!, two.containerName!]));
+
+    const launches = await detachedLaunches();
+    expect(launches).toHaveLength(2);
+    const credentialOf = (launch: string) => launch.match(/-e (?:ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)=(\S+)/)?.[1];
+    const mcpConfigOf = (launch: string) => /-v (\S+):\/lazy-builder\/daemon-mcp\.json:ro/.exec(launch)?.[1];
+    expect(credentialOf(launches[0]!)).toBeTruthy();
+    expect(credentialOf(launches[0]!)).not.toBe(credentialOf(launches[1]!));
+    expect(mcpConfigOf(launches[0]!)).not.toBe(mcpConfigOf(launches[1]!));
+    const secondMcp = await readFile(mcpConfigOf(launches[1]!)!, 'utf-8');
+    expect(await readFile(mcpConfigOf(launches[0]!)!, 'utf-8')).not.toBe(secondMcp);
+
+    const ambiguous = await rpcStatus(alice, 'attachSession', {});
+    expect(ambiguous.status).toBe(409);
+    expect(ambiguous.message).toContain('name the one to attach to');
+
+    await rpc(alice, 'stopBuilderSession', { id: one.id });
+    expect(await docker.containers()).toContain(two.containerName!);
+    expect(await docker.containers()).not.toContain(one.containerName!);
+    const after = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: two.id } }) as BuilderSession;
+    expect(after.state).toBe('running');
+    expect(after.builderId).toBe(two.builderId);
+    expect(await readFile(mcpConfigOf(launches[1]!)!, 'utf-8')).toBe(secondMcp);
+    expect(await rpcStatus(alice, 'attachSession', { id: two.id })).toEqual({ status: 200, message: '' });
+    // One running now: no id finds it.
+    expect(await rpc(alice, 'attachSession', {})).toMatchObject({ sessionId: two.id });
+
+    // The stopped one is rejoined by id, on its own run; the other is untouched.
+    const rejoined = await rpc(alice, 'startBuilderSession', { id: one.id }) as BuilderSession;
+    expect(rejoined.id).toBe(one.id);
+    expect(rejoined.state).toBe('running');
+    expect(await detachedLaunches()).toHaveLength(3);
+    expect(await docker.containers()).toContain(two.containerName!);
   }, 180_000);
 
   // INVARIANT: a read landing inside a member's Stop (container already gone,
@@ -902,7 +954,7 @@ await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)
     }));
 
     await rpc(alice, 'stopBuilderSession', { id: started.id });
-    await rpc(alice, 'startBuilderSession', {});
+    await rpc(alice, 'startBuilderSession', { id: started.id });
 
     // The RESUMED launch's mounted config — a different file, seeded from the
     // member's persisted state — still carries all three answers.
@@ -1002,7 +1054,7 @@ await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)
     const once = join(proofDir, 'end-fired');
     await docker.onRm(`[ -f ${JSON.stringify(once)} ] && exit 0; touch ${JSON.stringify(once)}; ${JSON.stringify(process.execPath)} run ${JSON.stringify(endScript)}`);
 
-    const start = await rpcStatus(alice, 'startBuilderSession', {});
+    const start = await rpcStatus(alice, 'startBuilderSession', { id: row.id });
 
     // The end ran inside the window (the hook fired), and it WON: the start is
     // refused rather than resurrecting the session, and nothing was launched.
@@ -1092,10 +1144,12 @@ await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)
     expect(rows).toEqual([]);
   }, 180_000);
 
-  // INVARIANT: resuming never runs two builders of one member side by side, and
-  // never stops the running one silently: without `replaceRunning` it is a 409;
-  // with it the running builder is stopped (its conversation kept) first.
-  test('a live builder is stopped only when the member confirms, then the picked one resumes', async () => {
+  // INVARIANT: a member runs as many builders as they start, as `lazy builder`
+  // allows on a laptop. Resuming a Builder while another of theirs runs ADDS a
+  // run and never stops the running one; resuming a Builder that already runs
+  // in one of their runs returns that run, so one conversation never runs in
+  // two containers.
+  test('resuming while a builder runs gives two running builders, and resuming the same one again joins it', async () => {
     await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
     await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
     const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
@@ -1108,19 +1162,61 @@ await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)
     const live = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
     expect(live.state).toBe('running');
 
-    const refused = await rpcStatus(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID });
-    expect(refused.status).toBe(409);
-    expect(refused.message).toContain('already have a builder running');
-    expect(await docker.containers()).toContain(live.containerName!);
-
-    const resumed = await rpc(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID, replaceRunning: true }) as BuilderSession;
+    const resumed = await rpc(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
     expect(resumed.state).toBe('running');
-    expect(resumed.id).toBe(live.id);
+    expect(resumed.id).not.toBe(live.id);
+    expect(resumed.builderId).not.toBe(live.builderId);
     expect(resumed.agentSessionId).toBe(CLAUDE_SESSION_ID);
-    expect(await docker.containers()).not.toContain(live.containerName!);
+    const containers = await docker.containers();
+    expect(containers).toContain(live.containerName!);
+    expect(containers).toContain(resumed.containerName!);
     const launches = await detachedLaunches();
     expect(launches.length).toBe(3);
     expect(claudeArgvOf(launches[2]!)).toContain(CLAUDE_SESSION_ID);
+
+    const rows = await rpc(alice, 'storage', { method: 'listBuilderSessions', args: { projectRoot: ctx.root } }) as BuilderSession[];
+    expect(rows.filter((r) => r.state === 'running').map((r) => r.id).sort()).toEqual([live.id, resumed.id].sort());
+
+    // The same Builder again: its run is the answer, nothing new launches.
+    const again = await rpc(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
+    expect(again.id).toBe(resumed.id);
+    expect(await detachedLaunches()).toHaveLength(3);
+  }, 180_000);
+
+  // INVARIANT: a FRESH run that has never stopped is joined to its conversation
+  // as soon as its capture names it. Its Builder is listed (and offered Resume)
+  // within about half a minute of starting; Resume must find this run then, or
+  // one conversation runs in two containers.
+  test('resuming the Builder a never-stopped run is capturing returns that run and launches nothing', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const alice = await mintUserToken(ALICE_EMAIL, 'Alice');
+    await armLaunchEnvironment();
+
+    const fresh = await rpc(alice, 'startBuilderSession', {}) as BuilderSession;
+    expect(fresh.agentSessionId ?? null).toBeNull();
+    const mcpConfig = /-v (\S+):\/lazy-builder\/daemon-mcp\.json:ro/.exec((await detachedLaunches())[0]!)![1]!;
+    await writeSessionFileAsContainer((await detachedLaunches())[0]!, CLAUDE_SESSION_ID);
+
+    // The capture the running supervisor makes, on its own builder token.
+    const builderToken = (JSON.parse(await readFile(mcpConfig, 'utf-8')) as { token: string }).token;
+    const builderClient = DaemonClient.fromTarget(target, builderToken, undefined, 'builder');
+    await builderClient.rpc('storage', ctx.root, { method: 'saveConversation', args: { conversation: {
+      memberEmail: null, sessionId: CLAUDE_SESSION_ID, projectPath: ctx.root, cwd: ctx.root,
+      version: null, gitBranch: null, summary: 'Plan the release',
+      startedAt: '2026-10-01T10:00:00Z', endedAt: null, importedAt: Date.now(),
+      totalUsage: { input_tokens: 0, output_tokens: 0 }, subagents: [],
+      messages: [{ uuid: 'u1', parentUuid: null, role: 'user', text: 'Plan the release', timestamp: '2026-10-01T10:00:00Z', model: null, usage: null }],
+      stats: { messageCount: 1, userMessageCount: 1, assistantMessageCount: 0, subagentCount: 0, totalTokens: 0 },
+    } } });
+
+    const row = await rpc(alice, 'storage', { method: 'getBuilderSession', args: { id: fresh.id } }) as BuilderSession;
+    expect(row.state).toBe('running');
+    expect(row.agentSessionId).toBe(CLAUDE_SESSION_ID);
+
+    const resumed = await rpc(alice, 'resumeBuilder', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
+    expect(resumed.id).toBe(fresh.id);
+    expect(await detachedLaunches()).toHaveLength(1);
   }, 180_000);
 
   // INVARIANT: a teammate's builder is never resumed as yours, and its file is
@@ -1202,10 +1298,12 @@ await DaemonClient.fromTarget(${JSON.stringify(target)}, ${JSON.stringify(alice)
     expect(prompt).toContain(`(builder ${CLAUDE_SESSION_ID}), which ${ALICE_EMAIL} had`);
     expect(prompt).toContain('Here is a plan.');
 
-    // Without confirming, a second continue never stops the running builder.
-    const refused = await rpcStatus(bob, 'continueBuilderFromSummary', { builderId: CLAUDE_SESSION_ID });
-    expect(refused.status).toBe(409);
-    expect(await detachedLaunches()).toHaveLength(1);
+    // A second continue ADDS a builder; the running one keeps running.
+    const second = await rpc(bob, 'continueBuilderFromSummary', { builderId: CLAUDE_SESSION_ID }) as BuilderSession;
+    expect(second.id).not.toBe(run.id);
+    expect(second.state).toBe('running');
+    expect(await detachedLaunches()).toHaveLength(2);
+    expect(await docker.containers()).toContain(run.containerName!);
   }, 180_000);
 
   // INVARIANT: a continued builder keeps its seed and its "continued from" link

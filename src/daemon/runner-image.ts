@@ -73,6 +73,12 @@ export type RunnerImageState =
 interface Tracker {
   projectRoot: string;
   binary: string;
+  /**
+   * Make the engine `binary` drives able to build, before a build (not a
+   * periodic re-check): the smolvm runner brings its project machine up here,
+   * which its relay deliberately never does by itself.
+   */
+  prepare?: () => Promise<void>;
   status: RunnerImageState;
   /** Bumped per build so a superseded build's completion cannot overwrite a newer state. */
   generation: number;
@@ -250,6 +256,7 @@ function startBuild(
       // Outside the job: it is not this build, and Cancel must not stop it.
       // (The custom build's own base-first step IS inside the job; if Cancel
       // stops that, this call — waiting on the same lock — builds it after.)
+      await t.prepare?.();
       void runWithoutBuildObserver(() => ensureImage(t.binary, { useDefaultImage: true })).catch((err) => {
         logger.warn(`Runner image: lazy's default image ${defaultImage} could not be prepared: ${err instanceof Error ? err.message : String(err)}`);
       });
@@ -461,7 +468,7 @@ async function resolveTarget(projectRoot: string): Promise<{ imageName: string; 
  */
 export async function startRunnerImageBoot(
   projectRoot: string,
-  deps: { isContainerRunner?: () => Promise<{ binary: string } | null> } = {},
+  deps: { isContainerRunner?: () => Promise<{ binary: string; prepare?: () => Promise<void> } | null> } = {},
 ): Promise<void> {
   try {
     // Registered for EVERY container-runner daemon, even one with no custom
@@ -470,7 +477,7 @@ export async function startRunnerImageBoot(
     // whichever launch notices first.
     const runner = await (deps.isContainerRunner ?? (() => containerRunnerBinary(projectRoot)))();
     if (!runner) return;
-    const t: Tracker = { projectRoot, binary: runner.binary, status: { state: 'none' }, generation: 0, checkedAt: 0, refreshing: false, refreshFailures: 0, refreshRetryAtMs: 0, job: null };
+    const t: Tracker = { projectRoot, binary: runner.binary, ...(runner.prepare ? { prepare: runner.prepare } : {}), status: { state: 'none' }, generation: 0, checkedAt: 0, refreshing: false, refreshFailures: 0, refreshRetryAtMs: 0, job: null };
     tracker = t;
     registerCustomImageGate({
       repair: (imageName) => repairTrackedImage(t, imageName),
@@ -578,6 +585,7 @@ async function startDefaultImageRebuild(t: Tracker): Promise<{ ok: true; status:
   job.narrate(`rebuilding lazy's default runner image ${imageName} — rebuild requested`);
   defaultRebuildDone = (async () => {
     try {
+      await t.prepare?.();
       await whileNotCancelled(job, job.run(() => ensureImage(t.binary, {
         useDefaultImage: true,
         rebuild: true,
@@ -687,12 +695,14 @@ async function startRequestedBuild(opts: { rebuild?: boolean; noCache?: boolean 
 }
 
 /** The container runtime binary this project's daemon builds with, or null for a non-container runner. */
-export async function containerRunnerBinary(projectRoot: string): Promise<{ binary: string } | null> {
+export async function containerRunnerBinary(projectRoot: string): Promise<{ binary: string; prepare?: () => Promise<void> } | null> {
   const { createRunner } = await import('../runner');
   const { DockerRunner } = await import('../runner/docker-runner');
+  const { SmolvmRunner } = await import('../runner/smolvm-runner');
   const runner = await createRunner(projectRoot);
   if (!(runner instanceof DockerRunner)) return null;
-  return { binary: (runner as unknown as { binary: string }).binary };
+  if (runner instanceof SmolvmRunner) return { binary: runner.containerCli, prepare: () => runner.ensureMachine() };
+  return { binary: runner.containerCli };
 }
 
 /** Tests only: forget the tracker and unregister the gate. */

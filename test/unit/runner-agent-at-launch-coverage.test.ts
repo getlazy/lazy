@@ -36,6 +36,9 @@ async function sourceFiles(dir: string): Promise<string[]> {
 const DEFINITION_SUFFIXES = [
   join('runner', 'docker-runner.ts'),
   join('runner', 'host-process-runner.ts'),
+  // Overrides launchSupervisor (pin/record checks, protocol subtree) and
+  // delegates to DockerRunner's — a definition, not a call site.
+  join('runner', 'smolvm-runner.ts'),
   join('runner', 'types.ts'),
   // Interface / docs mentions only.
   join('runner', 'index.ts'),

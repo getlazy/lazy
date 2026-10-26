@@ -239,7 +239,7 @@ describe('daemon-owned builder session: credential binding and registry', () => 
     // stale 'running' row: it falls through to the (refused, and therefore
     // failing) resume launch — but only AFTER capturing the resume intent onto
     // the row.
-    await rpc('startBuilderSession', {});
+    await rpc('startBuilderSession', { id: 'sess-stale-1' });
 
     const after = await storage.getBuilderSession('sess-stale-1');
     expect(after?.agentSessionId).toBe('claude-sess-after-restart');

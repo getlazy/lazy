@@ -38,6 +38,7 @@
  */
 
 import type { Storage } from '../storage';
+import { terminalEngineOf } from '../runner/container-cli';
 import type { BuilderSession, CommitRun } from '../storage/types';
 import { RUN_ATTACH_PREFIX, runContainerName } from '../run/identity';
 import type { Session, Task, ActorInput } from '../types';
@@ -83,6 +84,8 @@ export type SessionAttachTarget =
       session: Session;
       container: string;
       binary: string;
+      /** The runner's own Engine API socket (smolvm: the relay); unset → the client's engine. */
+      engineSocket?: string;
     }
   | {
       kind: 'run';
@@ -90,6 +93,7 @@ export type SessionAttachTarget =
       run: CommitRun;
       container: string;
       binary: string;
+      engineSocket?: string;
     };
 
 export type SessionAttachResolution =
@@ -117,7 +121,7 @@ export interface ResolveSessionAttachOptions {
 }
 
 function binaryFor(runner: RunnerView): string {
-  return runner.type === 'podman' ? 'podman' : 'docker';
+  return terminalEngineOf(runner).binary;
 }
 
 /**
@@ -140,7 +144,7 @@ export async function resolveSessionAttachTarget(
     }
     return {
       ok: true,
-      target: { kind: 'run', sessionId, run, container: runContainerName(projectRoot, run.slug), binary: binaryFor(runner) },
+      target: { kind: 'run', sessionId, run, container: runContainerName(projectRoot, run.slug), ...terminalEngineOf(runner) },
     };
   }
 
@@ -271,7 +275,7 @@ export async function resolveSessionAttachTarget(
       task,
       session,
       container: execContainerName(task, session, runner),
-      binary: binaryFor(runner),
+      ...terminalEngineOf(runner),
     },
   };
 }
@@ -455,11 +459,24 @@ export async function handleAttachSession(
 
   let sessionId = typeof params.id === 'string' && params.id ? params.id : null;
   if (!sessionId) {
-    const active = await storage.getActiveBuilderSessionForMember(projectRoot, callerEmail);
-    if (!active) {
-      throw new RpcError(404, 'attachSession: no active builder session for you on this project. Start one with startBuilderSession.');
+    // A member may run several builders: with no id, the answer is their one
+    // running builder (or their one not-ended session), and more than one is
+    // a question for the caller, never a pick made here.
+    const mine = (await storage.listBuilderSessions(projectRoot))
+      .filter((s) => s.memberEmail === callerEmail && s.state !== 'ended');
+    const live = mine.filter((s) => s.state === 'running' || s.state === 'starting');
+    const only = live.length === 1 ? live[0] : live.length === 0 && mine.length === 1 ? mine[0] : null;
+    if (!only) {
+      if (mine.length === 0) {
+        throw new RpcError(404, 'attachSession: no active builder session for you on this project. Start one with startBuilderSession.');
+      }
+      throw new RpcError(
+        409,
+        `attachSession: you have ${live.length || mine.length} builder sessions on this project ` +
+        `(${(live.length ? live : mine).map((s) => s.id).join(', ')}); name the one to attach to.`,
+      );
     }
-    sessionId = active.id;
+    sessionId = only.id;
   }
 
   const resolved = await resolveSessionAttachTarget({

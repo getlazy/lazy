@@ -426,6 +426,20 @@ export interface FileLinesResult {
   atEof: boolean;
 }
 
+export interface DiffBlobQuery {
+  /** Post-image path for `head`, pre-image path for `base`. */
+  path: string;
+  side: 'base' | 'head';
+}
+
+export interface DiffBlobResult {
+  path: string;
+  side: 'base' | 'head';
+  contentType: string;
+  size: number;
+  contentBase64: string;
+}
+
 export interface ReviewActions {
   /** Blocked tasks awaiting review, newest activity first is the caller's job. */
   listQueue(): Promise<ReviewQueueEntry[]>;
@@ -483,6 +497,12 @@ export interface ReviewActions {
    * ONE change, not a file browser pointed at the worktree.
    */
   getFileLines(taskId: string, input: FileLinesQuery): Promise<FileLinesResult>;
+  /**
+   * One image of the diff, as bytes, for the before/after pictures — the same
+   * refs and allow-list as `getFileLines`, plus a size cap and a content check
+   * (see handleDiffBlob). Optional only for adapters that predate it.
+   */
+  getDiffBlob?(taskId: string, input: DiffBlobQuery): Promise<DiffBlobResult>;
   /** All anchored review comments for a task, oldest first. */
   listComments(taskId: string): Promise<ReviewComment[]>;
   /**

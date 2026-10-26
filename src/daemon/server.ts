@@ -775,13 +775,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // daemon: stopped like task containers are at a restart. A run's record and
   // checkout stay; its next Run services starts a fresh container.
   try {
-    const runnerType = (await loadConfig(projectRoot)).runner.type;
-    if (runnerType === 'docker' || runnerType === 'podman') {
-      const { removeRunContainers } = await import('./commit-run-container');
-      const swept = await removeRunContainers(projectRoot, runnerType);
-      if (swept.removed > 0) logger.info(`Removed ${swept.removed} run container(s) left by the previous daemon.`);
-      for (const f of swept.failed) logger.warn(`Could not remove run container ${f.name} left by the previous daemon: ${f.error}`);
-    }
+    const { sweepRunContainers } = await import('./commit-run-container');
+    const swept = await sweepRunContainers(projectRoot);
+    if (swept.removed > 0) logger.info(`Removed ${swept.removed} run container(s) left by the previous daemon.`);
+    for (const f of swept.failed) logger.warn(`Could not remove run container ${f.name} left by the previous daemon: ${f.error}`);
   } catch (err) {
     logger.warn(`Could not look for run containers left by the previous daemon: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -2748,17 +2745,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // daemon, as task containers do; found by label, never by the `lazy-`
     // prefix the loop above stops. Bounded: this is inside the shutdown budget.
     try {
-      const runnerType = (await loadConfig(projectRoot)).runner.type;
-      if (runnerType === 'docker' || runnerType === 'podman') {
-        const { removeRunContainers } = await import('./commit-run-container');
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const swept = await Promise.race([
-          removeRunContainers(projectRoot, runnerType),
-          new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 10_000); }),
-        ]).finally(() => clearTimeout(timer));
-        if (swept === null) logger.warn('Shutdown: removing run containers did not finish in 10s; the next daemon start removes what is left.');
-        else for (const f of swept.failed) logger.warn(`Shutdown: could not remove run container ${f.name}: ${f.error}`);
-      }
+      const { sweepRunContainers } = await import('./commit-run-container');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const swept = await Promise.race([
+        sweepRunContainers(projectRoot),
+        new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 10_000); }),
+      ]).finally(() => clearTimeout(timer));
+      if (swept === null) logger.warn('Shutdown: removing run containers did not finish in 10s; the next daemon start removes what is left.');
+      else for (const f of swept.failed) logger.warn(`Shutdown: could not remove run container ${f.name}: ${f.error}`);
     } catch (err) {
       logger.warn(`Shutdown: could not look for run containers: ${err instanceof Error ? err.message : String(err)}`);
     }

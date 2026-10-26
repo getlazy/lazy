@@ -406,7 +406,7 @@ What it checks:
 | Loops | The reconcile, sync-retry and remote-sync loops: when each last completed a tick, how long it took, how many ticks since start. A loop whose last completed tick is far older than its interval is a WARN, then a FAIL, and the row names the phase the running tick is stuck in |
 | Reconciler sweeps | Each recovery sweep and reconcile phase: last run, duration and last error. A sweep that just failed is a WARN; one that has failed on every run for five minutes is a FAIL. Healthy sweeps are folded into one line unless you pass `--verbose` |
 | Proxy | Where the proxy listens, and a real request to its own health path with the round-trip time — that request carries no credential and reaches no model, so it costs nothing. Also whether the proxy's audit log can be written |
-| Storage | Who holds the storage lock (the daemon itself is the only healthy answer; a dead holder, or a pid that now belongs to a different process, is called out) and whether writes are completing |
+| Storage | Who holds the storage lock (the daemon itself is the only healthy answer; a dead holder, a pid that now belongs to a different process, a lock file that is gone, and a daemon that gave up its lock while still running are each called out) and whether writes are completing |
 | Runner | Docker or Podman reachable (or, for the host runner, the agent binary), and whether the container image is built |
 | Tasks | Tasks that say `working` but have no live run, and for how long; tasks with queued syncs and where their retries stand; interrupted tasks that nothing will resume on its own (auto-resume gave up, or is turned off) |
 | Dashboard | Whether the web dashboard is bound, on which addresses, and why an extra address for containers could not be bound |

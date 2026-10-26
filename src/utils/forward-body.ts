@@ -2,7 +2,7 @@
  * The body of an incoming `Bun.serve` request, safe to hand to `fetch` as an
  * outgoing streamed body.
  *
- * WHY: Bun 1.3.11 (the version `.bun-version` pins) has a fast path for
+ * WHY: Bun 1.3.11 has a fast path for
  * `fetch(url, { body: req.body })` when `req.body` is a server request's own
  * stream, and on a chunked request that path writes the terminating chunk
  * TWICE (`…0\r\n\r\n0\r\n\r\n`). The forwarded request itself completes, but the

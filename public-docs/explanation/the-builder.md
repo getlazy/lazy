@@ -44,9 +44,9 @@ Use the builder to decide and direct; use a cluster to hand off a defined pile o
 
   ![The dashboard Builders page: a line explaining that past dialogues with the project's builder are captured as they happen, a search box, and a table with one builder conversation (id, started, ended, turns, title).](../images/dashboard/builders.png)
 
-- **Lazy Teams** (private alpha): the **Builders** page has a **Start your builder** button (it reads **Open your builder** while yours is running) and opens an in-browser terminal; the builder runs on the server. In a clone logged in to Teams, `lazy builder` attaches your terminal to it, and `lazy builder stop` and `lazy builder end` stop or finish it. See [Builders in Lazy Teams](../lazy-teams-builders.md).
+- **Lazy Teams** (private alpha): the **Builders** page has a **Start a new builder** button and lists every builder of yours with **Open** and **Stop**; you can run several at once, each in an in-browser terminal, on the server. In a clone logged in to Teams, `lazy builder` starts another one and attaches your terminal to it, `lazy builder attach` reattaches, and `lazy builder stop` and `lazy builder end` stop or finish one. See [Builders in Lazy Teams](../lazy-teams-builders.md).
 
-  ![The Lazy Teams Builders page. An Open your builder button sits above a transcript search box and a list of three builders with their start time, turn count, owner and a Running or Stopped status.](../images/teams/teams-builders.png)
+  ![The Lazy Teams Builders page. A Start a new builder button with a count of your running builders, a Your builders list with two running builders each offering Open and Stop, a transcript search box, and a list of every builder with its status.](../images/teams/teams-builders.png)
 
 ## Limits
 

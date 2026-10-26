@@ -9,7 +9,7 @@
  * The same session is reachable from the Teams web page.
  *
  * Every decision stays where it already lives: which session a member has, and
- * whether a second attach joins it, is the daemon's (`startBuilderSession`);
+ * whether a start adds a session or rejoins one, is the daemon's (`startBuilderSession`);
  * whether this member may attach at all is Teams' (the same policy its browser
  * terminal uses); which container a session id reaches is the daemon's again,
  * from the session record. This module only asks and relays.
@@ -81,9 +81,12 @@ async function attachAndReport(
 // --- lazy builder ---------------------------------------------------------
 
 /**
- * `lazy builder [end|stop [<session-id>]]` in a bound clone.
+ * `lazy builder [attach [<session-id>] | end|stop [<session-id>]]` in a bound clone.
  * `lazy builder list` is not handled here: it lists captured conversations
  * through storage, which already reaches the project's store through Teams.
+ *
+ * Plain `lazy builder` starts ANOTHER builder every time, as it does on a
+ * laptop; `attach` rejoins one that exists.
  */
 export async function commandBuilderBound(root: string, login: TeamsLogin, args: string[]): Promise<void> {
   const sub = args[0];
@@ -91,19 +94,25 @@ export async function commandBuilderBound(root: string, login: TeamsLogin, args:
     await endOrStopBuilderSession(root, sub, args[1]);
     return;
   }
+  const rejoin = sub === 'attach';
+  const rest = rejoin ? args.slice(1) : args;
   // `--yes` / `--autonomous` restate what a server-side session already is
   // (autonomous, confirmed by starting it); everything else chooses a model,
   // an effort or a conversation to resume, which the server decides.
-  refuseLocalOnlyFlags('builder', args, new Set(['--yes', '--autonomous']));
-  if (args.some((a) => !a.startsWith('-'))) {
-    fail(`unknown builder subcommand '${args.find((a) => !a.startsWith('-'))}'. Use \`lazy builder\`, \`lazy builder end\` or \`lazy builder stop\`.`);
+  refuseLocalOnlyFlags('builder', rest, new Set(['--yes', '--autonomous']));
+  const positional = rest.filter((a) => !a.startsWith('-'));
+  if (!rejoin && positional.length > 0) {
+    fail(`unknown builder subcommand '${positional[0]}'. Use \`lazy builder\`, \`lazy builder attach\`, \`lazy builder end\` or \`lazy builder stop\`.`);
   }
+  if (positional.length > 1) fail('`lazy builder attach` takes at most one session id.');
 
   let session;
   try {
-    session = await rpcStartBuilderSession();
+    session = rejoin
+      ? await rpcStartBuilderSession(positional[0] ?? (await pickOwnSession(root, 'attach to', true)).id)
+      : await rpcStartBuilderSession();
   } catch (err) {
-    fail(`could not start your builder session: ${errorText(err)}`);
+    fail(`could not ${rejoin ? 'rejoin' : 'start'} your builder session: ${errorText(err)}`);
   }
   try {
     await rpcAttachSession(session.id);
@@ -111,13 +120,14 @@ export async function commandBuilderBound(root: string, login: TeamsLogin, args:
     fail(`your builder session ${session.id} cannot be attached to: ${errorText(err)}`);
   }
 
+  const again = `\`lazy builder attach ${session.id}\``;
   console.error(
     `Attached to your builder session ${session.id} on ${login.binding.teams_url} (${login.binding.project}).\n` +
-    `It runs on the server: ${DETACH_HINT} detaches and leaves it running; \`lazy builder end\` ends it.`,
+    `It runs on the server: ${DETACH_HINT} detaches and leaves it running; \`lazy builder end ${session.id}\` ends it.`,
   );
   await attachAndReport(root, session.id, 'attach', (outcome) => {
     if (outcome.kind === 'detached') {
-      console.error(`\nDetached. Session ${session.id} is still running — \`lazy builder\` reattaches, \`lazy builder end\` ends it.`);
+      console.error(`\nDetached. Session ${session.id} is still running — ${again} reattaches, \`lazy builder end ${session.id}\` ends it.`);
       return;
     }
     if (outcome.kind === 'exited') {
@@ -125,33 +135,42 @@ export async function commandBuilderBound(root: string, login: TeamsLogin, args:
       process.exitCode = outcome.code ?? 0;
       return;
     }
-    console.error(`\nLost the connection to session ${session.id}: ${outcome.message}. It may still be running — \`lazy builder\` reattaches.`);
+    console.error(`\nLost the connection to session ${session.id}: ${outcome.message}. It may still be running — ${again} reattaches.`);
     process.exitCode = 1;
   });
 }
 
-async function endOrStopBuilderSession(root: string, verb: 'end' | 'stop', explicitId: string | undefined): Promise<void> {
-  let id = explicitId;
-  if (!id) {
-    // The member's own not-yet-ended session, whatever state its container is
-    // in — a stopped one can still be ended, and one whose container died can
-    // still be stopped or ended. The daemon answers for the CALLER's member
-    // from their token; the member argument here is ignored on a shared daemon.
-    let active: BuilderSession | null;
-    try {
-      const storage = await requireStorage();
-      active = await storage.getActiveBuilderSessionForMember(root, null);
-    } catch (err) {
-      fail(`could not look up your builder session: ${errorText(err)}`);
-    }
-    if (!active) fail(`you have no builder session on this project to ${verb}.`);
-    id = active.id;
+/**
+ * The member's one session to act on when none was named: their one running
+ * builder (`preferRunning`), else their one not-ended session. Several is a
+ * question for the member — the ids are listed and nothing is picked for them.
+ * The daemon narrows the list to the caller's own member on a shared daemon.
+ */
+async function pickOwnSession(root: string, verb: string, preferRunning: boolean): Promise<BuilderSession> {
+  let mine: BuilderSession[];
+  try {
+    const storage = await requireStorage();
+    mine = (await storage.listBuilderSessions(root)).filter((s) => s.state !== 'ended');
+  } catch (err) {
+    fail(`could not look up your builder sessions: ${errorText(err)}`);
   }
+  if (mine.length === 0) fail(`you have no builder session on this project to ${verb}.`);
+  const live = mine.filter((s) => s.state === 'running' || s.state === 'starting');
+  const pool = preferRunning && live.length > 0 ? live : mine;
+  if (pool.length === 1) return pool[0]!;
+  fail(
+    `you have ${pool.length} builder sessions on this project; name the one to ${verb}:\n` +
+    pool.map((s) => `  ${s.id}  ${s.state}, started ${s.createdAt}`).join('\n'),
+  );
+}
+
+async function endOrStopBuilderSession(root: string, verb: 'end' | 'stop', explicitId: string | undefined): Promise<void> {
+  const id = explicitId ?? (await pickOwnSession(root, verb, verb === 'stop')).id;
   try {
     const result = verb === 'end' ? await rpcEndBuilderSession(id) : await rpcStopBuilderSession(id);
     console.log(verb === 'end'
       ? `Ended builder session ${result.id}.`
-      : `Stopped builder session ${result.id}. \`lazy builder\` resumes its conversation.`);
+      : `Stopped builder session ${result.id}. \`lazy builder attach ${result.id}\` resumes its conversation.`);
   } catch (err) {
     fail(`could not ${verb} builder session ${id}: ${errorText(err)}`);
   }

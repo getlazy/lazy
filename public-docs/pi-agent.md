@@ -220,10 +220,11 @@ attached per request at the proxy.
 
 ## Lazy tools
 
-Pi has no built-in MCP support. Lazy bridges its tool server into Pi with a
+Lazy turns off Pi's own MCP client and bridges its tool server into Pi with a
 small Pi extension written into the task's sandbox home on every turn, so a Pi
 task gets the full `lazy_*` tool set (read-only on `lazy ask` turns), with the
-same per-task scoping as other agents.
+same per-task scoping as other agents. MCP servers configured in Pi's own
+`mcp.json` are not connected.
 
 ## Read-only turns
 
@@ -261,5 +262,6 @@ harness is Pi, not only the built-in `pi` profile. See
 The default `lazy-runner` image has Pi installed, alongside every other agent
 lazy can run in a container. A custom `Dockerfile.lazy` that starts
 `FROM lazy-runner` has it too. One built on another base adds Pi's install
-line itself — `lazy` prints it when the image is missing the binary. The install is pinned to a specific Pi version that lazy's
-integration was verified against.
+line itself — `lazy` prints it when the image is missing the binary. The image installs Pi's latest
+release, like the other agents' CLIs. Lazy needs Pi 1.0.4 or later; `lazy doctor`
+reports an older one, and a turn on it fails saying so.

@@ -195,7 +195,7 @@ describe('stopOrphanedContainerPair (the --unlock reach-in)', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'lazy-unlock-nopid-'));
     mkdirSync(join(tempDir, SANDBOX_DIR), { recursive: true });
 
-    const reached = await stopOrphanedContainerPair('no-such-task-id', tempDir);
+    const reached = await stopOrphanedContainerPair('no-such-task-id', tempDir, tempDir);
 
     expect(reached).toBe(false);
   });
@@ -209,7 +209,7 @@ describe('stopOrphanedContainerPair (the --unlock reach-in)', () => {
     const pidFile = pairPidFilePath(tempDir);
     writeFileSync(pidFile, 'not-a-pid\n');
 
-    const reached = await stopOrphanedContainerPair('no-such-task-id', tempDir);
+    const reached = await stopOrphanedContainerPair('no-such-task-id', tempDir, tempDir);
 
     expect(reached).toBe(false);
     expect(existsSync(pidFile)).toBe(false);

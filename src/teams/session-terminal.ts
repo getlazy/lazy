@@ -153,6 +153,10 @@ export async function runRemoteTerminal(opts: {
       if (rawTaken) io.stdin.setRawMode(false);
       io.stdin.pause();
       try {
+        // The person left: say so, so the daemon ends (or, for a builder,
+        // detaches from) the terminal now instead of holding it for a
+        // reconnect this client never makes (src/server/terminal-hold.ts).
+        if (outcome.kind === 'detached' && open) ws.send(shellClientMessage({ type: 'end' }));
         ws.close();
       } catch (err) {
         // Closing a socket that is already closing is the only way this

@@ -52,6 +52,11 @@ export interface DaemonHealthRow {
   reason: string;
   /** What to do about it — always present on a FAIL. */
   remedy?: string;
+  /**
+   * Set when restarting the daemon is the whole fix — so a client that can
+   * restart it (Lazy Teams) offers that instead of a support hand-off.
+   */
+  remedyKind?: 'restart-daemon';
 }
 
 export interface DaemonHealthReport {
@@ -328,6 +333,7 @@ export function buildLoopRow(
       state: 'fail',
       reason: 'never started in this daemon',
       remedy: `Check \`lazy daemon logs\` for a startup error; ${RESTART_REMEDY}`,
+      ...RESTART_FIXES,
     };
   }
 
@@ -356,6 +362,7 @@ export function buildLoopRow(
       remedy:
         '`lazy daemon logs` shows what the tick is waiting on (search for the phase named above); ' +
         `while it is stuck nothing this loop does happens. ${RESTART_REMEDY}`,
+      ...RESTART_FIXES,
     };
   }
   if (staleFor >= warnMs) {
@@ -414,6 +421,7 @@ export function buildProxyRow(handle: ProxyHealthHandle | null, probe: ProxyProb
       state: 'fail',
       reason: 'the proxy is not running in this daemon',
       remedy: `Every agent turn reaches the model through the proxy, so none can run. ${RESTART_REMEDY}`,
+      ...RESTART_FIXES,
     };
   }
   const also = handle.binds.length > 1 ? ` (also on ${handle.binds.slice(1).join(', ')})` : '';
@@ -423,6 +431,7 @@ export function buildProxyRow(handle: ProxyHealthHandle | null, probe: ProxyProb
       state: 'fail',
       reason: `${handle.bind}:${handle.port}${also} did not answer ${probe.url}: ${probe.error}`,
       remedy: `Agent turns cannot reach the model until the proxy answers. ${RESTART_REMEDY}`,
+      ...RESTART_FIXES,
     };
   }
   return {
@@ -443,7 +452,7 @@ export function buildAuditRow(
 ): DaemonHealthRow {
   const base = { id: 'proxy:audit-log', group: 'proxy' as const, name: 'Proxy audit log writable' };
   if (!handle || !writable) {
-    return { ...base, state: 'fail', reason: 'no proxy, so no audit log', remedy: RESTART_REMEDY };
+    return { ...base, state: 'fail', reason: 'no proxy, so no audit log', remedy: RESTART_REMEDY, ...RESTART_FIXES };
   }
   const remedy =
     `Make ${handle.auditDir} writable by the daemon's user (and check free disk space). ` +
@@ -473,24 +482,80 @@ export type StorageLockFacts =
   | { kind: 'held'; lockPath: string; pid: number; acquiredAt: string | null; verdict: HolderVerdict };
 
 /**
+ * Whether THIS daemon's store handle holds the lock for its life, as the
+ * daemon itself knows it — independent of what the file says:
+ * - `held`: it took the lock at startup and still holds it;
+ * - `released`: its store is open but the life-long hold was given up (the
+ *   regression where a borrower's close() released it);
+ * - `not-open`: the store is still opening, or nothing has asked for it yet;
+ * - `openFailed`: opening it FAILED — the daemon cannot work at all. Carries
+ *   the open error, since when, and whether a restart can fix it (not while a
+ *   live holder elsewhere keeps the lock, nor while a restore owns the store).
+ */
+export type StoreLockHold =
+  | 'held'
+  | 'released'
+  | 'not-open'
+  | { openFailed: { error: string; since: number; restartFixes: boolean } };
+
+/** Marks a failing row whose fix is restarting the daemon — which Lazy Teams can do itself. */
+const RESTART_FIXES = { remedyKind: 'restart-daemon' } as const;
+
+/**
  * The storage lock, from the daemon's side. The daemon takes it at startup and
  * holds it for its whole life — that is what makes it the store's single
- * writer — so the ONLY healthy answer is "held by this daemon". Any other
- * holder, a dead or recycled one, or no file at all is a daemon whose writes
- * are either queued forever or unprotected against a second writer.
+ * writer — so the ONLY healthy answer is "held by this daemon". Every failure
+ * below is a store a second writer could really get into (no file, or a file
+ * naming a dead holder) or one this daemon cannot write (a live foreign
+ * holder); each reason says which, from the file AND from what this daemon
+ * knows about its own hold.
  */
-export function buildStorageLockRow(facts: StorageLockFacts, daemonPid: number, now: number): DaemonHealthRow {
+export function buildStorageLockRow(
+  facts: StorageLockFacts,
+  daemonPid: number,
+  now: number,
+  selfHold: StoreLockHold = 'held',
+): DaemonHealthRow {
   const base = { id: 'storage:lock', group: 'storage' as const, name: 'Storage lock' };
   if (facts.kind === 'no-file-lock') {
     return { ...base, state: 'ok', reason: `the ${facts.backend} backend has no file lock` };
   }
-  if (facts.kind === 'missing') {
+  const retake = `Restart the daemon so it takes the lock again: ${RESTART_REMEDY}`;
+  // A live foreign holder is said more precisely below, whatever the open says.
+  const foreignLive = facts.kind === 'held' && facts.verdict.alive && facts.pid !== daemonPid;
+  if (typeof selfHold === 'object' && !foreignLive) {
+    const { error, since, restartFixes } = selfHold.openFailed;
     return {
       ...base,
       state: 'fail',
-      reason: `${facts.lockPath} is gone — the daemon still writes as the store's owner, but nothing ` +
-        'stops a second process from taking the store and writing beside it',
-      remedy: `Stop every other lazy process on this store, then restart the daemon so it takes the lock again: ${RESTART_REMEDY}`,
+      reason: `this daemon could not open its store (failing since ${ago(now - since)}), so it can do no work: ${firstLine(error)}`,
+      remedy: restartFixes
+        ? `${RESTART_REMEDY} If it fails again, \`lazy daemon logs\` says why.`
+        : 'A restart will not help while the cause stands: the error above names the process holding the store, ' +
+          'or the restore that owns it — stop that process, or let the restore finish, then restart the daemon.',
+      ...(restartFixes ? RESTART_FIXES : {}),
+    };
+  }
+  if (facts.kind === 'missing') {
+    if (selfHold === 'not-open') {
+      return {
+        ...base,
+        state: 'warn',
+        reason: `${facts.lockPath} does not exist because this daemon has not opened its store yet, so nothing holds it`,
+        remedy: `If this does not clear within a minute, the store could not be opened — \`lazy daemon logs\` says why. ${retake}`,
+        ...RESTART_FIXES,
+      };
+    }
+    return {
+      ...base,
+      state: 'fail',
+      reason: selfHold === 'released'
+        ? `${facts.lockPath} is gone: this daemon gave up the lock it holds for its whole life while still ` +
+          'running, so between its writes nothing stops a second daemon from opening the store and writing beside it'
+        : `${facts.lockPath} was deleted from under this daemon, which still believes it holds it — ` +
+          'nothing stops a second process from taking the store and writing beside it',
+      remedy: retake,
+      ...RESTART_FIXES,
     };
   }
   if (facts.kind === 'unreadable') {
@@ -506,8 +571,11 @@ export function buildStorageLockRow(facts: StorageLockFacts, daemonPid: number, 
     return {
       ...base,
       state: 'fail',
-      reason: `${facts.lockPath} names pid ${facts.pid}${since}, but ${describeDeadReason(facts.verdict.reason)}`,
-      remedy: 'Run `lazy doctor`, which offers to remove a stale lock, then restart the daemon.',
+      reason: `${facts.lockPath} names pid ${facts.pid}${since}, but ${describeDeadReason(facts.verdict.reason)} — ` +
+        'this daemon does not hold it, and any process may reclaim it',
+      // The daemon's own acquire reclaims a lock whose holder is dead.
+      remedy: retake,
+      ...RESTART_FIXES,
     };
   }
   if (facts.pid !== daemonPid) {
@@ -518,6 +586,18 @@ export function buildStorageLockRow(facts: StorageLockFacts, daemonPid: number, 
       remedy:
         `Find out what pid ${facts.pid} is (\`ps -p ${facts.pid}\`) and stop it if it is hung. ` +
         'Do NOT delete the lock file while its holder is alive — that admits a second writer and corrupts the store.',
+    };
+  }
+  if (selfHold === 'released') {
+    // The file names this daemon only because one write is in flight: between
+    // writes it is gone, which is the case above.
+    return {
+      ...base,
+      state: 'fail',
+      reason: `this daemon gave up the lock it holds for its whole life while still running; ${facts.lockPath} names it ` +
+        'only while one of its writes is in flight, so between writes nothing stops a second daemon from opening the store',
+      remedy: retake,
+      ...RESTART_FIXES,
     };
   }
   return { ...base, state: 'ok', reason: `held by this daemon (pid ${daemonPid})${since}, as designed` };
@@ -544,6 +624,7 @@ export function buildStorageWritesRow(
         state: 'fail',
         reason,
         remedy: `Every store write in this daemon waits on that one. \`lazy daemon logs\` may show what it is doing; ${RESTART_REMEDY}`,
+        ...RESTART_FIXES,
       };
     }
     if (runningFor >= STORAGE_WRITE_WARN_MS) {
@@ -825,6 +906,7 @@ export function buildDashboardRow(facts: DashboardFacts): DaemonHealthRow {
       state: 'fail',
       reason: primary?.reason ?? 'no dashboard listener was recorded',
       remedy: RESTART_REMEDY,
+      ...RESTART_FIXES,
     };
   }
   const failed = facts.binds.filter(b => b.surface === 'dashboard' && !b.primary && !b.ok);

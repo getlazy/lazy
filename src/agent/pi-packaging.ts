@@ -9,23 +9,46 @@
  * shimming a fake `node` onto PATH, which would change what `node` means for
  * every project built on the image.
  *
- * The version is PINNED. pi releases frequently and its CLI surface is what
- * lazy's arg-building and parsing were verified against; a floating `latest`
- * would let an unreviewed release change the contract under every task
- * container rebuild.
+ * The version is NOT pinned, like every other harness: images install pi's
+ * latest release, and lazy tolerates harness upgrades rather than freezing
+ * them. Re-verified unchanged against 1.3.0 (pi-agent-unpin-1x, 2026-10-21):
+ * headless json stream, --session-id resume, --thinking request bodies on all
+ * three wires, the extension bridge and models.json — see
+ * docs/pi-agent-integration.md.
  */
 
 import type { HealthCheck } from '../remote/driver';
 import type { AgentPackaging } from './interface';
 import { spawnSyncUnsupervised } from '../utils/spawn';
 
-/** The npm package and version lazy installs and was verified against. */
+/** The npm package lazy installs (latest release, unpinned). */
 export const PI_NPM_PACKAGE = '@earendil-works/pi-coding-agent';
-export const PI_PINNED_VERSION = '0.84.4';
+
+/**
+ * The oldest pi lazy's argv works with: 1.0.4 added `--no-mcp`, which every
+ * launch passes, and an older pi exits on it as an unknown option. A floor,
+ * not a pin — images install the latest release.
+ */
+export const PI_MIN_VERSION = '1.0.4';
 
 export const PI_INSTALL_HINT =
-  `Install with: bun add -g --ignore-scripts ${PI_NPM_PACKAGE}@${PI_PINNED_VERSION} ` +
-  '(needs node or a bun wrapper on PATH as `pi`)';
+  `Install with: bun add -g --ignore-scripts ${PI_NPM_PACKAGE} ` +
+  `(pi ${PI_MIN_VERSION} or later; needs node or a bun wrapper on PATH as \`pi\`)`;
+
+/**
+ * Whether a `pi --version` string is at least {@link PI_MIN_VERSION}. An
+ * unparseable version is not judged too old — only a recognisably older one.
+ */
+export function piVersionMeetsMinimum(version: string): boolean {
+  const parse = (v: string) => v.match(/(\d+)\.(\d+)\.(\d+)/)?.slice(1).map(Number);
+  const have = parse(version);
+  const need = parse(PI_MIN_VERSION)!;
+  if (!have) return true;
+  for (let i = 0; i < 3; i++) {
+    if (have[i]! !== need[i]!) return have[i]! > need[i]!;
+  }
+  return true;
+}
 
 /** Path of pi's bundled entry point under a `bun add -g` install. */
 const PI_GLOBAL_CLI_JS =
@@ -41,7 +64,7 @@ export class PiPackaging implements AgentPackaging {
   }
 
   npmPackage(): string {
-    return `${PI_NPM_PACKAGE}@${PI_PINNED_VERSION}`;
+    return PI_NPM_PACKAGE;
   }
 
   binaryName(): string {
@@ -54,12 +77,12 @@ export class PiPackaging implements AgentPackaging {
 
   dockerInstallCommand(): string {
     // Appended to the DEFAULT base Dockerfile (no bun there), as `user`:
-    // install bun for pi's runtime, install the pinned package with postinstall
+    // install bun for pi's runtime, install the latest package with postinstall
     // scripts blocked, then write a bun wrapper — pi's own bin shebang wants
     // node, which the image deliberately does not have.
     return (
       'RUN curl -fsSL https://bun.sh/install | bash \\\n' +
-      `    && /home/user/.bun/bin/bun add -g --ignore-scripts ${PI_NPM_PACKAGE}@${PI_PINNED_VERSION} \\\n` +
+      `    && /home/user/.bun/bin/bun add -g --ignore-scripts ${PI_NPM_PACKAGE} \\\n` +
       '    && mkdir -p /home/user/.local/bin \\\n' +
       `    && printf '#!/bin/sh\\nexec /home/user/.bun/bin/bun ${PI_GLOBAL_CLI_JS} "$@"\\n' > /home/user/.local/bin/pi \\\n` +
       '    && chmod +x /home/user/.local/bin/pi'
@@ -80,7 +103,7 @@ RUN useradd --create-home --shell /bin/bash user \\
 USER user
 ENV PATH="/home/user/.local/bin:\${PATH}"
 
-# Install the pi coding agent (pinned) with a bun wrapper as \`user\`.
+# Install the pi coding agent (latest) with a bun wrapper as \`user\`.
 ${this.dockerInstallCommand()}
 
 WORKDIR /work
@@ -106,7 +129,16 @@ WORKDIR /work
         timeout: 10_000,
       });
       if (version.exitCode === 0) {
-        results.push({ state: 'ok', what: `pi CLI installed (v${version.stdout.toString().trim()})` });
+        const installed = version.stdout.toString().trim();
+        if (!piVersionMeetsMinimum(installed)) {
+          return [{
+            state: 'fail',
+            what: `pi CLI installed (v${installed})`,
+            problem: `pi ${installed} is older than ${PI_MIN_VERSION}, the oldest version lazy can run`,
+            reason: `Every pi turn would fail on an unknown option. ${PI_INSTALL_HINT}`,
+          }];
+        }
+        results.push({ state: 'ok', what: `pi CLI installed (v${installed})` });
       } else {
         return [{
           state: 'fail',

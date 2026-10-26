@@ -316,6 +316,46 @@ export async function getFileAtCommit(sha: string, filepath: string, cwd?: strin
   return result.stdout;
 }
 
+
+export type BlobAtRefResult =
+  | { kind: 'content'; bytes: Uint8Array }
+  | { kind: 'tooLarge'; size: number }
+  /** A symlink (mode 120000), submodule or tree — never read as file content. */
+  | { kind: 'notRegular' }
+  | { kind: 'missing' };
+
+/**
+ * The raw bytes of one REGULAR file at a ref, bounded before they are read.
+ *
+ * The entry's mode is checked first (`ls-tree`), so a symlink's blob — its
+ * target string — is never handed out as if it were the file, and its size is
+ * checked before `cat-file` streams anything.
+ */
+export async function getRegularBlobAtRef(
+  ref: string,
+  filepath: string,
+  cwd: string,
+  maxBytes: number,
+): Promise<BlobAtRefResult> {
+  const listed = await runGit(['ls-tree', '-l', '-z', ref, '--', filepath], { cwd, trim: false });
+  if (listed.exitCode !== 0) {
+    throw new Error(`git ls-tree ${ref} -- ${filepath} failed: ${listed.stderr}`);
+  }
+  // `<mode> <type> <sha> <size>\t<path>\0` — one entry, whose path must be
+  // exactly the one asked for (ls-tree also matches a directory prefix).
+  const entry = listed.stdout.split('\0').find((e) => e.split('\t').slice(1).join('\t') === filepath);
+  if (!entry) return { kind: 'missing' };
+  const [mode, type, sha, sizeText] = entry.split('\t')[0]!.trim().split(/\s+/);
+  if (type !== 'blob' || (mode !== '100644' && mode !== '100755') || !sha) return { kind: 'notRegular' };
+  const size = Number(sizeText);
+  if (!Number.isFinite(size)) throw new Error(`git ls-tree gave no size for ${ref}:${filepath}`);
+  if (size > maxBytes) return { kind: 'tooLarge', size };
+  const blob = await runGit(['cat-file', 'blob', sha], { cwd, binaryStdout: true });
+  if (blob.exitCode !== 0 || !blob.stdoutBytes) {
+    throw new Error(`git cat-file blob ${sha} (${ref}:${filepath}) failed: ${blob.stderr}`);
+  }
+  return { kind: 'content', bytes: blob.stdoutBytes };
+}
 export async function createTag(name: string, cwd?: string): Promise<void> {
   const result = await runGit(['tag', name], { cwd });
   if (result.exitCode !== 0) {

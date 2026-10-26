@@ -53,6 +53,7 @@ import { reportProseBlocks } from '../review/prose-blocks';
 import { buildVerifyState } from '../review/verify-state';
 import { latestAgentWorkTurn } from '../task/turn-context';
 import { getOrCreateStorage } from './rpc-handlers';
+import { withLaunchIdempotency } from './launch-idempotency';
 import type { ActorIdentity } from './actor-tokens';
 import type { ReviewCommentSide, ReviewCommentIntent } from '../types';
 import type { ProgressEmitter } from './progress';
@@ -60,6 +61,7 @@ import { TASK_LEVEL_REVIEW_ANCHOR } from '../review/task-level-anchor';
 import { hasAnyQueuedComment, hasAnyAsk } from '../server/review-actions';
 import { parseUnifiedDiff, mermaidDiffDiagrams } from '../server/review-diff';
 import { loadMarkdownSources, renderMarkdownDocument } from '../server/review-markdown';
+import { imagePreviewFor } from '../review/image-preview';
 
 const SIDES: readonly ReviewCommentSide[] = ['old', 'new'];
 const INTENTS: readonly ReviewCommentIntent[] = ['ask', 'comment'];
@@ -82,6 +84,11 @@ export async function handleReviewDiff(projectRoot: string, params: Record<strin
   if (optionalBoolean(params, 'presentations') === true) {
     const presented = await presentationsFromDiff(diff, (query) => actions.getFileLines(taskId, query));
     return { diff, ...presented };
+  }
+  // `images: true` alone: which files are drawn as pictures, without rendering
+  // the documents and diagrams a page like accept never shows.
+  if (optionalBoolean(params, 'images') === true) {
+    return { diff, imagePreviews: imagePreviewsFromDiff(diff) };
   }
   return { diff };
 }
@@ -184,6 +191,11 @@ export async function reviewPresentations(actions: PresentationReads, taskId: st
   return presentationsFromDiff(diff, (query) => actions.getFileLines(taskId, query));
 }
 
+/** The image slots of a diff — `imagePreviewFor` over every file. */
+export function imagePreviewsFromDiff(diff: string) {
+  return parseUnifiedDiff(diff).map(imagePreviewFor).filter((p) => p !== null);
+}
+
 /**
  * Documents and diagrams for a diff that has already been fetched. Shared by
  * `reviewDiff` (when the caller asked) and `reviewPresentations`, so the two
@@ -197,13 +209,18 @@ export async function presentationsFromDiff(
   const sources = await loadMarkdownSources(files, readLines);
   const documents = [];
   const diagrams = [];
+  // Which files get a before/after picture — the daemon's rule, sent so a
+  // client never keeps its own list of image extensions.
+  const imagePreviews = [];
   for (const file of files) {
+    const image = imagePreviewFor(file);
+    if (image) imagePreviews.push(image);
     const doc = renderMarkdownDocument(file, sources.get(file.path), { allowComments: false });
     if (doc) documents.push({ path: file.path, ...doc });
     const blocks = mermaidDiffDiagrams(file);
     if (blocks.length > 0) diagrams.push({ path: file.path, blocks });
   }
-  return { documents, diagrams };
+  return { documents, diagrams, imagePreviews };
 }
 
 /**
@@ -326,16 +343,21 @@ export async function handleReviewAsk(projectRoot: string, params: Record<string
     };
   }
 
-  const comment = await createReviewActions(projectRoot).postComment(taskId, {
-    threadId: optionalString(params, 'threadId'),
-    file: anchor.file,
-    line: anchor.line,
-    side: anchor.side,
-    content,
-    intent: 'ask',
-    anchorSnippet: optionalString(params, 'anchorSnippet'),
-  });
-  return { comment };
+  // A retry with the same idempotency key gets the original answer and never
+  // posts the question twice (src/daemon/launch-idempotency.ts). The comment is
+  // written before the ask can fail, so a failure is replayed, never re-run.
+  return withLaunchIdempotency(await getOrCreateStorage(), 'reviewAsk', params, async () => {
+    const comment = await createReviewActions(projectRoot).postComment(taskId, {
+      threadId: optionalString(params, 'threadId'),
+      file: anchor.file,
+      line: anchor.line,
+      side: anchor.side,
+      content,
+      intent: 'ask',
+      anchorSnippet: optionalString(params, 'anchorSnippet'),
+    });
+    return { comment };
+  }, { failuresAreFinal: true });
 }
 
 export async function handleReviewRetryAsk(projectRoot: string, params: Record<string, unknown>) {

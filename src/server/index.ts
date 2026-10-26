@@ -16,6 +16,7 @@ import { logger } from '../utils/logger';
 import { redactSecretValuesDeep } from '../utils/redact';
 import { latestAgentWorkTurn } from '../task/turn-context';
 
+import { imageBlobHeaders } from '../review/image-preview';
 import {
   taskListHtml,
   searchResultsHtml,
@@ -3757,6 +3758,28 @@ async function handleReviewRoute(
           end: Number(q.get('end')),
         }),
       );
+    } catch (err) {
+      const status = err instanceof RpcError ? err.status : 500;
+      return json({ error: err instanceof Error ? err.message : String(err) }, status);
+    }
+  }
+
+  // The bytes of one image in this task's diff, for the before/after pictures
+  // (src/server/review-image.ts). The daemon decides what may be read (only
+  // files of this diff, never a symlink, capped, bytes checked against the
+  // extension — handleDiffBlob); this serves them with the image's own type,
+  // never sniffed, and a sandbox CSP for a blob opened on its own.
+  params = matchRoute(path, '/api/review/:id/blob');
+  if (params) {
+    if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
+    if (!actions.getDiffBlob) return json({ error: 'Image previews are not available from this daemon.' }, 501);
+    const resolved = await storage.resolveTask(params.id);
+    if (!resolved.task) return json({ error: 'Task not found' }, 404);
+    const side = url.searchParams.get('side');
+    if (side !== 'base' && side !== 'head') return json({ error: "side must be 'base' or 'head'" }, 400);
+    try {
+      const blob = await actions.getDiffBlob(resolved.task.id, { path: url.searchParams.get('path') ?? '', side });
+      return new Response(Buffer.from(blob.contentBase64, 'base64'), { headers: imageBlobHeaders(blob.contentType) });
     } catch (err) {
       const status = err instanceof RpcError ? err.status : 500;
       return json({ error: err instanceof Error ? err.message : String(err) }, status);

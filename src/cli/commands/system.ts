@@ -7,6 +7,8 @@ import { commandSystemAgent, systemAgentUsage } from './system-agent';
 import { commandSystemPassphrase, systemPassphraseUsage } from './system-passphrase';
 import { commandSystemSourceId, systemSourceIdUsage } from './system-source-id';
 import { commandSystemGuestInitScript, systemGuestInitScriptUsage } from './system-guest-init-script';
+import { commandSystemSmolvmBuildImage, systemSmolvmBuildImageUsage } from './system-smolvm-build-image';
+import { commandSystemSmolvmInstall, systemSmolvmInstallUsage } from './system-smolvm-install';
 import { commandSystemRepairCommits, systemRepairCommitsUsage } from './system-repair-commits';
 import { commandSystemStoreCheck, systemStoreCheckUsage } from './system-store-check';
 import {
@@ -50,6 +52,12 @@ export async function commandSystem(args: string[]): Promise<void> {
       break;
     case 'guest-init-script':
       await commandSystemGuestInitScript(sub);
+      break;
+    case 'smolvm-build-image':
+      await commandSystemSmolvmBuildImage(sub);
+      break;
+    case 'smolvm-install':
+      await commandSystemSmolvmInstall(sub);
       break;
     case 'source-id':
       await commandSystemSourceId(sub);
@@ -105,6 +113,8 @@ export const systemSubcommandUsage: Record<string, () => void> = {
   'passphrase': systemPassphraseUsage,
   'source-id': systemSourceIdUsage,
   'guest-init-script': systemGuestInitScriptUsage,
+  'smolvm-build-image': systemSmolvmBuildImageUsage,
+  'smolvm-install': systemSmolvmInstallUsage,
   'repair-commits': systemRepairCommitsUsage,
   'store-check': systemStoreCheckUsage,
   'store-backup': systemStoreBackupUsage,
@@ -131,6 +141,8 @@ Subcommands:
   status             Show current system state (offline/online, driver, daemon, storage)
   source-id          Print the content identity of this lazy source tree
   guest-init-script  Write out the daemon image's guest preparation script this lazy carries
+  smolvm-build-image Build the lazy daemon image in a throwaway smolvm machine (no host Docker)
+  smolvm-install     Download, verify and install the smolvm release lazy pins
   agent              Show agent readiness, switch the default agent, or set an agent API key
   passphrase         Enroll, inspect, or delete this machine's approval passphrase
   offline            Enable offline mode (skip all remote operations)

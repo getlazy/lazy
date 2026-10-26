@@ -186,7 +186,7 @@ const recordedStdin = argv.includes('-p') ? fs.readFileSync(0, 'utf8') : undefin
 //   --version  HostProcessRunner.checkAvailability() and PiPackaging.diagnose().
 function agentProbe(argv) {
   if (argv.includes('--version') || argv.includes('-v')) {
-    process.stdout.write('0.84.4-fake\n');
+    process.stdout.write('1.3.0-fake\n');
     return true;
   }
   return false;

@@ -10,7 +10,7 @@ before, and it is the command-line path. Prefer a browser? Start with the
 ## What you need
 
 - **git** and a git repository you want an agent to work on.
-- **[Bun](https://bun.sh)**, to build lazy from source.
+- **[Bun](https://bun.sh)** 1.4.3 or newer, to build lazy from source.
 - **Docker** (Docker Desktop on a Mac). Every task's agent runs in its own
   container.
 - **A model credential**, for example a Claude subscription or an Anthropic API

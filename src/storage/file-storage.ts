@@ -36,7 +36,7 @@ import {
   UsageLimitReadingsUnreadableError,
   validateStoredUsageLimitReading,
 } from './usage-limit-readings';
-import { BuilderSessionActiveError, BuilderSessionStateConflictError } from './interface';
+import { BuilderSessionStateConflictError } from './interface';
 import { normalizeTurnContent, normalizeRecordContent, repairRecordContents } from '../utils/turn-content';
 import type { SpanRecord } from '../tracing/types';
 import { appendSpansJsonl, readSpansJsonl } from './trace-spans';
@@ -392,12 +392,6 @@ interface SearchableConversationFile {
   messages: Array<{ text: string; role: string; timestamp?: string }>;
 }
 
-/**
- * Thrown by `createBuilderSession` when the member already has an active
- * (non-`ended`) session for the same project: ONE SESSION PER MEMBER PER
- * PROJECT (§5.7), enforced at write time inside the storage lock — see the
- * interface contract on createBuilderSession and BuilderSessionActiveError.
- */
 export class FileStorage implements Storage {
   private readonly basePath: string;
   private readonly tasksPath: string;
@@ -5491,20 +5485,8 @@ export class FileStorage implements Storage {
       if (sessions.some(s => s.id === session.id)) {
         throw new Error(`Builder session already exists: ${session.id}`);
       }
-      // ONE SESSION PER MEMBER PER PROJECT (§5.7), enforced at write time.
-      // This runs inside the SAME locked critical section as the insert above,
-      // so the claim a start registers before launching is also the exclusion:
-      // a rival start cannot slip a second active row in between the check and
-      // the insert, through this method or through the raw storage proxy.
-      // 'ended' rows do not count — starting again after an explicit end is
-      // the normal flow. Rows from other members or other projects are theirs.
-      const rival = sessions.find(s =>
-        s.projectRoot === session.projectRoot &&
-        s.memberEmail === session.memberEmail &&
-        s.state !== 'ended');
-      if (rival) {
-        throw new BuilderSessionActiveError(rival.id, rival.state);
-      }
+      // A member may hold any number of sessions on a project, as `lazy builder`
+      // allows on a laptop: nothing here refuses a second active row.
       await this.writeJson(this.builderSessionsPath, { sessions: [...sessions, session] });
       return session;
     });

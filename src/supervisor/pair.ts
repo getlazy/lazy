@@ -81,7 +81,10 @@ export function pairInContainerCmd(opts: {
     '--task-id', opts.taskId,
     '--worktree', opts.worktreePath,
     '--agent', opts.harness,
-    '--runner', opts.runnerType,
+    // The in-container runner names the MCP server command. A smolvm task's
+    // container runs on the machine's Docker engine, so inside it is docker —
+    // as a supervised turn tells it; `smolvm` there has no project to build from.
+    '--runner', opts.runnerType === 'smolvm' ? 'docker' : opts.runnerType,
   ];
   if (opts.sessionId) cmd.push('--resume', opts.sessionId);
   if (opts.modelId) cmd.push('--model', opts.modelId);

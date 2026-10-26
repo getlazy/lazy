@@ -6,6 +6,7 @@
  */
 
 import type { Runner } from '../runner/types';
+import { createSmolvmRunner } from '../runner/smolvm-runner';
 import type { RunnerType, ResolvedConfig, RoleTarget } from '../config/types';
 import { DockerRunner } from '../runner/docker-runner';
 import { PodmanRunner } from '../runner/podman-runner';
@@ -40,8 +41,10 @@ async function withProxyTargets(
  */
 export async function createOneshotRunner(lazyRoot: string): Promise<Runner> {
   const config = await loadConfig(lazyRoot);
+  // smolvm is a container runner too: its one-shots run on the project's
+  // machine, never on whatever Docker engine this host happens to have.
   const containerType: RunnerType =
-    config.runner.type === 'podman' ? 'podman' : 'docker';
+    config.runner.type === 'podman' || config.runner.type === 'smolvm' ? config.runner.type : 'docker';
 
   // The BUILDER role, not `[agent] agent_id`: a one-shot is a fresh-context call
   // lazy makes on the human's behalf, so it runs the builder's target end to end
@@ -79,7 +82,9 @@ export async function createOneshotRunner(lazyRoot: string): Promise<Runner> {
 
   const runner = containerType === 'podman'
     ? new PodmanRunner(lazyRoot)
-    : new DockerRunner(containerType, containerType, lazyRoot);
+    : containerType === 'smolvm'
+      ? await createSmolvmRunner(lazyRoot, config)
+      : new DockerRunner(containerType, containerType, lazyRoot);
   runner.setRoleTargets(roleTargets);
   // Both halves, always: the harness picks the binary, the profile name says
   // which profile that binary came from. Handing over only half is how a custom

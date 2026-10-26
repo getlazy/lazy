@@ -36,6 +36,7 @@
  */
 
 import { ensureTaskContainer, type EnsureTaskContainerParams, type EnsureTaskContainerResult } from './task-container';
+import { containerCliForType, containerCliOf } from '../runner/container-cli';
 import { getOrCreateStorage } from './rpc-handlers';
 import { RpcError } from './rpc-error';
 import { resolveProjectStartServicesCmd, resolveProjectStopServicesCmd } from '../serve/start-cmd';
@@ -57,9 +58,12 @@ export const SERVICES_LOG_FILE = '/tmp/lazy-services.log';
 /** How much of the log a status read returns. */
 const LOG_TAIL_BYTES = 16 * 1024;
 
-/** The container CLI a runner type drives. */
-export function containerBinaryFor(runnerType: string): string {
-  return runnerType === 'podman' ? 'podman' : 'docker';
+/**
+ * The container CLI a runner type drives — for smolvm, the project's script
+ * aimed at its machine (src/runner/container-cli.ts), never a bare `docker`.
+ */
+export function containerBinaryFor(projectRoot: string, runnerType: string): Promise<string> {
+  return containerCliForType(projectRoot, runnerType);
 }
 
 /**
@@ -413,7 +417,7 @@ export async function runStartServices(
 
   reporter.begin(P.services, `running ${command}`);
   const exec = deps.exec ?? defaultExec;
-  const binary = containerBinaryFor(container.runnerType);
+  const binary = await containerBinaryFor(projectRoot, container.runnerType);
   const result = await exec(
     [binary, 'exec', '-w', container.worktreePath, container.containerName, 'sh', '-c', startServicesScript(SETTLE_SECONDS), 'lazy-services', command, container.worktreePath],
     30_000,
@@ -530,7 +534,7 @@ export async function runContainerTarget(projectRoot: string, run: CommitRun): P
   if (!runner.usesSandbox()) return null;
   const name = runContainerName(projectRoot, run.slug);
   if (!(await runner.isRunning(name))) return null;
-  return { binary: containerBinaryFor(runner.type), name };
+  return { binary: containerCliOf(runner), name };
 }
 
 /** The task's container when it is running on a container runner; null otherwise. */
@@ -539,7 +543,7 @@ export async function taskContainerTarget(projectRoot: string, task: Task, sessi
   if (!runner.usesSandbox()) return null;
   const name = session?.container_name ?? runner.runNameForTask(taskRef(task));
   if (!(await runner.isRunning(name))) return null;
-  return { binary: containerBinaryFor(runner.type), name };
+  return { binary: containerCliOf(runner), name };
 }
 
 /**

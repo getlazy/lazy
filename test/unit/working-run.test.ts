@@ -108,6 +108,16 @@ describe('probeWorkingRun when the runtime does not answer', () => {
     expect(probe.substate).toBeNull();
   });
 
+  // INVARIANT: a runner that cannot tell whether a run is alive THROWS from
+  // isRunning (the smolvm runner, when its machine runs but its engine does not
+  // answer); that is liveness unknown, never not-alive.
+  test('an isRunning that throws yields unknown liveness, not a dead run', async () => {
+    const unsure = { ...runner, isRunning: async () => { throw new Error('the engine did not answer'); } } as unknown as Runner;
+    const probe = await probeWorkingRun('/nowhere', task(null), session, unsure);
+    expect(probe.livenessUnknown).toBe('the engine did not answer');
+    expect(probe.substate).toBeNull();
+  });
+
   test('an answered "no such run" is still not-alive', async () => {
     const answers = { ...runner, probeRunInfo: async () => ({ kind: 'answered', info: null }) } as unknown as Runner;
     const probe = await probeWorkingRun('/nowhere', task(null), session, answers);

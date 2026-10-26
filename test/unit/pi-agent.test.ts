@@ -12,7 +12,7 @@ import { join } from 'path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { PiAgent, PiActivityStream, resolvePiProvider, LAZY_PI_PROVIDER_ENV } from '../../src/agent/pi';
-import { PiPackaging, PI_PINNED_VERSION } from '../../src/agent/pi-packaging';
+import { PiPackaging, PI_NPM_PACKAGE, PI_MIN_VERSION, piVersionMeetsMinimum } from '../../src/agent/pi-packaging';
 import { getAgent, getAgentPackaging, listAgents, agentDisplayName } from '../../src/agent/registry';
 import { extractUsage } from '../../src/proxy/usage';
 import { aggregateUsage } from '../../src/proxy/aggregate';
@@ -85,6 +85,16 @@ describe('PiAgent', () => {
       expect(args).toContain('--no-approve');
       const interactive = agent.buildInteractiveArgs({ modelId: 'claude-opus-5', dangerouslySkipPermissions: false });
       expect(interactive).toContain('--no-approve');
+    });
+
+    // INVARIANT (security): --no-mcp keeps pi's built-in MCP client (0.99.0+) off,
+    // so lazy's bridge extension is the only MCP surface a pi turn has — an
+    // mcp.json a previous turn wrote into the HOME can never connect.
+    test('always passes --no-mcp', () => {
+      const args = agent.buildExecArgs({ prompt: 'x', modelId: 'claude-opus-5', dangerouslySkipPermissions: true });
+      expect(args).toContain('--no-mcp');
+      const interactive = agent.buildInteractiveArgs({ modelId: 'claude-opus-5', dangerouslySkipPermissions: false });
+      expect(interactive).toContain('--no-mcp');
     });
 
     // INVARIANT: the provider is lazy's decision, made from the resolved role
@@ -430,6 +440,19 @@ describe('PiAgent', () => {
       expect(failure.class).toBe('fatal_auth');
     });
 
+    // INVARIANT: a pi too old for lazy's argv (no --no-mcp, < 1.0.4) is a
+    // fatal_config that names the minimum and the install line — not the
+    // generic "rejected the invocation", which gives no way out.
+    test('a pi too old for --no-mcp is fatal_config naming the minimum', () => {
+      const failure = agent.classifyFailure({
+        message: 'agent crashed',
+        stderr: 'Error: Unknown option: --no-mcp\nWarning: Model "x" not found for provider "anthropic". Using custom model id.',
+      });
+      expect(failure.class).toBe('fatal_config');
+      expect(failure.reason).toContain(PI_MIN_VERSION);
+      expect(failure.reason).toContain('bun add -g');
+    });
+
     test('unknown provider is fatal_config', () => {
       const failure = agent.classifyFailure({
         message: 'agent crashed',
@@ -567,15 +590,25 @@ describe('PiPackaging', () => {
     expect(packaging.supportsContainerRunner()).toBe(true);
   });
 
-  // INVARIANT: the install is PINNED to the version the arg/stream contract
-  // was verified against — a floating latest would change the contract under
-  // every image rebuild.
-  test('docker install is pinned and blocks postinstall scripts', () => {
+  // INVARIANT: no harness is pinned (engineer, 2026-10-04) — pi installs its
+  // latest release like Claude Code, Cursor and Codex, and lazy tolerates
+  // harness upgrades instead. Postinstall scripts stay blocked.
+  test('docker install is unpinned and blocks postinstall scripts', () => {
     const install = packaging.dockerInstallCommand();
-    expect(install).toContain(`@earendil-works/pi-coding-agent@${PI_PINNED_VERSION}`);
-    expect(install).toContain('--ignore-scripts');
-    expect(packaging.npmPackage()).toContain(`@${PI_PINNED_VERSION}`);
+    expect(install).toContain(`add -g --ignore-scripts ${PI_NPM_PACKAGE} \\`);
+    expect(install).not.toMatch(/pi-coding-agent@/);
+    expect(packaging.npmPackage()).toBe(PI_NPM_PACKAGE);
     expect(packaging.generateDockerfile()).toContain(install);
+  });
+
+  test('version floor: 1.0.4 and later pass, older fails, unparseable is not judged', () => {
+    expect(piVersionMeetsMinimum('1.0.4')).toBe(true);
+    expect(piVersionMeetsMinimum('1.3.0')).toBe(true);
+    expect(piVersionMeetsMinimum('2.0.0')).toBe(true);
+    expect(piVersionMeetsMinimum('1.0.3')).toBe(false);
+    expect(piVersionMeetsMinimum('0.84.4')).toBe(false);
+    expect(piVersionMeetsMinimum('0.99.2')).toBe(false);
+    expect(piVersionMeetsMinimum('dev')).toBe(true);
   });
 
   test('supervisor tool checks use bare binary names', () => {

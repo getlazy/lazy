@@ -39,8 +39,10 @@ to paste, and a draggable bottom edge to change the height.
 ## Pair and Chat
 
 **Pair** takes over the agent's session in the same terminal, with the same
-lock as `lazy pair`: unblock and accept refuse until you stop, and a dropped
-connection ends pairing within 30 seconds so the task cannot stay locked
+lock as `lazy pair`: unblock and accept refuse until you stop. A dropped
+connection reconnects to the same session by itself (see
+[When the connection drops](#when-the-connection-drops)); if it cannot within
+5 minutes, pairing ends 30 seconds later, so the task cannot stay locked
 forever. Only one Pair session per task.
 
 **Chat** opens a read-only conversation with the task's agent (`lazy chat`).
@@ -100,10 +102,22 @@ Run is offered only for blocks that could be shell input (a `json`, `toml` or
 when no shell can be opened. A stopped container is not one of those reasons —
 Run starts it, and says so in the terminal it opens.
 
-If the connection drops, **Reconnect** opens a fresh shell (the previous one is
-gone; a terminal session does not survive the socket closing, and a reconnected
-session does not re-run its block). Closing the terminal, leaving the page, or
-typing `exit` ends the session.
+Closing the terminal, leaving the page, or typing `exit` ends the session.
+
+## When the connection drops
+
+A terminal whose connection drops — Wi-Fi changing, a laptop waking from sleep,
+a proxy closing a connection — is not ended. The program in it keeps running
+for **5 minutes**, and the page reconnects to it by itself: quick tries first,
+then every 30 seconds. The status line says **Connection lost — reconnecting…**
+while it does, and typing is paused (nothing you type in that gap is sent).
+When it is back, the output you missed is drawn once and the session carries on
+where it was. Watch reconnects the same way and redraws its stream.
+
+It does not reconnect when the session really ended: the program exited, you
+closed the terminal or left the page, or the server refused it. Then the status
+line says what happened and **Open a new session** starts a fresh one. A
+terminal that could not reconnect within the 5 minutes has ended too.
 
 ## Starting the container
 
@@ -114,9 +128,8 @@ Pair and Chat do the same. Two panels opened together share one start; they
 never race two containers for the same task.
 
 If the start fails — Docker not running, an image that will not build — the
-panel shows the failure text and its **Reconnect** button becomes **Start
-container**, so you can retry once you have fixed the cause. That is the only
-place a Start button appears next to a terminal.
+panel shows the failure text and a **Start container** button, so you can
+retry once you have fixed the cause. That is the only place a Start button appears next to a terminal.
 
 ## When a shell cannot be opened
 

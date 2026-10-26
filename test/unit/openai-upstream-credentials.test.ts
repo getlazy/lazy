@@ -209,8 +209,15 @@ describe('credential resolution for the proxy target map', () => {
   let root: string;
   let undoDaemonBase: () => void;
   const savedConfig = process.env.LAZY_CONFIG;
+  const savedCredentialEnv = new Map<string, string | undefined>();
 
   beforeAll(async () => {
+    // INVARIANT: credential-store fixtures own their credential inputs. An
+    // inherited API key must neither satisfy "missing" nor override a stored key.
+    for (const key of ['OPENAI_API_KEY', 'OPENROUTER_API_KEY']) {
+      savedCredentialEnv.set(key, process.env[key]);
+      delete process.env[key];
+    }
     root = await mkdtemp(join(tmpdir(), 'lazy-openai-cred-'));
     undoDaemonBase = pinDaemonBaseDir(await makeDaemonBaseDir());
     // A file-backed credential store, isolated from the developer's own.
@@ -221,6 +228,10 @@ describe('credential resolution for the proxy target map', () => {
 
   afterAll(async () => {
     undoDaemonBase();
+    for (const [key, value] of savedCredentialEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     if (savedConfig === undefined) delete process.env.LAZY_CONFIG;
     else process.env.LAZY_CONFIG = savedConfig;
     await rm(root, { recursive: true, force: true });

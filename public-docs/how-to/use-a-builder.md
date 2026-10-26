@@ -23,7 +23,7 @@ lazy builder list
 
 If `lazy upgrade` stops your builder to rebuild the image, it is relaunched in place afterwards with its conversation intact.
 
-In a clone logged in to Lazy Teams, `lazy builder` attaches your terminal to your builder running on the server, starting it if needed. Press ctrl-] to detach and leave it running. `lazy builder stop [<id>]` stops it and keeps the conversation; `lazy builder end [<id>]` ends the run; its conversation stays listed and can be resumed.
+In a clone logged in to Lazy Teams, `lazy builder` starts another builder on the server and attaches your terminal to it, as it starts another one on your own machine. Press ctrl-] to detach and leave it running; `lazy builder attach [<id>]` reattaches (relaunching a stopped one). `lazy builder stop [<id>]` stops one and keeps the conversation; `lazy builder end [<id>]` ends the run, and its conversation stays listed and can be resumed. With more than one builder, name the session id; lazy lists them when you leave it out.
 
 ### Dashboard
 
@@ -37,13 +37,13 @@ Open a conversation to read its messages (#1, #2, … with who said each and whe
 
 Open **Builders** in your project.
 
-![The Lazy Teams Builders page: an Open your builder button, a transcript search box and a list of builders with Running and Stopped badges](../images/teams/teams-builders.png)
+![The Lazy Teams Builders page: a Start a new builder button, your two running builders each with Open and Stop, a transcript search box and a list of builders with Running and Stopped badges](../images/teams/teams-builders.png)
 
-1. Choose **Start your builder**. If you already have one, the button reads **Open your builder** (running) or **Resume your builder** (stopped).
+1. Choose **Start a new builder**. Each press starts another one, so you can run several at once; every builder of yours is listed under **Your builders** with **Open** and **Stop**.
 2. Work in the terminal on the page. A builder runs on the account of the person using it, so you can only open your own.
-3. **Stop** keeps the transcript and **Resume** starts it again. **End** finishes the run; the transcript is kept, and the builder can still be resumed from the list.
-4. Each of your own builders in the list, stopped or ended, has a **Resume** button that continues it in a builder of yours. See [Resuming a builder](../reference/teams/builders.md#resuming-a-builder).
-5. Every builder in the list, a teammate's included, has **Continue**, which starts a new builder of yours from a summary of it. See [Continuing from a summary](../reference/teams/builders.md#continuing-from-a-summary).
+3. **Stop** keeps the transcript and **Resume** starts that builder again; your other builders keep running. **End** finishes the run; the transcript is kept, and the builder can still be resumed from the list.
+4. Each of your own builders in the list, stopped or ended, has a **Resume** button that continues it in an additional builder of yours. See [Resuming a builder](../reference/teams/builders.md#resuming-a-builder).
+5. Every builder in the list, a teammate's included, has **Continue**, which starts an additional builder of yours from a summary of it. See [Continuing from a summary](../reference/teams/builders.md#continuing-from-a-summary).
 
 Below, each past builder has a transcript. Tick **Select message** beside messages and choose **Create task** to start a new task from them. See [Builders in Lazy Teams](../lazy-teams-builders.md).
 

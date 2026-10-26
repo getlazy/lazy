@@ -15,7 +15,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync, chmodSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, isAbsolute, relative, resolve } from 'path';
 import { randomUUID } from 'crypto';
 import { getHome } from '../utils/home';
 import type { Command, Response, SupervisorStatus } from './types';
@@ -148,7 +148,7 @@ export function computeAgentExtraArgs(config: ResolvedConfig): { agent_extra_arg
  * Get the base directory for protocol files.
  * Defaults to ~/.lazy/protocol. Override with LAZY_PROTOCOL_BASE for testing.
  */
-function protocolBase(): string {
+export function protocolBase(): string {
   return process.env.LAZY_PROTOCOL_BASE || join(getHome(), '.lazy', 'protocol');
 }
 
@@ -636,11 +636,26 @@ export function cleanProtocol(dir: string): void {
  */
 export function removeProtocolDir(dir: string): void {
   try {
+    // On the smolvm runner `dir` is a symlink into the per-project tree
+    // `<protocol base>-smolvm/<machine>/` (moveProtocolDirInto): rmdir fails on
+    // a link, so remove its target and then the link itself. A link pointing
+    // anywhere else is never followed — only the link goes.
+    const { lstatSync, readlinkSync, rmdirSync } = require('fs');
+    let isLink = false;
+    try { isLink = lstatSync(dir).isSymbolicLink(); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+    if (isLink) {
+      const target = resolve(dirname(dir), readlinkSync(dir));
+      const rel = relative(`${dirname(dir)}-smolvm`, target);
+      if (rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)) {
+        cleanProtocol(target);
+        if (existsSync(target)) rmdirSync(target);
+      }
+      unlinkSync(dir);
+      return;
+    }
     // Remove files first, then the directory
     cleanProtocol(dir);
-    if (existsSync(dir)) {
-      const { rmdirSync } = require('fs');
-      rmdirSync(dir);
-    }
+    if (existsSync(dir)) rmdirSync(dir);
   } catch { /* best effort */ }
 }

@@ -37,12 +37,16 @@
  */
 
 import { ensureImage } from '../capture/claude';
+import { containerCliOf } from '../runner/container-cli';
 import { RunnerImageNotReadyError, DEFAULT_RUNNER_IMAGE_PIN } from '../capture/custom-image-gate';
 import { dataDirOfWorktree, lazyDataDirMaskArgs } from '../capture/lazy-dir-mask';
 import { buildTaskGitMounts } from '../capture/git-mounts';
 import { probeContainerGitPointers } from '../git/container-pointers';
 import { withDeliveredFilesGitConfig, deliveredExcludeFileFor } from '../git/delivered-files-exclude';
 import { createRunner } from '../runner';
+import { createSmolvmRunner, type SmolvmRunner } from '../runner/smolvm-runner';
+import type { Runner } from '../runner/types';
+import { isContainerRunnerType, type ResolvedConfig } from '../config/types';
 import { PROJECT_LABEL } from '../runner/docker-runner';
 import { buildPublishArgs } from '../serve/ports';
 import { loadConfig } from '../config/loader';
@@ -62,7 +66,7 @@ import type { PhaseNotify } from './progress';
 import type { CommitRun } from '../storage/types';
 import type { Storage } from '../storage';
 
-/** The network every run container joins (docker) — see the header. */
+/** The network every run container joins (docker and smolvm) — see the header. */
 export const RUN_NETWORK_SPEC: IsolatedNetworkSpec = {
   name: 'lazy-runs',
   bridge: 'lzruns0',
@@ -70,10 +74,6 @@ export const RUN_NETWORK_SPEC: IsolatedNetworkSpec = {
   purpose: 'commit runs',
 };
 
-/** The container CLI a runner type drives. */
-function binaryFor(runnerType: string): string {
-  return runnerType === 'podman' ? 'podman' : 'docker';
-}
 
 export interface RunContainerArgsParams {
   binary: string;
@@ -200,7 +200,13 @@ export async function ensureRunContainer(
       throw new RpcError(400,
         `This project runs on the ${runner.type} runner, which has no containers — a run needs one to publish its services in.`);
     }
-    const binary = binaryFor(runner.type);
+    // On smolvm a run goes through the same launch gate as a task turn — the
+    // smolvm pin, the machine record, create or start — before anything is
+    // asked of the machine's engine. Its lazy-runs network is then made on that
+    // engine (by runner type, below), and its ports reach the host through the
+    // machine's published services port (src/vm/solo-routes.ts).
+    if (runner.type === 'smolvm') await (runner as SmolvmRunner).ensureMachine();
+    const binary = containerCliOf(runner);
 
     let running = await runner.isRunning(containerName);
     if (running && !(await pathExists(worktreePath))) {
@@ -224,7 +230,7 @@ export async function ensureRunContainer(
     }
 
     params.onLaunching?.();
-    await launchRunContainer(projectRoot, run, { binary, containerName, worktreePath, notify: params.notify }, deps);
+    await launchRunContainer(projectRoot, run, { binary, runnerType: runner.type, containerName, worktreePath, notify: params.notify }, deps);
     logger.info(`Started the container for run ${run.slug} (${describeCommitRunTarget(run)} at ${run.head_sha.slice(0, 12)})${checkout.created ? ', with a fresh checkout' : ''}.`);
     return { containerName, worktreePath, runnerType: runner.type, alreadyRunning: false };
   });
@@ -233,10 +239,10 @@ export async function ensureRunContainer(
 async function launchRunContainer(
   projectRoot: string,
   run: CommitRun,
-  where: { binary: string; containerName: string; worktreePath: string; notify?: PhaseNotify },
+  where: { binary: string; runnerType: string; containerName: string; worktreePath: string; notify?: PhaseNotify },
   deps: EnsureRunContainerDeps,
 ): Promise<void> {
-  const { binary, containerName, worktreePath, notify } = where;
+  const { binary, runnerType, containerName, worktreePath, notify } = where;
   const exec = deps.run ?? runCaptured;
   // The run's own files (the project's "always" files a control plane pushed
   // under the run's id), before the container sees the checkout.
@@ -273,7 +279,7 @@ async function launchRunContainer(
   }
 
   let network: string | null = null;
-  if (binary === 'docker') {
+  if (runNetworkFor(runnerType)) {
     try {
       await (deps.ensureNetwork ?? ((b: string) => ensureIsolatedNetwork(b, RUN_NETWORK_SPEC)))(binary);
     } catch (err) {
@@ -322,6 +328,16 @@ async function launchRunContainer(
   await recordTaskEnvLaunched(projectRoot, run.id, containerName, vars);
 }
 
+/**
+ * The isolated network a run joins on this runner, or null (podman runs join
+ * podman's default network, as task containers do). Decided by runner TYPE,
+ * never by the client's name: the smolvm runner's client is a script path, and
+ * a name check would drop the isolation silently.
+ */
+export function runNetworkFor(runnerType: string): IsolatedNetworkSpec | null {
+  return runnerType === 'docker' || runnerType === 'smolvm' ? RUN_NETWORK_SPEC : null;
+}
+
 /** `rm -f` a run container. "No such container" is success. */
 export async function removeRunContainer(binary: string, name: string): Promise<void> {
   if (!name.startsWith(RUN_CONTAINER_PREFIX)) throw new Error(`Refusing to remove '${name}': not a run container.`);
@@ -338,8 +354,42 @@ export async function stopRunContainer(projectRoot: string, run: CommitRun): Pro
   if (!runner.usesSandbox()) return { stopped: false };
   const name = runContainerName(projectRoot, run.slug);
   const was = await runner.isRunning(name);
-  await removeRunContainer(binaryFor(runner.type), name);
+  await removeRunContainer(containerCliOf(runner), name);
   return { stopped: was };
+}
+
+/**
+ * The container client the daemon's start and shutdown sweeps remove run
+ * containers with, or null when there is nothing to sweep.
+ *
+ * Every container runner is swept, smolvm included — through ITS client, never
+ * a bare `docker`, which would ask a different engine and leave the guest's
+ * run containers running forever. Built without `createRunner`, which resolves
+ * the live proxy address and can fail while the daemon is starting or stopping.
+ * A smolvm machine that is not running runs no run container, and is never
+ * created or started just to be asked.
+ */
+export async function runContainerSweepCli(
+  projectRoot: string,
+  config: ResolvedConfig,
+  deps: { smolvmRunner?: (root: string, config: ResolvedConfig) => Promise<Pick<SmolvmRunner, 'machineRunning'> & Runner> } = {},
+): Promise<string | null> {
+  const type = config.runner.type;
+  if (!isContainerRunnerType(type)) return null;
+  if (type !== 'smolvm') return type;
+  const runner = await (deps.smolvmRunner ?? createSmolvmRunner)(projectRoot, config);
+  if (!(await runner.machineRunning())) return null;
+  return containerCliOf(runner);
+}
+
+/** The daemon's run-container sweep: {@link runContainerSweepCli}, then {@link removeRunContainers}. */
+export async function sweepRunContainers(
+  projectRoot: string,
+  deps: { cli?: () => Promise<string | null> } = {},
+): Promise<{ removed: number; failed: Array<{ name: string; error: string }> }> {
+  const cli = await (deps.cli ?? (async () => runContainerSweepCli(projectRoot, await loadConfig(projectRoot))))();
+  if (!cli) return { removed: 0, failed: [] };
+  return removeRunContainers(projectRoot, cli);
 }
 
 /**

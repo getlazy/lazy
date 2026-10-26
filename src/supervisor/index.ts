@@ -13,19 +13,19 @@
  *
  * The PID-1 wrapper script restarts the supervisor between turns so that
  * Bun's allocator (mimalloc) releases all memory back to the OS. On a stop
- * command the supervisor exits with code 42, which tells the wrapper to stop.
+ * command the supervisor exits with code 42; the wrapper keeps the environment.
  *
  * Legacy loop mode (without --one-shot) is still supported for backward
  * compatibility: the supervisor stays alive and returns to step 2.
  */
 
 import { existsSync } from 'fs';
+import { beginSupervisorCommand, writeSupervisorResponse } from '../protocol/supervisor-receipt';
 import { mkdir, realpath, writeFile } from 'fs/promises';
 import { basename, dirname, join } from 'path';
 import {
   readCommand,
   consumeCommand,
-  writeResponse,
   supersedeResponse,
   writeStatus,
   clearStatus,
@@ -119,7 +119,8 @@ function writeCorrelatedResponse(
   if (supersedeResponse(protocolDir)) {
     log('[supervisor] Set aside an unread response from an earlier command before answering this one.');
   }
-  writeResponse(protocolDir, attachCommandId(response, commandCorrelationId(command)));
+  const correlated = attachCommandId(response, commandCorrelationId(command));
+  writeSupervisorResponse(protocolDir, correlated);
   return response;
 }
 
@@ -133,8 +134,8 @@ export interface SupervisorConfig {
   /**
    * One-shot mode: process exactly one command then exit.
    * Exit code 0 = turn completed (wrapper restarts).
-   * Exit code 1 = turn failed (wrapper exits with the failure).
-   * Exit code 42 = stop command received (wrapper exits cleanly).
+   * Exit code 1 = turn failed (wrapper restarts with backoff).
+   * Exit code 42 = stop command received (environment stays alive).
    * This allows the OS to reclaim memory between turns.
    */
   oneShot?: boolean;
@@ -277,8 +278,8 @@ export function checkProtocolVersion(commandVersion: number | undefined, supervi
  *
  * In one-shot mode, processes exactly one command then exits:
  *   - Exit 0 on normal turn completion (wrapper restarts the process).
- *   - Exit 1 on a failed turn (wrapper exits with the failure).
- *   - Exit 42 on stop command (wrapper exits cleanly).
+ *   - Exit 1 on a failed turn (wrapper restarts the process).
+ *   - Exit 42 on stop command (wrapper waits for another turn).
  */
 export async function runSupervisor(config: SupervisorConfig): Promise<number> {
   const { protocolDir, worktreePath, pollIntervalMs = 500, oneShot = false, runnerType = 'docker' } = config;
@@ -361,6 +362,7 @@ export async function runSupervisor(config: SupervisorConfig): Promise<number> {
     // The command data is in the `command` variable; the file is just the
     // delivery mechanism. Consuming early prevents the retry loop's
     // hasCommand() check from seeing the stale file and aborting retries.
+    if (oneShot && command.type !== 'stop') beginSupervisorCommand(protocolDir, command);
     consumeCommand(protocolDir);
 
     if (command.type === 'stop') {

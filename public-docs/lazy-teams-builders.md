@@ -1,9 +1,10 @@
 # Builders in Lazy Teams
 
-Open **Builders** in your project to start or return to your builder, read
-previous conversations, and find the files builders have left for you.
+Open **Builders** in your project to start a builder — as many at once as you
+like — return to one of yours, read previous conversations, and find the files
+builders have left for you.
 
-![The Builders page listing builder conversations, with the live one marked running](images/teams/teams-builders.png)
+![The Builders page: your running builders, each with Open and Stop, above the list of builder conversations](images/teams/teams-builders.png)
 
 ## The terminal
 

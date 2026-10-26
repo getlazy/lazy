@@ -82,6 +82,7 @@ describe('GitHubDriver approveForMerge', () => {
       build_inputs: [],
       run_args: [],
     },
+    smolvm: { binary: '', image: '', cpus: 4, memory_mib: 8192, storage_gib: 64, allow_cidrs: [] },
     runner: { type: 'docker' as const, permission_mode: 'sandbox' as const, sandbox_allowed_domains: ['*.anthropic.com'], sandbox_deny_read: [], sandbox_deny_write: [], sandbox_allow_weaker_nested: false, verify_sandbox_boundary: 'off' as const },
     documents: {
       path: '',

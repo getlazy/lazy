@@ -12,13 +12,15 @@ export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck, DiagnoseOp
 export { PROJECT_LABEL_KEY } from './docker-runner';
 
 import type { Runner } from './types';
-import type { RunnerType, ResolvedConfig, RoleTarget } from '../config/types';
+import { isContainerRunnerType, type RunnerType, type ResolvedConfig, type RoleTarget } from '../config/types';
 import { DockerRunner } from './docker-runner';
 import { PodmanRunner } from './podman-runner';
+import { createSmolvmRunner } from './smolvm-runner';
 import { HostProcessRunner } from './host-process-runner';
 import { hostSandboxStorePath } from './host-sandbox';
 import {
   assertHostRunnerConfigAllowed,
+  assertRunnerAllowedInManagedMode,
   HOST_RUNNER_TYPE,
   isHostRunnerType,
 } from './host-runner-gate';
@@ -107,6 +109,8 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
     );
   }
 
+  assertRunnerAllowedInManagedMode(runnerType);
+
   // Host-only agents cannot use container runners. Check against the RESOLVED
   // runner type, not the global default — a per-task host override is exactly
   // how a host-only agent is meant to run on a container-default project.
@@ -118,7 +122,7 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
   const profileName = config.agent.agent_id;
   const harness = profileForAgentName(config, profileName, 'lazy.toml [agent] agent_id').harness;
   if (
-    (runnerType === 'docker' || runnerType === 'podman') &&
+    isContainerRunnerType(runnerType) &&
     !getAgentPackaging(harness).supportsContainerRunner()
   ) {
     throw new Error(
@@ -144,6 +148,11 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
       runner.setRoleTargets(roleTargets);
       return runner;
     }
+    case 'smolvm': {
+      const runner = await createSmolvmRunner(lazyRoot, config);
+      runner.setRoleTargets(roleTargets);
+      return runner;
+    }
     case HOST_RUNNER_TYPE: {
       const runner = new HostProcessRunner(lazyRoot);
       runner.setRoleTargets(roleTargets);
@@ -158,12 +167,15 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
       return runner;
     }
     default:
-      throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman`);
+      throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman, smolvm`);
   }
 }
 
 /**
  * Create a Runner from an explicit runner type (used by supervisor inside container).
+ *
+ * Not for `smolvm`: that runner belongs to a project (its machine, its
+ * relay), so it comes only from {@link createRunner} with the project root.
  */
 export function createRunnerFromType(runnerType: RunnerType): Runner {
   switch (runnerType) {
@@ -173,6 +185,8 @@ export function createRunnerFromType(runnerType: RunnerType): Runner {
       return new PodmanRunner();
     case HOST_RUNNER_TYPE:
       return new HostProcessRunner();
+    case 'smolvm':
+      throw new Error('The smolvm runner needs its project: create it with createRunner(<project root>), not from its type alone.');
     default:
       throw new Error(`Unknown runner type: ${runnerType}. Valid values: docker, podman`);
   }

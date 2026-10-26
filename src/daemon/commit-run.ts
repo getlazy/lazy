@@ -41,7 +41,8 @@ import { requireString, optionalBoolean, optionalString, optionalActorInput } fr
 import { createRunner } from '../runner';
 import { clearTaskEnv } from './task-env';
 import { forgetTaskFiles } from './task-files';
-import { readServicesRunState, containerBinaryFor, runStartServices } from './serve-run';
+import { readServicesRunState, runStartServices } from './serve-run';
+import { containerCliOf } from '../runner/container-cli';
 import { PhaseReporter, type PlannedPhase, type ProgressEmitter } from './progress';
 import { logger } from '../utils/logger';
 import { pathExists } from '../utils/fs';
@@ -446,7 +447,7 @@ async function servicesRunning(projectRoot: string, run: CommitRun): Promise<'ru
   const name = runContainerName(projectRoot, run.slug);
   if (!(await runner.isRunning(name))) return 'not-running';
   try {
-    const state = await readServicesRunState(containerBinaryFor(runner.type), name);
+    const state = await readServicesRunState(containerCliOf(runner), name);
     if (state === null) return { unknown: `${name} did not answer` };
     return state.state === 'running' ? 'running' : 'not-running';
   } catch (err) {
@@ -490,7 +491,7 @@ export async function removeCommitRun(
       if (hasChanges(changes)) throw dirtyCheckoutRefusal('Removing the run', changes);
     }
     const runner = await createRunner(projectRoot);
-    if (runner.usesSandbox()) await removeRunContainer(containerBinaryFor(runner.type), runContainerName(projectRoot, run.slug));
+    if (runner.usesSandbox()) await removeRunContainer(containerCliOf(runner), runContainerName(projectRoot, run.slug));
     const { discarded, discardedCommits } = await removeRunCheckout(projectRoot, run.slug, { confirmDiscard: true, recordedSha: run.head_sha });
     await storage.deleteCommitRun(run.id);
     await clearTaskEnv(projectRoot, run.id);

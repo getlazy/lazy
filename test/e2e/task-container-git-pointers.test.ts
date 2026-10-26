@@ -15,6 +15,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { hardwareTestEnv } from '../helpers/hardware-env';
 import { buildTaskGitMounts } from '../../src/capture/git-mounts';
 
 const binary = process.env.LAZY_TEST_CONTAINER_BINARY ?? 'docker';
@@ -22,7 +23,7 @@ const image = process.env.LAZY_TEST_GIT_IMAGE ?? 'lazy-runner:latest';
 
 function available(): boolean {
   try {
-    const info = Bun.spawnSync([binary, 'image', 'inspect', image], { stdout: 'ignore', stderr: 'ignore' });
+    const info = Bun.spawnSync([binary, 'image', 'inspect', image], { env: hardwareTestEnv(), stdout: 'ignore', stderr: 'ignore' });
     return info.exitCode === 0;
   } catch {
     // ENOENT: no container binary at all — the skip line below says so.
@@ -33,7 +34,7 @@ function available(): boolean {
 const skip = !available();
 if (skip) console.log(`[skip] test/e2e/task-container-git-pointers.test.ts: no ${binary} with image ${image}`);
 
-const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+const env = hardwareTestEnv({ GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' });
 function git(args: string[], cwd: string) {
   const r = Bun.spawnSync(['git', ...args], { cwd, env });
   if (r.exitCode !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr.toString()}`);
@@ -56,11 +57,11 @@ describe.skipIf(skip)('task container git pointers', () => {
     worktree = join(repo, '.lazy', 'worktrees', 'ctr-task');
     git(['worktree', 'add', '-q', '-b', 'lazy/ctr-task', worktree], repo);
     gitdir = join(repo, '.git', 'worktrees', 'ctr-task');
-  });
+  }, 120_000);
 
   afterAll(async () => {
     await rm(base, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   test('cannot be rewritten from inside, and git still works', async () => {
     const before = await Promise.all([join(worktree, '.git'), join(gitdir, 'commondir'), join(gitdir, 'gitdir')].map((p) => readFile(p, 'utf-8')));
@@ -84,7 +85,7 @@ describe.skipIf(skip)('task container git pointers', () => {
       binary, 'run', '--rm', '--entrypoint', 'sh',
       '-v', `${repo}:${repo}:ro`, '-v', `${worktree}:${worktree}`, ...args,
       '-w', worktree, image, '-c', script,
-    ], { stdout: 'pipe', stderr: 'pipe' });
+    ], { env, stdout: 'pipe', stderr: 'pipe' });
     const out = r.stdout.toString();
     expect(out).toContain('DONE');
     expect(out).not.toMatch(/WROTE|MOVED|REMOVED|GITFAIL/);
@@ -118,7 +119,7 @@ describe.skipIf(skip)('task container git pointers', () => {
       binary, 'run', '-d', '--rm', '--entrypoint', 'sh',
       '-v', repo + ':' + repo + ':ro', '-v', worktree + ':' + worktree, ...args,
       '-w', worktree, image, '-c', script,
-    ], { stdout: 'pipe', stderr: 'pipe' });
+    ], { env, stdout: 'pipe', stderr: 'pipe' });
     const container = started.stdout.toString().trim();
     const waitFor = async (name: string): Promise<string> => {
       const deadline = Date.now() + 20_000;
@@ -151,7 +152,7 @@ describe.skipIf(skip)('task container git pointers', () => {
         expect(await readFile(pointer, 'utf-8')).toBe(await readFile(join(probe, 'expected-' + index), 'utf-8'));
       }
     } finally {
-      if (container) Bun.spawnSync([binary, 'stop', '-t', '0', container], { stdout: 'ignore', stderr: 'ignore' });
+      if (container) Bun.spawnSync([binary, 'stop', '-t', '0', container], { env: hardwareTestEnv(), stdout: 'ignore', stderr: 'ignore' });
       await rm(probe, { recursive: true, force: true });
     }
   }, 120_000);

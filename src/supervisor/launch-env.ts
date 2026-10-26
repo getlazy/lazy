@@ -14,6 +14,7 @@
  */
 
 import { loadConfig } from '../config/loader';
+import { isContainerRunnerType } from '../config/types';
 import { profileNameForAgent } from '../config/agent-profiles';
 import { findLazyRoot } from '../project-paths';
 import { resolveRoleTarget, type LaunchSurface } from '../utils/role-target';
@@ -69,7 +70,7 @@ export function applyAuthEnvToProcess(vars: AuthEnvVar[]): void {
 
 function launchSurfaceFor(config: Awaited<ReturnType<typeof loadConfig>>): LaunchSurface {
   const runnerType = config.runner.type;
-  return runnerType === 'docker' || runnerType === 'podman' ? 'container' : 'host';
+  return isContainerRunnerType(runnerType) ? 'container' : 'host';
 }
 
 /**

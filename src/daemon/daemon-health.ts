@@ -56,7 +56,7 @@ import {
   SYNC_RETRY_LOOP,
   type ProxyHealthHandle,
 } from './health-registry';
-import { getOrCreateStorage } from './rpc-handlers';
+import { daemonStoreLockHold, getOrCreateStorage } from './rpc-handlers';
 import { getStartupCredentialProblem, missingTurnCredentials } from './credential-gate';
 import { teamModeEnabled } from './user-credentials';
 import { getWorkingGracePeriodMs } from '../utils/reconcile';
@@ -517,7 +517,7 @@ export async function collectDaemonHealth(
         const fileLocked = facts.kind !== 'no-file-lock';
         const activity = facts.kind === 'no-file-lock' ? null : storageLockActivity(facts.lockPath);
         return [
-          buildStorageLockRow(facts, process.pid, now()),
+          buildStorageLockRow(facts, process.pid, now(), daemonStoreLockHold()),
           buildStorageWritesRow(activity, fileLocked, now()),
         ];
       },

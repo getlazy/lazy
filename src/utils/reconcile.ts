@@ -10,6 +10,7 @@
  * Called automatically by list/blocked commands before displaying results.
  */
 
+import { recordRecreationIfRunning, recordRecreation } from '../task/environment-replaced';
 import { shouldLogImageHold, runnerImageHold } from '../daemon/runner-image-choice';
 import { SUPERVISED_HEADINGS } from '../task/supervised-headings';
 import { announceUncommittedLeftBehind } from '../task/uncommitted-left-behind';
@@ -550,7 +551,14 @@ async function abandonPreviousGenerationClaim(
       await runner.stopRun(name, { gracefulTimeoutSeconds: PREVIOUS_GENERATION_STOP_GRACE_SECONDS });
       stopped = true;
     }
-    if (await runner.runExists(name)) await runner.removeRun(name);
+    if (await runner.runExists(name)) {
+      if (record.owner === 'ask') {
+        // Restart survival is handled separately; until then, do not erase
+        // this shared environment's runtime evidence with the visiting claim.
+        await recordRecreationIfRunning(storage, task.id, 'the daemon restarted while an ask was running', runner, name);
+      }
+      await runner.removeRun(name);
+    }
   } catch (err) {
     // The abandonment still goes ahead: the turn cannot finish either way, and
     // a run left behind is the smaller harm next to a task held for a day.
@@ -880,6 +888,12 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
     return;
   }
 
+  if (await taskRunner.runExists(containerName)) {
+    await recordRecreationIfRunning(storage, task.id, null, taskRunner, containerName);
+  } else if (taskRunner.usesSandbox()) {
+    await recordRecreation(storage, task.id, 'the previous environment disappeared; exit code, OOM status and exit time are unavailable');
+  }
+
   // The run is not alive and there is no response. Before declaring the turn
   // interrupted, check whether the agent actually finished: a stranded completion
   // (supervisor died at finalize) leaves real committed work on the branch with no
@@ -1020,6 +1034,14 @@ export async function interruptForDaemonRestart(
   if (readResponse(getProtocolDir(taskId))?.status === 'completed') {
     logger.info(`Task ${taskShortId}: its turn already finished — not interrupting; the reconciler parks it`);
     return false;
+  }
+
+  if (session.container_name) {
+    // Keep the current restart boundary, but explain its environment loss
+    // before clearing the last durable reference (upgrade may already have
+    // removed the runtime record).
+    const runner = await createRunner(lazyRoot, session.runner_type ?? undefined);
+    await recordRecreationIfRunning(storage, taskId, `the daemon ${trigger === 'stop' ? 'stopped' : 'restarted'}`, runner, session.container_name);
   }
 
   await storage.updateTaskStatus(taskId, 'interrupted', await systemActor(lazyRoot));
@@ -4049,6 +4071,9 @@ export async function recoverStrandedWorkingTasks(
       // A live run may still be finalizing — leave it for the normal path.
       if (await taskRunner.isRunning(containerName)) continue;
 
+      if (await taskRunner.runExists(containerName)) {
+        await recordRecreationIfRunning(storage, task.id, null, taskRunner, containerName);
+      }
       const recovered = await recoverStrandedCompletion(storage, task, session, worktreePath, protoDir, lazyRoot);
       if (recovered) {
         await storage.updateSessionContainerName(session.id, null);

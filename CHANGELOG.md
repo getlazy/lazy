@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.93.1210] - 2026-10-23 - More fixes
+
+### Added
+
+- **Several builders at once in Lazy Teams** — "Start a new builder" always adds one, Resume and Continue never stop a running builder, and the Builders page lists each with Open and Stop.
+- **Images in task diffs** — changed PNG, JPEG, GIF, WebP, AVIF and SVG files show as pictures, before and after, in Lazy Teams and the dashboard.
+
+### Changed
+
+- **Building from source needs Bun 1.4.3 or newer** — older Bun drops attached `docker` output on Unix sockets, so the build refuses it.
+- **Pi agent** — task images install the latest Pi 1.x release instead of a pinned 0.84 (lazy now needs Pi 1.0.4+); Pi's own MCP servers stay off.
+- **`bin/native-install` on the microVM fleet** — builds the project image inside a throwaway microVM when none is published, so a native install on the microVM fleet no longer needs Docker.
+
+### Fixed
+
+- **Task containers** — failed or stopped turns preserve services and container files; replacements are explained on the task and in Lazy Teams.
+- **Lazy Teams Current review** — shows all comments the agent has not seen and leaves previously seen comments in the full thread.
+- **`lazy login` / `lazy clone <teams-url>` in the browser** — pressing Approve or Deny now reaches the waiting terminal instead of leaving it hanging.
+- **`lazy login` behind a TLS-terminating proxy such as ngrok** — logins over https succeed; an install whose address is set to http is flagged with `APP_PROTOCOL=https`, and the app manifest loads behind ngrok sign-in.
+- **Retried task launches** — a start, unblock, resume or question retried after a timeout or dropped connection returns the original launch instead of a refusal, a second turn or a duplicate question.
+- **Storage lock health** — the daemon no longer gives up its store lock during agent turns, ending the constant "Storage lock" health failure; Lazy Teams now names the failure and offers a restart.
+- **Lazy Teams service links** — an app's WebSockets (HMR, live views) no longer drop after an hour, after a quiet spell, or when a sign-in check briefly fails.
+- **Browser terminals stay attached** — a dropped shell, Pair, builder terminal or Watch reconnects by itself to the same running session instead of saying "Reload to reattach".
+- **Lazy Teams agent pickers** — a profile added or removed on Connections shows in the task form and project settings pickers when opened, without reloading the page.
+
 ## [0.93.1208] - 2026-10-20 - Run any commit
 
 Lazy Teams can now run the default branch, any pushed branch or a specific commit with its services, links and a shell, without creating a task. Builders gain Resume and Continue from a summary, and a task's Turns tab reads as a conversation. The rest is fixes: services survive a turn start, browser terminals copy, paste and scroll properly, and several recovery paths no longer fail or stall.

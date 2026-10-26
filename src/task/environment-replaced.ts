@@ -28,17 +28,21 @@
  *
  * The fact is cleared only after the work turn that carries it has been
  * launched, so a launch that fails after the old container was removed does not
- * lose it. It is recorded only when a RUNNING container was actually taken
- * away: a container that had already died needs no explaining beyond what the
- * agent would see anyway, and a first turn has nothing to lose.
+ * lose it. An exited container is recorded before removal too, with its runtime
+ * exit code, OOM flag and finish time. A first launch has nothing to replace.
  */
 
 import type { Storage } from '../storage';
+import type { RunInfo, RunInfoProbe } from '../runner/types';
 
 import environmentReplacedTemplate from '../prompts/environment-replaced.md' with { type: 'text' };
 
 /** Task metadata key holding the pending reasons (newline-free, "; "-joined). */
 export const ENVIRONMENT_REPLACED_KEY = 'environment_replaced';
+/** Last replacement remains visible after the next agent consumed its notice. */
+export const LAST_ENVIRONMENT_REPLACED_KEY = 'last_environment_replaced';
+/** Deduplicate observations only until the old environment is torn down. */
+export const RECORDED_ENVIRONMENT_EXIT_KEY = 'recorded_environment_exit';
 
 /** Reason: the turn's credential needs a different launch environment. */
 export const REASON_CREDENTIAL_CHANGED = "the credential this task's turns run on changed";
@@ -81,12 +85,13 @@ export async function recordEnvironmentReplaced(
   const reasons = existing ? existing.split('; ') : [];
   for (const r of reason.split('; ')) if (!reasons.includes(r)) reasons.push(r);
   await storage.updateTaskMetadata(taskId, ENVIRONMENT_REPLACED_KEY, reasons.join('; '));
+  await storage.updateTaskMetadata(taskId, LAST_ENVIRONMENT_REPLACED_KEY, JSON.stringify({ reason, at: new Date().toISOString() }));
 }
 
 /**
  * A launch that is about to recreate the task's container records the fact —
- * but only when the container it replaces is actually running, and only on a
- * sandboxed runner: a host-process run's environment is the host itself, and
+ * including a container that already exited, and only on a sandboxed runner:
+ * a host-process run's environment is the host itself, and
  * recreating it loses nothing outside the worktree.
  *
  * For the agent: the one-shot metadata above. For the person: a `system`
@@ -95,16 +100,42 @@ export async function recordEnvironmentReplaced(
  * agent is not told twice.
  */
 export async function recordRecreationIfRunning(
-  storage: Pick<Storage, 'getTaskMetadata' | 'updateTaskMetadata'> & Partial<Pick<Storage, 'appendJournalEntry'>>,
+  storage: Pick<Storage, 'getTaskMetadata' | 'updateTaskMetadata'> & Partial<Pick<Storage, 'appendJournalEntry' | 'getSessionByTaskId'>>,
   taskId: string,
   reason: string | null,
-  runner: { usesSandbox(): boolean; isRunning(runName: string): Promise<boolean> },
+  runner: {
+    usesSandbox(): boolean;
+    isRunning(runName: string): Promise<boolean>;
+    getRunInfo?(runName: string): Promise<RunInfo | null>;
+    probeRunInfo?(runName: string): Promise<RunInfoProbe>;
+  },
   runName: string,
 ): Promise<void> {
-  if (!reason) return;
   if (!runner.usesSandbox()) return;
-  if (!(await runner.isRunning(runName))) return;
-  await recordRecreation(storage, taskId, reason);
+  if (!(await runner.isRunning(runName))) {
+    const probe = runner.probeRunInfo ? await runner.probeRunInfo(runName) : null;
+    if (probe?.kind === 'no-answer') throw new Error(`Cannot inspect ${runName} before replacing it: ${probe.reason}`);
+    const info = probe?.kind === 'answered' ? probe.info : await runner.getRunInfo?.(runName);
+    if (info && !info.running) {
+      const death = `the previous environment exited with code ${info.exitCode}` +
+        (info.oomKilled === true ? ', OOM-killed (out of memory)' : info.oomKilled === false ? ', not OOM-killed' : ', OOM status unknown') +
+        (info.finishedAt ? `, at ${info.finishedAt}` : ', exit time unknown');
+      const fingerprint = `${runName}:${info.finishedAt}:${info.exitCode}:${info.oomKilled}`;
+      if (await storage.getTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY) !== fingerprint) {
+        await recordRecreation(storage, taskId, [death, reason].filter(Boolean).join('; '));
+        await storage.updateTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY, fingerprint);
+      }
+    } else if (!info && (await storage.getSessionByTaskId?.(taskId))?.container_name === runName &&
+      !await storage.getTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY)) {
+      await recordRecreation(storage, taskId, ['the previous environment disappeared; exit code, OOM status and exit time are unavailable', reason].filter(Boolean).join('; '));
+      await storage.updateTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY, `${runName}:missing`);
+    }
+    return;
+  }
+  if (await storage.getTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY)) {
+    await storage.updateTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY, '');
+  }
+  if (reason) await recordRecreation(storage, taskId, reason);
 }
 
 /**

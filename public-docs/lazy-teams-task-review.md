@@ -1206,7 +1206,8 @@ an agent turn. The branch must still exist locally or on the project's remote.
 - **Shell** opens a new shell. Open as many as you like; each has its own
   **Close**.
 - **Pair** takes over the agent's own session, so you drive it. If your
-  connection drops, pairing ends by itself within 30 seconds. Pair is not
+  connection drops, the page reconnects to the same session by itself; if it
+  cannot within 5 minutes, pairing ends 30 seconds later. Pair is not
   offered while the agent is mid-turn or while somebody else is already
   pairing. (Like any open terminal, it also holds the task — see
   [Taking turns with the agent](#taking-turns-with-the-agent).)
@@ -1216,6 +1217,14 @@ an agent turn. The branch must still exist locally or on the project's remote.
   while the task is waiting for you.
 - **Watch** shows what the agent is doing right now — its requests, what it is
   running and its own session — as it happens. It is read-only.
+
+If a terminal's connection drops — Wi-Fi changing, a laptop waking from sleep —
+the program in it keeps running for 5 minutes and the page reconnects to it by
+itself. The status line says **Connection lost. Reconnecting…** meanwhile, and
+typing is paused until it is back; the output you missed is then drawn once.
+Your builder's terminal, the Verify tab's shells and god mode's machine shell
+behave the same way. A terminal whose session really ended — the program exited,
+you closed it, or you are no longer allowed in — says so and does not retry.
 
 ### Your own environment
 

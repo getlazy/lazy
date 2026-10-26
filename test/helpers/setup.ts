@@ -5,6 +5,7 @@
  * initialized. Tests run the real CLI via subprocess for maximum fidelity.
  */
 
+import { hardwareTestEnv } from './hardware-env';
 import { basename, join, resolve } from 'path';
 import { mkdtemp, rm, writeFile, readFile, realpath } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
@@ -129,8 +130,8 @@ export interface TestContext {
    * managed-mode assertion pass against an unmanaged daemon.
    */
   restartDaemon: (extraEnv?: Record<string, string>) => Promise<void>;
-  /** Clean up the temporary directory */
-  cleanup: () => Promise<void>;
+  /** Stop fixture processes; optionally retain files for hardware failure inspection. */
+  cleanup: (options?: { preserveFiles?: boolean }) => Promise<void>;
 
   // --- fake-claude seam (only present with `setupTestLazy({ fakeClaude: true })`) ---
 
@@ -263,6 +264,8 @@ export interface SetupOptions {
    * activated via `LAZY_MOCK_CLAUDE_RESPONSE` (see preload-mocks.ts).
    */
   withDaemon?: boolean;
+  /** Base process environment, before harness pins; hardware suites strip ambient LAZY_* state. */
+  inheritedEnv?: Record<string, string | undefined>;
   /**
    * Extra env vars to pass to the test daemon at startup. Use this to activate
    * mock modules (e.g. `LAZY_MOCK_ACCEPT_GATES: '[]'` to load the remote mock
@@ -349,6 +352,19 @@ export interface SetupOptions {
    * full fake-binary supervisor seam. Implied by `fakeClaude: true`.
    */
   allowHostRunner?: boolean;
+
+  /**
+   * Run the daemon WITHOUT the module-mock preload and leave the project's
+   * runner as lazy.toml says, so a launch goes through the real runner:
+   * daemon → runner → container → `lazy supervise` → the agent binary the
+   * container carries. For hardware-gated suites only (the smolvm runner on a
+   * Mac): the suite sets `[runner] type` itself and supplies the agent the
+   * container runs. Implies `withDaemon: true` and strips inherited LAZY_*
+   * variables unless `inheritedEnv` is supplied explicitly. HOME is NOT redirected — the
+   * supervisor runs inside the container, so it writes nothing under the
+   * host's HOME, and the runner keeps its machine state in the real `~/.lazy`.
+   */
+  realRunner?: boolean;
 }
 
 /**
@@ -416,7 +432,7 @@ function spawnGit(cwd: string, ...args: string[]) {
   };
 }
 
-async function runLazy(cwd: string, args: string[], protocolBase: string, withDaemon: boolean, extraEnv?: Record<string, string>, input?: string, baseEnv?: Record<string, string>): Promise<WorkResult> {
+async function runLazy(cwd: string, args: string[], protocolBase: string, withDaemon: boolean, extraEnv?: Record<string, string>, input?: string, baseEnv?: Record<string, string>, inheritedEnv = process.env): Promise<WorkResult> {
   // Symmetric with runLazyMocked: in a daemonless suite, LAZY_TEST=1 keeps
   // `ctx.lazy` from auto-starting a daemon (ensureDaemon bypasses under
   // LAZY_TEST). Without it, a plain `ctx.lazy(['create'])` (e.g. createTask)
@@ -435,7 +451,7 @@ async function runLazy(cwd: string, args: string[], protocolBase: string, withDa
     // point) lets the implicitly auto-started daemon come up. Mirrors
     // runLazyMocked/startTestDaemon. Placed BEFORE extraEnv so individual tests
     // can clear it (e.g. ANTHROPIC_API_KEY: '') to exercise the gate.
-    env: { ...process.env, ...baseEnv, ...testParentEnv, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...lazyTestEnv, ...extraEnv },
+    env: { ...inheritedEnv, ...baseEnv, ...testParentEnv, ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing', LAZY_PROTOCOL_BASE: protocolBase, ...lazyTestEnv, ...extraEnv },
   });
 
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -456,6 +472,7 @@ async function runLazyMocked(
   extraEnv?: Record<string, string>,
   input?: string,
   baseEnv?: Record<string, string>,
+  inheritedEnv = process.env,
 ): Promise<WorkResult> {
   // When a real daemon is running for this test, LAZY_TEST=1 must NOT be set —
   // it would short-circuit tryRemoteStorage/tryRpc and bypass the daemon,
@@ -469,7 +486,7 @@ async function runLazyMocked(
     stdout: 'pipe',
     stderr: 'pipe',
     env: {
-      ...process.env,
+      ...inheritedEnv,
       ...baseEnv,
       ...testParentEnv,
       // Provide fake auth so getAuthEnvVars() doesn't fail. This is a DEFAULT —
@@ -509,7 +526,7 @@ async function startTestDaemon(
    * launch path under test). `baseEnv` carries the PATH that puts the fake
    * binary ahead of any real `claude`.
    */
-  options: { noPreload?: boolean; baseEnv?: Record<string, string>; transportPreload?: string } = {},
+  options: { noPreload?: boolean; baseEnv?: Record<string, string>; inheritedEnv?: Record<string, string | undefined>; transportPreload?: string } = {},
 ): Promise<void> {
   const { mkdir, open } = await import('fs/promises');
   const { join: pathJoin } = await import('path');
@@ -539,7 +556,7 @@ async function startTestDaemon(
         stdout: logHandle.fd,
         stderr: logHandle.fd,
         env: {
-          ...process.env,
+          ...(options.inheritedEnv ?? process.env),
           ...options.baseEnv,
           ...testParentEnv,
           // The daemon is the one process that must NEVER see LAZY_TEST=1 from
@@ -747,7 +764,9 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   // no module mock, private HOME); only the binary and the project's agent_id
   // differ. Everything below therefore branches on `useFakeAgent`.
   const useFakeAgent = useFakeClaude || useFakeCursor || useFakePi || useFakeCodex;
-  const withDaemon = options.withDaemon === true || useFakeAgent;
+  const withDaemon = options.withDaemon === true || useFakeAgent || options.realRunner === true;
+  const noDaemonPreload = useFakeAgent || options.realRunner === true;
+  const inheritedEnv = options.inheritedEnv ?? (options.realRunner ? hardwareTestEnv() : process.env);
   let fakeAgentDir: string | undefined;
   let fake: FakeClaude | undefined;
   let cursorFake: FakeCursor | undefined;
@@ -889,7 +908,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   spawnGit(root, 'commit', '-m', 'Initial commit');
 
   // Run `lazy init` (skip auth/github checks, non-interactive for piped test env)
-  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase, withDaemon, undefined, undefined, baseEnv);
+  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase, withDaemon, undefined, undefined, baseEnv, inheritedEnv);
   if (initResult.exitCode !== 0) {
     throw new Error(`lazy init failed: ${initResult.stderr}\n${initResult.stdout}`);
   }
@@ -979,8 +998,9 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
 
   if (withDaemon) {
     await startTestDaemon(root, protocolBase, composeDaemonEnv(), {
-      noPreload: useFakeAgent,
+      noPreload: noDaemonPreload,
       baseEnv,
+      inheritedEnv,
       transportPreload: options.daemonTransportPreload,
     });
   }
@@ -990,7 +1010,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
     protocolBase,
     agentHome,
     lazy: (args, optsArg) =>
-      runLazy(optsArg?.cwd ?? root, args, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv),
+      runLazy(optsArg?.cwd ?? root, args, protocolBase, withDaemon, optsArg?.env, optsArg?.input, baseEnv, inheritedEnv),
     lazyMocked: (args, mockResponse, optsArg) =>
       runLazyMocked(
         optsArg?.cwd ?? root,
@@ -1001,6 +1021,7 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
         optsArg?.env,
         optsArg?.input,
         baseEnv,
+        inheritedEnv,
       ),
     git: (...args) => spawnGit(root, ...args),
     setClaudeScenario: async (scenario) => {
@@ -1080,12 +1101,13 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
       }
       await stopTestDaemon(root);
       await startTestDaemon(root, protocolBase, composeDaemonEnv(extraEnv), {
-        noPreload: useFakeAgent,
+        noPreload: noDaemonPreload,
         baseEnv,
+        inheritedEnv,
         transportPreload: options.daemonTransportPreload,
       });
     },
-    cleanup: async () => {
+    cleanup: async (options) => {
       // Always stop any daemon that was spawned for this project — either
       // explicitly via withDaemon or implicitly auto-started by a CLI call
       // (ensureDaemon in src/daemon/auto-start.ts). Without this the daemon
@@ -1119,6 +1141,8 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
         if (priorProtocolBase === undefined) delete process.env.LAZY_PROTOCOL_BASE;
         else process.env.LAZY_PROTOCOL_BASE = priorProtocolBase;
       }
+
+      if (options?.preserveFiles) return;
 
       // Guard: only ever remove a storage dir this harness could have created.
       // Test roots come from mkdtemp('lazy-e2e-'), so the derived project name

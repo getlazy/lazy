@@ -169,6 +169,33 @@ reached. Connect **every paid endpoint in the chain** before starting it, includ
 tiers you do not expect to use. Each request spends your connection for the tier
 actually selected; credential-free tiers send no authentication.
 
+For example, put this in the project's **Settings → Configuration** (the
+project's `lazy.toml`):
+
+```toml
+[agents.claude-normal]
+harness = "claude-code"
+tiers = [
+  { endpoint = "anthropic-subscription", model = "claude-sonnet-5-5", threshold_percent = 80 },
+  { endpoint = "lunaroute", model = "glm-5.3-flash" },
+]
+
+[endpoints.anthropic-subscription]
+url = "https://api.anthropic.com"
+credential = "anthropic"
+
+[endpoints.lunaroute]
+url = "https://gw.lunaroute.com/"
+credential = "lunaroute-api-key"
+```
+
+Requests go to the subscription tier until it reaches 80% of its usage window,
+or until the provider refuses a request (HTTP 429); then they go to the next
+tier, even in the middle of a turn. `threshold_percent` applies only to a
+Claude or ChatGPT subscription tier. Each tier's `credential` names a stored
+credential, not the endpoint itself, and every member connects both endpoints
+in Teams before starting a task or builder on this agent.
+
 Usage readings belong to your endpoint connection, so profiles sharing it see
 the same readings. Replacing a credential clears those readings; renewing the
 same session preserves them. Endpoints using the same upstream account still

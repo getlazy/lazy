@@ -222,7 +222,10 @@ export function startTaskWatchStream(opts: {
 
     let runner: Runner;
     try {
-      runner = await createRunner(root);
+      // The task's OWN runner, as the shell resolves it: a task on smolvm in a
+      // docker project is followed through its machine's engine, not this host's.
+      const session = await storage.getSessionByTaskId(task.id);
+      runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
     } catch (err) {
       emit(renderWithColors(() => dim(`(supervisor and agent streams unavailable: ${err instanceof Error ? err.message : String(err)})`)));
       return;

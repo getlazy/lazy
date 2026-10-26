@@ -140,9 +140,18 @@ describe('builder-session storage', () => {
     expect(ended.state).toBe('ended');
   });
 
-  // INVARIANT: "one session per member per project" (§5.7) is served by this
-  // lookup — a second `startBuilderSession` call for the same member finds the
-  // existing non-ended row instead of registering a second one.
+  // INVARIANT: a member may hold several active sessions on one project at
+  // once (several builders, as `lazy builder` allows on a laptop) — only a
+  // duplicate id is refused. A storage-level one-per-member refusal is what
+  // made a second builder impossible in Teams.
+  test('createBuilderSession registers a second active session for the same member', async () => {
+    await storage.createBuilderSession(session({ id: 'one', state: 'running', builderId: 'b1' }));
+    await storage.createBuilderSession(session({ id: 'two', state: 'running', builderId: 'b2' }));
+    const mine = (await storage.listBuilderSessions('/proj/a')).filter((s) => s.state === 'running');
+    expect(mine.map((s) => s.id).sort()).toEqual(['one', 'two']);
+    await expect(storage.createBuilderSession(session({ id: 'one' }))).rejects.toThrow('already exists');
+  });
+
   test('getActiveBuilderSessionForMember finds the non-ended session and ignores ended ones', async () => {
     await storage.createBuilderSession(session({ id: 'old', state: 'ended', endedAt: new Date().toISOString() }));
     await storage.createBuilderSession(session({ id: 'new', state: 'running' }));

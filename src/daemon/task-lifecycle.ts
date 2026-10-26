@@ -19,6 +19,7 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { stopTaskAgent } from '../runner/stop-task-agent';
 import { isFatalFailureClass } from '../agent/failure-taxonomy';
 import { markAcceptGateRunning, clearAcceptGateRunning } from './accept-gate-marker';
 import { confirmRunnerImageForLaunch, mustRecreateForRunnerImage, readOnlyLaunchPin, runnerImageHold, RUNNER_IMAGE_NOT_READY_MARKER } from './runner-image-choice';
@@ -10646,7 +10647,7 @@ async function stopTaskRun(
   phases.begin(STOP_PHASES.halt);
   const runner = await createRunner(projectRoot, sess.runner_type ?? undefined);
   const containerName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-  await runner.stopRun(containerName);
+  await stopTaskAgent(runner, containerName, getProtocolDir(task.id));
 
   // INVARIANT: lazy stop writes an ErrorResponse to response.json uniformly
   // regardless of command_type. This unblocks any in-flight daemon RPC waiting
@@ -10693,13 +10694,9 @@ async function stopTaskRun(
     exit_code: null,
     logs: null,
   });
-  await storage.updateSessionContainerName(sess.id, null);
-
-  try {
-    await runner.removeRun(containerName);
-  } catch {
-    // Best-effort — the reconciler also sweeps orphaned runs.
-  }
+  // Sandboxed turns keep their shared environment. Host-process Stop removes
+  // the run record, so its session must no longer name that run.
+  if (!runner.usesSandbox()) await storage.updateSessionContainerName(sess.id, null);
   try {
     clearStatus(protoDir);
   } catch {
@@ -10790,22 +10787,17 @@ async function stopClaimedTurn(
   if (runName) {
     try {
       const runner = await createRunner(projectRoot, record.runner_type ?? undefined);
-      if (await runner.isRunning(runName)) await runner.stopRun(runName);
-      if (await runner.runExists(runName)) await runner.removeRun(runName);
-      // An ASK runs in the work container, so the session's stamp now points at
-      // a run that no longer exists. A review's run was never stamped there, so
-      // there is nothing to clear (and clearing would erase the implementer's).
       if (record.owner === 'ask') {
-        const sess = await storage.getSessionByTaskId(task.id);
-        if (sess?.container_name === runName) {
-          await storage.updateSessionContainerName(sess.id, null);
-        }
+        await stopTaskAgent(runner, runName, getProtocolDir(task.id));
+        if (!runner.usesSandbox()) await storage.updateSessionContainerName(record.session_id, null);
+      } else {
+        // A review has its own disposable environment, never the task's.
+        if (await runner.isRunning(runName)) await runner.stopRun(runName);
+        if (await runner.runExists(runName)) await runner.removeRun(runName);
       }
     } catch (err) {
-      logger.warn(
-        `Task ${displayId(task)}: failed to stop ${record.owner} run ${runName}: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-      );
+      throw new Error(`Task ${displayId(task)}: could not stop ${record.owner} run ${runName}: ` +
+        `${err instanceof Error ? err.message : String(err)}`);
     }
   } else {
     // No run stamped: the claim was made but the launch had not returned yet.

@@ -208,6 +208,8 @@ const SUB_ARGS: Record<string, string[]> = {
   'system source-id': ['.'],
   // Machine-local and project-free: --id answers without writing to /run.
   'system guest-init-script': ['--id'],
+  // Machine-local and project-free: prints the pinned builder image and builds nothing.
+  'system smolvm-build-image': ['--print-builder-image'],
   'system repair-commits': ['--all'],
   'system store-check': ['/nonexistent-store'],
   'system store-backup': ['--store', '/nonexistent-store'],
@@ -332,6 +334,7 @@ const EXPECTED: Record<string, Expectation> = {
   'system passphrase': W,
   'system source-id': W,
   'system guest-init-script': W,
+  'system smolvm-build-image': W,
   'system repair-commits': R,
   'system store-check': F,
   'system store-backup': F,

@@ -17,6 +17,18 @@ import {
   RpcError,
 } from '../../src/daemon/rpc-handlers';
 
+
+/** Teams' environment: managed, a foreign docker host, and a vendored smolvm. */
+async function inManagedMode<T>(fn: () => Promise<T>): Promise<T> {
+  const keys = ['LAZY_MANAGED', 'LAZY_FOREIGN_DOCKER_HOST', 'LAZY_SMOLVM_BINARY'] as const;
+  const prior = keys.map((k) => process.env[k]);
+  process.env.LAZY_MANAGED = '1';
+  process.env.LAZY_FOREIGN_DOCKER_HOST = '1';
+  process.env.LAZY_SMOLVM_BINARY = '/opt/lazy/smolvm/smolvm';
+  try { return await fn(); }
+  finally { keys.forEach((k, i) => { if (prior[i] === undefined) delete process.env[k]; else process.env[k] = prior[i]; }); }
+}
+
 describe('editTask RPC', () => {
   let root: string;
   let prevLazyConfig: string | undefined;
@@ -38,6 +50,17 @@ describe('editTask RPC', () => {
     if (prevLazyConfig === undefined) delete process.env.LAZY_CONFIG;
     else process.env.LAZY_CONFIG = prevLazyConfig;
     await rm(root, { recursive: true, force: true });
+  });
+
+  test('refuses a smolvm runner in managed mode and stores nothing', async () => {
+    // INVARIANT: Teams never runs the smolvm runner; a per-task override is a 400 and runner_type is unchanged.
+    const storage = await getOrCreateStorage();
+    const task = await storage.createTask('Goal', undefined, undefined, 'vm-edit');
+    const err = await inManagedMode(() => handleEditTask(root, { taskId: task.id, runner: 'smolvm' }).then(() => null, (e) => e));
+    expect(err).toBeInstanceOf(RpcError);
+    expect((err as RpcError).status).toBe(400);
+    expect((err as RpcError).message).toMatch(/not available on Lazy Teams/);
+    expect((await storage.getTask(task.id))?.runner_type).toBeNull();
   });
 
   test('updates goal and prompt before any turns', async () => {

@@ -268,6 +268,11 @@ case "\${1:-}" in
     exit 0
     ;;
   run)
+    if [ -f "\$STATE/run-hook" ]; then
+      shift
+      bash "\$STATE/run-hook" "\$@"
+      exit \$?
+    fi
     # A damaged image store: the next N runs fail the way Docker does when it
     # cannot extract a layer of the image (the 2026-10-15 field message).
     if [ -f "\$STATE/damaged-runs" ]; then
@@ -621,6 +626,8 @@ export interface FakeDocker {
   slowDetachedRuns(seconds: number): Promise<void>;
   /** Make `docker run` probes fail (missing-binary preflight tests). */
   failRuns(): Promise<void>;
+  /** Handle a run at the runtime boundary, receiving every argument after `run`. */
+  onRun(script: string): Promise<void>;
   /**
    * The next `times` `docker run`s fail with Docker's "failed to extract layer …
    * invalid tar header" (exit 125): an image whose stored layers are torn.
@@ -822,6 +829,9 @@ export async function installFakeDocker(
     },
     async failRuns() {
       await writeFile(join(stateDir, 'fail-run'), '1');
+    },
+    async onRun(script) {
+      await writeFile(join(stateDir, 'run-hook'), script);
     },
     async damageRuns(times: number) {
       await writeFile(join(stateDir, 'damaged-runs'), String(times));

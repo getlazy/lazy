@@ -54,6 +54,7 @@ import { mermaidEnhanceScript } from '../../src/server/mermaid';
 import { changesViewScript } from '../../src/server/review-presentation';
 import { doctorDialogScript } from '../../src/server/settings';
 import { diffViewScript } from '../../src/server/review-diff';
+import { imagePreviewScript } from '../../src/server/review-image';
 import { relativeTimeScript } from '../../src/server/timestamps';
 import { modifierKeyScript } from '../../src/server/modifier-key';
 import { screenshotLightboxScript } from '../../src/server/screenshot-lightbox';
@@ -152,6 +153,7 @@ const ISLANDS: Record<string, () => string> = {
   changesViewScript: () => changesViewScript(),
   doctorDialogScript: () => doctorDialogScript(),
   diffViewScript: () => diffViewScript('#rv-root', '/expand'),
+  imagePreviewScript: () => imagePreviewScript(),
   relativeTimeScript: () => relativeTimeScript(),
   modifierKeyScript: () => modifierKeyScript(),
   screenshotLightboxScript: () => screenshotLightboxScript(),

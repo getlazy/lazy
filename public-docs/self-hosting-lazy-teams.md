@@ -87,6 +87,12 @@ If you already terminate TLS elsewhere (nginx, Traefik, Caddy of your own, a clo
 
 Step 4 works whether or not your proxy sends an `X-Forwarded-Proto` header. Some terminators — Tailscale serve and Cloudflare Tunnel among them — do not, and an app that judged the scheme from that header alone would redirect such a request to HTTPS forever. This install treats traffic arriving on the direct port as already-encrypted, which is true when the only thing that can reach that port is your own proxy.
 
+### Set `APP_PROTOCOL=https` when something else terminates TLS
+
+Behind ngrok, Tailscale serve, a Cloudflare Tunnel or any proxy that terminates TLS, Lazy Teams itself only ever sees plain HTTP. Set `APP_PROTOCOL=https` so it knows its public address is `https://<APP_HOST>`. That address goes into emailed links and into the tokens `lazy login` receives: the CLI only keeps a token signed for exactly the address you typed, so an install that calls itself `http://` makes `lazy login https://…` refuse with "its public address is set to http". This matters most when you have turned `FORCE_SSL` off (as a native install behind ngrok often does); with it on, the protocol already defaults to https.
+
+Lazy Teams also reads a trusted proxy's `X-Forwarded-Proto: https` when minting a login token, and the **Public address** check on the installation page warns, naming `APP_PROTOCOL=https`, when you reach the install over HTTPS while it is set to HTTP. Setting it explicitly is still the fix: an explicit `APP_PROTOCOL` always wins.
+
 ## Signing in through your proxy's login
 
 If your reverse proxy already signs people in — an ngrok Traffic Policy with Google OAuth, oauth2-proxy, Cloudflare Access — Lazy Teams can trust that identity instead of showing its own login screen. It is off unless you set **both** of these:
@@ -150,7 +156,7 @@ Nothing is exempted from the proxy. Two small documents the command line needs *
 
 ### Set it up
 
-The three `bin/rails` commands below run in the app's own environment (for a Compose install, `docker compose exec app bin/rails …`; for a native install, from the checkout's `lazy-teams/` directory). Rake does not read `.env`, so export the same `CLI_JWT_PRIVATE_KEY_FILE`, `APP_HOST`, `TRUSTED_IDENTITY_HEADER` there when you run them.
+The three `bin/rails` commands below run in the app's own environment (for a Compose install, `docker compose exec app bin/rails …`; for a native install, from the checkout's `lazy-teams/` directory). Rake does not read `.env`, so export the same `CLI_JWT_PRIVATE_KEY_FILE`, `APP_HOST`, `APP_PROTOCOL`, `TRUSTED_IDENTITY_HEADER` there when you run them. Set `APP_PROTOCOL=https` before you start (ngrok terminates TLS; see [above](#set-app_protocolhttps-when-something-else-terminates-tls)): the policy names the token issuer, and with `APP_PROTOCOL` unset it has to allow both the `http://` and `https://` spellings of your address. If you change `APP_PROTOCOL` or `APP_HOST` later, print and apply the policy again.
 
 1. Generate a signing key and give it to Lazy Teams. Setting it is what tells the install it is behind a proxy:
 
@@ -569,9 +575,10 @@ clone:
 - **The ordinary commands work** — `lazy list`, `lazy show`, `lazy diff`,
   `lazy create`, `lazy start`, `lazy unblock`, `lazy accept` and the rest — run
   through the install, as you, exactly as if you had used the browser.
-- **`lazy builder` attaches to your builder on the server**, next to the
-  project. It is the same session the **Builders** page opens, and its
-  conversation stays with the project.
+- **`lazy builder` starts a builder of yours on the server**, next to the
+  project, and attaches to it; `lazy builder attach [<id>]` reattaches. These
+  are the same builders the **Builders** page lists and opens, and their
+  conversations stay with the project.
 - **A Claude Code you run yourself** can use the project's `lazy_*` tools
   through the install, with fewer capabilities than the server-side builder —
   see [Claude Code against a Lazy Teams project](teams-bound-clone-agents.md).
@@ -859,7 +866,7 @@ Every task's app runs code an agent wrote, so Lazy Teams keeps each service host
 
 - **Only its own pages, and links followed to it.** A request another site's page makes — another project's or another task's service, or anything else on the web — is refused, unless it is a top-level navigation (following a link). Requests between two services of the *same* task are allowed, so a task's web service can call its own API service. WebSockets must come from the service's own pages.
 - **Only WebSockets are relayed as open connections**, and only once the task's app accepts the WebSocket.
-- **Open connections end when access does.** WebSockets and streamed responses are checked again every minute: signing out or leaving the team closes them. They also close after an hour (WebSockets after five minutes with no traffic); real WebSocket clients reconnect on their own.
+- **Open connections end when access does.** WebSockets and streamed responses are checked again every minute: signing out or leaving the team closes them. A brief failure of that check (the database busy for a moment) does not close anything; one that keeps failing for about five minutes does. A WebSocket otherwise stays open for as long as the browser and the app keep it open, however quiet it is; streamed responses (server-sent events, long downloads) close after an hour, and `EventSource` reconnects on its own.
 - **Cookies stay on their own host.** A `Domain` attribute on a cookie a service sets is removed, so it cannot reach sibling services.
 - **Your sign-in proxy's credentials stay with the proxy.** Before a request reaches the task's app, Lazy Teams removes these cookies (by name prefix, any case): `lazy_teams_service`, `ngrok`, `__ngrok`, `_oauth2_proxy`, `CF_Authorization`, `CF_AppSession`, `_pomerium`, `authelia_session`, `_forward_auth`, `tailscale`, `GCP_IAP_`, `AWSELBAuthSessionCookie`, `authentik_proxy`, `VouchCookie`; and these headers (by prefix): `Cf-Access-`, `Ngrok-`, `X-Auth-Request-`, `X-Forwarded-Email`, `X-Forwarded-User`, `X-Forwarded-Preferred-Username`, `X-Forwarded-Groups`, `X-Forwarded-Access-Token`, `X-Pomerium-`, `Remote-User`, `Remote-Email`, `Remote-Name`, `Remote-Groups`, `Tailscale-`, `X-Goog-IAP-JWT-Assertion`, `X-Goog-Authenticated-User-`, `X-Amzn-Oidc-`, `X-Authentik-`, `X-Vouch-`, plus the trusted identity and secret headers. A proxy that uses other names for its own cookie should be configured not to send it to the service hosts.
 
@@ -894,7 +901,7 @@ LAZY_DAEMON_IMAGE=ghcr.io/getlazy/lazy-daemon:<the Lazy Teams image's version>
 
 The binary must be an absolute path to a copy whose checksum was recorded when it was obtained. A bare command name is refused, and so is a binary that no longer matches what was recorded.
 
-`LAZY_DAEMON_IMAGE` names the image each project's microVM boots. The published Lazy Teams image defaults it to `ghcr.io/getlazy/lazy-daemon` at its own version tag. Anywhere else — an image you built yourself, for instance — there is no default, and a project refuses to start until it is set. The image is published for `linux/arm64` and `linux/amd64` as `ghcr.io/getlazy/lazy-daemon` and `docker.io/getlazy/lazy-daemon`, tagged with each exact build `v<major>.<minor>.<n>`. Pin that exact tag, the one matching your Lazy Teams version, and not `latest`: the application and its projects must run the same version of lazy. You can also build the image yourself from a lazy checkout with `scripts/publish-lazy-daemon-image.sh`. Its `--save <path>` writes a tar you can point `LAZY_DAEMON_IMAGE` at directly, which is also how you run with no registry access. A plain build leaves a local image tag you can name instead.
+`LAZY_DAEMON_IMAGE` names the image each project's microVM boots. The published Lazy Teams image defaults it to `ghcr.io/getlazy/lazy-daemon` at its own version tag. Anywhere else — an image you built yourself, for instance — there is no default, and a project refuses to start until it is set. The image is published for `linux/arm64` and `linux/amd64` as `ghcr.io/getlazy/lazy-daemon` and `docker.io/getlazy/lazy-daemon`, tagged with each exact build `v<major>.<minor>.<n>`. Pin that exact tag, the one matching your Lazy Teams version, and not `latest`: the application and its projects must run the same version of lazy. You can also build the image yourself from a lazy checkout with `scripts/publish-lazy-daemon-image.sh`. Its `--save <path>` writes a tar you can point `LAZY_DAEMON_IMAGE` at directly, which is also how you run with no registry access. A plain build leaves a local image tag you can name instead. With no Docker at all, `lazy-teams/bin/smolvm-build-daemon-image` builds the same tar inside a throwaway microVM (it needs only the microVM runtime, `smolvm`): the microVM brings its own container engine, and the tar is checked layer by layer before it is written into place.
 
 An unknown `LAZY_FLEET_BACKEND` refuses to start rather than falling back, so a typo cannot silently put you on a weaker boundary than you asked for.
 
@@ -987,9 +994,9 @@ workaround — it removes the boundary the rest of this page depends on.
 | `APP_DIRECT_BIND` | no | Interface the direct port publishes on (default `127.0.0.1`) |
 | `FORCE_SSL` | no | HTTPS redirect, `secure` cookies, HSTS (default on) |
 | `ASSUME_SSL` | no | Treat incoming traffic as encrypted (defaults to `FORCE_SSL`) |
-| `APP_PROTOCOL` | no | Scheme in emailed links (defaults from `FORCE_SSL`) |
+| `APP_PROTOCOL` | no | The scheme of this install's public address: emailed links and the issuer of `lazy login` tokens (defaults from `FORCE_SSL`; set `https` behind a TLS-terminating proxy) |
 | `ALLOWED_HOSTS` | no | Extra hostnames the install answers to, comma-separated |
-| `CLI_JWT_PRIVATE_KEY_FILE` (or `CLI_JWT_PRIVATE_KEY`), `CLI_JWT_ISSUER` | no | Behind an authenticating proxy: the key Teams signs command-line tokens with, and the token issuer (defaults to `<APP_PROTOCOL>://<APP_HOST>`, without a port). `lazy login` refuses a token whose issuer is not exactly the address people type, port included, so set `CLI_JWT_ISSUER` when that differs; see "Behind an authenticating proxy" |
+| `CLI_JWT_PRIVATE_KEY_FILE` (or `CLI_JWT_PRIVATE_KEY`), `CLI_JWT_ISSUER` | no | Behind an authenticating proxy: the key Teams signs command-line tokens with, and the token issuer (defaults to `<APP_PROTOCOL>://<APP_HOST>`, without a port; with `APP_PROTOCOL` unset, a login approved through a trusted proxy that sends `X-Forwarded-Proto: https` gets `https://<APP_HOST>`). `lazy login` refuses a token whose issuer is not exactly the address people type, port included, so set `CLI_JWT_ISSUER` when that differs; see "Behind an authenticating proxy" |
 | `TRUSTED_IDENTITY_HEADER`, `TRUSTED_PROXY_SECRET` | no | Sign people in from your reverse proxy's login; both must be set (see "Signing in through your proxy's login") |
 | `SERVICES_HOST` | no | Host name task services open under (`<task>-<port>-<project>-<team>-<id>.<SERVICES_HOST>`); at most 189 characters (Teams refuses to start with a longer one); needs a wildcard DNS name and certificate; not needed on a `localhost` install (see "Reaching a task's running services") |
 | `SMTP_*`, `MAILER_FROM` | no | Outgoing email |
@@ -1256,7 +1263,7 @@ Once your team is running tasks, see [Agents in Lazy Teams](./lazy-teams-agents.
 
 ## Diagnosing a builder that is slow to start or fails
 
-Pressing **Start your builder** opens a page that follows the start: it says the builder is starting, moves to the builder's terminal once it is running, or shows why it could not start. The first start after an update can take a few minutes while the project prepares its container image; later starts are quick.
+Pressing **Start a new builder** opens a page that follows the start: it says the builder is starting, moves to the builder's terminal once it is running, or shows why it could not start. The first start after an update can take a few minutes while the project prepares its container image; later starts are quick.
 
 As a site administrator in god mode you have four places to look, all keyed by the **run id** — the id in the builder's address (`…/builders/runs/<run id>`):
 
