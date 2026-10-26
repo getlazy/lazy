@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+.doc-diagram { margin:1.5rem 0; overflow-x:auto; }
+.doc-diagram svg { min-width:40rem; max-width:100%; height:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
+.doc-diagram figcaption { color:var(--muted); font-size:.9rem; text-align:center; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../diagrams.js"></script>
+<script defer src="../search.js" data-root="../"></script>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.94</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#how-to-guides">How-to guides</a> › <span aria-current="page">Troubleshooting</span></nav>
+<h1 id="troubleshooting"><a class="anchor" href="#troubleshooting" aria-hidden="true">#</a>Troubleshooting</h1>
+<nav class="toc" aria-label="On this page"><details><summary>On this page</summary><ul><li><a href="#doctors-cleanup-flags">Doctor's cleanup flags</a></li><li><a href="#sessions-start-with-a-lot-of-the-context-window-already-used">Sessions start with a lot of the context window already used</a></li><li><a href="#the-daemon-wont-start">The daemon won't start</a></li><li><a href="#the-daemon-runs-but-stops-doing-work">The daemon runs but stops doing work</a></li><li><a href="#daemon-is-not-running-while-a-daemon-clearly-is">"Daemon is not running" while a daemon clearly is</a></li><li><a href="#the-daemon-is-alive-but-nothing-is-happening">The daemon is alive but nothing is happening</a></li><li><a href="#the-daemon-answers-but-work-has-stopped-lazy-daemon-health">The daemon answers, but work has stopped: lazy daemon health</a></li><li><a href="#what-stopping-the-daemon-costs">What stopping the daemon costs</a></li><li><a href="#where-one-tasks-pieces-live">Where one task's pieces live</a></li><li><a href="#lazytoml-wont-parse">lazy.toml won't parse</a></li><li><a href="#no-model-credential">No model credential</a></li><li><a href="#a-codex-task-answers-then-cant-touch-any-file">A Codex task answers, then can't touch any file</a></li><li><a href="#one-cursor-task-fails-auth-while-others-work">One Cursor task fails auth while others work</a></li><li><a href="#cursor-keeps-reconnecting-without-doing-work">Cursor keeps reconnecting without doing work</a></li><li><a href="#a-turn-fails-with-e2big-argument-list-too-long">A turn fails with E2BIG: argument list too long</a></li><li><a href="#lazy-pair-refuses-to-run-on-my-machine">lazy pair refuses to run on my machine</a></li><li><a href="#a-turn-keeps-retrying-after-a-model-error">A turn keeps retrying after a model error</a></li><li><a href="#lazy-pair-or-lazy-chat-asks-me-to-login">lazy pair or lazy chat asks me to /login</a></li><li><a href="#gh-isnt-logged-into-my-github-enterprise-server-host">gh isn't logged into my GitHub Enterprise Server host</a></li><li><a href="#every-command-fails-to-acquire-the-storage-lock">Every command fails to acquire the storage lock</a></li><li><a href="#accept-fails-with-indexlock-file-exists">Accept fails with index.lock: File exists</a></li><li><a href="#could-not-register-the-lazy-mcp-tools--refusing-to-run-it">"Could not register the lazy MCP tools … refusing to run it"</a></li><li><a href="#refusing-to-serve-lazy-mcp-tools--configured-for-a-different-task">"Refusing to serve lazy MCP tools: … configured for a different task"</a></li><li><a href="#a-lazy-tool-fails-then-every-later-tool-says-connection-closed">A lazy tool fails, then every later tool says "Connection closed"</a></li><li><a href="#claude-mcp-list-says--connected-but-the-agent-has-no-tools">claude mcp list says "✔ Connected" but the agent has no tools</a></li><li><a href="#redacted-in-logs-and-audit-records">&lt;redacted&gt; in logs and audit records</a></li><li><a href="#a-builder-fails-while-its-container-image-is-building">A builder fails while its container image is building</a></li><li><a href="#the-environment-that-runs-this-projects-tasks-isnt-working">"The environment that runs this project's tasks isn't working"</a></li><li><a href="#script-not-found-builder-or-a-selfcheck-with-no-output">Script not found "builder" , or a selfcheck with no output</a></li><li><a href="#lazy-sync--lazy-unblock-sits-silent-for-minutes-after-an-upgrade">lazy sync / lazy unblock sits silent for minutes after an upgrade</a></li><li><a href="#the-fix-isnt-working-after-lazy-upgrade">The fix isn't working after lazy upgrade</a></li><li><a href="#detected-dubious-ownership-in-repository-at-">detected dubious ownership in repository at …</a></li><li><a href="#lazy-sync-warns-that-the-local-and-remote-parent-branch-differ">lazy sync warns that the local and remote parent branch differ</a></li><li><a href="#a-colleague-pushed-to-my-tasks-branch">A colleague pushed to my task's branch</a></li><li><a href="#a-task-lists-hundreds-of-commits-it-never-made">A task lists hundreds of commits it never made</a></li><li><a href="#the-daemon-cant-fetch-from-the-remote">The daemon can't fetch from the remote</a></li><li><a href="#documentation-links">Documentation links</a></li><li><a href="#missing-git-pointers-inside-a-task-container">Missing git pointers inside a task container</a></li></ul></details></nav>
+<p>Start here when a lazy command fails before it does any work. Most of these
+have a one-line fix, and <code>lazy doctor</code> diagnoses all of them in one pass:</p>
+<pre><code>lazy doctor
+</code></pre>
+<p>Doctor announces its checklist before checking and shows the active phase while it works, including slow container checks. In Teams, god-mode Doctor shows the current phase while the page refreshes.</p>
+<p><code>lazy doctor</code> is the single diagnosis surface — every check prints what failed,
+why, and the command that fixes it. When a run finds errors, it also files
+one alert in the inbox (<code>lazy messages</code>, and Inbox on the dashboard) so
+people who never run doctor still see the findings. Re-running doctor does
+not stack a second alert for the same failures. The same report and the same
+cleanup flags are on the dashboard under <strong>Settings → Doctor</strong>. The sections
+below expand on the failures users hit most often.</p>
+<p>In Lazy Teams, a project health notice can be dismissed from its project page.
+It stays hidden in that browser session while the same problem is reported,
+and returns if the check clears and later fails again. Dismissing a notice
+does not repair the underlying issue or withdraw a support report.</p>
+<h2 id="doctors-cleanup-flags"><a class="anchor" href="#doctors-cleanup-flags" aria-hidden="true">#</a>Doctor&#39;s cleanup flags</h2>
+<p>A plain <code>lazy doctor</code> only <strong>reports</strong>. Anything it can clean up for you is a
+flag you choose to run, so nothing happens to your worktrees, images,
+containers, branches or tasks unless you ask:</p>
+<pre><code>lazy doctor --clean-worktrees
+lazy doctor --clean-docker-images
+lazy doctor --clean-orphaned-containers
+lazy doctor --unset-upstream-tracking
+lazy doctor --resume-interrupted-tasks
+lazy doctor --clean-local-command-conversations
+lazy doctor --repair-git-pointers
+</code></pre>
+<p>Every one of them has the same shape:</p>
+<ol>
+<li>It lists what it would touch — one line per item, with the size on disk
+where that is the point.</li>
+<li><code>--dry-run</code> stops there.</li>
+<li>Otherwise it asks before acting. <code>--yes</code> skips the question; without a
+terminal and without <code>--yes</code> it refuses rather than guessing, so a script
+can never clean up by accident.</li>
+<li>It then acts and prints one line per item, plus a count.</li>
+</ol>
+<p>A failure on one item is printed and the rest still run — one worktree git
+refuses to drop shouldn&#39;t strand the other four. The count says how many
+actually happened (<code>Removed 2 of 3 worktree(s).</code>) and the command exits non-zero
+whenever anything failed, so a script or <code>&amp;&amp;</code> chain sees it.</p>
+<p>Run one remedy at a time — doctor refuses two in one invocation, so you always
+know which listing you just approved.</p>
+<p>A task worktree normally has a <code>.git</code> <strong>file</strong>, containing <code>gitdir: ...</code>,
+not a directory. That alone does not mean it was overwritten. Containers see
+protected copies of these pointer files; doctor checks the originals on the
+machine running the daemon, not the containers’ mounted copies.</p>
+<p>What each one does:</p>
+<ul>
+<li><strong><code>--clean-worktrees</code></strong> removes the worktrees of finished (complete or
+abandoned) tasks. This is the one that reclaims real disk: a worktree keeps
+its own <code>node_modules</code>, <code>target/</code>, <code>build/</code> and every other dependency and
+build tree, and finished tasks hold onto them indefinitely. <strong>Branches are
+kept</strong> — the work itself is still there, only the checkout goes.</li>
+<li><strong><code>--clean-docker-images</code></strong> removes stale lazy runner images. It never
+removes the image your current lazy version uses, an image this machine has
+adopted, or an image pinned on a task — deleting one of those would break the
+next launch.</li>
+<li><strong><code>--clean-orphaned-containers</code></strong> removes containers of finished or deleted
+tasks. Open tasks keep their containers, running or stopped; the next turn or
+<strong>Run services</strong> restarts a stopped container. Cleanup refuses unreadable task
+records and keeps a container if its task reopens before removal.</li>
+<li><strong><code>--unset-upstream-tracking</code></strong> drops leftover upstream tracking config from
+lazy task branches. Tracking on a task branch is harmless in itself; doctor
+calls out the one case that is not — a branch whose tracking names a
+<em>different</em> branch, where a plain <code>git pull</code> on it would merge that other
+branch in.</li>
+<li><strong><code>--repair-git-pointers</code></strong> rewrites a task worktree&#39;s <code>.git</code>, <code>commondir</code>
+and <code>gitdir</code> files back to what lazy created when something changed them.
+Doctor reports such a worktree as an error — do not run git in it until it is
+repaired, because the changed files could make git run a program the task
+left behind. lazy itself refuses to run git there, and the daemon repairs it
+on its own within seconds; this flag does it on demand. A directory with no
+<code>.git</code> at all is listed but never touched. The same check covers the
+worktree&#39;s submodule repositories: a submodule config setting anything
+<code>git submodule</code> never writes is rewritten to the settings it does write (the
+original is kept beside it as <code>config.lazy-quarantine-&lt;id&gt;</code>), and a hooks
+folder holding a real hook is renamed <code>hooks.lazy-quarantine-&lt;id&gt;</code>.
+<code>.git</code> at all is listed but never touched.
+It also moves aside any repository a task created inside its worktree (a
+<code>.git</code> in a subfolder that is not a submodule of your base branch), renaming
+it rather than deleting it; a task whose turn is running is left alone.
+It also points a task worktree&#39;s <code>HEAD</code> back at the task&#39;s own branch when
+only the <code>HEAD</code> file was changed. A worktree that was really checked out on
+another branch is listed but not touched; run <code>git checkout &lt;task branch&gt;</code> in
+it (<code>git stash</code> first if it has uncommitted changes).</li>
+<li><strong><code>--resume-interrupted-tasks</code></strong> starts the next turn of interrupted tasks
+now. An interrupted task is resumable, not broken, and a running daemon offers
+to resume each one every few seconds — but it holds back a task you stopped
+yourself, one that has been interrupted repeatedly in a row, or one that has
+used up its automatic-resume budget for the day. This flag starts them anyway,
+and it is the only way to resume a task the daemon is holding back.</li>
+<li><strong><code>--clean-local-command-conversations</code></strong> drops Claude Code&#39;s local-command
+boilerplate (the caveat, a built-in slash command such as <code>/clear</code>, and its
+output) out of conversations that were stored before lazy started filtering it,
+so each conversation&#39;s summary is the first thing you actually said. On its
+own it deletes nothing: a stored row that holds nothing but boilerplate is
+listed and then left alone. Add
+<code>--delete-empty-local-command-conversations</code> to delete exactly those rows —
+it asks separately, <code>--yes</code> alone never implies it, and deletion is
+permanent. See
+<a href="../conversation-import/#local-command-transcripts">Conversation import</a>.</li>
+</ul>
+<p>The two that need Docker (or Podman) say so and stop if the runtime isn&#39;t
+running: an empty listing would look like a clean bill of health when in fact
+nothing was inspected.</p>
+<h2 id="sessions-start-with-a-lot-of-the-context-window-already-used"><a class="anchor" href="#sessions-start-with-a-lot-of-the-context-window-already-used" aria-hidden="true">#</a>Sessions start with a lot of the context window already used</h2>
+<p>Every session — the builder and every task agent — begins with a fixed block of
+text already in its context: the <code>CLAUDE.md</code> and <code>AGENTS.md</code> files the agent harness loads,
+lazy&#39;s own system prompt, your shared memory index, and the schemas for lazy&#39;s
+tools. None of it is wasted, but on a mature project it adds up, and the first
+place most people notice is a startup line from the agent harness about
+a <code>CLAUDE.md</code> or <code>AGENTS.md</code> being over its size limit.</p>
+<p><code>lazy doctor</code> prints the whole breakdown, so you never have to go looking for
+it:</p>
+<pre><code>lazy doctor
+</code></pre>
+<p>Under <strong>Context budget</strong> you get one block per role, because a builder session
+and a task agent session are not the same:</p>
+<pre><code>Context budget (injected into every session, before the first message):
+  Builder session
+    ≥10,412 tok  41,903 chars  AGENTS.md (project)
+      ! over the 40,000-char per-file limit Claude Code 2.1.266 warns at
+        It is still injected in full — nothing is truncated — but the harness
+        warns at every startup and re-reads the whole file every turn. …
+    ≥12,829 tok  55,002 chars  lazy system prompt
+      ≥4,001 tok  16,004 chars  of which shared memory index
+    ≥14,442 tok  64,389 chars  MCP tool schemas (52 tools)
+     ≥3,059 tok  13,172 chars  MCP server instructions
+    174,466 chars, ≥40,742 tokens before the first message (≥4% of a 1M-token window)
+    Context window: 1M tokens — claude-opus-5 is a 1M-window model and this launch presents a first-party base URL
+  Task agent session
+    …
+</code></pre>
+<p>Reading it:</p>
+<ul>
+<li><strong>Character counts are exact; token figures are a floor.</strong> They come from an
+offline tokenizer that undercounts Claude&#39;s own by roughly 15–20% on prose and
+more on code, which is why they are printed as <code>≥</code>. The real cost is higher,
+never lower — so a total that already looks large is worth acting on, and one
+that looks comfortable has less headroom than it says.</li>
+<li><strong>Indented lines break down the line above them</strong> and are not added again to
+the total. The shared memory index is part of the system prompt, so it is
+shown inside it.</li>
+<li><strong>Nothing here is ever truncated.</strong> The per-file <code>CLAUDE.md</code> / <code>AGENTS.md</code> limit is a
+warning from the agent harness, not a cut-off — an oversized file is still
+loaded in full, it just costs you that much of every session and gets re-read
+on every turn. The limit is per file, not a budget across all of them: two
+30,000-character files draw no warning even though they total 60,000.</li>
+<li><strong>The warning names the Claude Code release the limit was read from.</strong> The
+limit is not published as an API; it was read out of the harness bundle, and a
+later release could move it. If your harness is much newer than the release
+named on that line and the numbers look wrong, trust your harness.</li>
+<li><strong>The two roles differ for real reasons</strong>: different system prompts,
+different memory templates, an extra preamble that introduces a task agent to
+its own task, and the builder additionally loads your personal
+<code>~/.claude/CLAUDE.md</code>, which a task agent never sees. The tool schemas are the
+same for both.</li>
+<li><strong>This is what <em>lazy</em> costs, not the whole session.</strong> The agent harness has
+its own system prompt and built-in tools on top, and everything specific to a
+turn — the task&#39;s goal and prompt, previous turns, your comments — arrives
+afterwards. Expect the harness&#39;s own <code>/context</code> screen to show a bigger
+number; the gap is the harness&#39;s, and not something lazy can shrink for you.</li>
+<li><strong>The window is the one this role&#39;s next launch will actually get</strong>, not a
+fixed 200k. A 1M-window Anthropic model through lazy&#39;s proxy gets 1M; a 200k
+model stays 200k. Doctor prints that number under each role, and names a
+remedy if the project&#39;s upstream is pointed somewhere that would cap a 1M
+model. The per-file warning uses the same window, so a 1M session
+is allowed a larger file before the harness complains.</li>
+</ul>
+<p>When a role&#39;s total goes past a fifth of the window, doctor adds one line naming
+the largest thing <em>you</em> can shrink. There are only two:</p>
+<ul>
+<li><strong>A <code>CLAUDE.md</code> or <code>AGENTS.md</code> that has grown into a manual.</strong> Move the parts only some tasks
+need into a separate document they can read when it is relevant. Instructions
+every task must follow belong in it; reference material does not.</li>
+<li><strong>The shared memory index.</strong> Shrink it with <code>lazy memory compact</code>, or curate
+the records directly with <code>lazy memory save</code> and <code>lazy memory rm</code>. See
+<a href="../memory/">memory.md</a>.</li>
+</ul>
+<p>Lazy&#39;s own system prompt and tool schemas are not something a project can trim,
+so doctor never suggests it — if they are the whole of your total, it says so
+and leaves you alone.</p>
+<p>Measuring a session means assembling the prompt a launch would send, which needs
+a working runner. When there isn&#39;t one — the daemon is down, typically — the
+section prints <code>Could not measure</code> and points at the check that explains why,
+rather than quietly disappearing and leaving you to conclude lazy injects
+nothing.</p>
+<h2 id="the-daemon-wont-start"><a class="anchor" href="#the-daemon-wont-start" aria-hidden="true">#</a>The daemon won&#39;t start</h2>
+<p>Lazy needs its daemon: it owns task state, storage and the agent runner, and
+every CLI command is a client of it. The CLI auto-starts one when it isn&#39;t
+already running, and reports the failure rather than proceeding when it can&#39;t:</p>
+<pre><code>Error: &lt;what the daemon reported&gt;
+</code></pre>
+<p>The daemon writes the same message, with a timestamp, to its log — as the last
+thing it writes before giving up, so the end of the log is where to look. Find
+the log path with <code>lazy daemon status</code>, and read it with:</p>
+<pre><code>lazy daemon logs
+</code></pre>
+<p>The common causes, in rough order of frequency:</p>
+<ul>
+<li><p><strong><code>lazy.toml</code> doesn&#39;t parse or has an invalid value.</strong> See
+<a href="#lazytoml-wont-parse">lazy.toml won&#39;t parse</a> below.</p>
+</li>
+<li><p><strong>No model credential in the daemon&#39;s environment.</strong> See
+<a href="#no-model-credential">No model credential</a> below.</p>
+</li>
+<li><p><strong>The runner isn&#39;t available</strong> — Docker or Podman isn&#39;t installed or isn&#39;t
+running. <code>lazy doctor</code> names which, and
+<a href="../agent-container/">the agent container guide</a> covers the image itself.</p>
+</li>
+<li><p><strong>A port is already taken</strong> — usually a previous daemon that didn&#39;t exit.
+<code>lazy daemon list</code> shows every daemon on the host and
+<code>lazy daemon kill-stray</code> reaps the ones that no longer belong to a project.</p>
+</li>
+<li><p><strong>The proxy can&#39;t bind or reach its upstream.</strong> The audit/policy proxy is
+always on and has no off switch; the daemon fails loudly rather than silently
+sending traffic direct. Fix the <code>[proxy]</code> settings (<code>port</code>, <code>bind</code>,
+<code>upstream</code>) — <code>lazy daemon logs</code> says which one failed.</p>
+</li>
+<li><p><strong>A daemon for this project already runs from another daemon directory:</strong></p>
+<pre><code>Error: A lazy daemon for /path/to/project is already running (PID 222) outside this shell&#39;s daemon directory (/root/.lazy/daemon); refusing to start a second one.
+Point this shell at it:  export LAZY_DAEMON_BASE_DIR=/path/the/daemon/uses
+</code></pre>
+<p>The project&#39;s daemon was started with a different <code>LAZY_DAEMON_BASE_DIR</code>
+than your shell has, for example by a managed host. Lazy never starts a
+second daemon for one project. When it can read the running daemon&#39;s
+directory, it just uses that daemon. Otherwise run the <code>export</code> line it
+prints, or use the shell that started the daemon.</p>
+</li>
+</ul>
+<p><code>lazy doctor</code> deliberately keeps working when the daemon does not — it is the
+one command that must never die of the problem it exists to diagnose.</p>
+<h2 id="the-daemon-runs-but-stops-doing-work"><a class="anchor" href="#the-daemon-runs-but-stops-doing-work" aria-hidden="true">#</a>The daemon runs but stops doing work</h2>
+<p>Sometimes the daemon is running but makes no progress: tasks stop changing state,
+and <code>lazy daemon logs</code> repeats <code>skipping tick, previous reconcile still running</code>.
+That means something the daemon depends on (a file or a network call) has stopped
+answering. Because the daemon&#39;s status check bounds every wait, it still answers,
+and <code>lazy daemon status</code> prints a <code>Stuck:</code> line naming what it is waiting on.</p>
+<p>To see more, ask the daemon for a report of everything it is waiting on. It
+writes the report to its log:</p>
+<pre><code class="language-bash">kill -USR2 &lt;daemon pid&gt;      # the pid is in `lazy daemon status`
+lazy daemon logs              # look for &quot;Daemon wedge report&quot;
+</code></pre>
+<p>On Linux the report counts what each daemon thread is blocked on in the kernel.
+Threads waiting in <code>fuse_*</code> or <code>request_wait_answer</code> point at a mounted
+filesystem that has stopped answering. Restarting the daemon (<code>lazy daemon restart</code>) loses no work: tasks that were mid-turn are marked interrupted and
+resume on their own. If the cause is a mounted filesystem, fix or remount it
+first, or the daemon will get stuck the same way again.</p>
+<h2 id="daemon-is-not-running-while-a-daemon-clearly-is"><a class="anchor" href="#daemon-is-not-running-while-a-daemon-clearly-is" aria-hidden="true">#</a>&quot;Daemon is not running&quot; while a daemon clearly is</h2>
+<p>Every so often the daemon is up — the web dashboard answers, agents keep
+working — but <code>lazy daemon status</code> insists it isn&#39;t running, and
+<code>lazy daemon start</code> then fails because the running daemon still holds the
+storage lock. There is a specific cause: the daemon&#39;s PID file (<code>lazy.pid</code> in
+the daemon&#39;s state directory) was deleted while it was running.</p>
+<p>The daemon now notices and rewrites the file itself within a few seconds.
+<code>lazy doctor</code> reports the state in these terms — naming the live daemon&#39;s PID,
+recovered from the lock file — instead of repeating &quot;daemon is not running&quot;:</p>
+<pre><code>lazy doctor
+</code></pre>
+<p>If the report persists across re-runs, that daemon is running code from before
+the self-repair existed, and <code>lazy daemon restart</code> clears it — bearing in mind
+that a restart interrupts running agent and pair sessions.</p>
+<p>Deleting those files is not something lazy does to itself any more: cleanup of
+daemon state files now refuses to run while a live process holds the daemon
+lock, so a <code>lazy daemon start</code> that loses the race can no longer take the
+incumbent&#39;s files with it.</p>
+<h2 id="the-daemon-is-alive-but-nothing-is-happening"><a class="anchor" href="#the-daemon-is-alive-but-nothing-is-happening" aria-hidden="true">#</a>The daemon is alive but nothing is happening</h2>
+<p>A daemon whose event loop is stuck is the hardest failure to recognise, because
+it looks exactly like a healthy idle one: the process is there, the socket is
+still listening, and nothing errors. Tasks simply stop progressing.</p>
+<p><code>lazy daemon status</code> names this state directly:</p>
+<pre><code>Daemon is ALIVE but UNRESPONSIVE (PID 41287).
+  Socket:  /home/you/.lazy/daemon/&lt;slug&gt;/lazy.sock
+  Probe:   connected, but no reply within 3s
+</code></pre>
+<p>The probe is bounded on purpose. A frozen daemon still has its kernel listener,
+so connecting succeeds and the request is queued to a process that will never
+read it — an unbounded status check would wait forever on the very daemon it was
+run to investigate. <code>lazy daemon status</code> and <code>lazy daemon stop</code> both give up
+after a few seconds and say so.</p>
+<p>Recovery is one command:</p>
+<pre><code>lazy daemon restart
+</code></pre>
+<p>No hand-rolled <code>kill</code> is needed. <code>lazy daemon stop</code> (which <code>restart</code> runs first)
+escalates on its own and narrates each step: bounded shutdown request → SIGTERM →
+SIGKILL. The escalation exists because a polite signal may not finish the job:
+a frozen daemon cannot act on it at all, and a busy one may still be shutting
+down when the clock runs out. Either way, until the process is gone it holds the
+daemon lock, so no replacement can start — which is why stop finishes the job
+itself rather than telling you to reach for <code>kill -9</code>.</p>
+<p>The grace period before the SIGKILL depends on what the daemon did with the
+shutdown request. One that <em>accepted</em> it is winding down deliberately (closing
+storage, waiting on child processes) and gets 15 seconds; one that never answered
+has already failed to behave and gets 5. That asymmetry is deliberate: a single
+short clock would force-kill a healthy daemon in the middle of a slow but correct
+shutdown.</p>
+<p>A process that survives SIGKILL is stuck in the kernel — uninterruptible I/O,
+usually a hung network mount. <code>lazy daemon stop</code> says so explicitly instead of
+reporting a clean stop; nothing in user space can clear it.</p>
+<p>To see whether the daemon&#39;s reconcile loop is the thing stuck, run
+<code>lazy daemon health</code> (next section): its <strong>Reconcile loop</strong> row says when the
+last tick finished and, if one has been running too long, which phase it is in.
+For the full story, run the daemon with debug logging: each tick logs a line when
+it starts and another when it completes, so a start with no matching completion is
+the wedge, and the last phase logged before it points at the cause.</p>
+<h2 id="the-daemon-answers-but-work-has-stopped-lazy-daemon-health"><a class="anchor" href="#the-daemon-answers-but-work-has-stopped-lazy-daemon-health" aria-hidden="true">#</a>The daemon answers, but work has stopped: <code>lazy daemon health</code></h2>
+<p>Most things that go wrong inside a running daemon do not crash it — by design. A
+background loop that hangs, a recovery step that fails on every pass, a proxy that
+stopped answering, a task left saying <code>working</code> with nothing running: each is
+caught and logged, and the daemon keeps serving. <code>lazy daemon status</code> then says
+&quot;running&quot;, and it is, while the work it exists for has quietly stopped.</p>
+<p><code>lazy daemon health</code> asks the daemon about each of its moving parts and prints one
+row per check, <strong>OK</strong>, <strong>WARN</strong> or <strong>FAIL</strong>, with a one-line reason. Rows that are
+not OK say what to do:</p>
+<pre><code>$ lazy daemon health
+Daemon health — /home/you/src/my-project
+
+Daemon
+  ✓ Version and uptime — lazy 0.23.1, pid 41287, up 3h12m04s, source 5d1e… (computed)
+  ✓ Daemon runs the CLI&#39;s build — same build (5d1e…)
+
+Loops
+  ✗ Reconcile loop — last tick finished 7m02s ago (took 180ms); 2210 ticks since start,
+    every 5s; the current tick has been running 7m01s, in &#39;runAutoReact&#39;
+      → `lazy daemon logs` shows what the tick is waiting on …
+  ✓ Sync retry loop — last tick finished 2s ago (took 3ms); …
+  ✓ Remote sync loop — last tick finished 41s ago (took 2.1s); …
+
+Reconciler sweeps
+  ✓ 25 sweeps healthy (--verbose lists each)
+
+Proxy
+  ✓ Proxy answering — listening on 127.0.0.1:52811; self-check answered in 1ms
+  ✓ Proxy audit log writable — /home/you/src/my-project/.lazy/logs; last record 12s ago
+…
+14 OK, 0 WARN, 1 FAIL
+</code></pre>
+<p>What it checks:</p>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Rows</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Daemon</td>
+<td>Version, pid and uptime; whether the daemon runs the same build as the CLI you typed the command in</td>
+</tr>
+<tr>
+<td>Loops</td>
+<td>The reconcile, sync-retry and remote-sync loops: when each last completed a tick, how long it took, how many ticks since start. A loop whose last completed tick is far older than its interval is a WARN, then a FAIL, and the row names the phase the running tick is stuck in</td>
+</tr>
+<tr>
+<td>Reconciler sweeps</td>
+<td>Each recovery sweep and reconcile phase: last run, duration and last error. A sweep that just failed is a WARN; one that has failed on every run for five minutes is a FAIL. Healthy sweeps are folded into one line unless you pass <code>--verbose</code></td>
+</tr>
+<tr>
+<td>Proxy</td>
+<td>Where the proxy listens, and a real request to its own health path with the round-trip time — that request carries no credential and reaches no model, so it costs nothing. Also whether the proxy&#39;s audit log can be written</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Who holds the storage lock (the daemon itself is the only healthy answer; a dead holder, a pid that now belongs to a different process, a lock file that is gone, and a daemon that gave up its lock while still running are each called out) and whether writes are completing</td>
+</tr>
+<tr>
+<td>Runner</td>
+<td>Docker or Podman reachable (or, for the host runner, the agent binary), and whether the container image is built</td>
+</tr>
+<tr>
+<td>Tasks</td>
+<td>Tasks that say <code>working</code> but have no live run, and for how long; tasks with queued syncs and where their retries stand; interrupted tasks that nothing will resume on its own (auto-resume gave up, or is turned off)</td>
+</tr>
+<tr>
+<td>Dashboard</td>
+<td>Whether the web dashboard is bound, on which addresses, and why an extra address for containers could not be bound</td>
+</tr>
+</tbody></table>
+<p>Each check runs under its own time limit, so a part that hangs shows up as a FAIL
+row naming it rather than a command that never returns. Rows print as each check
+completes. The command never starts a daemon: with none running, it reports that
+as its one row.</p>
+<p>It exits 1 when any row FAILs, and 0 otherwise, so it can gate a script. <code>--json</code>
+prints the whole report for tools:</p>
+<pre><code>lazy daemon health --json | jq &#39;.rows[] | select(.state != &quot;ok&quot;)&#39;
+</code></pre>
+<p><code>lazy doctor</code> includes a single <strong>Daemon health</strong> line summarising this report and
+pointing here; the rows and their remedies live only in <code>lazy daemon health</code>.</p>
+<h2 id="what-stopping-the-daemon-costs"><a class="anchor" href="#what-stopping-the-daemon-costs" aria-hidden="true">#</a>What stopping the daemon costs</h2>
+<p><code>lazy daemon stop</code> and <code>lazy daemon restart</code> list what is live before they act,
+and — at a terminal — ask before going ahead. The three classes are affected
+differently, so they are reported separately rather than as one count:</p>
+<ul>
+<li><strong>Working task agents</strong> are stopped with the daemon. The in-flight turn is
+lost (committed work is kept) and the task resumes from its last checkpoint
+once a daemon is running again. This is not special to <code>lazy daemon stop</code>:
+a daemon told to quit any other way — a service manager stopping it, a plain
+<code>kill</code>, or closing the terminal it is running in — stops its agents the same
+way and records why each turn ended, which is why it takes a moment to exit
+rather than vanishing instantly.</li>
+<li><strong>Builder sessions</strong> (<code>lazy builder</code>) are <em>not</em> stopped with the daemon.
+They keep running and reconnect in place when the daemon comes back — the
+in-container supervisor refreshes the proxy address and relaunches Claude with
+<code>--resume</code>. While the daemon is down they cannot reach the model through the
+audit proxy; restart the daemon and wait for the one-line reconnect notice
+rather than relaunching by hand.</li>
+<li><strong>Pair sessions</strong> are not stopped either, and nothing resumes them: the task
+stays locked in <code>pairing</code> until you exit the session.</li>
+</ul>
+<p>One thing cannot be enumerated yet and is named as such in the warning rather
+than silently omitted: a <code>lazy pair</code> started outside a task (on main).</p>
+<p>A daemon that has wedged is the most common reason to stop one, so the warning
+is built to survive it: each lookup is bounded separately, one that fails or
+hangs never hides the others, and the report says which part it could not read
+and why — an unreachable daemon, an error it replied with, or a lookup that
+timed out. The proxy consequence is stated from your <code>[proxy]</code> setting rather
+than from asking the daemon, so it still appears when the daemon cannot answer.</p>
+<p><code>--yes</code> — and any non-interactive invocation, where there is no TTY to ask —
+still prints the warning but never blocks; scripts are not held up. Nothing
+about what stopping <em>does</em> changed; this is only the courtesy of saying so
+first, the same one <code>lazy upgrade</code> already had.</p>
+<h2 id="where-one-tasks-pieces-live"><a class="anchor" href="#where-one-tasks-pieces-live" aria-hidden="true">#</a>Where one task&#39;s pieces live</h2>
+<p>Troubleshooting a single task means knowing four locations, and none of them is
+guessable from the outside: the worktree depends on the project&#39;s data dir <em>and</em>
+on the task&#39;s ref, and the store root is wherever <code>[storage] external_path</code>
+points.</p>
+<ul>
+<li><strong>Worktree</strong> — <code>&lt;project root&gt;/&lt;data dir&gt;/worktrees/&lt;task ref&gt;</code>. Removed when
+the task ends, so its absence is ordinary for a finished task and a real
+finding for a working one. <code>lazy doctor &lt;task-id&gt;</code> prints it and says whether
+it is there.</li>
+<li><strong>Store root</strong> and <strong>task data dir</strong> — where the task&#39;s own records live,
+under <code>[storage] external_path</code> when one is set.</li>
+<li><strong>Container / run name</strong> — on the task&#39;s session, next to <code>runner_type</code>. A
+docker session is found by container name, a host one by pidfile.</li>
+<li><strong>Daemon log</strong> — <code>daemon.log</code> under the daemon&#39;s own dir; <code>lazy daemon logs</code>
+prints its recent lines and the path it read (<code>-f</code> keeps following).</li>
+</ul>
+<p>The daemon reports the worktree, the store root and the task data dir as a
+<code>paths</code> block on its <code>show</code> RPC, for clients that are not a shell on this host;
+the container name and runner are already on the session there.</p>
+<p>A browser client can render all of these on the task page for an operator,
+alongside the task&#39;s full id, its session id and the session&#39;s
+<code>interrupt_reason</code>. Locations only — a path to a token file is shown so an
+operator can read it with their own credentials; no value ever is.</p>
+<p>When the daemon itself is down there is no task page to read: every task read
+fails and the browser lands back on the project page. That page carries a
+<strong>Diagnostics</strong> control in its header for an elevated admin — and, when the
+project is not answering, says so and points at the same place — so the project
+diagnostics (supervisor state, restart history, daemon log tail) stay one click
+away in the state they exist for. Members see none of it; a daemon is not
+theirs to operate.</p>
+<h2 id="lazytoml-wont-parse"><a class="anchor" href="#lazytoml-wont-parse" aria-hidden="true">#</a>lazy.toml won&#39;t parse</h2>
+<p>A <code>lazy.toml</code> that exists but cannot be read is always a hard error, never a
+silent fallback to defaults: running with settings you didn&#39;t write is worse
+than not running. The message names the file, the line that failed and its
+text, and what the parser objected to — so a 300-line config does not turn into
+a hunt:</p>
+<pre><code>Failed to parse /path/to/lazy.toml: line 8: port = = 26024 — TOML Parse error: Expected a value but found &#39;=&#39;
+</code></pre>
+<p>The daemon applies the same rule before it starts anything at all, so a broken
+<code>lazy.toml</code> never gets as far as a daemon running on guessed values.</p>
+<p>A daemon that is ALREADY running is different: if <code>lazy.toml</code> breaks while it
+runs, it keeps working on the last config it loaded from that same file rather
+than stopping. It says so once in a system message (<code>lazy messages</code>), and for
+as long as the file stays broken <code>lazy daemon status</code> and <code>lazy doctor</code> report
+that the last good config is in use. Fix the file and the daemon picks it up
+again by itself. Until then, do not run <code>lazy daemon restart</code> or <code>lazy upgrade</code>:
+a daemon cannot start on a file that does not load, so you would be left with
+no daemon at all.</p>
+<p>The same applies to a value that parses as TOML but isn&#39;t usable — an unknown
+effort level, a port outside 1–65535, a malformed <code>[docs] url</code>. Each is
+reported with the section, the key, and the accepted values.</p>
+<p><code>lazy doctor</code> also lists <strong>unknown</strong> sections and keys — typos and options lazy does not
+recognise. Those are warnings, not errors: lazy ignores them.</p>
+<p>The full key-by-key reference is <a href="../lazy-toml/">lazy.toml</a>.</p>
+<h2 id="no-model-credential"><a class="anchor" href="#no-model-credential" aria-hidden="true">#</a>No model credential</h2>
+<p>The daemon — not your shell — is what launches agents, so the credential has to
+reach the <strong>daemon</strong>. The durable fix is to store it, which takes the shell out
+of the picture entirely:</p>
+<pre><code>claude setup-token | lazy auth set anthropic
+lazy daemon restart
+</code></pre>
+<p>The daemon reads the store at startup, so it no longer matters which terminal
+started it. This is also what stops <code>lazy upgrade</code> aborting with &quot;no
+authentication credential found in the environment&quot; when you run it from a shell
+that never exported a token. See <a href="../credentials/">Credentials</a>.</p>
+<p>Exporting still works and still wins over the store, if you prefer it:</p>
+<pre><code>export CLAUDE_CODE_OAUTH_TOKEN=…      # or ANTHROPIC_API_KEY
+lazy daemon restart
+</code></pre>
+<p><code>lazy doctor</code> prints one line per credential your <a href="../lazy-toml/#agentsname--named-agent-profiles">agent
+profiles</a> bill — the profiles
+the <strong>builder</strong> and <strong>agent</strong> roles default to, plus every <code>[agents.&lt;name&gt;]</code>
+block in your lazy.toml — naming the credential, where it was found, and which
+profiles need it:</p>
+<pre><code>✓ Anthropic credential present (daemon env: ANTHROPIC_API_KEY; needed by claude-code)
+✓ OpenAI credential present (credential store: keychain; needed by openai-pi)
+✗ OpenRouter credential present (needed by openrouter-codex)
+</code></pre>
+<p>A missing credential fails the check by name, with the profiles it strands, how
+to obtain one, and the <code>lazy auth set &lt;name&gt;</code> command that stores it. The source
+is the daemon&#39;s environment or the credential store (naming its backend). When the daemon cannot be
+asked, doctor falls back to your shell&#39;s environment and the store and says so
+on every line — that answer may not be what lazy actually uses, so check the
+daemon and run it again.</p>
+<p>Doctor is deliberately stricter than the daemon&#39;s startup check. The daemon
+starts as long as the two <strong>role defaults</strong> have their credentials, so a profile
+you declared but never selected never blocks it; a task that selects such a
+profile fails at launch, naming the profile and the credential. Doctor reports
+that credential as missing up front, so you learn it before a task does.</p>
+<p>If every profile your configuration uses points at an upstream that takes no
+credential — <code>credential = &quot;none&quot;</code>, written explicitly for a local model server — no
+credential is required at all, the daemon starts without one, and doctor says
+so:</p>
+<pre><code>✓ Model credential present (none needed — every configured profile uses an upstream that takes no credential)
+</code></pre>
+<h2 id="a-codex-task-answers-then-cant-touch-any-file"><a class="anchor" href="#a-codex-task-answers-then-cant-touch-any-file" aria-hidden="true">#</a>A Codex task answers, then can&#39;t touch any file</h2>
+<p>Symptom: a Codex task authenticates, the model clearly replies, and then the
+turn stops without changing anything — reporting something like
+<code>failed to spawn code-mode host …/codex-code-mode-host: No such file or directory</code>.</p>
+<p>Cause: the task image is older than this fix. Codex ships its tool runner as a
+second binary next to the CLI, and some models route every tool call through it.
+An image built without that binary gives you an agent that can talk and nothing
+else.</p>
+<p>Fix: rebuild the task image.</p>
+<pre><code>lazy upgrade --images
+</code></pre>
+<p><code>lazy doctor</code> reports this one directly — look for &quot;Codex code-mode host
+installed&quot; — so you can check before starting a task rather than after losing a
+turn.</p>
+<h2 id="one-cursor-task-fails-auth-while-others-work"><a class="anchor" href="#one-cursor-task-fails-auth-while-others-work" aria-hidden="true">#</a>One Cursor task fails auth while others work</h2>
+<p>Symptom: most Cursor tasks run fine, but one task dies immediately with
+<code>fatal_auth</code> / &quot;Cursor CLI is not authenticated&quot; / &quot;set CURSOR_API_KEY&quot;, and
+resuming it fails the same way. It can also look like the task &quot;switched to
+Claude&quot; — the container was built with Claude credentials while the task still
+says Cursor.</p>
+<p>Cause: that task&#39;s container was created without the Cursor key in its
+environment. Credentials are fixed at container create time, so resume keeps
+reusing the broken container.</p>
+<p>Fix: recreate that task&#39;s container, then resume or unblock:</p>
+<pre><code>lazy shell &lt;task&gt; --restart
+lazy resume &lt;task&gt;
+</code></pre>
+<h2 id="cursor-keeps-reconnecting-without-doing-work"><a class="anchor" href="#cursor-keeps-reconnecting-without-doing-work" aria-hidden="true">#</a>Cursor keeps reconnecting without doing work</h2>
+<p>Cursor can exit after reporting only reconnection events. Lazy retries an
+unrecognized failure up to six times in one turn, then ends the turn; the task
+becomes <code>interrupted</code> and automatic resume tries again later, with its usual
+limits. The task&#39;s last error carries Cursor&#39;s own error output. Also check
+the proxy audit (<code>lazy stats audit</code>) for a
+Cursor upstream HTTP status on the same task. Lazy records the short error
+message Cursor returned with it (credentials removed), which usually names
+why the request was rejected.</p>
+<h2 id="a-turn-fails-with-e2big-argument-list-too-long"><a class="anchor" href="#a-turn-fails-with-e2big-argument-list-too-long" aria-hidden="true">#</a>A turn fails with <code>E2BIG: argument list too long</code></h2>
+<p>Every agent lazy runs — Claude Code, Codex, Cursor and Pi — receives its task
+prompt on standard input, and a long system prompt through a private temporary
+file, so the operating system&#39;s limit on the size of one command-line argument
+(128 KiB on Linux) no longer applies to prompts however much feedback, history
+or notes they carry. Lazy also checks every agent launch before starting it and
+refuses one whose command line is oversized, naming the argument.</p>
+<p>If a turn still stops with <code>E2BIG</code> or &quot;was not launched: argv element … over
+the … argv bound&quot;, look for oversized environment values (for example a very
+large variable set with <code>lazy env set</code>) or report it — it is a bug in how
+lazy launches the agent. Lazy does not retry such a launch, because every retry
+would fail the same way; once fixed, resume the task with <code>lazy resume &lt;task&gt;</code>.
+No feedback is lost: undelivered feedback is re-delivered on the next turn.</p>
+<h2 id="lazy-pair-refuses-to-run-on-my-machine"><a class="anchor" href="#lazy-pair-refuses-to-run-on-my-machine" aria-hidden="true">#</a><code>lazy pair</code> refuses to run on my machine</h2>
+<p>Expected. Pairing runs <strong>inside the task&#39;s container</strong>, where the task&#39;s own
+turns run — not as a host process against the worktree. <strong>Branchless pairing</strong>
+(<code>lazy pair</code> on a non-task branch: no task, no worktree) has no container and
+requires an explicit <code>lazy pair --host</code>, which says what it is doing before it
+launches. There is no automatic fallback: if the container path fails, pairing
+fails loudly. If you are on a <code>lazy/*</code> branch whose task this store does not
+have (or cannot pair), <code>lazy pair --host --no-task</code> pairs in the current
+directory with no task context. See <a href="../pairing/">Pairing</a>.</p>
+<p>Claude Code, Codex, Cursor and Pi tasks all pair in their containers.
+Conversation capture and the end-of-session AI summary work on Claude Code
+and Pi; Cursor and Codex CLI pairing skip them and say so when they start.</p>
+<p><code>--host</code> itself is claude-code-only, and refuses on a task running any other
+agent. The host launcher runs Claude Code whatever the task&#39;s agent is, so
+<code>--host</code> on a Cursor task would open the wrong agent against that task&#39;s work.
+Pair it in its container instead.</p>
+<h2 id="a-turn-keeps-retrying-after-a-model-error"><a class="anchor" href="#a-turn-keeps-retrying-after-a-model-error" aria-hidden="true">#</a>A turn keeps retrying after a model error</h2>
+<p>Transient overload (529) and network failures retry after 5, 10, 20, 40 and
+60 seconds. Task status, Watch and Teams show the attempt, next retry time and
+recovery deadline. Recovery stops after six failed attempts or five minutes
+without recovery. A relaunched agent has at most 60 seconds to show useful
+model or tool activity; repeated error messages do not extend that time.</p>
+<p>After exhaustion, the failure remains transient: automatic recovery can resume
+the task if enabled, or you can resume it yourself. These bounds apply to
+Claude Code, Codex, Cursor and Pi.</p>
+<h2 id="lazy-pair-or-lazy-chat-asks-me-to-login"><a class="anchor" href="#lazy-pair-or-lazy-chat-asks-me-to-login" aria-hidden="true">#</a><code>lazy pair</code> or <code>lazy chat</code> asks me to <code>/login</code></h2>
+<p>Interactive sessions take their credential from the <strong>daemon</strong>, exactly like
+task agents do — not from the shell you typed the command in. If you see a
+<code>/login</code> prompt, the daemon is the thing to look at:</p>
+<pre><code>lazy daemon status
+lazy doctor
+</code></pre>
+<p>Store a credential (<code>claude setup-token | lazy auth set anthropic</code>) or restart
+the daemon from a shell that has one exported — either way, <code>lazy daemon restart</code>
+and the next <code>lazy pair</code> picks it up.</p>
+<p>Your shell is deliberately not consulted, even when it does export a token:
+a terminal opened after the daemon started exports nothing, so pairing would
+hand Claude Code no credential at all. Sourcing both from one place makes
+pairing behave like the rest of lazy.</p>
+<p>If you <em>want</em> a session on your own login instead of the daemon&#39;s, type <code>/login</code>
+inside it. That override persists.</p>
+<p>When no credential can be resolved at all, <code>lazy pair</code> and <code>lazy chat</code> fail
+<strong>before</strong> launching Claude Code, naming what they checked — rather than opening
+a session that looks fine until a <code>/login</code> prompt appears minutes later.</p>
+<h2 id="gh-isnt-logged-into-my-github-enterprise-server-host"><a class="anchor" href="#gh-isnt-logged-into-my-github-enterprise-server-host" aria-hidden="true">#</a><code>gh</code> isn&#39;t logged into my GitHub Enterprise Server host</h2>
+<pre><code>✗ GitHub authentication (github.mycorp.com)
+  gh is not authenticated to github.mycorp.com, the host of remote &#39;origin&#39;. Run: gh auth login --hostname github.mycorp.com
+</code></pre>
+<p><code>gh</code> keeps a <strong>separate login per host</strong>. Being logged into github.com tells it
+nothing about an Enterprise install, so lazy would push and open PRs against a
+host <code>gh</code> has no token for — surfacing much later as an opaque <code>gh</code> error in the
+middle of an accept.</p>
+<p><code>lazy doctor</code> names the host the check ran against, taken from the git remote
+lazy is configured to use (<code>[remote] git_remote</code>, default <code>origin</code>). Log in to
+exactly that host:</p>
+<pre><code>gh auth login --hostname github.mycorp.com
+lazy doctor
+</code></pre>
+<p>Scoping carries down to the token as well: the token-scope warning below the
+auth check reports on <em>that host&#39;s</em> token, so a broad github.com token no
+longer taints a minimal Enterprise one, or the reverse.</p>
+<p>If the check names a host that is <strong>not</strong> a GitHub install at all, doctor says so
+on the next line —</p>
+<pre><code>✓ Git remote origin
+  ! Remote points to git@gitlab.mycorp.com:team/app.git, which does not appear to be GitHub
+</code></pre>
+<p>— and no amount of <code>gh auth login</code> will help: <code>[remote] driver</code> is set to
+<code>&quot;github&quot;</code> for a remote that belongs to another forge. Fix the driver (or the
+remote) instead. See
+<a href="../lazy-toml/#github-enterprise-server">GitHub Enterprise Server</a>.</p>
+<p>This works in both directions. A <code>github.com</code> remote is pinned to <code>github.com</code>
+just as an Enterprise remote is pinned to its own host, so being logged into an
+Enterprise install does not make a <code>github.com</code> remote read green either. A
+dot-com report has no host in the label,
+and the terse <code>Run: gh auth login</code> — since there is only one host it could
+mean:</p>
+<pre><code>✗ GitHub authentication
+  Run: gh auth login
+</code></pre>
+<h2 id="every-command-fails-to-acquire-the-storage-lock"><a class="anchor" href="#every-command-fails-to-acquire-the-storage-lock" aria-hidden="true">#</a>Every command fails to acquire the storage lock</h2>
+<pre><code>Error: Failed to acquire storage lock after 50 attempts. Lock file: …/.storage-lock
+       — held by process pid 1433 since … (/System/…/postersyncd)
+</code></pre>
+<p>Lazy serialises writes to its store with a lock file that records who holds it.
+If the holder dies without releasing it — a crash, a <code>kill -9</code>, an upgrade
+mid-write — the file is left behind, and the next command reclaims it once it
+can see the holder is gone.</p>
+<p>The holder is identified by more than its pid: lazy records the process&#39;s start
+time when it takes the lock and compares it before believing anyone still holds
+it. Pids get recycled, so a recycled pid — an unrelated system daemon that
+inherited a dead holder&#39;s pid — is not believed to be a live holder. Lazy
+reclaims such a lock automatically, and says plainly when a holder cannot be a
+lazy process.</p>
+<p>If a lock is left that lazy cannot judge on its own, <code>lazy doctor</code> reports it
+and offers to clear it — it does this before any of its other checks, so it
+still works when every other command is blocked:</p>
+<pre><code>lazy doctor            # asks first
+lazy doctor --yes      # clears it without asking
+lazy doctor --dry-run  # only says what it would remove
+</code></pre>
+<p>A lock taken inside a Lazy Teams project&#39;s machine is never reclaimed from
+outside that machine: lazy there cannot see whether the machine&#39;s daemon is
+still running, so it refuses with a message that names the lock file. Stop the
+project from its page first; if the lock is still there afterwards, remove it
+with the <code>rm</code> command the message prints.</p>
+<p>Removing the lock by hand (<code>rm …/.storage-lock</code>) is safe <strong>only</strong> when no lazy
+process is running. If one is, wait for it instead. A copied or misconfigured
+<code>[storage] external_path</code> can name another checkout&#39;s store; lazy refuses that
+checkout before taking the lock. See <a href="../store-ownership/">Store ownership</a> for
+separate stores, moving a checkout, and claiming a store without an owner.</p>
+<h3 id="when-the-daemon-holds-the-lock"><a class="anchor" href="#when-the-daemon-holds-the-lock" aria-hidden="true">#</a>When the daemon holds the lock</h3>
+<p>This is the normal state of every healthy install, not a problem. The daemon is
+the store&#39;s single writer: it takes the storage lock when it starts and holds it
+until it stops. Doctor says so and runs every check as usual — it reads task
+state <em>through</em> the daemon, so the lock is no obstacle:</p>
+<pre><code>✓ Storage lock held by the daemon (pid 5294, as designed)
+</code></pre>
+<p>Doctor confirms two things before it says that: the holder pid is the daemon&#39;s
+own (from its lock and PID files), and the daemon actually answers a real
+storage read within a few seconds. A daemon that holds the lock but does not
+answer is a failure, and doctor reports it as one:</p>
+<pre><code>✗ Daemon holds the storage lock but is not serving storage
+  … it did not answer a storage read within 3000ms.
+</code></pre>
+<p>Then the checks that read task state are named as skipped, and the remedy is
+<code>lazy daemon status</code> / <code>lazy daemon restart</code> — never deleting the lock file,
+which would admit a second writer while the daemon still lives.</p>
+<p>The same check runs when doctor is started from the dashboard&#39;s Doctor page
+(or a hosted Lazy Teams install). There the daemon checks itself by reading its
+own storage directly, so a healthy daemon reports the lock as held &quot;as
+designed&quot;. If that check cannot be made at all, doctor says so as a warning
+rather than calling the daemon stuck.</p>
+<h3 id="when-the-holder-is-alive-but-never-lets-go"><a class="anchor" href="#when-the-holder-is-alive-but-never-lets-go" aria-hidden="true">#</a>When the holder is alive but never lets go</h3>
+<p>A lock whose holder verifies as the process that took it is <em>not</em> stale, so
+lazy will not reclaim it — that would corrupt the store. A hung lazy process
+therefore blocks every command in the project for as long as it lives.</p>
+<p><code>lazy doctor</code> looks at the lock instead of queueing behind it, and always
+finishes:</p>
+<pre><code>✓ Storage lock available
+  ! The storage lock is held by pid 5294 (…), taken 3s ago … — the store is busy.
+
+✗ Storage lock is wedged
+  The storage lock has been held by pid 5294 (…), taken 14m ago — one storage
+  operation, for longer than any real one takes.
+</code></pre>
+<p>Both of those describe a holder that is <em>not</em> the daemon — some other lazy
+process taking the lock for one operation. Such a lock is normally held for
+milliseconds, so doctor warns while it is fresh and calls it <em>wedged</em> once one
+acquire has outlived a minute. The checks that read task state are reported as
+skipped rather than run, and every other check in the report is unaffected.</p>
+<p>The remedy is aimed at the process, not the file: find out what pid it names
+(<code>lazy daemon status</code>, <code>ps -p &lt;pid&gt;</code>) and stop it if it is hung, then re-run
+<code>lazy doctor</code>. Deleting the lock file while its holder is alive lets a second
+writer into the store.</p>
+<p>If the lock file does not record a readable acquire time — it was truncated
+mid-write, or written by a lazy old enough not to record one — doctor cannot
+tell busy from wedged, so it fails rather than warns:</p>
+<pre><code>✗ Storage lock age is unreadable
+  The storage lock is held by pid 5294 (…), unchanged for the whole 1500ms probe,
+  but …/.storage-lock does not record a readable acquired_at.
+</code></pre>
+<p>A warning would be the wrong call there: the damaged timestamp is on disk, so
+every later run would read the same unreadable value and stay quiet while the
+lock is held forever. The remedy is the same — go look at the process the
+message names.</p>
+<p>Only <code>lazy doctor</code> fails fast like this. Every other command keeps queueing on
+a contended lock, which is what you want from a command that has work to do.</p>
+<h2 id="accept-fails-with-indexlock-file-exists"><a class="anchor" href="#accept-fails-with-indexlock-file-exists" aria-hidden="true">#</a>Accept fails with <code>index.lock: File exists</code></h2>
+<pre><code>Accept failed: git could not update the index because a lock file already exists at
+…/.git/worktrees/&lt;task&gt;/index.lock. …
+</code></pre>
+<p>Git creates an <code>index.lock</code> while it updates a worktree&#39;s index, then renames
+it into place. If that git process is killed mid-write — a crash, a forced
+daemon stop, a container teardown — the lock file is left behind, and every
+later accept whose merge target is that worktree fails until the lock is gone.</p>
+<p>Lazy checks whether any process still has the lock open before removing it. When
+nothing holds it, accept clears the lock, says so, and continues. When a live
+process still has it open, accept refuses and names the process — deleting a
+lock out from under a live git corrupts the repository.</p>
+<p>If lazy cannot check (no way to list open files in that environment) it also
+refuses, and tells you the exact <code>rm</code> path to use only when you are sure no git
+is using that worktree:</p>
+<pre><code>rm …/.git/worktrees/&lt;task&gt;/index.lock
+</code></pre>
+<p>Then retry the accept. The task is left as it was — the merge did not start.</p>
+<h2 id="could-not-register-the-lazy-mcp-tools--refusing-to-run-it"><a class="anchor" href="#could-not-register-the-lazy-mcp-tools--refusing-to-run-it" aria-hidden="true">#</a>&quot;Could not register the lazy MCP tools … refusing to run it&quot;</h2>
+<p>A turn failed before the agent started, with something like:</p>
+<pre><code>Could not register the lazy MCP tools for task 0c4623c0, so this turn would have
+run with NO lazy_* tools at all — refusing to run it.
+  Container/host: 2ab3ca200fdf
+  Turn scope: write
+  Cause: LAZY_DAEMON_CONFIG not set. The daemon must provide MCP config when launching containers.
+</code></pre>
+<p>That is deliberate. An agent without <code>lazy_*</code> tools cannot read task history,
+raise items, commit through lazy, or reach any lazy state — it would do
+the work with the wrong picture and no way to say so, so lazy refuses the turn
+loudly rather than letting it run blind.</p>
+<p>The message names everything you need:</p>
+<ul>
+<li><strong>Container/host</strong> — inside a container this is the container id, so
+<code>docker logs &lt;id&gt;</code> reaches the right one.</li>
+<li><strong>Cause</strong> — <code>LAZY_DAEMON_CONFIG not set</code> means the container was launched
+without daemon config. <code>LAZY_DAEMON_CONFIG</code> comes from the launch argv, so it
+cannot be repaired inside a running container: the next relaunch supplies it.</li>
+</ul>
+<p>Check the daemon is up (<code>lazy daemon status</code>), then resume the task — the
+relaunch fixes the common case. <code>lazy doctor</code> reports launch-path problems.
+Any other cause (<code>EACCES</code>, <code>EISDIR</code>, <code>ENOSPC</code>) is a filesystem problem where the
+agent&#39;s <code>~/.claude.json</code> is written.</p>
+<h2 id="refusing-to-serve-lazy-mcp-tools--configured-for-a-different-task"><a class="anchor" href="#refusing-to-serve-lazy-mcp-tools--configured-for-a-different-task" aria-hidden="true">#</a>&quot;Refusing to serve lazy MCP tools: … configured for a different task&quot;</h2>
+<p>A turn&#39;s agent has no <code>lazy_*</code> tools, and the MCP server&#39;s output says:</p>
+<pre><code>Refusing to serve lazy MCP tools: this server was configured for a different task
+than the turn it was spawned in.
+  This turn expects: task 6148d734-… in /repo/.lazy/worktrees/my-task
+  The MCP entry says: task 91290431-… in /repo/.lazy/worktrees/old-task
+</code></pre>
+<p>Claude Code discovers MCP servers in exactly one place — <code>$HOME/.claude.json</code> —
+and every lazy supervisor rewrites the single <code>mcpServers.lazy</code> entry there
+before each turn, stamping in that turn&#39;s task and worktree. Containerized tasks
+each have their own HOME, so supervisors for different tasks do not share an MCP
+config file on the host.</p>
+<p>A stray <code>lazy supervise</code> process left behind by an earlier run can keep
+rewriting that entry while a real agent works, so the agent&#39;s tools would be
+served against the stray&#39;s (possibly already deleted) worktree. The server
+compares its own <code>--task-id</code>/<code>--worktree</code> against what the supervisor exported
+for this turn and exits instead, so an agent gets its own task&#39;s tools or none —
+never another task&#39;s.</p>
+<p>The remedy is in the message: find the stray supervisor and kill it.</p>
+<pre><code class="language-bash">ps ax | grep &quot;lazy supervise&quot;
+kill &lt;pid&gt;
+</code></pre>
+<p>Then re-run the turn. If the process it names belongs to a live task you care
+about, that task is the one to stop cleanly (<code>lazy stop &lt;task&gt;</code>) rather than
+kill. Note that &quot;no tools&quot; is itself fatal and visible — the turn is aborted, not
+run blind.</p>
+<h2 id="a-lazy-tool-fails-then-every-later-tool-says-connection-closed"><a class="anchor" href="#a-lazy-tool-fails-then-every-later-tool-says-connection-closed" aria-hidden="true">#</a>A lazy tool fails, then every later tool says &quot;Connection closed&quot;</h2>
+<p>What it looks like in an agent&#39;s transcript:</p>
+<pre><code>lazy_commit → git commit failed: fatal: cannot change to
+              &#39;/repo/.lazy/worktrees/482b10cc&#39;: No such file or directory
+lazy_status → Connection closed
+</code></pre>
+<p>Two separate faults, one after the other.</p>
+<p><strong>The dead directory</strong> is the shared-<code>~/.claude.json</code> hijack described in the
+section above: the MCP server this agent was talking to had been spawned from an
+entry another supervisor overwrote, so it was bound to a worktree that had
+already been cleaned up. The agent&#39;s own worktree was never involved. That entry
+can now only be served by the task it names, and if a bound worktree does go
+missing anyway the tool says so itself — naming the path, the task, the likely
+cause and the remedy — rather than passing git&#39;s wording through.</p>
+<p><strong>&quot;Connection closed&quot; is not a network problem.</strong> It is what an MCP client reports
+when the server process is simply gone. The <code>lazy_status</code> that followed could not
+reach the daemon. An unreachable daemon comes back as an ordinary tool error and
+the session keeps working. If you see &quot;Connection closed&quot;, the server really did die: look at the
+supervisor log for a <code>[lazy-mcp]</code> line, which reports the reason.</p>
+<p>If a tool ever answers with the missing-worktree message, do what it says — report
+it and stop. Every tool on that connection is bound to the same dead path, so
+retrying, or reaching for a different lazy tool, will only produce the same
+failure. Nothing was read or written in the missing directory, and your own
+worktree is untouched.</p>
+<h2 id="claude-mcp-list-says--connected-but-the-agent-has-no-tools"><a class="anchor" href="#claude-mcp-list-says--connected-but-the-agent-has-no-tools" aria-hidden="true">#</a><code>claude mcp list</code> says &quot;✔ Connected&quot; but the agent has no tools</h2>
+<p>You bashed into the agent container, ran <code>claude mcp list</code>, and got:</p>
+<pre><code>lazy: lazy-agent mcp --daemon-config /…/daemon-mcp-lazy-my-task.json --task-id … - ✔ Connected
+</code></pre>
+<p>…while the agent in that same container was failing every call with
+<code>No such tool available: lazy_status</code>.</p>
+<p>Both things are true at once, because <strong><code>mcp list</code> does not check what you think
+it checks</strong>. It starts the server, sends <code>initialize</code>, and prints &quot;✔ Connected&quot;
+if it gets an answer. It never prints a tool count, and it never looks at the
+agent&#39;s own process. Three quite different states all render identically:</p>
+<ul>
+<li>the server is healthy and the agent has every tool (the normal case);</li>
+<li>the server starts, answers <code>initialize</code>, and registers <strong>zero</strong> tools;</li>
+<li>the server is fine and <strong>Claude Code never loaded it</strong> into the agent process.</li>
+</ul>
+<p>So &quot;✔ Connected&quot; is not evidence that the wiring works, and it should never end
+an investigation.</p>
+<h3 id="run-lazy-doctor-task-id-from-the-host"><a class="anchor" href="#run-lazy-doctor-task-id-from-the-host" aria-hidden="true">#</a>Run <code>lazy doctor &lt;task-id&gt;</code> from the host</h3>
+<p><code>lazy doctor &lt;task-id&gt;</code> runs its usual task checks and then runs <code>lazy-agent doctor</code> inside that task&#39;s container, passing the output straight through — so
+you never have to find the container name yourself:</p>
+<pre><code class="language-bash">lazy doctor my-task
+</code></pre>
+<p>The container section is skipped, with the reason printed, when there is no live
+container to enter: the agent only exists while a turn is running, and the MCP
+config being diagnosed is written per turn. A skip is never counted as a pass.
+Add <code>--probe-agent</code> to forward that flag to the in-container doctor (see below).</p>
+<p>If you are already in the container — or the task&#39;s run is gone and you are
+inspecting a fresh one — run it directly, with no arguments:</p>
+<pre><code class="language-bash">docker exec -it &lt;container&gt; bash
+lazy-agent doctor
+</code></pre>
+<p>In your own Lazy Teams terminal, doctor explains that Pair and Chat supply
+their lazy tools per connection and marks the shared-config checks as not
+applicable (<code>–</code>). Those checks do not diagnose your paired agent&#39;s connection.
+If its tools are disconnected, close and reopen Pair or Chat to connect again.</p>
+<p>Everywhere else it walks the whole chain and marks each link, exiting non-zero if any fails. A failed link is printed as what is wrong (for example <code>✗ LAZY_DAEMON_CONFIG is not set</code>), not as the name of the thing checked:</p>
+<ol>
+<li><strong><code>LAZY_DAEMON_CONFIG</code></strong> — set, mounted, readable, parseable; reports the
+project root, task id and daemon target. The bearer token is never printed.</li>
+<li><strong><code>~/.claude.json</code></strong> — is there a <code>lazy</code> server entry, does its command
+resolve on <code>PATH</code>, does its <code>--daemon-config</code> path exist in this container,
+and does its <code>--task-id</code> match this container&#39;s task (a mismatch is a stale
+entry from a previous task).
+It also fails when the entry was written by another process: its
+<code>--worktree</code> no longer exists, it names a daemon config other than this
+session&#39;s, or — in a builder session — it is scoped to a task. Claude Code
+reads a single <code>~/.claude.json</code>, so a stray <code>lazy mcp</code> started in the same
+container can take over the lazy tools, and every call then fails while the
+daemon is running. Stop that process (<code>ps -eo pid,args | grep &#39; mcp &#39;</code>) and
+restart the session, which rewrites the entry.</li>
+<li><strong><code>~/.claude/settings.json</code></strong> — how many <code>mcp__lazy__*</code> entries are allowed.</li>
+<li><strong>Read-only (ask) mode</strong> — on or off, and how many tools that implies. Ask
+turns legitimately get a smaller set; this tells you which count is healthy.</li>
+<li><strong>Live MCP self-test</strong> — spawns the server with exactly the argv from
+<code>~/.claude.json</code>, drives <code>initialize</code> + <code>tools/list</code>, and prints the actual
+<strong>tool count and names</strong>. This is the check <code>mcp list</code> cannot do.</li>
+<li><strong>Daemon round-trip</strong> — calls one read-only tool (<code>lazy_status</code>) for real.
+This separates &quot;the server starts&quot; from &quot;the server can reach the daemon&quot;,
+and exercises the config mount, the token and the host route end to end.</li>
+</ol>
+<p>Add <code>--probe-agent</code> to also start a real <code>claude</code> process (<code>claude -p &#39;ok&#39;</code>),
+read only its first stream-json line, and report which MCP servers and
+<code>mcp__lazy__*</code> tools <strong>Claude Code itself</strong> loaded, then kill it. That is the
+only check that observes the agent&#39;s own process, which is why it is opt-in —
+it starts a real agent process. <code>--json</code> gives machine-readable output.</p>
+<p>Reading the result: if the self-test lists tools but <code>--probe-agent</code> shows none,
+the server is fine and Claude Code is not loading it. If the self-test lists
+zero tools, the server itself came up empty. If the round-trip fails with a
+401/403, the token or task id is stale (checks 1 and 2); if it fails to connect,
+the daemon is down or its target is not routable from the container.</p>
+<h3 id="turns-catch-this-by-themselves"><a class="anchor" href="#turns-catch-this-by-themselves" aria-hidden="true">#</a>Turns catch this by themselves</h3>
+<p>You usually will not have to run any of this. Claude Code reports
+the MCP servers and tools it loaded on the first line of its own stream, and the
+supervisor checks that line: a turn that provably started with <strong>no</strong> lazy tools
+is killed immediately and fails with a message naming what was observed, rather
+than running blind to completion. Such a turn is never retried — a relaunch with
+the same config cannot conjure tools.</p>
+<p>Two deliberate limits on that check:</p>
+<ul>
+<li>It fails only on <strong>positive evidence of zero</strong>. An agent that reports nothing
+about its tools (a different release or agent) leaves the
+turn alone. Absence of evidence is not evidence of absence.</li>
+<li>It asserts <strong>at least one</strong> lazy tool, not the full set, because read-only
+ask turns legitimately receive fewer.</li>
+</ul>
+<p>What was observed is recorded on the turn, so <code>lazy show</code> can answer &quot;did that
+turn have its tools?&quot; long after the container is gone.</p>
+<h2 id="redacted-in-logs-and-audit-records"><a class="anchor" href="#redacted-in-logs-and-audit-records" aria-hidden="true">#</a><code>&lt;redacted&gt;</code> in logs and audit records</h2>
+<p>Lazy scrubs live credential values out of anything it writes for a human to
+read, so a log you paste into a bug report cannot carry your token. You will see
+<code>&lt;redacted&gt;</code> in place of the value at four places:</p>
+<ul>
+<li>the <code>[session] debug = true</code> command echo</li>
+<li>lazy&#39;s log files and console output</li>
+<li>the supervisor and builder logs</li>
+<li><code>lazy stats audit</code> records — including the agent&#39;s own Bash command strings
+and tool results, which is where an agent that runs <code>env</code> or reads a
+credentials file would otherwise land a live value on disk</li>
+</ul>
+<p>Only the <em>value</em> is replaced. Env var names, mounts, image tags, commands, file
+paths and everything else stay intact, so the output is still diagnosable.</p>
+<p>Redaction is driven by env var <strong>key names</strong> (anything matching <code>*_TOKEN</code>,
+<code>*_KEY</code>, <code>*_SECRET</code>, <code>*_PASSWORD</code>, <code>*_CREDENTIAL(S)</code>, <code>*_AUTH</code>), never by
+guessing which values look secret. Two consequences worth knowing:</p>
+<ul>
+<li>A credential lazy does not have in its own environment is not scrubbed —
+redaction covers what lazy launches agents with, not arbitrary secrets in your
+repo.</li>
+<li>Values shorter than 12 characters are left alone on purpose. Ollama sets
+<code>ANTHROPIC_API_KEY=ollama</code> and the QA agent uses <code>none</code>; substring-replacing
+words that short would corrupt unrelated log lines while protecting nothing.</li>
+</ul>
+<h2 id="a-builder-fails-while-its-container-image-is-building"><a class="anchor" href="#a-builder-fails-while-its-container-image-is-building" aria-hidden="true">#</a>A builder fails while its container image is building</h2>
+<p>When starting a builder in Lazy Teams, the failed start page shows the container
+build&#39;s last relevant output beneath the exit code. The same diagnostic is saved
+with the builder session, so you can return to it after leaving the page. A
+project administrator can also read the failed start in the project&#39;s app logs.
+For a BuildKit failure, look for the failing step&#39;s error message above the
+final <code>ERROR</code> line; the exit code alone does not identify the cause.</p>
+<h2 id="the-environment-that-runs-this-projects-tasks-isnt-working"><a class="anchor" href="#the-environment-that-runs-this-projects-tasks-isnt-working" aria-hidden="true">#</a>&quot;The environment that runs this project&#39;s tasks isn&#39;t working&quot;</h2>
+<p>In Lazy Teams, this health banner offers a project admin the fix that matches
+the failure. Docker&#39;s own error text is under <strong>Docker&#39;s error</strong> in the banner.</p>
+<ul>
+<li><strong>The machine has a damaged image store</strong> (Docker reports <code>failed to extract layer</code> or <code>invalid tar header</code>): lazy repairs this by itself first. When a
+task or builder fails to start this way, lazy removes only that image (never
+volumes, containers or other images), rebuilds it without the build cache and
+tries the start once more; the task&#39;s journal and the project&#39;s messages
+record it, with what the damaged layer looked like before it was removed
+(its real checksum against the expected one, where it stops decoding, and
+what else Docker was doing), and the instance&#39;s Doctor shows the latest one.
+The rebuild reuses the image&#39;s base image, so damage there is not
+repaired this way. A repair that did not help is not tried again for the
+same image and error until someone rebuilds that image, so a task that keeps
+being restarted does not rebuild over and over. A full disk (<code>no space left on device</code>) is not treated as damage, and nothing is removed for it: free
+space on the machine instead. If the banner still shows, the damage is outside what the
+rebuild replaces: use
+<strong>Reset Docker storage</strong>, and once the check runs again, rebuild the image.</li>
+<li><strong>The project&#39;s image is broken</strong>, and the project builds its own image
+(<code>[docker] dockerfile</code>, or a committed <code>Dockerfile.lazy</code>): use <strong>Rebuild
+image</strong>. If that doesn&#39;t fix it, use <strong>Rebuild without cache</strong>.</li>
+<li><strong>lazy&#39;s runner image is broken</strong>, and the project has no image of its own:
+use <strong>Rebuild lazy&#39;s image</strong>. This rebuilds lazy&#39;s default image from scratch.
+From a terminal, <code>lazy system runner-image rebuild</code> does the same thing.</li>
+</ul>
+<h2 id="script-not-found-builder-or-a-selfcheck-with-no-output"><a class="anchor" href="#script-not-found-builder-or-a-selfcheck-with-no-output" aria-hidden="true">#</a><code>Script not found &quot;builder&quot;</code>, or a selfcheck with no output</h2>
+<p>Both are the same fault: the file at <code>/usr/local/bin/lazy-agent</code> inside the
+container is <strong>not</strong> the compiled lazy agent. Containers bind-mount an agent
+binary from <code>~/.lazy/bin</code> there, so whatever that host file is is what runs.</p>
+<p>Each install lives under a name derived from its own bytes
+(<code>~/.lazy/bin/lazy-agent-&lt;id&gt;</code>) and is never written to again once installed;
+<code>~/.lazy/bin/lazy-agent-current</code> is a symlink pointing at the current one. That is
+why <code>lazy upgrade</code> no longer disturbs containers that are already running — they
+keep mounting the file they started with. (<code>~/.lazy/bin/lazy-agent</code>, if you still
+have one, is from an older layout: lazy leaves it alone for containers that
+mount it and removes it once none do.)</p>
+<p>The case seen in the field was a bare Bun runtime, which produces two
+unrelated-looking errors from one cause:</p>
+<ul>
+<li><code>error: Script not found &quot;builder&quot;</code> — Bun&#39;s message for <code>bun &lt;script&gt;</code> when no
+such package script exists. The container&#39;s entry argv is
+<code>lazy-agent builder …</code>, so Bun reads <code>builder</code> as a script name.</li>
+<li><code>Builder preflight failed: &#39;lazy-agent selfcheck&#39; did not identify the lazy agent (exit 1, stdout: &lt;no output&gt;, …)</code> — Bun says <code>Script not found &quot;selfcheck&quot;</code> on stderr and prints nothing on stdout.</li>
+</ul>
+<p>Diagnose it on the host:</p>
+<pre><code class="language-bash">lazy doctor          # the &quot;Agent binary&quot; check names what the file actually is
+</code></pre>
+<p>Fix it by rebuilding:</p>
+<pre><code class="language-bash">lazy upgrade         # installed build
+bun run build        # source checkout, then lazy upgrade
+</code></pre>
+<p>Every producer of that file now verifies it before installing it: <code>bun run build</code>
+(before embedding the agent into the compiled <code>lazy</code> binary), extraction from that
+embedded copy, the dev-mode rebuild, container image tagging (a throwaway
+container runs <code>lazy-agent selfcheck</code> with the mount path), and <code>lazy upgrade</code>
+itself. A rebuild that produces a non-agent is refused and the previous working
+binary is left in place, so a bad build degrades to a stale agent rather than a
+broken one.</p>
+<p>If <code>lazy upgrade</code> reports the failure instead of fixing it, the source it is
+building <em>from</em> is wrong — in a source checkout, check that <code>./lazy-agent</code> in the
+repo is either the 12-byte placeholder or a real build, and re-run
+<code>bun run build</code>.</p>
+<h2 id="lazy-sync--lazy-unblock-sits-silent-for-minutes-after-an-upgrade"><a class="anchor" href="#lazy-sync--lazy-unblock-sits-silent-for-minutes-after-an-upgrade" aria-hidden="true">#</a><code>lazy sync</code> / <code>lazy unblock</code> sits silent for minutes after an upgrade</h2>
+<p>Launching a turn builds the container image if one is missing, so a command that
+starts a turn can block for as long as a build takes. That is expected the first
+time you use a project on a new machine. It is <strong>not</strong> expected right after an
+upgrade that already built the image.</p>
+<p>Look at <code>lazy daemon logs</code>. Every container build lazy runs now announces itself
+on one line before any build output, and one line after:</p>
+<pre><code>Building container image lazy-runner:0.23 from the embedded default Dockerfile
+  — missing on this host — first build for lazy 0.23.1670 (this can take several minutes).
+Built container image lazy-runner:0.23 from the embedded default Dockerfile in 4m12s.
+</code></pre>
+<p>The build&#39;s own progress output is streamed between the two, tagged with the
+image name (<code>[build lazy-runner:0.23]</code>). Two things to read off it:</p>
+<ul>
+<li><strong>Which image, and from which Dockerfile.</strong> If the Dockerfile path is not one
+you recognise — or the image name is not one of yours — the build belongs to a
+different project&#39;s daemon on the same machine.</li>
+<li><strong>Why.</strong> The reason is on the first line: <code>missing on this host</code>,
+<code>too old: built N days ago</code>, or the name of the input file whose content
+changed.</li>
+</ul>
+<p>If the reason says <code>missing on this host</code> immediately after an upgrade, the
+upgrade built one image and the daemon then resolved a different one. The usual
+cause is a worktree Dockerfile adoption that was cleared: adoption is scoped to
+lazy&#39;s <code>major.minor</code>, so a genuine minor-version bump expires it and the daemon
+falls back to the project root Dockerfile. <code>lazy doctor</code> reports the adoption&#39;s
+state and why it was cleared.</p>
+<h2 id="the-fix-isnt-working-after-lazy-upgrade"><a class="anchor" href="#the-fix-isnt-working-after-lazy-upgrade" aria-hidden="true">#</a>The fix isn&#39;t working after <code>lazy upgrade</code></h2>
+<p>When you rebuild from a source checkout, <code>lazy upgrade</code> prints which checkout
+produced the agent binary — path, branch, short commit, and whether the tree was
+clean or dirty — on the <code>rebuilt agent binary (verified)</code> line. If you ran upgrade
+from the wrong branch, that line is the first place to look.</p>
+<p>After the fact, the same metadata is embedded in the binary:</p>
+<pre><code class="language-bash">lazy --version
+lazy-agent selfcheck
+</code></pre>
+<p>Both append branch, commit, clean/dirty, and source path, for example
+<code>0.90.4100 (main@1a2b3c4, clean, /opt/lazy)</code>. A run straight from a source
+checkout asks git for the current commit. Images built without git (the daemon
+and Lazy Teams images) carry the identity they were built from; a build that got
+neither git nor that identity prints <code>(source unknown: …)</code> rather than nothing.
+<code>lazy doctor</code> shows the running daemon&#39;s version and commit on its version row.
+<code>lazy daemon status</code> includes branch and path on its <strong>Built:</strong> line for compiled
+daemons.</p>
+<p>Building from <code>main</code> while fixes live on a release branch is fine — the failure
+mode is when that choice is invisible. Check the provenance lines before chasing
+behavior that simply is not in the binary you installed.</p>
+<h2 id="detected-dubious-ownership-in-repository-at-"><a class="anchor" href="#detected-dubious-ownership-in-repository-at-" aria-hidden="true">#</a><code>detected dubious ownership in repository at …</code></h2>
+<p>git refuses a repository whose directory belongs to a different user than the one
+running git, and it suggests you fix that with:</p>
+<pre><code>git config --global --add safe.directory /path/to/the/worktree
+</code></pre>
+<p><strong>Do not run that for a lazy worktree.</strong> The path in the message is a worktree
+lazy created and manages, and in almost every case the git that refused it was
+running inside the agent container — where your host&#39;s <code>~/.gitconfig</code> is never
+read, so the suggested command would change nothing while quietly widening trust
+on your machine.</p>
+<p>Lazy marks its own worktree and git directories as trusted in the gitconfig it
+generates for each task at <code>&lt;worktree&gt;/.lazy-task-sandbox/.gitconfig</code>, which the
+container uses as its global git config. Nothing else is trusted: every other
+repository visible inside the container still gets git&#39;s ownership check in full,
+and your real <code>~/.gitconfig</code> is never touched.</p>
+<p>If you see this anyway, that generated file did not reach the container. Relaunch
+the task to regenerate it:</p>
+<pre><code class="language-bash">lazy stop &lt;task&gt;
+lazy unblock &lt;task&gt;
+</code></pre>
+<p>If it survives a relaunch, the failure is on the host side rather than in the
+container — check who owns the path (<code>ls -ld &lt;worktree&gt;</code>). It should be the same
+user that runs lazy and its daemon; a worktree owned by <code>root</code> usually means some
+command was run under <code>sudo</code> that should not have been.</p>
+<h2 id="lazy-sync-warns-that-the-local-and-remote-parent-branch-differ"><a class="anchor" href="#lazy-sync-warns-that-the-local-and-remote-parent-branch-differ" aria-hidden="true">#</a><code>lazy sync</code> warns that the local and remote parent branch differ</h2>
+<p>When a subtask syncs, lazy merges its parent branch in. If your project has a
+remote, that branch can exist in two places at once — locally, and as
+<code>origin/&lt;branch&gt;</code> — and they do not always agree. When they do not, sync says so:</p>
+<pre><code>Local `lazy/parent-task` and `origin/lazy/parent-task` differ: 2 commit(s) only
+local, 0 only on the remote. Used `lazy/parent-task` — `lazy/parent-task` is
+unprotected, so `lazy accept` merges into the LOCAL branch.
+</code></pre>
+<p>This is information, not an error: the sync succeeded. Lazy always merges from
+the ref <code>lazy accept</code> will actually merge into, so the two commands agree about
+what your task is built on.</p>
+<p>Which ref that is depends on the parent branch:</p>
+<ul>
+<li><strong>A parent task&#39;s branch, or any other unprotected branch</strong> — accept merges it
+locally, so sync uses the local branch. A parent task&#39;s own commits live only
+on your machine: agents cannot push, by design.</li>
+<li><strong>A protected branch such as <code>main</code></strong> — accept merges on the forge, so sync
+uses <code>origin/&lt;branch&gt;</code>. Any local commits on that branch are not part of the
+merge until they are pushed, and the warning says so.</li>
+</ul>
+<p><strong>Sync never pushes a parent branch.</strong> If a branch of your own is ahead of the
+remote and you want the remote to carry those commits, push it yourself —
+the warning names the exact command. Lazy leaves it alone because you may be
+part-way through work on that branch.</p>
+<p>If you see this warning and the outcome still surprises you, <code>lazy diff &lt;task&gt;</code>
+shows what the task is actually built on.</p>
+<h2 id="a-colleague-pushed-to-my-tasks-branch"><a class="anchor" href="#a-colleague-pushed-to-my-tasks-branch" aria-hidden="true">#</a>A colleague pushed to my task&#39;s branch</h2>
+<p>Run <code>lazy sync &lt;task&gt;</code>. Before it merges the parent branch, sync checks the
+task&#39;s OWN branch on origin, and merges <code>origin/&lt;task-branch&gt;</code> into the worktree
+when it has commits your copy lacks — a fast-forward when the branch is only
+behind, a real merge when both sides moved. Conflicts are handed to the task&#39;s
+agent to resolve, so you do not have to pair into the worktree and run <code>git merge</code> by hand.</p>
+<p>The step names itself in the output, including when it does nothing:</p>
+<pre><code>✓ [1/5] Check task branch on origin — origin/lazy/my-task has new commits
+– [1/5] Check task branch on origin skipped — origin/lazy/my-task has no new commits
+</code></pre>
+<p>It is also skipped, with the reason on that line, when your remote driver is
+<code>local</code>, when lazy is offline, or when the branch has never been pushed. Sync
+does not push the result back — the push after the next turn, or <code>lazy accept</code>,
+does that.</p>
+<h2 id="a-task-lists-hundreds-of-commits-it-never-made"><a class="anchor" href="#a-task-lists-hundreds-of-commits-it-never-made" aria-hidden="true">#</a>A task lists hundreds of commits it never made</h2>
+<p>A task&#39;s Commits tab — in <code>lazy show</code>, in the web review, in search — should
+list what its own branch carries. A task whose stored list holds hundreds of
+other people&#39;s commits has a wrong record only; the branch, the diff and the
+review are unaffected. Nothing else deletes a commit record, so clean the list
+up explicitly:</p>
+<pre><code>lazy system repair-commits --all
+</code></pre>
+<p>That reports what it would change and writes nothing. It lists the records it
+would remove, with their commit subjects, so you can see what is about to go
+rather than approving a number. On a large project the scan takes a while, so
+it prints each task as it checks it.</p>
+<p>When the report looks right, apply it:</p>
+<pre><code>lazy system repair-commits --all --apply
+</code></pre>
+<p>Name a single task instead of <code>--all</code> to check just that one. Add <code>--json</code> for
+machine-readable output; with <code>--apply</code> it also needs <code>--yes</code>, since there is
+nobody to confirm with.</p>
+<p>Some tasks are reported as <strong>skipped</strong> and left exactly as they are. That
+happens when the correct list can no longer be computed with confidence, and in
+every case the records are kept rather than guessed at:</p>
+<ul>
+<li>The task&#39;s branch is gone entirely — accepted long ago, worktree removed, no
+remaining ref.</li>
+<li>The branch survives only as a ref, and that ref does not contain some of the
+recorded commits. Usually this means the worktree was removed while its last
+commits had never been pushed, so the ref is behind the work: those records
+may well be real, and deleting them would destroy the only trace of them.</li>
+</ul>
+<p>A skipped task is not a failure, and re-running later can resolve it — for the
+second case, restoring or re-fetching the branch is what gives the command
+something trustworthy to compare against.</p>
+<h2 id="the-daemon-cant-fetch-from-the-remote"><a class="anchor" href="#the-daemon-cant-fetch-from-the-remote" aria-hidden="true">#</a>The daemon can&#39;t fetch from the remote</h2>
+<p>The daemon polls your remote about once a minute so it can notice branches that
+were merged or closed elsewhere. If it cannot authenticate, <code>daemon.log</code> says
+so once, with what to do:</p>
+<pre><code>Fetch from &#39;origin&#39; failed for /path/to/project: fatal: could not read Username for &#39;https://github.com&#39;: terminal prompts disabled
+  The remote needs credentials this machine does not have. Authenticate git for it
+  (a credential helper, `gh auth login`, or an SSH key), or set `sync_interval = 0`
+  under [server] in lazy.toml to stop syncing this project.
+</code></pre>
+<p>The daemon keeps retrying on its normal schedule — a network blip should heal
+by itself — but it only writes that message again when the reason changes, so a
+remote you have no credentials for does not fill the log.</p>
+<p><strong>Git never prompts here, on purpose.</strong> The daemon runs in the background,
+often sharing a terminal with whatever started it, and a background <code>git</code> asking
+<code>Username for &#39;https://github.com&#39;:</code> takes over that terminal with nothing to
+say which process wants an answer. A fetch without credentials fails
+immediately instead. Everything else — your own <code>lazy</code> commands, agents in their
+containers — is unaffected.</p>
+<p>Fix it the same way you would for any other git on the machine: log in with
+<code>gh auth login</code>, configure a credential helper, or use an SSH remote with a key
+the daemon&#39;s user can read.</p>
+<h2 id="documentation-links"><a class="anchor" href="#documentation-links" aria-hidden="true">#</a>Documentation links</h2>
+<p>Messages like <em>&quot;Check documentation at <a href="https://docs.getlazy.dev/…" rel="noopener noreferrer">https://docs.getlazy.dev/…</a>&quot;</em> point at
+this site. Forks and self-hosted mirrors can repoint them, and projects that
+would rather not show them can turn them off, with one key:</p>
+<pre><code class="language-toml">[docs]
+url = &quot;https://docs.example.com&quot;   # &quot;&quot; disables documentation pointers
+</code></pre>
+<p>Every message that carries a pointer is fully actionable without it — the link
+is always a supplement, never the instruction.</p>
+<h2 id="missing-git-pointers-inside-a-task-container"><a class="anchor" href="#missing-git-pointers-inside-a-task-container" aria-hidden="true">#</a>Missing git pointers inside a task container</h2>
+<p>A linked worktree normally has a <code>.git</code> file, not a directory. If
+<code>lazy doctor --repair-git-pointers</code> finds no host-pointer problem but git
+inside a paused task&#39;s container still reports a missing <code>.git</code>, recreate the
+container rather than editing git files inside it. From a terminal connected
+to the project daemon, run:</p>
+<pre><code class="language-sh">lazy shell &lt;task&gt; --restart -- git status
+</code></pre>
+<p>This replaces the container and its mounts, not the worktree: uncommitted files
+remain, but container-only packages and running processes are lost. A working
+task must finish or be stopped first. In the web interface (including Teams),
+starting the task container checks its mounted pointers against the validated
+host originals and recreates a faulty paused container automatically. If the
+pointer check cannot run, the container is left untouched and the diagnostic
+error is reported. If the error persists after recreation, report it with the
+daemon logs; a successful host check alone does not identify the cause of a
+container failure.</p>
+
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../pi-agent/"><span>Previous</span>Running tasks with the Pi coding agent</a><a class="next" href="../reference/dashboard/index/"><span>Next</span>Dashboard</a></nav>
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch" open><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/" aria-current="page">Troubleshooting</a></li></ul></details>
+<details class="branch"><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch"><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
+</body>
+</html>

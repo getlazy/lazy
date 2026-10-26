@@ -1,5 +1,5 @@
 {
-  "version": "v0.93",
+  "version": "v0.94",
   "pages": [
     {
       "path": "accept-check",
@@ -34,6 +34,9 @@
         "when-the-image-is-built",
         "watching-rebuilding-and-cancelling-the-build",
         "resetting-a-machines-docker-storage",
+        "how-long-a-tasks-container-lives",
+        "services-and-other-long-running-commands",
+        "keep-your-services-data-across-restarts-put-it-in-lazy_task_data",
         "rebuilding",
         "when-an-agent-cannot-start",
         "what-the-container-can-and-cannot-change-in-git",
@@ -228,6 +231,8 @@
         "credentials",
         "quick-start",
         "commands",
+        "share-a-credential-across-projects",
+        "share-credentials-in-lazy-teams",
         "storing-a-credential",
         "when-a-stored-credential-takes-effect",
         "named-credentials",
@@ -268,6 +273,22 @@
         "backing-up-and-moving-off-the-box",
         "what-this-guide-cannot-verify-for-you",
         "getting-help"
+      ]
+    },
+    {
+      "path": "deploying-lazy-teams-kamal-kvm",
+      "source": "deploying-lazy-teams-kamal-kvm.md",
+      "file": "deploying-lazy-teams-kamal-kvm/index.html",
+      "title": "Deploying Lazy Teams on a KVM server with Kamal, behind ngrok",
+      "anchors": [
+        "deploying-lazy-teams-on-a-kvm-server-with-kamal-behind-ngrok",
+        "what-you-need",
+        "how-it-is-laid-out",
+        "moving-a-native-install-onto-the-server",
+        "deploying-a-new-version",
+        "starting-over-on-the-server",
+        "what-changes-for-people-when-the-address-changes",
+        "checking-ngrok"
       ]
     },
     {
@@ -324,6 +345,8 @@
         "why-it-exists",
         "the-pieces",
         "who-starts-a-turn",
+        "how-a-turn-ends",
+        "work-left-uncommitted-when-a-turn-ends",
         "how-feedback-reaches-the-agent",
         "in-each-surface",
         "limits"
@@ -429,6 +452,21 @@
       ]
     },
     {
+      "path": "how-to/ssh-into-a-task",
+      "source": "how-to/ssh-into-a-task.md",
+      "file": "how-to/ssh-into-a-task/index.html",
+      "title": "How to SSH into a task",
+      "anchors": [
+        "how-to-ssh-into-a-task",
+        "set-it-up-once-per-task",
+        "preview-a-service-with-ssh--l",
+        "copy-files-with-scp-and-sftp",
+        "work-in-vs-code-or-a-jetbrains-ide",
+        "limits",
+        "related"
+      ]
+    },
+    {
       "path": "how-to/upgrade",
       "source": "how-to/upgrade.md",
       "file": "how-to/upgrade/index.html",
@@ -451,6 +489,7 @@
         "cli",
         "dashboard",
         "lazy-teams",
+        "codex-builders",
         "related"
       ]
     },
@@ -501,7 +540,8 @@
         "tiered-agents-and-builders",
         "agents-the-project-adds",
         "automations",
-        "cli-vs-teams"
+        "cli-vs-teams",
+        "temporary-model-errors"
       ]
     },
     {
@@ -513,7 +553,8 @@
         "builders-in-lazy-teams",
         "the-terminal",
         "create-a-task-from-messages",
-        "files"
+        "files",
+        "running-environment"
       ]
     },
     {
@@ -523,7 +564,8 @@
       "title": "Environment variables, secrets and files",
       "anchors": [
         "environment-variables-secrets-and-files",
-        "what-a-task-gets"
+        "what-a-task-gets",
+        "data-directory"
       ]
     },
     {
@@ -560,6 +602,7 @@
         "how-to-verify",
         "the-verify-section",
         "services",
+        "sessions",
         "maintained-files",
         "changes-diff",
         "markdown-files-read-as-documents",
@@ -579,6 +622,7 @@
         "clusters",
         "what-is-still-outstanding-on-your-review",
         "protected-files",
+        "chat",
         "give-feedback",
         "asking-about-the-task-and-replying-to-an-answer",
         "starting-resuming-and-reopening",
@@ -599,7 +643,7 @@
         "your-own-environment",
         "what-carries-over-to-the-agent",
         "who-pays-and-who-is-named",
-        "taking-turns-with-the-agent",
+        "working-beside-the-agent",
         "related",
         "ids-in-text-are-links"
       ]
@@ -728,6 +772,7 @@
       "title": "Managed mode: which parts of lazy.toml a shared host honours",
       "anchors": [
         "managed-mode-which-parts-of-lazytoml-a-shared-host-honours",
+        "project-checkout",
         "why-override-some-keys-and-refuse-others",
         "unclassified-keys-fail-closed",
         "finding-out-why-your-config-is-being-ignored",
@@ -784,6 +829,7 @@
       "anchors": [
         "pairing",
         "where-the-session-runs",
+        "pairing-in-lazy-teams",
         "the---host-escape-hatch",
         "tools-the-paired-session-gets",
         "cursor-and-codex-pairing",
@@ -1533,6 +1579,15 @@
       ]
     },
     {
+      "path": "reference/cli/sessions",
+      "source": "reference/cli/sessions.md",
+      "file": "reference/cli/sessions/index.html",
+      "title": "lazy sessions",
+      "anchors": [
+        "lazy-sessions"
+      ]
+    },
+    {
       "path": "reference/cli/shell",
       "source": "reference/cli/shell.md",
       "file": "reference/cli/shell/index.html",
@@ -1818,6 +1873,15 @@
       "title": "lazy system store-check",
       "anchors": [
         "lazy-system-store-check"
+      ]
+    },
+    {
+      "path": "reference/cli/system-store-rehome",
+      "source": "reference/cli/system-store-rehome.md",
+      "file": "reference/cli/system-store-rehome/index.html",
+      "title": "lazy system store-rehome",
+      "anchors": [
+        "lazy-system-store-rehome"
       ]
     },
     {
@@ -2152,9 +2216,11 @@
       "anchors": [
         "project-machine",
         "header",
+        "network-check",
         "services",
         "docker-storage",
         "resources",
+        "free-space",
         "memory"
       ]
     },
@@ -2167,6 +2233,7 @@
         "project-overview",
         "top-bar",
         "header",
+        "forge-identity",
         "quick-actions",
         "notices",
         "needs-you",
@@ -2181,6 +2248,7 @@
       "anchors": [
         "project-settings",
         "tabs",
+        "image-and-build-history",
         "in-force-now",
         "change-defaults-for-new-tasks",
         "not-editable-yet",
@@ -2255,6 +2323,7 @@
         "header",
         "banners",
         "tabs",
+        "chat",
         "the-conversation-view",
         "action-area"
       ]
@@ -2443,6 +2512,7 @@
         "restoring-a-backup",
         "automatic-store-backup-before-every-roll",
         "keeping-the-fleet-on-your-own-filesystem",
+        "deleting-projects-teams-and-users",
         "adopting-an-existing-store",
         "before-you-start",
         "1-stop-the-local-daemon",
@@ -2541,37 +2611,7 @@
       "title": "The task state machine",
       "anchors": [
         "the-task-state-machine",
-        "statuses",
-        "a-parent-task-is-told-when-its-subtask-list-changes",
-        "allowed-transitions",
-        "who-moves-a-task",
-        "humans-and-builders-and-agents-over-mcp",
-        "the-agent",
-        "the-daemon-on-its-own",
-        "how-a-turn-ends",
-        "work-left-uncommitted-when-the-turn-ends",
-        "a-declaration-is-about-a-sha-and-it-can-go-stale",
-        "only-one-turn-runs-at-a-time",
-        "accept-and-the-merging-status",
-        "working-but-not-alive",
-        "waiting-on-subtasks",
-        "agent-reported-progress",
-        "agent-failure-classification",
-        "the-taxonomy",
-        "retry-pacing",
-        "what-stop-means",
-        "seeing-what-is-being-retried",
-        "watchdog-kills",
-        "crashes-restarts-and-recovery",
-        "detection",
-        "when-the-daemon-restarts",
-        "what-is-recorded",
-        "circuit-breaker",
-        "auto-resume",
-        "feedback-is-redelivered-after-a-crash",
-        "three-crash-scenarios",
-        "a-turn-nobody-read",
-        "manual-recovery"
+        "why-some-arrows-look-surprising"
       ]
     },
     {
@@ -2582,12 +2622,25 @@
       "anchors": [
         "store-backups-before-every-upgrade",
         "when-a-backup-is-taken",
+        "while-a-backup-runs",
         "where-and-how-many",
         "when-a-backup-fails",
         "taking-one-by-hand",
         "restoring-a-backup",
         "a-store-that-is-a-mount-point",
         "a-restore-refuses-a-link-in-the-backup"
+      ]
+    },
+    {
+      "path": "store-ownership",
+      "source": "store-ownership.md",
+      "file": "store-ownership/index.html",
+      "title": "One store per project checkout",
+      "anchors": [
+        "one-store-per-project-checkout",
+        "moving-a-checkout",
+        "upgrading-an-existing-project",
+        "lazy-teams"
       ]
     },
     {
@@ -2645,6 +2698,7 @@
         "35-a-pull-request-into-a-parent-tasks-branch-a-person-may-ask-an-agent-may-not",
         "36-reading-a-prmr-agents-read-through-lazy-with-no-forge-token",
         "37-the-machine-and-its-image-build-watched-by-people-not-agents",
+        "38-re-homing-a-store-is-a-local-operator-action",
         "when-you-find-an-asymmetry-that-is-not-listed-here"
       ]
     },
@@ -2710,6 +2764,7 @@
         "working-on-a-tasks-branch-on-your-own-machine",
         "which-project-this-clone-is",
         "when-the-project-or-team-is-renamed",
+        "when-the-project-is-deleted",
         "seeing-where-a-machine-and-a-clone-point",
         "logging-out",
         "where-the-login-is-kept",
@@ -2755,6 +2810,7 @@
         "cursor-keeps-reconnecting-without-doing-work",
         "a-turn-fails-with-e2big-argument-list-too-long",
         "lazy-pair-refuses-to-run-on-my-machine",
+        "a-turn-keeps-retrying-after-a-model-error",
         "lazy-pair-or-lazy-chat-asks-me-to-login",
         "gh-isnt-logged-into-my-github-enterprise-server-host",
         "every-command-fails-to-acquire-the-storage-lock",
@@ -2947,6 +3003,7 @@
     "images/dashboard/scratch.png",
     "images/dashboard/search.png",
     "images/dashboard/settings.png",
+    "images/dashboard/task-sessions.png",
     "images/dashboard/task.png",
     "images/dashboard/tasks.png",
     "images/explanation/accept-refusals.png",
@@ -2975,9 +3032,14 @@
     "images/how-to/dashboard-task-complete.png",
     "images/how-to/dashboard-task-working.png",
     "images/how-to/teams-new-task.png",
+    "images/ssh-setup-already.png",
+    "images/ssh-setup-move.png",
+    "images/ssh-setup.png",
     "images/teams-topics/agents-new-task-picker.png",
     "images/teams-topics/agents-project-default.png",
     "images/teams-topics/builders-terminal.png",
+    "images/teams-topics/danger-zone-project.png",
+    "images/teams-topics/danger-zone-team-refused.png",
     "images/teams-topics/login-device-approval.png",
     "images/teams-topics/review-accept.png",
     "images/teams-topics/review-changes.png",
@@ -2991,16 +3053,29 @@
     "images/teams-topics/slack-tokens.png",
     "images/teams-topics/task-environment.png",
     "images/teams-topics/teams-services-open-link.png",
+    "images/teams-topics/teams-task-sessions.png",
     "images/teams/teams-account-settings.png",
+    "images/teams/teams-builders-list-phone.png",
+    "images/teams/teams-builders-list.png",
     "images/teams/teams-builders.png",
     "images/teams/teams-clusters.png",
     "images/teams/teams-dashboard.png",
+    "images/teams/teams-image-build-log-phone.png",
+    "images/teams/teams-image-build-log.png",
+    "images/teams/teams-image-history-phone.png",
+    "images/teams/teams-image-history.png",
+    "images/teams/teams-machine-admin-free-space-phone.png",
+    "images/teams/teams-machine-admin-free-space.png",
+    "images/teams/teams-machine-restart.png",
     "images/teams/teams-members.png",
     "images/teams/teams-memory.png",
     "images/teams/teams-messages.png",
+    "images/teams/teams-network-results.png",
     "images/teams/teams-project-environment.png",
     "images/teams/teams-project-machine.png",
     "images/teams/teams-project-overview.png",
+    "images/teams/teams-project-push-access-phone.png",
+    "images/teams/teams-project-push-access.png",
     "images/teams/teams-project-settings.png",
     "images/teams/teams-raised.png",
     "images/teams/teams-review-queue.png",
@@ -3008,6 +3083,11 @@
     "images/teams/teams-run-page.png",
     "images/teams/teams-run-pull-confirm.png",
     "images/teams/teams-search.png",
+    "images/teams/teams-ssh-keys.png",
+    "images/teams/teams-task-chat.png",
+    "images/teams/teams-task-connect-over-ssh.png",
+    "images/teams/teams-task-shell-codex-phone.png",
+    "images/teams/teams-task-shell-codex.png",
     "images/teams/teams-task-turns-phone.png",
     "images/teams/teams-task-turns.png",
     "images/teams/teams-task.png",

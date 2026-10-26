@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reaching a task's dev server — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+.doc-diagram { margin:1.5rem 0; overflow-x:auto; }
+.doc-diagram svg { min-width:40rem; max-width:100%; height:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
+.doc-diagram figcaption { color:var(--muted); font-size:.9rem; text-align:center; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../diagrams.js"></script>
+<script defer src="../search.js" data-root="../"></script>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.94</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#how-to-guides">How-to guides</a> › <span aria-current="page">Reaching a task's dev server</span></nav>
+<h1 id="reaching-a-tasks-dev-server"><a class="anchor" href="#reaching-a-tasks-dev-server" aria-hidden="true">#</a>Reaching a task&#39;s dev server</h1>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#naming-services">Naming services</a></li><li><a href="#the-url-is-a-name-taskservicelazylocalhost">The URL is a name: &lt;task&gt;.&lt;service&gt;.lazy.localhost</a></li><li><a href="#under-lazy-teams">Under Lazy Teams</a></li><li><a href="#when-nothing-is-listening">When nothing is listening</a></li><li><a href="#what-the-host-port-is-and-why-it-isnt-3000">What the host port is, and why it isn't 3000</a></li><li><a href="#changing-serve-takes-effect-on-the-next-container">Changing [serve] takes effect on the next container</a></li><li><a href="#one-off-ports-lazy-forward">One-off ports: lazy forward</a></li><li><a href="#working-inside-the-tasks-environment">Working inside the task's environment</a></li><li><a href="#the-product-at-a-commit-without-a-task">The product at a commit, without a task</a></li></ul></details></nav>
+<p>A task runs in its own environment. When the work is a web app, that environment
+has a dev server in it — and until you can open it in a browser, the task is only
+half usable.</p>
+<p>Declare the ports your project serves on, and every task&#39;s dev server gets its
+own name in the browser. <code>lazy url</code> tells you where.</p>
+<p><img src="../images/topics/services-tab.png" alt="The Services tab of a task page. With no Start services command set it offers Configure services" loading="lazy"></p>
+<p>In the web UI, a <strong>Services</strong> card on both the task detail page and the review page shows each service with its URL as a link, a green/grey liveness dot from the same TCP check <code>lazy url</code> uses, and the <code>lazy url &lt;task&gt; &lt;service&gt;</code> command ready to copy. When no services are configured, the card offers <strong>Configure services</strong>. The task <em>list</em> does not show it. The same mapping is printed by <code>lazy url</code> and shown in <code>lazy show</code>.</p>
+<pre><code class="language-toml"># lazy.toml
+[serve]
+ports = [3000, 5173]
+</code></pre>
+<pre><code class="language-bash">lazy start my-task
+lazy url my-task
+# 3000  http://my-task.3000.lazy.localhost:26024  ● listening
+# 5173  http://my-task.5173.lazy.localhost:26024  ○ not listening
+
+open &quot;$(lazy url my-task 3000)&quot;
+</code></pre>
+<p>The dot is a liveness check: ● means a plain TCP connect to the port the
+container publishes succeeds — something is listening behind the URL right now;
+○ means the port is published but nothing answers yet (the dev server has not
+started, or has stopped). The check connects and immediately closes without
+sending a byte, so it never counts as a request to your app. With a service
+argument (<code>lazy url my-task 3000</code>) the output stays exactly one bare URL, so it
+keeps composing in scripts.</p>
+<h2 id="naming-services"><a class="anchor" href="#naming-services" aria-hidden="true">#</a>Naming services</h2>
+<p>With more than a port or two, the number stops being a good name. Give them one:</p>
+<pre><code class="language-toml">[serve.services]
+web = 3000
+api = 8080
+storybook = 6006
+</code></pre>
+<pre><code class="language-bash">lazy url my-task            # web  http://my-task.web.lazy.localhost:26024
+                            # api  http://my-task.api.lazy.localhost:26024
+                            # ...
+lazy url my-task web        # http://my-task.web.lazy.localhost:26024
+</code></pre>
+<p>Both spellings can be used together — <code>ports</code> for the ones whose number <em>is</em> the
+name, <code>[serve.services]</code> for the ones worth naming. A bare port from <code>ports</code> is
+addressed by its number (<code>lazy url my-task 5173</code>); a named service is addressed
+by name or by its container port, case-insensitively. Service names must start
+with a letter, so a name is never mistaken for a port.</p>
+<h2 id="the-url-is-a-name-taskservicelazylocalhost"><a class="anchor" href="#the-url-is-a-name-taskservicelazylocalhost" aria-hidden="true">#</a>The URL is a name: <code>&lt;task&gt;.&lt;service&gt;.lazy.localhost</code></h2>
+<p>That URL is served by the running lazy daemon, on the same port as the
+dashboard. The daemon reads the hostname, finds the task&#39;s container and the
+port it publishes, and forwards the request there — including WebSockets, so
+hot reload and ActionCable work through it.</p>
+<p>Two things that gets you, both of which a bare <code>127.0.0.1:49154</code> cannot:</p>
+<ul>
+<li><strong>Each task gets its own cookie jar.</strong> Cookies ignore ports, so every task app
+on <code>127.0.0.1</code> shares one — two tasks running the same Rails app would log
+each other out on every page load. <code>my-task</code> and <code>other-task</code> are different
+hosts, so their sessions no longer collide.</li>
+<li><strong>The URL stops moving.</strong> The published host port is assigned when the
+container is created, so it changes on every recreate. The name does not: a
+browser tab, a bookmark, or a note in a PR keeps working across restarts.</li>
+</ul>
+<p>The task part is the task&#39;s <strong>code</strong> when it has one, and its short id
+otherwise (<code>http://a1b2c3d4.web.lazy.localhost:26024</code>). That is why task codes
+are restricted to what a hostname allows — lowercase letters, digits and
+hyphens, up to 63 characters. Older tasks whose code does not fit keep it
+and keep working everywhere else; in a URL they are addressed by
+short id, which is what <code>lazy url</code> prints for them. The service part is the
+service name, or the container port for a bare <code>[serve] ports</code> entry.
+The task always comes first, so every service of one task sits together:
+<code>my-task.web</code> and <code>my-task.3000</code> both address <code>my-task</code>.</p>
+<h3 id="--direct-for-curl-and-scripts"><a class="anchor" href="#--direct-for-curl-and-scripts" aria-hidden="true">#</a><code>--direct</code> for curl and scripts</h3>
+<p>Chromium and Firefox resolve <code>*.localhost</code> to loopback themselves, so nothing
+has to be installed for a browser to reach these names. <strong>The OS resolver
+usually does not</strong>, and a wildcard cannot go in <code>/etc/hosts</code> — so <code>curl</code>, an
+HTTP client in a script, and anything else that is not a browser needs the raw
+mapping:</p>
+<pre><code class="language-bash">curl &quot;$(lazy url my-task web --direct)&quot;   # http://127.0.0.1:49154
+</code></pre>
+<p><code>--direct</code> works in both shapes — with a service argument it prints the one
+bare loopback URL, and without one it lists them all.</p>
+<h2 id="under-lazy-teams"><a class="anchor" href="#under-lazy-teams" aria-hidden="true">#</a>Under Lazy Teams</h2>
+<p>When the project runs under Lazy Teams, each task&#39;s Services card has an
+<strong>Open</strong> link for every service. Teams proxies the request to the project and on
+to the task, so the service opens from any browser signed in to Teams as a
+member of the project — not only on the machine running it — with WebSockets
+and hot reload passing through. The service gets a host name of its own under
+the install&#39;s services host — the task, the port, the project and the team, then
+a short id (<code>fix-login-3000-web-acme-k3x73f9a1c2e.&lt;services host&gt;</code>) — so the
+address can be read and shared, and as with <code>lazy url</code>, every task keeps its own cookie jar. What an install
+needs for that name to resolve is in
+<a href="../self-hosting-lazy-teams/#reaching-a-tasks-running-services">Self-hosting Lazy Teams</a>.</p>
+<p>The address printed beside <strong>Open</strong> is the one Teams serves the service on, and
+the <code>lazy url</code> command is not shown there: under Teams, <code>lazy.localhost</code> names
+belong to the project&#39;s own machine and answer nowhere else. An install with
+no services host shows no address and says what an operator must set up.</p>
+<p>Opening a declared service that is not answering yet — the task&#39;s environment
+is down, or nothing listens on the port — shows a page that says whether
+something is bringing it up and how long it has waited, checks again every few
+seconds and opens the service as soon as it answers. When nothing is starting
+it, the page offers <strong>Run services</strong>, which starts the task&#39;s environment first
+if it is down and shows each step as it happens.</p>
+<p>A server started inside a task&#39;s container must listen on all interfaces
+(<code>0.0.0.0</code>), not only on the container&#39;s loopback, to be reachable through the
+published port — <code>BINDING=0.0.0.0 bin/rails server</code>, <code>vite --host</code>, and so on.</p>
+<h3 id="previewing-a-tasks-app-or-files-in-teams"><a class="anchor" href="#previewing-a-tasks-app-or-files-in-teams" aria-hidden="true">#</a>Previewing a task&#39;s app or files in Teams</h3>
+<ul>
+<li><p><strong>A preview a reviewer can open:</strong> copy the address beside <strong>Open</strong> on the
+task&#39;s Services card and share it. Anyone who is a member of the project can
+open it from their own browser; if they are not signed in, Teams&#39; sign-in
+comes first and then takes them to the service.</p>
+</li>
+<li><p><strong>The task&#39;s changes:</strong> the task&#39;s <strong>Changes</strong> tab shows every file the task
+changed, as a diff (see
+<a href="../lazy-teams-task-review/#changes-diff">Changes</a>).</p>
+</li>
+<li><p><strong>The task&#39;s files themselves:</strong> the task&#39;s <strong>Shell</strong> tab opens a terminal in
+the task&#39;s environment, where you can look at any file in its worktree (see
+<a href="../lazy-teams-task-review/#shell-working-inside-the-tasks-environment">Shell</a>).</p>
+</li>
+<li><p><strong>The worktree in a browser:</strong> serve it as a service. Declare a port in the
+project&#39;s <code>lazy.toml</code> and set
+the project&#39;s Start services command (on the project&#39;s configuration page,
+<strong>Configure services</strong>) to a static file server, for example:</p>
+<pre><code class="language-toml">[serve]
+ports = [8000]
+</code></pre>
+<p>with Start services set to <code>python3 -m http.server 8000 --bind 0.0.0.0</code>
+(the command runs in the worktree, and needs Python in the task&#39;s image).
+<strong>Run services</strong> on the task starts it, and <strong>Open</strong> browses the worktree.
+The command runs in every task&#39;s environment, so a project that already has a
+dev server usually serves that instead.</p>
+</li>
+</ul>
+<p><code>lazy url</code> and <code>lazy forward</code> open ports on the machine running the project,
+which is what they are for on a solo install; under Teams, use the service link.</p>
+<h3 id="links-in-the-pull-request"><a class="anchor" href="#links-in-the-pull-request" aria-hidden="true">#</a>Links in the pull request</h3>
+<p>When the install has a public address, a submitted task&#39;s PR/MR description
+opens with one line: a link to the task in Teams and a link to its <strong>main
+service</strong>, so a reviewer can switch between the pull request and the running
+app. The main service is the port named by <code>main_service</code>, or the first
+declared port when it is not set:</p>
+<pre><code class="language-toml">[serve]
+ports = [3000, 5173]
+main_service = 5173     # must be one of the declared ports
+</code></pre>
+<p>A <code>main_service</code> that is not a declared port is a config error. The task&#39;s Services card marks which service that is. The service link appears only where the install can open task services (it has a services host); otherwise the line carries the task link alone. With no ports
+declared, the line carries the task link only. The line is kept current as the
+host or main service changes, and is never added on a solo install, where a
+localhost address would mean nothing to a reviewer. The links are plain; Teams&#39;
+own sign-in still guards them.</p>
+<h2 id="when-nothing-is-listening"><a class="anchor" href="#when-nothing-is-listening" aria-hidden="true">#</a>When nothing is listening</h2>
+<p>Opening a task service in a browser when the dev server is not up does not
+give you the browser’s own &quot;connection refused&quot; page. In Teams and the daemon
+dashboard, when a Start services command is configured, a <strong>Services are
+starting</strong> page shows the start command’s live
+progress while it waits for the specific port you opened. Each port is
+checked independently: a ready web service opens even if another service is
+still starting. Once that port answers, you reach the exact URL you requested,
+including its path and query, without a detour through the task page.</p>
+<p>If nothing is starting the service, the page explains what is missing and
+offers <strong>Run services</strong>. That starts the environment first if needed, then
+runs the configured start command. Without a Start services command, the
+dashboard opens the task’s Services page so you can configure one.</p>
+<p>Only browser <em>navigations</em> get this waiting page. An asset, an XHR or a <code>fetch</code> gets a
+<code>502</code> with a one-line explanation instead, because answering those with an HTML
+page produces a confusing failure rather than a clear one.</p>
+<p>Nothing on that page starts anything by itself. Pressing a button does; opening
+a URL never does, and no page you visit elsewhere can start a container by
+embedding a task URL.</p>
+<h2 id="what-the-host-port-is-and-why-it-isnt-3000"><a class="anchor" href="#what-the-host-port-is-and-why-it-isnt-3000" aria-hidden="true">#</a>What the host port is, and why it isn&#39;t 3000</h2>
+<p>Every task gets an <strong>OS-assigned</strong> host port (docker&#39;s <code>-p 127.0.0.1:0:3000</code>),
+not a fixed one. That is what makes five tasks that all serve on 3000 able to run
+at once — a fixed host port would mean the second task&#39;s container fails to
+start. The runtime is the source of truth for the mapping; <code>lazy url</code> asks it,
+so a mapping is never stale.</p>
+<p>The binding is <strong>loopback only</strong>. A task&#39;s dev server is for the person driving
+the task, not for the coffee-shop network the laptop is on.</p>
+<h2 id="changing-serve-takes-effect-on-the-next-container"><a class="anchor" href="#changing-serve-takes-effect-on-the-next-container" aria-hidden="true">#</a>Changing <code>[serve]</code> takes effect on the next container</h2>
+<p>Published ports are fixed when a container is <strong>created</strong> — neither docker nor
+podman can add a mapping to a running container. So editing <code>[serve]</code> does not
+change a task that is already up. <code>lazy show</code> says so plainly:</p>
+<pre><code>  Serving:
+    web → http://my-task.web.lazy.localhost:26024
+    api → (not published — restart to pick up [serve])
+</code></pre>
+<p>To pick the change up on a task that is already up:</p>
+<pre><code class="language-bash">lazy shell my-task --restart
+</code></pre>
+<p>That recreates the container with the current <code>[serve]</code> and drops you into it —
+so anything running inside (including a dev server) stops. It is refused while
+the agent is mid-turn; <code>lazy stop &lt;task&gt;</code> first, or wait for the turn to end.</p>
+<p><code>[serve]</code> is read from the <strong>project root&#39;s</strong> <code>lazy.toml</code>, like every other
+setting — a copy inside a task worktree is ignored. A branch that adds a service
+gets it once the change is on the root, which is also the config a task&#39;s
+container is created from. The Services tab on the task page still <em>shows</em>
+those branch-only ports, each with <code>lazy forward &lt;task&gt; &lt;port&gt;</code> so you can
+reach them while the container is up, without treating the worktree file as
+config.</p>
+<h2 id="one-off-ports-lazy-forward"><a class="anchor" href="#one-off-ports-lazy-forward" aria-hidden="true">#</a>One-off ports: <code>lazy forward</code></h2>
+<p><code>[serve]</code> is for the ports a project <em>always</em> serves on. For the ones you want
+once — a database you feel like poking at, a debug server, a port you never
+declared — there is <code>lazy forward</code>:</p>
+<pre><code class="language-bash">lazy forward my-task 5432
+# Forwarding 127.0.0.1:49231 -&gt; lazy-my-task:5432
+#
+# Forwarding while this command runs. Press Ctrl-C to stop.
+</code></pre>
+<p>It runs in the foreground and forwards for exactly as long as it runs. Ctrl-C
+closes every listener and every connection it was carrying; nothing is left
+published, and nothing is registered anywhere to clean up later.</p>
+<p>Each argument is a port pair:</p>
+<pre><code class="language-bash">lazy forward my-task 3000                 # container 3000 → an assigned host port
+lazy forward my-task 8080:3000            # container 3000 → 127.0.0.1:8080
+lazy forward my-task 8080:3000 5433:5432  # as many pairs as you like
+</code></pre>
+<p>A bare number means &quot;assign me a free host port&quot;, which is the spelling that can
+never collide with something already on your machine. Either way the resolved
+address is printed as soon as the listener is up, one line per pair.</p>
+<p>Like <code>[serve]</code>, the listener is <strong>loopback only</strong> — a forwarded port is never
+exposed to the network the machine is on.</p>
+<p>Two things it deliberately does not do. It never starts a container: a freshly
+created one has nothing listening yet, so a forward into it would be dead on
+arrival. Bring the task up with <code>lazy shell my-task</code> first, start
+whatever should be listening, then forward in another terminal. And it does not
+show up in <code>lazy url</code>, which reports what the <em>container</em> publishes — a forward
+lives only in the terminal you started it in.</p>
+<p>For a long-lived forward from an editor or another machine&#39;s terminal, <code>ssh -L</code>
+works too, once the task is set up for SSH: see
+<a href="../how-to/ssh-into-a-task/#preview-a-service-with-ssh--l">How to SSH into a task</a>.</p>
+<p>If the task&#39;s image is old enough to predate lazy shipping <code>socat</code> (which is how
+a forwarded connection reaches a port inside the container), the command says so
+up front and points at <code>lazy upgrade --images</code>.</p>
+<h2 id="working-inside-the-tasks-environment"><a class="anchor" href="#working-inside-the-tasks-environment" aria-hidden="true">#</a>Working inside the task&#39;s environment</h2>
+<p>The typical loop: get a shell in the container, set things up, start the server,
+open it.</p>
+<pre><code class="language-bash">lazy shell my-task      # a shell inside the task&#39;s container
+# ... npm install, npm run dev ...
+
+# in another terminal
+lazy url my-task web
+</code></pre>
+<p><code>lazy shell &lt;task&gt;</code> opens a shell inside the task&#39;s container by default: the
+same node, the same installed packages, the same network as the agent sees.
+<code>lazy shell &lt;task&gt; --host</code> gives you a shell in the task&#39;s worktree on your own
+machine instead, which is the right thing for git and host editors.</p>
+<p>If the task&#39;s container is not running, <code>lazy shell</code> starts it first and says so
+— which also means the container is created fresh, picking up the current
+<code>[serve]</code>.</p>
+<h2 id="the-product-at-a-commit-without-a-task"><a class="anchor" href="#the-product-at-a-commit-without-a-task" aria-hidden="true">#</a>The product at a commit, without a task</h2>
+<p>The same services, links and shell are available for the default branch, any
+other branch, or a specific commit, with no task involved — see
+<a href="../running-a-commit/">Running the product at any commit</a>.</p>
+
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../how-to/back-up-and-restore/"><span>Previous</span>How to back up and restore your store</a><a class="next" href="../running-a-commit/"><span>Next</span>Running the product at any commit</a></nav>
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch" open><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/" aria-current="page">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<details class="branch"><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch"><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
+</body>
+</html>

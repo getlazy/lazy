@@ -25,6 +25,9 @@ code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size
 pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
 pre code { background:none; padding:0; font-size:.85em; }
 table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+.doc-diagram { margin:1.5rem 0; overflow-x:auto; }
+.doc-diagram svg { min-width:40rem; max-width:100%; height:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
+.doc-diagram figcaption { color:var(--muted); font-size:.9rem; text-align:center; }
 th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
 blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
 img { max-width:100%; }
@@ -76,568 +79,137 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
   .layout main { grid-column:2; padding-left:2.5rem; }
 }</style>
 <script defer src="../search-index.js"></script>
+<script defer src="../diagrams.js"></script>
 <script defer src="../search.js" data-root="../"></script>
 </head>
 <body>
-<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.93</span><a class="contents" href="#contents">Contents</a></div></header>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.94</span><a class="contents" href="#contents">Contents</a></div></header>
 <div class="layout">
 <main>
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../#architecture">Architecture</a> › <span aria-current="page">The task state machine</span></nav>
 <h1 id="the-task-state-machine"><a class="anchor" href="#the-task-state-machine" aria-hidden="true">#</a>The task state machine</h1>
-<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#statuses">Statuses</a></li><li><a href="#allowed-transitions">Allowed transitions</a></li><li><a href="#who-moves-a-task">Who moves a task</a></li><li><a href="#how-a-turn-ends">How a turn ends</a></li><li><a href="#only-one-turn-runs-at-a-time">Only one turn runs at a time</a></li><li><a href="#accept-and-the-merging-status">Accept and the merging status</a></li><li><a href="#working-but-not-alive">Working, but not alive</a></li><li><a href="#waiting-on-subtasks">Waiting on subtasks</a></li><li><a href="#agent-reported-progress">Agent-reported progress</a></li><li><a href="#agent-failure-classification">Agent failure classification</a></li><li><a href="#crashes-restarts-and-recovery">Crashes, restarts and recovery</a></li></ul></details></nav>
-<p>Every task is in exactly one <strong>status</strong>, and the daemon allows only certain moves between statuses. This page lists the statuses, the moves, who makes each one (an agent, a human, or the daemon on its own), and what lazy does when an agent crashes or the daemon restarts. For the concepts behind it, see <a href="../explanation/tasks-and-turns/">Tasks and turns</a>.</p>
-<h2 id="statuses"><a class="anchor" href="#statuses" aria-hidden="true">#</a>Statuses</h2>
-<p>The dashboard&#39;s <strong>Tasks</strong> page shows each task&#39;s status next to its code. Here the <strong>All</strong> filter lists a <code>backlog</code> cluster and its two <code>backlog</code> children, a <code>working</code> task, a <code>conflict</code> task (a protected file is waiting for a decision), <code>blocked</code> tasks waiting on a human, and a finished task that the list labels <code>accepted</code> (its status is <code>complete</code>):</p>
-<p><img src="../images/explanation/task-statuses.png" alt="The dashboard Tasks page with the All filter selected. A table lists tasks with a status pill each: backlog, working, conflict, blocked and accepted. Rows for tasks awaiting review carry a &quot;review&quot; link." loading="lazy"></p>
-<p>There are eleven statuses:</p>
-<ul>
-<li><p><strong><code>backlog</code></strong>: created but not started. No session exists.</p>
-</li>
-<li><p><strong><code>working</code></strong>: a turn is running. The part in brackets that some surfaces add, such as <code>working(agent)</code>, says what lazy can see running (see <a href="#working-but-not-alive">Working, but not alive</a>).</p>
-</li>
-<li><p><strong><code>blocked</code></strong>: a turn ended and the task is waiting for a human.</p>
-</li>
-<li><p><strong><code>conflict</code></strong>: the same resting place as <code>blocked</code>, with a decision owed at accept time. The task is unblocked, resumed and paired exactly like a <code>blocked</code> one and nothing reverts the violated files; only <code>lazy accept</code> gates on them: every <em>pending</em> violated file must be approved there (all-or-nothing) or the accept is refused. See <a href="../lazy-toml/#resolving-a-conflict-task">Resolving a conflict task</a>.</p>
-<p><strong><code>conflict</code> is derived, never set by hand.</strong> The set of pending violations decides it: a paused task is labelled <code>conflict</code> while that set is non-empty and <code>blocked</code> once it is empty. Every way a task comes to rest (a turn or sync finishing, a failed turn being parked, crash recovery, a pairing session ending, <code>lazy stop</code>, <code>lazy doctor &lt;task&gt;</code>) re-checks the set rather than writing <code>blocked</code>.</p>
-</li>
-<li><p><strong><code>submitted</code></strong>: the task&#39;s branch has an open pull/merge request waiting for review on the forge (<code>lazy submit</code>). It is a paused status like <code>blocked</code>: you can unblock it, review it, sync it, pair on it or accept it.</p>
-<p><strong>A sync or review does not take a <code>submitted</code> task away from its reviewer.</strong> Both move the task through <code>working</code> for the duration of the turn. A review restores the status it found. A sync restores only <code>submitted</code>; from any other status it parks like a finished turn (<code>blocked</code>, or <code>conflict</code>), and a sync from <code>interrupted</code> does not go back to <code>interrupted</code>. A sync that fails in a way lazy will not retry (a dead credential, a bad model id) restores <code>submitted</code> too; a crash lazy <em>will</em> retry goes to <code>interrupted</code> instead, because the merge may be half applied. The exception is a protected-file decision still owed: pending violations make the task <code>conflict</code> regardless.</p>
-<p><strong>A task finds its own PR/MR by its branch.</strong> If lazy has no PR/MR on record for a task (it stopped right after the forge created one, or someone opened it by hand), the daemon&#39;s background sync looks it up by branch. An open one is recorded on the task. One merged into the task&#39;s target completes the task, but only when everything on the task&#39;s branch is already in the target; otherwise a comment explains why. One merged into some other branch leaves the task alone and raises an alert. A closed one changes nothing. When lazy opens a PR/MR itself, it first adopts an open one on the branch if there is one.</p>
-</li>
-<li><p><strong><code>pairing</code></strong>: a human is working interactively with the task&#39;s agent, in the task&#39;s container (see <a href="../pairing/">Pairing</a>).</p>
-</li>
-<li><p><strong><code>interrupted</code></strong>: an agent turn died or was killed (crash, watchdog, daemon restart) without finishing.</p>
-</li>
-<li><p><strong><code>merging</code></strong>: a merge is in flight: either an accept is merging the branch locally right now, or the task&#39;s PR/MR has been handed to the forge and is waiting for CI and merge. If an accept dies partway, the daemon resumes it rather than undoing it.</p>
-</li>
-<li><p><strong><code>zombie</code></strong>: system-only recovery state for a task whose work was accepted but whose status was never updated. The daemon moves it straight on to <code>complete</code>.</p>
-</li>
-<li><p><strong><code>complete</code></strong>: accepted and merged. When the task had a parent <em>task</em>, lazy leaves a <code>[Subtask accepted]</code> comment on the parent with the merge commit SHA. The comment does not start a turn or unblock the parent. <code>lazy wait</code> reports the same SHA as <code>head_sha</code>.</p>
-</li>
-<li><p><strong><code>abandoned</code></strong>: rejected (<code>lazy reject</code>) or closed (<code>lazy close</code>). Both resolve to this one status. A parent task gets a <code>[Subtask removed]</code> comment naming the reason.</p>
-</li>
-</ul>
-<p><strong>Terminal statuses</strong> (finished, core fields frozen): <code>complete</code>, <code>abandoned</code>. <strong>Waiting for a human</strong>: <code>blocked</code>, <code>conflict</code>, <code>submitted</code>. <strong>Has a live worktree that must not be merged into</strong>: <code>working</code>, <code>interrupted</code>, <code>pairing</code>, <code>merging</code>.</p>
-<h3 id="a-parent-task-is-told-when-its-subtask-list-changes"><a class="anchor" href="#a-parent-task-is-told-when-its-subtask-list-changes" aria-hidden="true">#</a>A parent task is told when its subtask list changes</h3>
-<p>A task whose subtasks come and go gets a one-line comment each time, so its agent can see what happened on its next turn:</p>
-<ul>
-<li><code>[Subtask added] &lt;child&gt; — &quot;&lt;goal&gt;&quot;</code> when a subtask is created under it, reparented into it, or reopened after having been closed.</li>
-<li><code>[Subtask removed] &lt;child&gt; — &quot;&lt;reason&gt;&quot;</code> when a subtask is closed, rejected or abandoned, and <code>[Subtask removed] &lt;child&gt; — reparented to &lt;parent&gt;</code> when it moves elsewhere.</li>
-<li><code>[Subtask accepted] &lt;child&gt; …</code> when a subtask is accepted and merged. An accepted subtask is only ever reported this way, never also as removed.</li>
-</ul>
-<p>Like every lazy comment, these never start a turn and never unblock the parent: they show up in its next notes. Nothing is written to a parent that is already <code>complete</code> or <code>abandoned</code>.</p>
-<h2 id="allowed-transitions"><a class="anchor" href="#allowed-transitions" aria-hidden="true">#</a>Allowed transitions</h2>
-<p>The daemon refuses any move not in this table (&quot;Invalid status transition&quot;). Staying in the same status is always a no-op.</p>
+<p>A task has one status at a time. The arrows below come from the same transition table the daemon uses to allow status changes.</p>
+<figure class="doc-diagram"><pre>stateDiagram-v2
+  [*] --&gt; backlog
+  backlog --&gt; working
+  backlog --&gt; blocked
+  backlog --&gt; abandoned
+  working --&gt; blocked
+  working --&gt; conflict
+  working --&gt; interrupted
+  working --&gt; merging
+  working --&gt; submitted
+  blocked --&gt; working
+  blocked --&gt; conflict
+  blocked --&gt; submitted
+  blocked --&gt; merging
+  blocked --&gt; pairing
+  blocked --&gt; abandoned
+  blocked --&gt; backlog
+  conflict --&gt; working
+  conflict --&gt; blocked
+  conflict --&gt; submitted
+  conflict --&gt; merging
+  conflict --&gt; pairing
+  conflict --&gt; abandoned
+  interrupted --&gt; working
+  interrupted --&gt; merging
+  interrupted --&gt; pairing
+  interrupted --&gt; abandoned
+  submitted --&gt; working
+  submitted --&gt; merging
+  submitted --&gt; pairing
+  submitted --&gt; abandoned
+  submitted --&gt; blocked
+  pairing --&gt; blocked
+  pairing --&gt; conflict
+  merging --&gt; complete
+  merging --&gt; blocked
+  merging --&gt; conflict
+  merging --&gt; submitted
+  zombie --&gt; complete
+  complete --&gt; blocked
+  complete --&gt; backlog
+  abandoned --&gt; blocked
+  abandoned --&gt; backlog
+  backlog --&gt; zombie
+  working --&gt; zombie
+  blocked --&gt; zombie
+  conflict --&gt; zombie
+  interrupted --&gt; zombie
+  submitted --&gt; zombie
+  pairing --&gt; zombie
+  merging --&gt; zombie
+  note right of zombie: Recovery only</pre><figcaption>Every allowed task status transition, including recovery paths</figcaption></figure>
 <table>
 <thead>
 <tr>
-<th>From</th>
-<th>Can move to</th>
+<th>Status</th>
+<th>What it means</th>
+<th>How it leaves</th>
 </tr>
 </thead>
 <tbody><tr>
 <td><code>backlog</code></td>
-<td><code>working</code>, <code>blocked</code>, <code>abandoned</code></td>
+<td>Created, not started.</td>
+<td>Start, close, or recover existing work.</td>
 </tr>
 <tr>
 <td><code>working</code></td>
-<td><code>blocked</code>, <code>conflict</code>, <code>submitted</code>, <code>interrupted</code>, <code>merging</code></td>
+<td>A turn or accept check is running.</td>
+<td>Turn finishes, crashes, submits, or begins merging.</td>
 </tr>
 <tr>
 <td><code>blocked</code></td>
-<td><code>working</code>, <code>conflict</code>, <code>submitted</code>, <code>merging</code>, <code>pairing</code>, <code>abandoned</code>, <code>backlog</code> (allowed by the table; nothing currently makes this move)</td>
+<td>Work is paused for review or feedback.</td>
+<td>Unblock, resume, submit, pair, accept, or close.</td>
 </tr>
 <tr>
 <td><code>conflict</code></td>
-<td><code>working</code>, <code>blocked</code>, <code>submitted</code>, <code>merging</code>, <code>pairing</code>, <code>abandoned</code></td>
+<td>Paused with a protected-file decision due.</td>
+<td>Resolve at accept, unblock, resume, pair, submit, or close.</td>
 </tr>
 <tr>
 <td><code>submitted</code></td>
-<td><code>working</code>, <code>blocked</code>, <code>merging</code>, <code>pairing</code>, <code>abandoned</code></td>
+<td>A PR or MR is open for review.</td>
+<td>Review, unblock, pair, accept, close, or retarget the PR.</td>
 </tr>
 <tr>
 <td><code>interrupted</code></td>
-<td><code>working</code>, <code>merging</code>, <code>pairing</code>, <code>abandoned</code></td>
+<td>A turn stopped before finishing.</td>
+<td>Resume, pair, close, or recover a remote merge.</td>
 </tr>
 <tr>
 <td><code>pairing</code></td>
-<td><code>blocked</code>, <code>conflict</code></td>
+<td>A person is working with the agent.</td>
+<td>End the pairing session.</td>
 </tr>
 <tr>
 <td><code>merging</code></td>
-<td><code>complete</code>, <code>blocked</code>, <code>conflict</code>, <code>submitted</code></td>
+<td>Accept or a forge merge is underway.</td>
+<td>Merge completes or the prior paused status is restored.</td>
 </tr>
 <tr>
 <td><code>zombie</code></td>
-<td><code>complete</code></td>
+<td>The daemon is recovering work already accepted.</td>
+<td>Recovery completes.</td>
 </tr>
 <tr>
 <td><code>complete</code></td>
-<td><code>blocked</code>, <code>backlog</code></td>
+<td>Work was accepted and merged.</td>
+<td>Reopen.</td>
 </tr>
 <tr>
 <td><code>abandoned</code></td>
-<td><code>blocked</code>, <code>backlog</code></td>
+<td>Task was closed or rejected.</td>
+<td>Reopen.</td>
 </tr>
 </tbody></table>
-<p>Any non-terminal status can also move to <code>zombie</code>, but only the daemon does that.</p>
-<p>Some absences are deliberate:</p>
-<ul>
-<li><strong><code>merging</code> never moves to <code>abandoned</code>.</strong> A task mid-merge cannot be closed or rejected, so a half-applied merge is never abandoned. A merge either completes or fails back to the status the task held before the accept.</li>
-<li><strong><code>working</code> never moves to <code>pairing</code> or <code>abandoned</code>.</strong> The agent is running. <code>lazy reject</code> and <code>lazy close</code> on a working task stop the agent first (<code>working</code> → <code>interrupted</code>), then abandon it.</li>
-<li><strong><code>interrupted</code> never moves to <code>complete</code></strong>, and <code>lazy accept</code> does not take an interrupted task: resume or unblock it first.</li>
-<li><strong><code>blocked</code> never moves to <code>complete</code> directly.</strong> It goes through <code>merging</code>.</li>
-</ul>
-<h2 id="who-moves-a-task"><a class="anchor" href="#who-moves-a-task" aria-hidden="true">#</a>Who moves a task</h2>
-<p>Every status change records an <strong>actor</strong>: <code>human</code> (the CLI), <code>builder</code> (an AI orchestrator using the MCP tools), <code>agent</code> (a task&#39;s own agent driving its own subtasks over MCP), <code>system</code> (the daemon on its own) or <code>supervisor</code> (lazy&#39;s per-task supervisor, for its own follow-up prompts). The actor records the channel, not who wrote the words; it never changes what a command does. A command that arrives over MCP makes the same move as its CLI twin but records <code>builder</code> or <code>agent</code>.</p>
-<h3 id="humans-and-builders-and-agents-over-mcp"><a class="anchor" href="#humans-and-builders-and-agents-over-mcp" aria-hidden="true">#</a>Humans (and builders and agents, over MCP)</h3>
-<table>
-<thead>
-<tr>
-<th>Command</th>
-<th>Move</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>lazy start</code></td>
-<td><code>backlog</code> → <code>working</code></td>
-</tr>
-<tr>
-<td><code>lazy unblock</code></td>
-<td><code>blocked</code>, <code>conflict</code>, <code>interrupted</code> or <code>submitted</code> → <code>working</code>, with your feedback saved first. It does not merge upstream; run <code>lazy sync</code> for that</td>
-</tr>
-<tr>
-<td><code>lazy resume</code></td>
-<td><code>interrupted</code>, <code>blocked</code> or <code>conflict</code> → <code>working</code>, with no feedback. Pending protected-file violations do not refuse it</td>
-</tr>
-<tr>
-<td><code>lazy pair</code></td>
-<td><code>blocked</code>, <code>conflict</code>, <code>interrupted</code> or <code>submitted</code> → <code>pairing</code>; on exit back to <code>blocked</code> (or <code>conflict</code> while violations are pending)</td>
-</tr>
-<tr>
-<td><code>lazy submit</code></td>
-<td><code>blocked</code> or <code>conflict</code> → <code>submitted</code></td>
-</tr>
-<tr>
-<td><code>lazy sync</code></td>
-<td><code>blocked</code>, <code>conflict</code>, <code>interrupted</code> or <code>submitted</code> → <code>working</code> → back to <code>submitted</code> if that is where it started (see <code>submitted</code> above); otherwise it parks like any finished turn: <code>blocked</code>, or <code>conflict</code> while violations are pending. A sync from <code>interrupted</code> does not return to <code>interrupted</code></td>
-</tr>
-<tr>
-<td><code>lazy review</code></td>
-<td><code>blocked</code>, <code>conflict</code>, <code>interrupted</code> or <code>submitted</code> → <code>working</code> → the status it found</td>
-</tr>
-<tr>
-<td><code>lazy ask</code></td>
-<td><code>blocked</code> or <code>conflict</code> → <code>working</code> → the same status. An ask never changes task state; the brief <code>working</code> marks the task busy. After a timeout the task stays <code>working</code> so a late answer can be recorded, then parks as usual</td>
-</tr>
-<tr>
-<td><code>lazy stop</code></td>
-<td><code>working</code> → <code>blocked</code> (or <code>conflict</code> while violations are pending), marked as stopped by you: the daemon does not run it again until its next completed turn (see <a href="#crashes-restarts-and-recovery">Crashes, restarts and recovery</a>)</td>
-</tr>
-<tr>
-<td><code>lazy accept</code></td>
-<td><code>blocked</code>, <code>conflict</code> or <code>submitted</code> → <code>merging</code> → <code>complete</code> (see <a href="#accept-and-the-merging-status">Accept</a>)</td>
-</tr>
-<tr>
-<td><code>lazy reject</code>, <code>lazy close</code></td>
-<td><code>backlog</code>, <code>blocked</code>, <code>conflict</code>, <code>interrupted</code>, <code>submitted</code> → <code>abandoned</code> (<code>reject</code> does not apply to <code>backlog</code>); a <code>working</code> task is stopped first</td>
-</tr>
-<tr>
-<td><code>lazy reopen</code></td>
-<td><code>complete</code> or <code>abandoned</code> → <code>blocked</code> when the task had a session, otherwise <code>backlog</code></td>
-</tr>
-</tbody></table>
-<p><code>lazy chat</code> changes no status, records no turn and makes no commits; it holds the worktree lock while open, so start, unblock, sync and resume refuse until it closes.</p>
-<p>Reopening restores the task on its own branch at its last head. If no head can be found it refuses and changes nothing. Reopening an accepted task supersedes that accept: lazy never treats it as a crashed accept to recover.</p>
-<h3 id="the-agent"><a class="anchor" href="#the-agent" aria-hidden="true">#</a>The agent</h3>
-<ul>
-<li><strong>A turn completes</strong>: <code>working</code> → <code>blocked</code>, or <code>conflict</code> when it produced file-permission violations or earlier ones are still unresolved. A turn that runs no permission check (an ask, a sync) never clears pending violations.</li>
-<li><strong>A turn dies</strong>: <code>working</code> → <code>interrupted</code> (see <a href="#crashes-restarts-and-recovery">Crashes, restarts and recovery</a>).</li>
-</ul>
-<h3 id="the-daemon-on-its-own"><a class="anchor" href="#the-daemon-on-its-own" aria-hidden="true">#</a>The daemon, on its own</h3>
-<p>The daemon keeps checking task state in the background and fixes up anything that has changed underneath it:</p>
-<ul>
-<li><strong>Working tasks</strong>: a finished turn is recorded and the task parks <code>blocked</code> (or <code>conflict</code>). A task whose agent died without finishing gets a crash turn recorded and moves to <code>interrupted</code>.</li>
-<li><strong>Late answers</strong>: an answer that arrives after its task was marked <code>interrupted</code> is still recorded and the task parks <code>blocked</code> (via <code>working</code>).</li>
-<li><strong>Auto-resume</strong>: <code>interrupted</code> → <code>working</code> (see below).</li>
-<li><strong>Dead pairing sessions</strong>: a task left in <code>pairing</code> after its process ended parks <code>blocked</code> (or <code>conflict</code>).</li>
-<li><strong>Backlog tasks whose branch already has commits</strong> (for example work that arrived from another machine) move to <code>blocked</code>.</li>
-<li><strong>Accepted work whose status was never updated</strong> (an accept that died after its merge): the task moves through <code>zombie</code> to <code>complete</code>.</li>
-<li><strong>PR/MR merged on the forge</strong>: the task completes through <code>merging</code>. A PR/MR closed on the forge sends a <code>merging</code> task back to <code>blocked</code>, as does a failed pipeline on its PR/MR; on any other task, a PR/MR closed without merging abandons the task and reparents its children.</li>
-<li><strong>Re-parenting that could not move a PR/MR</strong>: if a task&#39;s parent was accepted or closed and the forge refused to retarget its open PR/MR, lazy closes the PR/MR and the task moves <code>submitted</code> → <code>blocked</code>.</li>
-<li><strong>Leftover containers</strong> for <code>complete</code> or <code>abandoned</code> tasks are removed.</li>
-</ul>
-<h2 id="how-a-turn-ends"><a class="anchor" href="#how-a-turn-ends" aria-hidden="true">#</a>How a turn ends</h2>
-<p>A task&#39;s status says where the task IS. It cannot say whether the agent thought
-it was finished: <code>blocked</code> reads exactly the same whether the agent delivered
-the whole task or simply ran out of budget halfway through. So an agent says
-which, and a turn ends in one of three ways.</p>
-<p>Nothing asks the agent which of the three it was — lazy reads the ending off
-what the turn did.</p>
-<ul>
-<li><strong>Declared done.</strong> The agent calls <code>lazy_final</code> — pencils down. The claim
-names the branch head at the moment it was made and is recorded on that turn,
-along with an optional one-line note. It is not a turn-end signal: the turn
-still ends when the agent stops, and an agent may keep working after declaring.
-Declaring is what starts an automatic review; it does not gate acceptance.</li>
-<li><strong>Needs input.</strong> The agent raised a blocking item (see
-<a href="../raised-items/">Raised items</a>). The task parks for a human decision.</li>
-<li><strong>Neither.</strong> The turn simply stopped — budget, watchdog, crash, or the agent
-said nothing. The task parks <code>blocked</code>.</li>
-</ul>
-<p>The last two look the same in the status: blocked is blocked whether or not
-anything was raised. What differs is the record — a blocking item, or none —
-and lazy labels the task from that.</p>
-<p><strong>You can accept from any of the three.</strong> A human-facing task gets its
-walkthrough whichever way the turn ended, precisely so the decision you are
-being asked to make has something to go on.</p>
-<p>The first two are exclusive. <code>lazy_final</code> refuses while a blocking item is open
-on the task, and names the item, because filing one is the agent having already
-chosen the other ending. The task&#39;s journal records which items parked it.</p>
-<h3 id="work-left-uncommitted-when-the-turn-ends"><a class="anchor" href="#work-left-uncommitted-when-the-turn-ends" aria-hidden="true">#</a>Work left uncommitted when the turn ends</h3>
-<p>A task is reviewed and merged from its <strong>commits</strong>. Anything an agent edits and
-never commits is in no diff, in no walkthrough, and in nothing <code>lazy accept</code>
-would carry — and it disappears with the worktree.
-Four things make that visible rather than silent.</p>
-<ul>
-<li><strong>The agent is asked, once, before the turn closes.</strong> When a turn is about to
-end with uncommitted paths, whether it declared itself done or parked for
-input, lazy names them and asks the agent once whether it has committed all
-its work — commit what belongs to the task, or say why it should stay
-uncommitted. A turn that declared itself done is additionally asked to commit
-or discard anything still loose, as its last check. Lazy never commits on an
-agent&#39;s behalf. Read-only turns are never asked.</li>
-<li><strong>Stopped background work is asked about first.</strong> If a turn ends while a
-background command the agent started is still running, Claude Code stops
-it. Lazy then asks the agent once, before the question about uncommitted
-work, whether it needed that command to finish, naming the command. If it
-did, it can run it again in the foreground; if not, it says so. Same rules:
-once per turn, never on read-only turns, recorded on the task as a
-&quot;Stopped Background Work Check&quot;.</li>
-<li><strong>Anything still loose is announced.</strong> If the agent does not commit or
-discard it (for example because it could not), the task gets an
-&quot;[Uncommitted work left behind]&quot; comment naming the paths, which the agent
-also receives on the next unblock, and a system message is filed so it is
-seen without opening the task.</li>
-<li><strong>The paths are on the turn record.</strong> the web review page shows the count on
-the turn, with the paths in the tooltip, and <code>lazy show</code> puts the same count on the turn
-and lists the paths in <code>--full</code>.</li>
-<li><strong>Accept refuses, and says which files.</strong> A task whose worktree still holds
-uncommitted changes cannot be accepted, and the refusal names the paths and
-states that none of them is on the branch. Commit what belongs to the task,
-discard the rest, then accept.</li>
-</ul>
-<h3 id="a-declaration-is-about-a-sha-and-it-can-go-stale"><a class="anchor" href="#a-declaration-is-about-a-sha-and-it-can-go-stale" aria-hidden="true">#</a>A declaration is about a SHA, and it can go stale</h3>
-<p>Because a final names the head it was made at, the head can move afterwards — a
-sync merge, a commit made while pairing, a subtask accepted into a parent. None
-of those cancel the declaration; every surface that shows a final instead says
-so:</p>
-<pre><code>declared final at 9f3c1a2b; head has since moved (a sync)
-</code></pre>
-<p>What DOES cancel it is an agent going back to work: a later agent work turn that
-produces commits clears the declaration, and whoever did that work declares
-again when they are finished. A turn that committed nothing, a sync, a review, a
-question and the automated follow-ups all leave it standing.</p>
-<p>The web review page leads with the declaration; <code>lazy show</code> prints it (or <code>not declared</code>) next to the task&#39;s status,
-and <code>lazy show --json</code> carries it as <code>final</code>.</p>
-<h2 id="only-one-turn-runs-at-a-time"><a class="anchor" href="#only-one-turn-runs-at-a-time" aria-hidden="true">#</a>Only one turn runs at a time</h2>
-<p>A task never has two turns dispatched at once. If an unblock, an ask and an automatic sync arrive together, the first one to claim the task wins, and the others see the task is busy:</p>
-<ul>
-<li>an ask or unblock is refused (409) <strong>before</strong> anything is recorded, so no feedback is lost; send it again once the task is idle;</li>
-<li>a sync re-queues itself and is reported as <code>pending_sync</code>, naming the status it stood down for, and runs later.</li>
-</ul>
-<p>A turn is only dispatched from <code>blocked</code>, <code>conflict</code>, <code>submitted</code> or <code>interrupted</code>. A task in <code>pairing</code> or <code>merging</code> is never handed a new turn.</p>
-<h2 id="accept-and-the-merging-status"><a class="anchor" href="#accept-and-the-merging-status" aria-hidden="true">#</a>Accept and the <code>merging</code> status</h2>
-<p>Accept works from any park where the turn ended normally (declared done, parked for a decision, or simply stopped) and requires only that every open blocking item is resolved in the same command. The one park it refuses is <code>interrupted</code>, whose ending is unknown. Every precondition is checked before anything is written, so a refusal leaves the task exactly as it was.</p>
-<p>Status tracks the phase in flight:</p>
-<table>
-<thead>
-<tr>
-<th>Accept phase</th>
-<th>Status</th>
-</tr>
-</thead>
-<tbody><tr>
-<td>Acceptance gate (opt-in)</td>
-<td><code>working</code>, with no agent behind it</td>
-</tr>
-<tr>
-<td>Merge phase (description, merge, finalize)</td>
-<td><code>merging</code></td>
-</tr>
-<tr>
-<td>Aborted at any point</td>
-<td>the status held before the accept: <code>blocked</code>, <code>conflict</code> or <code>submitted</code></td>
-</tr>
-</tbody></table>
-<ul>
-<li><strong>The merge is the commit point.</strong> The moment it lands the task becomes <code>complete</code>. Fast-forwarding the local branch, pushing the parent, tagging, reparenting children and cleanup happen after, are retried by the daemon if they fail, and never move the task out of <code>complete</code>. A failure there exits non-zero and names the step.</li>
-<li><strong>A remote merge</strong> hands the merge to the forge: the task stays <code>merging</code> until the daemon sees the PR/MR merged (→ <code>complete</code>) or closed (→ <code>blocked</code>).</li>
-<li><strong>An accept that dies</strong> (daemon restart, crash, kill) leaves the task in <code>merging</code>, and the daemon resumes it, whether it died before or after the merge landed; a merge that already landed is recognised and not repeated. While that resume is pending, <code>reject</code>, <code>close</code>, <code>submit</code> and <code>unblock</code> refuse. After three failed automatic resumes the daemon stops and files a system message, and those commands work again to recover the task, except when the work has already landed on the target: then they point you at <code>lazy accept</code>, which finishes the accept. <code>lazy doctor</code> reports anything sitting in <code>merging</code>.</li>
-<li>Two accepts of the same task at once never both merge.</li>
-<li>The parent must not be active (<code>working</code>, <code>pairing</code>, <code>merging</code>, <code>interrupted</code>). The one exemption: a task&#39;s own agent accepting a direct subtask over MCP while the parent is <code>working</code>, or a human pairing in the parent&#39;s container accepting from that session. A task agent can accept a direct subtask only, never its own task.</li>
-<li>Uncommitted work in the destination worktree does not block the merge and is never lost: the accept sets it aside, merges, and puts it back.</li>
-<li>The merge description is an enhancement, never a gate. If its one-shot agent fails or times out, the accept falls back to a plain list of commits.</li>
-</ul>
-<p>For what accept does to git, see <a href="../architecture/tasks-in-git/">Git integration</a>.</p>
-<h2 id="working-but-not-alive"><a class="anchor" href="#working-but-not-alive" aria-hidden="true">#</a>Working, but not alive</h2>
-<p><code>working</code> is where the task is in its lifecycle; the part in brackets is what
-lazy can see running for it right now. <code>working(not-alive)</code> means the task is
-still recorded as mid-turn but nothing is running for it and no answer is
-waiting — the turn&#39;s process has died. It is a short-lived state: once the
-turn is at least 30 seconds old, the daemon&#39;s next check (every few seconds)
-either recovers a turn that had finished its work to <code>blocked</code>, or records the
-crash, moves the task to <code>interrupted</code> and resumes it automatically.</p>
-<p>Two things that look similar are not that:</p>
-<ul>
-<li><strong><code>working(launching)</code></strong> — the daemon is still starting the turn&#39;s container
-or process. Building the container image on a fresh machine or after an
-upgrade can take minutes; the task is not dead, it has not started yet.</li>
-<li><strong>A running review</strong> — <code>lazy review</code> runs its reviewer separately from the
-task&#39;s own agent, and the task reads <code>working(agent:reviewing)</code> for as long as
-the reviewer is running. If the reviewer dies without answering, the review is
-recorded as failed and the task goes back to the status it had before. A
-review or <code>lazy ask</code> that was running when the daemon restarted cannot finish
-— the restart cuts it off from the model — so the new daemon stops it, records
-it as failed, and puts the task back the same way.</li>
-<li><strong>Plain <code>working</code>, no brackets</strong> — the run is starting up or its answer is
-being collected, or the container runtime did not answer when lazy asked
-about the run (a busy Docker, for example), so its liveness is unknown rather
-than dead. <code>lazy daemon health</code> names that last case as a warning with the
-reason.</li>
-</ul>
-<p>A task that reads <code>working(not-alive)</code> for more than a minute or so is a bug
-worth reporting. Include the <code>liveness</code> and <code>session</code> parts of
-<code>lazy show &lt;task&gt; --json</code> and the output of
-<code>lazy daemon logs &lt;short-id&gt; -n 20000</code>, where <code>&lt;short-id&gt;</code> is the
-first 8 characters of the task&#39;s <code>id</code> in that JSON (daemon log lines name tasks
-that way).</p>
-<h2 id="waiting-on-subtasks"><a class="anchor" href="#waiting-on-subtasks" aria-hidden="true">#</a>Waiting on subtasks</h2>
-<p>An agent that splits its work into subtasks drives them with blocking lazy
-tools — <code>lazy_wait</code> (wait until a subtask finishes its turn) and <code>lazy_ask</code>
-(ask a subtask&#39;s agent a question and wait for the answer). While blocked in one
-of those calls the parent agent is doing nothing. A <code>lazy_wait</code> also returns early,
-with an <code>interrupted</code> reason, when someone adds a subtask to the waiting task from
-outside, so the parent can react instead of mistaking it for a timeout. Lazy shows the wait instead of
-a plain <code>working(agent)</code>:</p>
-<pre><code>working(waiting on fix-foo (2m10s))
-</code></pre>
-<p>This appears in <code>lazy list</code>, <code>lazy active</code>, <code>lazy status</code>, <code>lazy show</code>,
-<code>lazy watch</code>, and the MCP <code>substate</code> field. Two concurrent waits list both
-labels; a larger fan-out is summarized (<code>waiting on a, b +2</code>).</p>
-<p>Waiting outranks the turn-flavour substates (<code>agent:answering</code>,
-<code>agent:reviewing</code>) — those say what the turn <em>is</em>, <code>waiting</code> says what it is
-doing this second. A lazy-side phase (<code>harness:&lt;phase&gt;</code>) outranks waiting, and a
-dead run still reads <code>not-alive</code>. If the daemon is killed mid-wait, the marker
-is disregarded and the task falls back to <code>working(agent)</code>.</p>
-<p>Time spent waiting is recorded separately from the agent&#39;s own working time, so
-a turn that spent two hours blocked on a subtask does not bill those two hours
-to the agent in duration or cost reports. A failure to record a wait never
-affects the wait itself.</p>
-<h2 id="agent-reported-progress"><a class="anchor" href="#agent-reported-progress" aria-hidden="true">#</a>Agent-reported progress</h2>
-<p>The working substate answers <em>who is active</em> — agent, lazy, a wait, nothing.
-It cannot answer <em>doing what</em>. <code>lazy_update_progress</code> fills that gap: the agent
-posts a short line and every surface that shows the substate folds it in:</p>
-<pre><code>working(agent: running migration 3/7)
-</code></pre>
-<ul>
-<li><strong>Latest wins, no history.</strong> Each call replaces the previous line, and
-nothing is kept — a progress line is worthless five minutes later. What is
-worth keeping about a turn (rationale, decisions, deferrals) belongs in the
-journal.</li>
-<li><strong>Bounded.</strong> The line is whitespace-collapsed and capped at 120 characters.
-Longer messages are truncated, never rejected, and the agent is told.</li>
-<li><strong>Only while the agent is active.</strong> It decorates <code>agent</code>, <code>agent:answering</code>,
-<code>agent:reviewing</code> and <code>waiting on …</code>, never <code>harness:&lt;phase&gt;</code> or <code>not-alive</code>.</li>
-<li><strong>Cleared with the turn.</strong> Every new turn starts with no progress line, so a
-message from a finished turn never lingers.</li>
-</ul>
-<p>A progress post that cannot be recorded is simply lost; it never costs the agent
-its tool call.</p>
-<h2 id="agent-failure-classification"><a class="anchor" href="#agent-failure-classification" aria-hidden="true">#</a>Agent failure classification</h2>
-<p>Not every agent failure deserves the same response. A rate limit clears on its
-own; a revoked credential never does. So lazy sorts each failure into a class
-and acts on the class.</p>
-<p>This is about credentials and conditions that go bad <em>while a task runs</em>. A
-turn on a profile with no credential at all is refused before it launches, and
-the task keeps its status.</p>
-<h3 id="the-taxonomy"><a class="anchor" href="#the-taxonomy" aria-hidden="true">#</a>The taxonomy</h3>
-<table>
-<thead>
-<tr>
-<th>Class</th>
-<th>Examples</th>
-<th>Behaviour</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><code>fatal_auth</code></td>
-<td>401/403, invalid API key, missing credential, credit balance exhausted, a provider quota or spend cap (monthly usage limit, out of credits, <code>insufficient_quota</code>)</td>
-<td>Stop on the first failure</td>
-</tr>
-<tr>
-<td><code>fatal_config</code></td>
-<td>unknown flag, invalid model, agent binary missing (exit 127)</td>
-<td>Stop on the first failure</td>
-</tr>
-<tr>
-<td><code>transient_overload</code></td>
-<td>429, 529, 503, &quot;overloaded&quot; (a per-minute or short-window rate limit)</td>
-<td>Retry indefinitely, 5s→60s</td>
-</tr>
-<tr>
-<td><code>transient_network</code></td>
-<td>ECONNRESET, ETIMEDOUT, socket hang up, <code>fetch failed</code></td>
-<td>Retry indefinitely, 5s→60s</td>
-</tr>
-<tr>
-<td><code>transient_unreachable</code></td>
-<td>ECONNREFUSED, ENOTFOUND</td>
-<td>Retry 5s→60s, <strong>bounded</strong> at 12 attempts (~9 min), then stop</td>
-</tr>
-<tr>
-<td><code>unknown</code></td>
-<td>anything unrecognized</td>
-<td>Retry 15s→60s, <strong>bounded</strong> at 6 attempts (~4 min) per turn; the crash-loop detector still applies</td>
-</tr>
-</tbody></table>
-<p>A failure lazy does not recognize is classed <code>unknown</code>.</p>
-<p>Each agent&#39;s own wording is recognized too (Claude Code&#39;s &quot;Invalid API key ·
-Please run /login&quot;, Cursor&#39;s &quot;not logged in&quot;).</p>
-<h3 id="retry-pacing"><a class="anchor" href="#retry-pacing" aria-hidden="true">#</a>Retry pacing</h3>
-<p>Transient failures are retried at 5s → 10s → 20s → 40s → 60s (capped) —
-roughly 60 retries an hour.</p>
-<p>The crash-loop detector (3 failures in a row, each under 10s) does <strong>not</strong> apply
-to transient classes. It still applies to <code>unknown</code>, which
-is also capped at 6 attempts per turn so a slow, repeating failure cannot
-retry forever.</p>
-<p><code>transient_unreachable</code> sits in between: a refused connection to a local proxy
-can heal if the proxy restarts, so it is retried generously, but not forever.</p>
-<h3 id="what-stop-means"><a class="anchor" href="#what-stop-means" aria-hidden="true">#</a>What &quot;stop&quot; means</h3>
-<p>When a failure is classed fatal (or <code>transient_unreachable</code> runs out of
-attempts), the turn ends and the task moves to <strong><code>blocked</code></strong> — not
-<code>interrupted</code> — with the class and reason recorded on it. Auto-resume only ever
-restarts <code>interrupted</code> tasks, so this is what keeps lazy from relaunching into a
-condition that will not clear, and puts the task in front of you with the reason
-attached.</p>
-<p>A crash loop, or an <code>unknown</code> failure that used up its 6 attempts, is
-different: its class is <code>unknown</code>, recorded for diagnosis only. The task goes
-to <code>interrupted</code> and is auto-resumed, because many such causes are transient.</p>
-<p>Conditions that never clear on their own are kept out of <code>unknown</code>. A Cursor
-plan quota spent or a spend limit reached is <code>fatal_auth</code>; Claude&#39;s <code>usage limit reached</code> is a 5-hour window that clears by itself and stays
-<code>transient_overload</code>. A Cursor quota message is only fatal when nothing in it
-says the limit clears soon: a rate-limit marker or a short reset horizon
-(&quot;resets in 20 minutes&quot;) stays <code>transient_overload</code>, while a reset stated as a
-<em>date</em> (&quot;when your monthly cycle ends on 9/19/2026&quot;) does not. When in doubt,
-lazy retries.</p>
-<p>The same rule applies to every provider&#39;s quota. A 429 that says a monthly
-usage limit, spend cap or credit balance has been reached (Ollama, OpenAI,
-Anthropic) is <code>fatal_auth</code>: the task blocks with the provider&#39;s own message,
-including any upgrade or add-credits link it gave. A per-minute rate limit, or
-a cap whose message says it clears soon, is still retried.</p>
-<h3 id="seeing-what-is-being-retried"><a class="anchor" href="#seeing-what-is-being-retried" aria-hidden="true">#</a>Seeing what is being retried</h3>
-<p>While a turn is retrying, lazy shows one line saying what and why — for example
-<code>attempt 7 (transient_overload): API Error: 529 overloaded</code>, with the error
-snippet truncated — in all of:</p>
-<ul>
-<li>the <code>lazy watch</code> / <code>lazy status</code> header</li>
-<li>the <code>lazy list</code> / <code>lazy active</code> substate</li>
-<li>the &quot;Retry State&quot; block in <code>lazy show</code></li>
-<li>the supervisor log (<code>Phase: retrying …</code>)</li>
-<li><code>retry_status</code> in MCP <code>lazy_show</code>, so a builder can tell a task stuck retrying
-from a healthy <code>working</code> one</li>
-</ul>
-<h3 id="watchdog-kills"><a class="anchor" href="#watchdog-kills" aria-hidden="true">#</a>Watchdog kills</h3>
-<p>A no-progress watchdog kill has no error to classify — lazy killed the agent
-itself, after <code>[agent] watchdog_output_timeout_ms</code> (default <strong>30 minutes</strong>; the
-timer resets on every completed step) passed with no forward progress. What
-happens next depends on one question:</p>
-<table>
-<thead>
-<tr>
-<th>Did the turn capture anything?</th>
-<th>Behaviour</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><strong>Yes</strong> — a final result, or new commits</td>
-<td>Not retried. The work is already on disk, so relaunching would repeat it or hang the same way; the turn ends and you read what was captured</td>
-</tr>
-<tr>
-<td><strong>No</strong> — no result, no new commits</td>
-<td>Relaunched within the turn (5s → 10s backoff), at most 3 attempts. Each attempt costs a full no-progress window, so the bound is tight</td>
-</tr>
-</tbody></table>
-<p>If lazy cannot read git to check for commits, it treats the kill as having
-captured nothing and retries.</p>
-<p>When a watchdog kill ends the turn, the task goes to <strong><code>interrupted</code></strong> with
-auto-resume, not <code>blocked</code>. The recorded turn and the interrupt reason say which
-guard fired, what its limit was, that keep-alive output does not count as
-progress, and whether lazy already relaunched.</p>
-<h2 id="crashes-restarts-and-recovery"><a class="anchor" href="#crashes-restarts-and-recovery" aria-hidden="true">#</a>Crashes, restarts and recovery</h2>
-<p><code>interrupted</code> means a turn died or was killed without finishing. Lazy detects that in three ways, records what happened, and resumes automatically unless it would be pointless or you said stop.</p>
-<h3 id="detection"><a class="anchor" href="#detection" aria-hidden="true">#</a>Detection</h3>
-<p>The daemon watches <code>working</code> tasks. A task whose agent container or process is gone without having finished its turn is marked <code>interrupted</code>. A task that became <code>working</code> within the last 30 seconds is left alone, so a container still starting up is not mistaken for a dead one. A turn that had already finished and committed its work, but whose end-of-turn handshake was lost, is recovered instead: the commits are backfilled, a <code>[Recovered]</code> turn is recorded and the task parks <code>blocked</code> for review. A cluster task is never recovered this way, because its branch carries its children&#39;s accepted work; a killed cluster goes to <code>interrupted</code> and is resumed like any other task. A sync killed halfway is likewise <code>interrupted</code>, never &quot;finished&quot;.</p>
-<h3 id="when-the-daemon-restarts"><a class="anchor" href="#when-the-daemon-restarts" aria-hidden="true">#</a>When the daemon restarts</h3>
-<p>A restart cuts every running agent off from its model connection, so the new daemon handles each <code>working</code> task by what it finds:</p>
-<ul>
-<li><strong>A work turn that was running</strong> moves to <code>interrupted</code> with a recorded reason, does not count toward the crash limit below, and is resumed against the new daemon. If the daemon stopped rather than restarted, the next daemon picks the task up when it starts.</li>
-<li><strong>A turn whose finished response is already on disk</strong> is not interrupted; it is recorded and the task parks as usual.</li>
-<li><strong>An ask or review that was running</strong> cannot finish. The new daemon stops it, records it as failed, and puts the task back to the status it had before.</li>
-<li><strong>A task in <code>merging</code></strong> whose accept died is resumed to completion (see <a href="#accept-and-the-merging-status">Accept</a>).</li>
-<li><strong>A <code>complete</code> task still owing post-merge steps</strong> (fast-forward, parent push, tagging, reparenting, cleanup) has them retried until they succeed.</li>
-<li><strong>A task in <code>pairing</code></strong> whose pairing process is gone parks <code>blocked</code> (or <code>conflict</code>).</li>
-<li><strong>Subtask comments</strong> a parent missed are delivered again.</li>
-</ul>
-<p>A task you stopped with <code>lazy stop</code> is not resumed by any of this. The stop lasts until the task&#39;s next completed turn, whoever starts it: your <code>lazy resume</code> or <code>lazy unblock</code>, but also a completed <code>lazy ask</code> or <code>lazy review</code>, which lifts the stop too.</p>
-<h3 id="what-is-recorded"><a class="anchor" href="#what-is-recorded" aria-hidden="true">#</a>What is recorded</h3>
-<p>The crash is recorded as a turn on the task (visible in <code>lazy show</code>), along with diagnostics: a reason (for example &quot;OOM killed or SIGKILL (exit code 137)&quot;), the exit code, the time, and the last lines of the container&#39;s logs. Every turn that dies leaves a visible record, even when the same failure repeats: two identical <code>fatal_auth</code> failures on consecutive unblocks are recorded as two turns.</p>
-<h3 id="circuit-breaker"><a class="anchor" href="#circuit-breaker" aria-hidden="true">#</a>Circuit breaker</h3>
-<p>Each crash counts toward a limit of <strong>3 consecutive interruptions</strong>. Once it is reached, the immediate retries end, but the task is not given up on: it moves to a slower retry queue, where the daemon resumes it every <code>auto_resume_interval_minutes</code> (default 30), with at most one automatic resume project-wide per <code>auto_resume_gap_minutes</code> (default 5). Retries end for good after <code>auto_resume_max_attempts</code> slow attempts (default 24, about 12 hours); only then does the task stay <code>interrupted</code> until you run <code>lazy resume</code> or <code>lazy unblock</code>. Setting <code>auto_resume = false</code> under <code>[daemon]</code> turns off the slower queue (see <a href="../lazy-toml/#daemon">lazy.toml</a>). Until retries end, the daemon may run an interrupted task again and spend model tokens. The counter and the queue reset whenever a turn completes, and when you resume or unblock the task yourself. The settings are in <a href="../lazy-toml/#daemon">lazy.toml</a>.</p>
-<h3 id="auto-resume"><a class="anchor" href="#auto-resume" aria-hidden="true">#</a>Auto-resume</h3>
-<p>Auto-resume continues the agent&#39;s existing conversation, so it keeps its full history; the files on disk reflect wherever the crash left them, and the agent is told to verify before continuing.</p>
-<ul>
-<li><strong>Clean worktree</strong> (the agent crashed before editing anything, or after committing everything): the parent branch is merged into the task branch first, so a resumed task does not drift behind. A task pinned to a fixed base commit (<code>lazy clone --same-base</code>) is not merged.</li>
-<li><strong>Uncommitted changes</strong> (the agent crashed mid-edit): no merge, since merging over half-finished edits would fail or tangle them. The agent is told there are uncommitted changes and asked to review them, keep or discard what it finds, commit, and continue.</li>
-</ul>
-<p>The resume is recorded as a <code>system</code> turn, &quot;Session interrupted and auto-resumed&quot;. If the crash happened while lazy was merging upstream into the task and the merge failed, the task is <strong>not</strong> auto-resumed: a human needs to look at the conflict.</p>
-<h3 id="feedback-is-redelivered-after-a-crash"><a class="anchor" href="#feedback-is-redelivered-after-a-crash" aria-hidden="true">#</a>Feedback is redelivered after a crash</h3>
-<p>Your feedback is saved before the agent is launched. If the turn then crashes before the agent finishes responding to it, the resume (automatic or <code>lazy resume</code>) delivers that feedback again <strong>verbatim</strong>, in place of the generic &quot;you were interrupted&quot; prompt. If several pieces of feedback went unanswered, the newest is reproduced and the prompt says how many others there are. Once an agent turn completes normally, all feedback before it counts as delivered and is never redelivered.</p>
-<p>This applies to your initial task prompt, <code>lazy unblock</code> feedback, <code>lazy ask</code> questions, and PR comments and CI output delivered automatically. A comment made through lazy itself (<code>lazy comment</code>, the web UI, <code>lazy_comment</code>) is different: it never starts a turn, and reaches the agent with the next <code>lazy unblock</code>, or, when it is written while the agent is still doing the turn&#39;s main work, before that turn ends. Each such hand-off counts toward <a href="../lazy-toml/#limits"><code>max_turns_without_human</code></a>; past it the comment waits for your unblock. Lazy&#39;s own notices (such as <code>[Subtask accepted]</code>) never keep a turn going on their own.</p>
-<h3 id="three-crash-scenarios"><a class="anchor" href="#three-crash-scenarios" aria-hidden="true">#</a>Three crash scenarios</h3>
-<table>
-<thead>
-<tr>
-<th>Crash</th>
-<th>State after</th>
-<th>On auto-resume</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><strong>Before any edits</strong></td>
-<td>Worktree clean, no new commits</td>
-<td>Upstream merged; agent verifies and continues</td>
-</tr>
-<tr>
-<td><strong>Mid-edit</strong></td>
-<td>Worktree has uncommitted changes</td>
-<td>No merge; agent reviews the changes, commits, fixes or discards them</td>
-</tr>
-<tr>
-<td><strong>After committing but before the turn finished</strong></td>
-<td>Worktree clean, commits on the branch</td>
-<td>Upstream merged; agent finds its commits and continues. The commits are recorded on the task when a later turn finishes</td>
-</tr>
-</tbody></table>
-<h3 id="a-turn-nobody-read"><a class="anchor" href="#a-turn-nobody-read" aria-hidden="true">#</a>A turn nobody read</h3>
-<p>If you unblock a task just as its agent finishes a turn, that finished turn is not lost: lazy still records it in the task&#39;s history, and remembers the agent session it ran in, so <code>lazy pair</code> resumes where the agent left off. A turn recovered this way is history only; it does not change the task&#39;s status or disturb the turn now running.</p>
-<h3 id="manual-recovery"><a class="anchor" href="#manual-recovery" aria-hidden="true">#</a>Manual recovery</h3>
-<ul>
-<li><strong><code>lazy resume &lt;task&gt;</code></strong>: resume without feedback. Resets the crash counter.</li>
-<li><strong><code>lazy unblock &lt;task&gt; --message &quot;...&quot;</code></strong>: give feedback and resume. Resets the counter.</li>
-<li><strong><code>lazy pair &lt;task&gt;</code></strong>: work with the agent interactively to debug.</li>
-<li><strong><code>lazy show &lt;task&gt;</code></strong>: see the interrupt diagnostics: reason, exit code, time, recent log lines, the consecutive-interruption count, and whether the session was auto-resumed.</li>
-</ul>
+<h2 id="why-some-arrows-look-surprising"><a class="anchor" href="#why-some-arrows-look-surprising" aria-hidden="true">#</a>Why some arrows look surprising</h2>
+<p>A sync on a <code>submitted</code> task restores <code>submitted</code> when it finishes: syncing changes the branch, not whether its PR is awaiting review. A protected-file decision still due can instead leave it in <code>conflict</code>.</p>
+<p>A task stopped by a person stays stopped until its next completed turn; the daemon does not automatically restart it. A crashed turn goes to <code>interrupted</code> and may be resumed automatically.</p>
+<p>An accept that dies during <code>merging</code> is resumed. Once the merge lands, the task becomes <code>complete</code>; remaining push and cleanup steps can be retried.</p>
+<p>For what happens inside a turn, see <a href="../explanation/tasks-and-turns/">Tasks and turns</a>. For accepting and forge reviews, see <a href="../explanation/review-and-accept/">Review and accept</a>. For protected files, see <a href="../lazy-toml/#resolving-a-conflict-task">Resolving a conflict task</a>.</p>
 
 <nav class="pager" aria-label="Previous and next"><a class="prev" href="../architecture/tasks-in-git/"><span>Previous</span>Git integration</a><span></span></nav>
 </main>
@@ -647,15 +219,15 @@ progress, and whether lazy already relaunched.</p>
 <details class="branch"><summary>Tutorials</summary>
 <ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
 <details class="branch"><summary>How-to guides</summary>
-<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
 <details class="branch"><summary>Reference</summary>
-<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
 <details class="branch"><summary>Explanation</summary>
 <ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
 <details class="branch" open><summary>Architecture</summary>
 <ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/" aria-current="page">The task state machine</a></li></ul></details>
 <details class="branch all-pages"><summary>All pages</summary>
-<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
 </nav>
 </div>
 </body>

@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The agent container — lazy docs</title>
+<style>:root { color-scheme: light dark; --fg:#1b1f23; --bg:#fff; --muted:#57606a; --line:#d8dee4; --link:#0969da; --code:#f6f8fa; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --link:#4493f8; --code:#161b22; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+.wrap { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem 6rem; }
+header.site { border-bottom:1px solid var(--line); }
+header.site .wrap { max-width:76rem; display:flex; flex-wrap:wrap; gap:.75rem; align-items:baseline; padding-block:1rem; }
+header.site a { color:var(--fg); text-decoration:none; font-weight:600; }
+header.site .version { color:var(--muted); font-size:.85rem; }
+a { color: var(--link); }
+h1,h2,h3,h4,h5,h6 { line-height:1.25; margin:2rem 0 .75rem; scroll-margin-top:1rem; }
+h1 { font-size:1.9rem; margin-top:1rem; }
+h2 { font-size:1.4rem; padding-bottom:.25rem; border-bottom:1px solid var(--line); }
+a.anchor { float:left; margin-left:-1em; padding-right:.25em; color:var(--muted); text-decoration:none; opacity:0; }
+h1:hover a.anchor, h2:hover a.anchor, h3:hover a.anchor, h4:hover a.anchor { opacity:1; }
+code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size:.9em; }
+pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
+pre code { background:none; padding:0; font-size:.85em; }
+table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+.doc-diagram { margin:1.5rem 0; overflow-x:auto; }
+.doc-diagram svg { min-width:40rem; max-width:100%; height:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
+.doc-diagram figcaption { color:var(--muted); font-size:.9rem; text-align:center; }
+th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
+blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
+img { max-width:100%; }
+hr { border:0; border-top:1px solid var(--line); margin:2rem 0; }
+ul.pages { list-style:none; padding:0; }
+ul.pages li { padding:.3rem 0; border-bottom:1px solid var(--line); }
+ul.pages .path { color:var(--muted); font-size:.8rem; margin-left:.5rem; }
+h2.group { margin-top:2.5rem; }
+p.intro { color:var(--muted); margin-top:-.25rem; }
+ul.pages li.group { border-bottom:0; padding-top:.9rem; font-weight:600; color:var(--muted); font-size:.85rem; text-transform:uppercase; letter-spacing:.03em; }
+ul.pages li.in-group { padding-left:1rem; }
+header.site .contents { margin-left:auto; font-weight:400; font-size:.9rem; color:var(--link); }
+.layout { display:grid; grid-template-columns:minmax(0,1fr); max-width:76rem; margin:0 auto; }
+.layout main { min-width:0; max-width:46rem; padding:1.5rem 1.25rem 4rem; }
+.sidebar { border-top:1px solid var(--line); padding:1rem 1.25rem 4rem; font-size:.92rem; }
+.sidebar summary { cursor:pointer; padding:.25rem .4rem; border-radius:4px; }
+.sidebar > details > summary { font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-top:.6rem; }
+.sidebar li.group > details > summary { color:var(--muted); }
+.sidebar ul { list-style:none; margin:0; padding:0; }
+.sidebar li { margin:.1rem 0; }
+.sidebar details > ul { padding-left:.5rem; }
+.sidebar li.group ul { padding-left:.75rem; border-left:1px solid var(--line); }
+.sidebar a { text-decoration:none; display:block; padding:.1rem .4rem; border-radius:4px; }
+.sidebar a[aria-current="page"] { background:var(--code); color:var(--fg); font-weight:600; }
+nav.crumbs { font-size:.85rem; color:var(--muted); }
+nav.pager { display:flex; justify-content:space-between; gap:1rem; margin-top:3rem; border-top:1px solid var(--line); padding-top:1rem; }
+nav.pager a { text-decoration:none; max-width:48%; }
+nav.pager a.next { text-align:right; margin-left:auto; }
+nav.pager span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search { position:relative; order:3; flex:1 0 100%; min-width:0; }
+nav.toc { margin:1rem 0 1.5rem; padding:.5rem .9rem; border:1px solid var(--line); border-radius:6px; background:var(--code); font-size:.92rem; }
+nav.toc summary { cursor:pointer; font-weight:600; }
+nav.toc ul { margin:.4rem 0 .2rem; padding-left:1.1rem; columns:1; }
+nav.toc li { margin:.15rem 0; }
+@media (min-width: 40rem) { nav.toc ul { columns:2; } }
+header.site .search input { font:inherit; font-size:.9rem; padding:.25rem .6rem; width:100%; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; }
+header.site .search ul.results { position:absolute; right:0; top:2.2rem; z-index:10; width:min(32rem,90vw); max-height:70vh; overflow-y:auto; margin:0; padding:.25rem; list-style:none; background:var(--bg); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.2); }
+header.site .search ul.results[hidden] { display:none; }
+header.site .search ul.results a { display:block; padding:.4rem .6rem; border-radius:4px; font-weight:400; color:var(--fg); }
+header.site .search ul.results a strong { display:block; font-size:.9rem; }
+header.site .search ul.results a span { display:block; font-size:.8rem; color:var(--muted); }
+header.site .search ul.results a[aria-selected="true"], header.site .search ul.results a:hover { background:var(--code); }
+header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size:.9rem; }
+@media (min-width: 60rem) {
+  header.site .search { margin-left:auto; order:0; flex:1 1 6rem; max-width:14rem; }
+  header.site .contents { display:none; }
+  .layout { grid-template-columns:16rem minmax(0,1fr); }
+  .sidebar { grid-column:1; grid-row:1; border-top:0; border-right:1px solid var(--line); position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto; }
+  .layout main { grid-column:2; padding-left:2.5rem; }
+}</style>
+<script defer src="../search-index.js"></script>
+<script defer src="../diagrams.js"></script>
+<script defer src="../search.js" data-root="../"></script>
+</head>
+<body>
+<header class="site"><div class="wrap"><a href="../">lazy documentation</a><span class="version">v0.94</span><a class="contents" href="#contents">Contents</a></div></header>
+<div class="layout">
+<main>
+<nav class="crumbs" aria-label="Breadcrumbs"><a href="../#explanation">Explanation</a> › <span aria-current="page">The agent container</span></nav>
+<h1 id="the-agent-container"><a class="anchor" href="#the-agent-container" aria-hidden="true">#</a>The agent container</h1>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#a-container-lasts-across-turns">A container lasts across turns</a></li><li><a href="#the-default-image">The default image</a></li><li><a href="#giving-your-project-its-own-image">Giving your project its own image</a></li><li><a href="#the-headless-browser">The headless browser</a></li><li><a href="#when-the-image-is-built">When the image is built</a></li><li><a href="#resetting-a-machines-docker-storage">Resetting a machine's Docker storage</a></li><li><a href="#how-long-a-tasks-container-lives">How long a task's container lives</a></li><li><a href="#rebuilding">Rebuilding</a></li><li><a href="#when-an-agent-cannot-start">When an agent cannot start</a></li><li><a href="#what-the-container-can-and-cannot-change-in-git">What the container can and cannot change in git</a></li></ul></details></nav>
+<p>Every task&#39;s agent runs in a Docker container of its own. This page is for anyone
+whose agents need tools the default image does not have, or who is diagnosing an
+agent that cannot start: what the default image contains, how to give your
+project its own image, and when lazy rebuilds it.</p>
+<h2 id="a-container-lasts-across-turns"><a class="anchor" href="#a-container-lasts-across-turns" aria-hidden="true">#</a>A container lasts across turns</h2>
+<p>A task keeps its container between turns. A failed agent, a timeout, or Stop
+ends the turn without replacing the container. Services and files outside the
+task&#39;s checkout stay there for the next turn. This applies in Lazy Teams and
+when running lazy on your own machine.</p>
+<p>Accepting, rejecting or closing the task cleans up its container. Explicitly
+restarting the environment, changing its agent, environment variables or image,
+can also replace it. An out-of-memory kill or an external container stop can
+stop it independently of lazy. When lazy starts that same container again for
+a work turn or Run services, its files and installed tools are kept. A missing
+container, or one that cannot start again, needs a replacement.</p>
+<p>Lazy records an observed exit in the task&#39;s journal, including its exit code,
+whether Docker reported an out-of-memory kill, and when it exited, when those
+facts are available. Starting the container again in place does not produce a
+replacement warning. The journal is visible in Lazy Teams and the dashboard.</p>
+<p>Before creating a replacement, lazy records the loss and tells the next work
+turn, including when replacement is needed to launch that turn. Lazy Teams also
+keeps an <strong>Environment replaced</strong> notice on the task page after the agent has
+seen it.</p>
+<p>Keep data you need beyond the task in durable storage: container files outside
+the checkout do not survive environment replacement or task cleanup.</p>
+<h2 id="the-default-image"><a class="anchor" href="#the-default-image" aria-hidden="true">#</a>The default image</h2>
+<p>A project with no <code>[docker] dockerfile</code> in its <code>lazy.toml</code> and no <code>Dockerfile.lazy</code>
+at its root runs agents in lazy&#39;s default image, <code>lazy-runner</code>, which is deliberately minimal. It is Debian
+(bookworm-slim) with:</p>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>git</code>, <code>curl</code>, <code>jq</code>, <code>wget</code>, <code>unzip</code>, <code>less</code>, <code>openssh-client</code>, <code>gnupg</code>, <code>sudo</code></td>
+<td>Basic tools</td>
+</tr>
+<tr>
+<td>Chromium (<code>$CHROME_BIN</code>)</td>
+<td>Screenshots for visual checks of UI work</td>
+</tr>
+<tr>
+<td><code>tmux</code></td>
+<td>A task&#39;s services run in a named terminal session you can watch and attach to (see below)</td>
+</tr>
+<tr>
+<td>Claude Code, Codex, Cursor CLI, Pi</td>
+<td>Every agent lazy can run in a container, so one image serves whichever agent a task uses</td>
+</tr>
+</tbody></table>
+<p>The agent runs as <code>user</code>, with passwordless <code>sudo</code>, so it can install what it
+needs for one task. Lazy itself is never baked into an image: it is
+mounted in when the container starts, so an image never pins you to an older
+lazy.</p>
+<p>To see exactly what the default image is built from:</p>
+<pre><code class="language-bash">lazy system export-dockerfile --stdout
+</code></pre>
+<p>Every lazy release publishes this image as <code>ghcr.io/getlazy/lazy-runner</code> (also
+on Docker Hub as <code>getlazy/lazy-runner</code>), tagged with the release version (for example
+<code>v0.91.1402</code>), <code>v0.91</code>, <code>latest</code>, and a content tag <code>sha-&lt;fingerprint&gt;</code> naming
+the exact Dockerfile it was built from. The first task on a machine <strong>pulls</strong>
+the content tag your lazy version builds from and tags it locally as
+<code>lazy-runner:&lt;major.minor&gt;</code> and <code>lazy-runner:latest</code>, so <code>FROM lazy-runner</code>
+keeps working. Lazy builds the image locally instead, and says why, when:</p>
+<ul>
+<li>it is offline;</li>
+<li>no release published the image your lazy version builds from, for example
+when you run lazy from a source checkout with a changed runner Dockerfile;
+lazy then also tags its own build with that content tag;</li>
+<li>the pull fails;</li>
+<li>the published image was built from a different Dockerfile than the one your
+lazy version uses.</li>
+</ul>
+<p>A pulled image keeps the agent CLIs it was pulled with; lazy never refreshes it
+behind your back. To get newer versions of Claude Code, Codex, Cursor or Pi,
+upgrade lazy, which pulls the newest published image for its runner.</p>
+<h2 id="giving-your-project-its-own-image"><a class="anchor" href="#giving-your-project-its-own-image" aria-hidden="true">#</a>Giving your project its own image</h2>
+<p>When agents keep installing the same toolchain (a language runtime, a database
+client, your project&#39;s dependencies), build it into an image instead. Write a
+<code>Dockerfile.lazy</code> at the root of your repository, usually starting from the
+default image:</p>
+<pre><code class="language-dockerfile">FROM lazy-runner
+RUN sudo apt-get update &amp;&amp; sudo apt-get install -y --no-install-recommends postgresql-client
+</code></pre>
+<p>No configuration is needed: when <code>[docker] dockerfile</code> is unset, lazy uses a
+<code>Dockerfile.lazy</code> at the project root, once it is committed on the checked-out
+branch. An uncommitted one, staged or not, is ignored (tasks use the default
+image and <code>lazy doctor</code> says so). Lazy
+builds exactly the committed version: uncommitted edits to the file are not
+used, and it must be a regular file, not a symbolic link.</p>
+<p>On a Lazy Teams install that runs projects on the host&#39;s own Docker rather than
+in a virtual machine per project, a committed <code>Dockerfile.lazy</code> is not built
+automatically either: its build would run on a machine shared with other
+projects. Tasks there use the default image. The project gets a system message saying
+so, the agent is told the file will not change its container, and the task&#39;s
+launch progress says it too. The project owner can still choose the file explicitly with
+<code>[docker] dockerfile</code> in the project configuration.</p>
+<p>To use a file with another name or in
+another directory, name it instead (relative to the project root):</p>
+<pre><code class="language-toml">[docker]
+dockerfile = &quot;docker/agents.Dockerfile&quot;
+build_inputs = [&quot;package-lock.json&quot;]
+</code></pre>
+<p>The project image uses <code>docker/agents.Dockerfile</code> and rebuilds when the
+lockfile changes. In Lazy Teams, a project admin sets this on <strong>Settings →
+Configuration</strong>.</p>
+<p>A file named there must exist — a missing one fails the launch rather than
+falling back to the default image, and so does a Dockerfile that fails to build
+(the error names the file and shows the end of the build output). If
+<code>FROM lazy-runner</code> names a base image that is not built yet, lazy builds it
+first. All <code>[docker]</code> settings, including <code>build_inputs</code> (rebuild when a
+lockfile changes), are in <a href="../lazy-toml/#docker">lazy.toml</a>.</p>
+<p>The build is done by the daemon, from the project root&#39;s copy of the file. An
+agent editing <code>Dockerfile.lazy</code> on its task branch does not change the image
+its own task runs in; the change takes effect for tasks started after that
+branch is accepted. Agents know this: when a task needs a toolchain the
+container lacks (asking for a Rust service in a project with no <code>cargo</code>, say),
+the agent adds it to <code>Dockerfile.lazy</code>, installs it in its own container for
+the task at hand, and tells you what it added.</p>
+<h3 id="when-dockerfilelazy-does-not-build"><a class="anchor" href="#when-dockerfilelazy-does-not-build" aria-hidden="true">#</a>When <code>Dockerfile.lazy</code> does not build</h3>
+<p>If the project&#39;s <code>Dockerfile.lazy</code> fails to build, nothing that needs an agent
+waits on it silently: builders start on the default image and say so, and a
+task&#39;s agent runs on the default image only if somebody confirms that on the
+task. On Lazy Teams the project page shows the failure and its build output,
+with two ways out:</p>
+<ul>
+<li><strong>Use <code>Dockerfile.lazy</code> from another branch or task</strong> (team admins). Pick a
+branch, or a task whose branch has a working file. Its committed file is shown
+next to the project branch&#39;s; on confirmation lazy builds it, with that
+branch&#39;s committed files as the build context, and only if it builds does the
+whole project — every builder and task — switch to it. The page says who
+adopted it and from where. Long lines wrap and long runs of spaces are drawn,
+so nothing hides past the edge; a file containing invisible or
+text-direction characters is marked where they are and cannot be adopted
+until they are removed. It stays in use when the project branch&#39;s own file
+changes later: the page says so and offers <strong>Switch back</strong>, and nothing
+switches until an admin chooses it. An adopted image also survives lazy
+upgrades, being rebuilt for the new version. On installs that run projects on
+the host&#39;s own Docker rather than in a virtual machine, this is not offered:
+the project owner names a Dockerfile in the project configuration instead.</li>
+<li><strong>Create a task to fix it.</strong> The new-task form arrives filled in with the
+build output. On projects that run in a virtual machine, the task&#39;s agent can
+check its fix with the <code>lazy_image_build</code> tool. It builds the task&#39;s own
+<code>Dockerfile.lazy</code> (including an uncommitted change to it) against the task&#39;s
+committed files, inside the project&#39;s virtual machine, and returns the
+output. The build runs in a separate builder of its own that is removed
+afterwards, so it shares no build cache with the project&#39;s real image and
+produces no image at all; it has no access to secrets, SSH keys or registry
+logins. Once it builds,
+an admin adopts the file from the task&#39;s branch as above.</li>
+</ul>
+<p>If your task containers need to be <em>created</em> with extra Docker flags (for
+example <code>--cap-add=SYS_PTRACE</code>), that is <code>[docker] run_args</code> — a container
+setting, not an image one, so no Dockerfile change can provide it.</p>
+<p>In Lazy Teams, a project admin can set it under <strong>Settings → Configuration</strong>:</p>
+<pre><code class="language-toml">[docker]
+run_args = [&quot;--cap-add=SYS_PTRACE&quot;]
+</code></pre>
+<p>Every new task container gets that capability. Review container arguments
+before saving them, since they apply to every task in the project.</p>
+<h3 id="scripts-that-call-node"><a class="anchor" href="#scripts-that-call-node" aria-hidden="true">#</a>Scripts that call <code>node</code></h3>
+<p><code>bun install</code> writes <code>node_modules/.bin/*</code> shims that start with
+<code>#!/usr/bin/env node</code>. If your image has no <code>node</code> (the default image has none),
+any <code>package.json</code> script that runs a dependency&#39;s CLI by name — <code>tsc --noEmit</code>,
+<code>eslint .</code> — fails with <strong>exit 127</strong> before the tool runs. Either install node
+in your image, or run the tool&#39;s entry module through bun:</p>
+<pre><code class="language-json">&quot;typecheck&quot;: &quot;bun node_modules/typescript/lib/tsc.js --noEmit&quot;
+</code></pre>
+<p>Watch for this in <code>[checks] post_turn</code>: a check whose scripts all exit 127
+checks nothing.</p>
+<h2 id="the-headless-browser"><a class="anchor" href="#the-headless-browser" aria-hidden="true">#</a>The headless browser</h2>
+<p>Agents find the browser through <code>$CHROME_BIN</code> (and <code>chromium</code> on <code>PATH</code>). If you
+build your own image from something other than <code>lazy-runner</code>, set <code>CHROME_BIN</code>
+too, so agents do not try to install a browser in every task. Rendering an HTML
+file to an image is one command:</p>
+<pre><code>&quot;$CHROME_BIN&quot; --headless --disable-gpu --no-sandbox --hide-scrollbars \
+  --window-size=1280,1600 --screenshot=/tmp/shot.png file:///tmp/page.html
+</code></pre>
+<p>Chromium logs D-Bus and GPU warnings on every run in a container; they are noise,
+not failure. The exit code and a non-empty output file are the signals.</p>
+<h2 id="when-the-image-is-built"><a class="anchor" href="#when-the-image-is-built" aria-hidden="true">#</a>When the image is built</h2>
+<p>The daemon builds your project&#39;s image <strong>when it starts</strong>, in the background —
+not inside the first task or builder launch. Everything except running an agent
+keeps working while it builds: creating tasks, reviewing, commenting, browsing.
+Lazy Teams shows the build on the project page, the dashboard shows it at the
+top, and <code>lazy system runner-image</code> prints it.</p>
+<p>Until the image is ready:</p>
+<ul>
+<li><strong>A builder starts on lazy&#39;s default image</strong>, and says so in a banner.</li>
+<li><strong>An agent runs on the default image only if you confirm it.</strong> Start, resume
+and feedback ask first: in Lazy Teams and the dashboard with a &quot;run on the
+default image&quot; button or tick, at the terminal with a prompt (or
+<code>--default-image</code> / <code>--yes</code>), and over MCP with a confirmation code. If you
+would rather wait, do nothing; tasks waiting to be resumed automatically wait
+for the image too.</li>
+<li><strong>Questions and reviews never wait.</strong> Asking a task something and reviewing
+it are read-only, so they run on lazy&#39;s default image straight away, without
+a confirmation, and do not change which image the task&#39;s own work runs on.</li>
+<li><strong>Every turn shows the image it ran on</strong>, next to its agent and model.</li>
+<li><strong>A failed build stays visible</strong>, with its reason and the Dockerfile it came
+from, until you fix it and build again (the project page&#39;s &quot;Build it again&quot;,
+or <code>lazy system runner-image retry</code>). No launch quietly starts its own build.</li>
+</ul>
+<h3 id="watching-rebuilding-and-cancelling-the-build"><a class="anchor" href="#watching-rebuilding-and-cancelling-the-build" aria-hidden="true">#</a>Watching, rebuilding and cancelling the build</h3>
+<p>The build has a log you can follow while it runs: every line the container
+builder prints, each Dockerfile step with how long it took (or that it came
+from the cache), and where the build is — &quot;step 4 of 9&quot;. When a build fails,
+the step that failed is named with its own output, and the project&#39;s state
+says whether it is something you can fix (a step of your Dockerfile) or
+something for whoever runs the machine (the container runtime is down, the
+disk is full).</p>
+<pre><code class="language-sh">lazy system runner-image log --follow   # stream the build, step by step
+lazy system runner-image rebuild        # build again, even if it is up to date
+lazy system runner-image cancel         # stop the running build
+</code></pre>
+<p><strong>Rebuild</strong> builds the image again even when it is current (<code>--no-cache</code> also
+refetches everything the Dockerfile pulls). A rebuild of a ready image does not
+take it away: launches keep using it until the new one has built, and after a
+failed rebuild. <strong>Cancel</strong> stops the build at once. Adopting a Dockerfile from
+another branch in Lazy Teams is a build like any other: it returns straight
+away, and its log shows the branch being exported and checked before the build
+itself.</p>
+<p>Logs never show a credential: lazy removes every secret it holds — your
+credentials and the stand-ins it gives task containers — before a line reaches
+you. <code>lazy system machine</code> shows the rest of the machine the same way: the
+container runtime, the project daemon and its proxy, each one&#39;s recent log
+(<code>--logs</code>), and CPU, memory and disk use. On a Lazy Teams host shared by several
+projects, the host&#39;s name and its CPU, memory and disk figures are withheld,
+because they describe every project there.</p>
+<h2 id="resetting-a-machines-docker-storage"><a class="anchor" href="#resetting-a-machines-docker-storage" aria-hidden="true">#</a>Resetting a machine&#39;s Docker storage</h2>
+<p>On a Lazy Teams project&#39;s own machine, if Docker keeps running out of memory or
+its disk is full, its storage can be emptied and started clean. A project admin
+(or the installation&#39;s administrator in god mode) does it from the <strong>Machine</strong>
+page under <strong>Docker storage</strong>; an operator on the machine runs</p>
+<pre><code>lazy system machine reset-docker-storage    # asks first; --yes skips the question
+</code></pre>
+<p><strong>This deletes every image, container, volume and build cache on the machine</strong>,
+including every open task&#39;s data directory (<code>$LAZY_TASK_DATA</code>, where its
+services keep their databases), and stops everything running in Docker, so it asks for confirmation. It then
+holds lazy&#39;s automatic Docker recovery off, stops Docker, unmounts everything
+under its storage, removes the storage without crossing a mount point, and
+starts Docker again, telling you each step as it happens (on the page, or in the
+terminal).
+<strong>Builds and task starts are cold afterwards</strong>: images are pulled again and
+layers rebuilt, so the first ones take longer. If a step fails, the page says
+which and Docker is started again anyway. Plain members do not see the button.</p>
+<p>Nothing switches back on its own once the image is ready. A task or builder
+that runs on the default image keeps a banner that turns into <strong>Restart with
+the project&#39;s image</strong>: for a task the switch applies from its next turn (a turn
+in progress is not interrupted; <code>lazy system runner-image use-project &lt;task&gt;</code>
+from a terminal), and for a builder it is a stop and a start that keeps the
+conversation.</p>
+<h2 id="how-long-a-tasks-container-lives"><a class="anchor" href="#how-long-a-tasks-container-lives" aria-hidden="true">#</a>How long a task&#39;s container lives</h2>
+<p>A task normally keeps its container between turns, including packages,
+toolchains and caches installed outside its worktree. The operations below
+determine when that environment is kept or replaced.</p>
+<ul>
+<li><strong>Stop</strong> ends the agent’s turn and keeps its container and services.</li>
+<li><strong>A daemon restart</strong> (<code>lazy daemon restart</code> or a crash) stops only
+the agent. The container and everything running in it keep running; a turn
+that was cut off resumes in the same container.</li>
+<li><strong>A container that stopped</strong> — the machine rebooted, Docker restarted, it ran
+out of memory, or was stopped outside lazy — is started again, with its files, the
+next time the task needs it. What was running in it, its services included,
+ended with it.</li>
+<li><strong>It is created anew</strong> only when it has to be: the task&#39;s agent, environment
+variables, credential or image changed, you restart the environment
+(<code>lazy shell &lt;task&gt; --restart</code>), or the container cannot be started again.</li>
+<li><strong>A full <code>lazy upgrade</code></strong> stops and removes this project’s running task
+containers before restarting the daemon. Running services end, and packages,
+caches or other files kept only inside those containers are lost. The
+worktree, saved agent history and mounted data, including <code>$LAZY_TASK_DATA</code>,
+survive; later launches create containers on the upgraded image.</li>
+<li><strong>It is removed</strong> when the task is accepted, rejected or closed.</li>
+</ul>
+<p><code>lazy upgrade --images</code> only refreshes the image: it stops no containers and
+does not restart the daemon. Existing containers keep their current image.
+Containers already stopped when a full upgrade runs are kept too. Restart the
+task’s environment with <code>lazy shell &lt;task&gt; --restart</code> to move a kept container
+to the refreshed image; this also loses its container-only files.</p>
+<h3 id="services-and-other-long-running-commands"><a class="anchor" href="#services-and-other-long-running-commands" aria-hidden="true">#</a>Services and other long-running commands</h3>
+<p>A task&#39;s services — the project&#39;s Start services command — run in a named
+terminal session called <code>services</code> inside the task&#39;s container, using
+<a href="https://github.com/tmux/tmux" rel="noopener noreferrer">tmux</a>. Because it is a real terminal, a debugger
+or a REPL the command opens waits for your input instead of hanging. The session
+keeps running between turns and across daemon restarts, so a dev server you
+started is still up when you come back.</p>
+<ul>
+<li><strong>Its output</strong> is kept in a log of at most about 16 MiB (two 8 MiB files), and
+its live screen can be read at any time, without attaching. An agent reads both
+with the <code>lazy_sessions</code> tool, so it can check whether a server came up or why
+it stopped.</li>
+<li><strong>Attaching</strong> to the session opens a terminal on it: you see the same screen,
+and what you type goes to the command. On your own machine, from a shell in the task&#39;s container
+(<code>lazy shell &lt;task&gt;</code>), run <code>tmux -S /tmp/lazy-tmux/default attach -t services</code>
+(add <code>-r</code> to watch without typing); detach with <code>Ctrl-b d</code> and the command keeps
+running. Watching or typing into a session never holds up the agent, and a
+running turn never keeps you out.</li>
+<li><strong>After every work turn</strong>, lazy restarts the command inside the same session,
+so a terminal attached to it stays attached and sees the restart. The previous
+run&#39;s output is kept as the older of the two log files, so if the command
+crashed during the turn you can still read why.</li>
+</ul>
+<p>An image of your own needs <code>tmux</code> installed to get the session (or
+<code>FROM lazy-runner</code>); without it, Start services still runs the command, detached with a log, but there is no screen to watch or attach to.</p>
+<h3 id="keep-your-services-data-across-restarts-put-it-in-lazy_task_data"><a class="anchor" href="#keep-your-services-data-across-restarts-put-it-in-lazy_task_data" aria-hidden="true">#</a>Keep your services&#39; data across restarts: put it in <code>$LAZY_TASK_DATA</code></h3>
+<p>An existing environment from before this directory was added stays as it is
+after an upgrade. Its Services tab and <code>lazy doctor</code> explain when to use
+<strong>Restart environment</strong> to get the directory and the rule that leaves services&#39;
+files alone. Restarting loses anything installed outside the worktree and what
+running services hold in memory.</p>
+<p>Every task has a data directory of its own at <code>/lazy/data</code>, named by the
+<code>LAZY_TASK_DATA</code> environment variable in the task&#39;s container. Put the data of
+the services your task runs there — a Postgres or Redis data directory, an
+uploads folder, a local cache:</p>
+<pre><code class="language-sh">initdb -D &quot;$LAZY_TASK_DATA/postgres&quot;
+redis-server --dir &quot;$LAZY_TASK_DATA/redis&quot;
+</code></pre>
+<ul>
+<li><strong>It survives</strong> the container being created anew, daemon and machine
+restarts, and image changes. It is not in git and not in the worktree.</li>
+<li><strong>Terminals see it too</strong>: a shell or pairing session on the task mounts the
+same directory, so a service you start from your own terminal uses the same
+data.</li>
+<li><strong>Lazy never changes it while the task is open</strong>: it does not change who owns
+its files, prune it, or remove it to free disk space. The disk-space page shows
+each task&#39;s data directory and its size. The one exception is
+<a href="#resetting-a-machines-docker-storage">resetting a machine&#39;s Docker storage</a>,
+which you confirm and which deletes every task&#39;s data directory with
+everything else in Docker.</li>
+<li><strong>It is removed</strong> when the task is accepted, rejected or closed. If it was
+still in use at that moment, the finished-task cleanup lists it until you
+remove it there.</li>
+<li><strong>An existing environment without this mount</strong> needs to be rebuilt to get
+the data directory. Rebuilding loses running processes and files kept only
+inside the container; the worktree and mounted data remain.</li>
+</ul>
+<p>Lazy also never takes over files in the worktree that belong to another user:
+when a service runs as its own user (<code>postgres</code>, <code>redis</code>), its files keep
+that owner across every turn.</p>
+<h2 id="rebuilding"><a class="anchor" href="#rebuilding" aria-hidden="true">#</a>Rebuilding</h2>
+<p>Lazy names a custom image after the content of its Dockerfile
+(<code>lazy-custom-&lt;hash&gt;</code>), so editing the Dockerfile in the project root makes
+the daemon build the new image the next time a launch asks for it — the launch
+itself waits or runs on the default image, as above. The build when the daemon
+starts uses the latest commit of the project&#39;s branch, not uncommitted files
+in your checkout.</p>
+<p>Lazy also rebuilds an image it BUILT on three occasions:</p>
+<ul>
+<li><strong><code>lazy upgrade</code> always rebuilds</strong>, from scratch.</li>
+<li><strong>After 14 days</strong>, an older image is rebuilt once, without the build cache —
+when the daemon starts, or in the background while it runs. Launches keep
+using the current image until the new one is built.</li>
+<li><strong>Whenever the project&#39;s branch advances.</strong> When an accepted task, a fast-forward, a
+pull, or a pull request merged on GitHub or GitLab gives the branch a new
+commit, the daemon rebuilds the project&#39;s image
+in the background from that commit — the commit&#39;s own files, Dockerfile
+included, never the files in your checkout and never a task&#39;s branch. A
+merge on the forge is noticed by the daemon&#39;s regular fetch of the remote
+(about once a minute), even when your checkout&#39;s branch has not moved yet. If a rebuild is already running,
+the newest commit is built once it ends and the ones in between are skipped.
+Launches and running containers keep the current image the whole time; the
+new one is used by the next container that is created, and only if it built.
+A failed build is shown where the image state is (the project page, the dashboard,
+<code>lazy system runner-image</code>) and changes nothing else. After a swap the image
+it replaced is removed unless something still uses it. The image state says
+which commit it was built from (<code>built from main @ 1a2b3c4d5e6f</code>). This does
+not apply to a Dockerfile a person adopted, or to a Teams install whose
+builds run on a shared host.</li>
+</ul>
+<p>A default image that was pulled from a release is never rebuilt for its age.
+A default image lazy BUILT is replaced, when it reaches 14 days, by the
+published image if one exists, and rebuilt only if not. <code>lazy upgrade</code> pulls
+the newest published image instead of building one.</p>
+<p>The image <em>tag</em> is lazy&#39;s major.minor version (for example
+<code>lazy-custom-&lt;hash&gt;:0.22</code>); it is an identity, not a freshness signal.
+<code>lazy doctor</code> lists older images left behind. What happens during a rebuild, and
+how to watch it, is in <a href="../upgrade-image-rebuild/">Image rebuilds on upgrade</a>.</p>
+<h2 id="when-an-agent-cannot-start"><a class="anchor" href="#when-an-agent-cannot-start" aria-hidden="true">#</a>When an agent cannot start</h2>
+<p><code>lazy doctor</code> checks the container runtime, the image and the agent binary, and
+says what to fix. The most common causes:</p>
+<ul>
+<li><strong>Docker is not running.</strong> Start Docker Desktop (or your Docker daemon) and
+retry.</li>
+<li><strong>The image failed to build.</strong> The build output names the failing step; fix
+your Dockerfile and launch again. <code>lazy system build</code> rebuilds on demand.</li>
+<li><strong>Lazy&#39;s agent binary is not the compiled one.</strong> Lazy mounts its own
+<code>lazy-agent</code> binary into every container; if that file is missing or is not a
+built lazy agent, the agent starts with no <code>lazy_*</code> tools. Reinstall lazy,
+then run <code>lazy upgrade</code>.</li>
+</ul>
+<p>See also <a href="../troubleshooting/">Troubleshooting</a>.</p>
+<h2 id="what-the-container-can-and-cannot-change-in-git"><a class="anchor" href="#what-the-container-can-and-cannot-change-in-git" aria-hidden="true">#</a>What the container can and cannot change in git</h2>
+<p>An agent works in its task&#39;s own git worktree. Inside the container, the
+repository&#39;s shared git directory (branches, config, hooks) is read-only; the
+agent can stage, diff, check out files and create commit objects, and lazy
+records its commits for it.</p>
+<p>Three small files tell git where a worktree&#39;s repository is: the worktree&#39;s
+<code>.git</code> file, and <code>commondir</code> and <code>gitdir</code> in the worktree&#39;s own git directory.
+Lazy protects them as follows:</p>
+<ul>
+<li><strong>The container sees read-only copies of those three files.</strong> It cannot
+rewrite, move or delete them.</li>
+<li><strong>lazy checks them before every git command it runs in a task worktree</strong>,
+without running git to do it, and refuses with a message naming the task if
+they differ from what lazy created.</li>
+<li><strong>The daemon puts them back</strong> within one reconcile tick if they were changed
+anyway, and <code>lazy doctor</code> reports any it finds as an error.
+<code>lazy doctor --repair-git-pointers</code> repairs them on demand.</li>
+</ul>
+<p>The same applies to the repositories of the worktree&#39;s <strong>submodules</strong>, which
+git keeps inside the worktree&#39;s own git directory where the container can
+write. lazy checks them the same way and refuses while one has a setting
+<code>git submodule</code> never writes, a live hook, or a work-tree setting pointing
+outside the task&#39;s worktree. <code>lazy accept</code>, <code>reject</code> and <code>close</code> refuse too,
+naming the file. The daemon puts them back between turns, and
+<code>lazy doctor --repair-git-pointers</code> does it on demand. Nothing is deleted:
+the original config is kept beside it as <code>config.lazy-quarantine-&lt;id&gt;</code>. The
+repair also reverts a setting you made yourself inside a task worktree&#39;s
+submodule.
+A worktree&#39;s <code>HEAD</code> file has to stay writable inside the container — git rewrites
+it on every checkout — so a task could point it at another branch (a sibling
+task&#39;s, its parent&#39;s, <code>main</code>). Before lazy commits, syncs, accepts or records
+commits in a task worktree, it reads <code>HEAD</code> and refuses unless it names the
+task&#39;s own branch; a detached <code>HEAD</code> is refused too, and <code>lazy doctor</code> reports
+the worktree.</p>
+<p>How it is put right depends on what happened:</p>
+<ul>
+<li><strong>Only the <code>HEAD</code> file was changed</strong> (the worktree&#39;s staged content is still
+the task&#39;s branch). When no turn or pairing session is running, the daemon
+points <code>HEAD</code> back within one reconcile tick, and
+<code>lazy doctor --repair-git-pointers</code> does it on demand. Only <code>HEAD</code> is
+rewritten, so uncommitted edits are kept.</li>
+<li><strong>The worktree was really checked out on another branch</strong>, or is detached.
+lazy leaves it alone: pointing <code>HEAD</code> back under another branch&#39;s files would
+make the next commit undo the task&#39;s work. <code>lazy doctor</code> tells you what to
+run: <code>git checkout &lt;task branch&gt;</code> in that worktree (<code>git stash</code> first if it
+has uncommitted changes).</li>
+</ul>
+<p>lazy also refuses a task worktree while the repository has
+<code>extensions.worktreeConfig</code> turned on, because git would then read a
+per-worktree config file the task can write.</p>
+<p>A task can also create a whole repository INSIDE its worktree — a <code>.git</code>
+folder in some subfolder, or a folder shaped like a bare repository — whose
+configuration runs a program for anyone who runs <code>git</code> in that subfolder, or
+opens the worktree in an editor that scans for nested repositories. So:</p>
+<ul>
+<li><strong><code>lazy doctor</code> reports any nested repository</strong> your base branch does not
+have as an error, naming its path. Submodules listed in the base branch&#39;s
+<code>.gitmodules</code> are normal and not reported.</li>
+<li><strong>lazy&#39;s own git does not look inside it.</strong> In a task worktree, lazy runs
+git without asking submodules whether they have uncommitted changes, and the
+agent&#39;s commit tool refuses to stage while a nested repository is present.</li>
+<li><strong>The daemon moves it aside between turns</strong> (never while a turn is running):
+<code>sub/.git</code> becomes <code>sub/.git.lazy-quarantine-1</code>; a symbolic link to a
+repository is moved out of the worktree into the project&#39;s <code>.lazy</code> folder.
+Nothing is deleted.
+<code>lazy doctor --repair-git-pointers</code> does the same on demand.</li>
+<li><strong><code>lazy accept</code> refuses</strong> while one is present, and names it.</li>
+</ul>
+<p>Until it has been moved aside, do not run git in that subfolder or open the
+worktree in an IDE.</p>
+<h3 id="git-hooks-do-not-run-on-lazys-own-git"><a class="anchor" href="#git-hooks-do-not-run-on-lazys-own-git" aria-hidden="true">#</a>Git hooks do not run on lazy&#39;s own git</h3>
+<p>lazy runs every git command of its own — the agent&#39;s commits, <code>lazy accept</code>&#39;s
+merge, syncs, worktree setup and pushes — with git hooks turned off
+(<code>core.hooksPath</code> pointed at nothing).</p>
+<p>What that means for you:</p>
+<ul>
+<li><strong>Pre-commit checks (husky, lint-staged, <code>pre-commit</code>) do not run</strong> on
+commits lazy makes. Run them in the agent&#39;s own work instead — for example
+as a <code>[checks] post_turn</code> command, or with <code>[automation.pre_accept]</code>, which
+runs in a container before the merge.</li>
+<li><strong>Git LFS still uploads.</strong> git-lfs normally uploads files from its pre-push
+hook; when a branch lazy pushes tracks files with LFS, lazy runs
+<code>git lfs push</code> itself before the push.</li>
+<li><strong>Your own git is unchanged.</strong> Hooks still run when you commit or push
+yourself.</li>
+</ul>
+
+<nav class="pager" aria-label="Previous and next"><a class="prev" href="../proxy-jit-credentials/"><span>Previous</span>Just-in-time credential injection</a><a class="next" href="../identity/"><span>Next</span>Who lazy says did it</a></nav>
+</main>
+<nav class="sidebar" id="contents" aria-label="Documentation">
+<details class="branch"><summary>Start here</summary>
+<ul><li><a href="../start-here/">Start here</a></li><li><a href="../">Overview</a></li></ul></details>
+<details class="branch"><summary>Tutorials</summary>
+<ul><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li></ul></details>
+<details class="branch"><summary>How-to guides</summary>
+<ul><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li></ul></details>
+<details class="branch"><summary>Reference</summary>
+<ul><li class="group"><details class="branch"><summary>Dashboard</summary><ul><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li></ul></details></li><li class="group"><details class="branch"><summary>CLI</summary><ul><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li></ul></details></li><li class="group"><details class="branch"><summary>Lazy Teams</summary><ul><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../reference/teams/team/">Team</a></li></ul></details></li><li class="group"><details class="branch"><summary>Configuration</summary><ul><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li></ul></details></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../playground/">The playground</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li></ul></details>
+<details class="branch" open><summary>Explanation</summary>
+<ul><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../agent-container/" aria-current="page">The agent container</a></li><li><a href="../identity/">Who lazy says did it</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li></ul></details>
+<details class="branch"><summary>Architecture</summary>
+<ul><li><a href="../architecture/index/">Architecture</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../state-machine/">The task state machine</a></li></ul></details>
+<details class="branch all-pages"><summary>All pages</summary>
+<ul><li><a href="../reference/teams/account-settings/">Account settings</a></li><li><a href="../lazy-teams-agents/">Agents in Lazy Teams</a></li><li><a href="../architecture/agents-and-proxy/">Agents, the proxy and credentials</a></li><li><a href="../architecture/index/">Architecture</a></li><li><a href="../builder-scratch-dir/">Builder scratch dir</a></li><li><a href="../reference/teams/builders/">Builders</a></li><li><a href="../lazy-teams-builders/">Builders in Lazy Teams</a></li><li><a href="../reference/dashboard/builders/">Builders screen</a></li><li><a href="../teams-bound-clone-agents/">Claude Code against a Lazy Teams project</a></li><li><a href="../reference/cli/index/">CLI reference</a></li><li><a href="../cluster-tasks/">Cluster tasks</a></li><li><a href="../reference/teams/clusters/">Clusters</a></li><li><a href="../reference/dashboard/clusters/">Clusters screen</a></li><li><a href="../comparing-runs/">Comparing runs: lazy clone --same-base</a></li><li><a href="../credentials/">Credentials</a></li><li><a href="../reference/dashboard/index/">Dashboard</a></li><li><a href="../reference/teams/dashboard/">Dashboard</a></li><li><a href="../reference/dashboard/overview/">Dashboard screen</a></li><li><a href="../deploying-lazy-teams-kamal-kvm/">Deploying Lazy Teams on a KVM server with Kamal, behind ngrok</a></li><li><a href="../deploying-lazy-teams-digitalocean/">Deploying Lazy Teams on DigitalOcean with Kamal</a></li><li><a href="../lazy-teams-environment/">Environment variables, secrets and files</a></li><li><a href="../architecture/forges/">Forges</a></li><li><a href="../getting-started/">Getting started: your first task</a></li><li><a href="../architecture/tasks-in-git/">Git integration</a></li><li><a href="../upgrade-image-rebuild/">How lazy upgrade rebuilds the container image</a></li><li><a href="../how-to/back-up-and-restore/">How to back up and restore your store</a></li><li><a href="../how-to/create-and-start-a-task/">How to create and start a task</a></li><li><a href="../how-to/give-feedback/">How to give feedback to a task</a></li><li><a href="../how-to/review-and-accept/">How to review and accept a task</a></li><li><a href="../how-to/set-env-and-secrets/">How to set environment variables and secrets</a></li><li><a href="../how-to/ssh-into-a-task/">How to SSH into a task</a></li><li><a href="../how-to/upgrade/">How to upgrade lazy</a></li><li><a href="../how-to/use-a-builder/">How to use a builder</a></li><li><a href="../conversation-import/">Importing Claude Code conversations</a></li><li><a href="../reference/dashboard/inbox/">Inbox screen</a></li><li><a href="../proxy-jit-credentials/">Just-in-time credential injection</a></li><li><a href="../reference/cli/accept/">lazy accept</a></li><li><a href="../reference/cli/active/">lazy active</a></li><li><a href="../reference/cli/artifact/">lazy artifact</a></li><li><a href="../reference/cli/ask/">lazy ask</a></li><li><a href="../reference/cli/auth/">lazy auth</a></li><li><a href="../reference/cli/blocked/">lazy blocked</a></li><li><a href="../reference/cli/branch/">lazy branch</a></li><li><a href="../reference/cli/browse/">lazy browse</a></li><li><a href="../reference/cli/builder/">lazy builder</a></li><li><a href="../reference/cli/chat/">lazy chat</a></li><li><a href="../reference/cli/clone/">lazy clone</a></li><li><a href="../reference/cli/close/">lazy close</a></li><li><a href="../reference/cli/comment/">lazy comment</a></li><li><a href="../reference/cli/completion/">lazy completion</a></li><li><a href="../reference/cli/config/">lazy config</a></li><li><a href="../reference/cli/conversations/">lazy conversations</a></li><li><a href="../reference/cli/create/">lazy create</a></li><li><a href="../reference/cli/customize/">lazy customize</a></li><li><a href="../reference/cli/customize-proxy-plugin/">lazy customize proxy-plugin</a></li><li><a href="../reference/cli/daemon/">lazy daemon</a></li><li><a href="../reference/cli/daemon-auto-budget/">lazy daemon auto-budget</a></li><li><a href="../reference/cli/daemon-config/">lazy daemon config</a></li><li><a href="../reference/cli/daemon-health/">lazy daemon health</a></li><li><a href="../reference/cli/daemon-logs/">lazy daemon logs</a></li><li><a href="../reference/cli/daemon-reload/">lazy daemon reload</a></li><li><a href="../reference/cli/daemon-resume-queue/">lazy daemon resume-queue</a></li><li><a href="../reference/cli/dashboard/">lazy dashboard</a></li><li><a href="../reference/cli/describe/">lazy describe</a></li><li><a href="../reference/cli/diff/">lazy diff</a></li><li><a href="../reference/cli/doctor/">lazy doctor</a></li><li><a href="../reference/cli/document/">lazy document</a></li><li><a href="../reference/cli/edit/">lazy edit</a></li><li><a href="../reference/cli/env/">lazy env</a></li><li><a href="../reference/cli/env-clear/">lazy env clear</a></li><li><a href="../reference/cli/env-list/">lazy env list</a></li><li><a href="../reference/cli/env-ls/">lazy env ls</a></li><li><a href="../reference/cli/env-rm/">lazy env rm</a></li><li><a href="../reference/cli/env-set/">lazy env set</a></li><li><a href="../reference/cli/env-unset/">lazy env unset</a></li><li><a href="../reference/cli/fix/">lazy fix</a></li><li><a href="../reference/cli/forward/">lazy forward</a></li><li><a href="../reference/cli/import-conversation/">lazy import-conversation</a></li><li><a href="../reference/cli/init/">lazy init</a></li><li><a href="../reference/cli/journal/">lazy journal</a></li><li><a href="../reference/cli/link/">lazy link</a></li><li><a href="../link/">lazy link — adopt a pull request or branch as a task</a></li><li><a href="../reference/cli/list/">lazy list</a></li><li><a href="../reference/cli/login/">lazy login</a></li><li><a href="../reference/cli/logout/">lazy logout</a></li><li><a href="../reference/cli/loop/">lazy loop</a></li><li><a href="../reference/cli/memory/">lazy memory</a></li><li><a href="../reference/cli/messages/">lazy messages</a></li><li><a href="../reference/cli/pair/">lazy pair</a></li><li><a href="../reference/cli/playground/">lazy playground</a></li><li><a href="../reference/cli/protect/">lazy protect</a></li><li><a href="../reference/cli/raised/">lazy raised</a></li><li><a href="../reference/cli/redo/">lazy redo</a></li><li><a href="../reference/cli/refactor/">lazy refactor</a></li><li><a href="../reference/cli/regions/">lazy regions</a></li><li><a href="../reference/cli/reject/">lazy reject</a></li><li><a href="../reference/cli/reopen/">lazy reopen</a></li><li><a href="../reference/cli/reparent/">lazy reparent</a></li><li><a href="../reference/cli/report/">lazy report</a></li><li><a href="../reference/cli/resume/">lazy resume</a></li><li><a href="../reference/cli/revert/">lazy revert</a></li><li><a href="../reference/cli/review/">lazy review</a></li><li><a href="../review/">lazy review — agent review of a task's work</a></li><li><a href="../reference/cli/rework/">lazy rework</a></li><li><a href="../reference/cli/scratch/">lazy scratch</a></li><li><a href="../reference/cli/search/">lazy search</a></li><li><a href="../reference/cli/sessions/">lazy sessions</a></li><li><a href="../reference/cli/shell/">lazy shell</a></li><li><a href="../reference/cli/show/">lazy show</a></li><li><a href="../reference/cli/start/">lazy start</a></li><li><a href="../reference/cli/stats/">lazy stats</a></li><li><a href="../reference/cli/stats-audit/">lazy stats audit</a></li><li><a href="../reference/cli/stats-budget/">lazy stats budget</a></li><li><a href="../reference/cli/stats-latency/">lazy stats latency</a></li><li><a href="../reference/cli/stats-limits/">lazy stats limits</a></li><li><a href="../reference/cli/stats-timings/">lazy stats timings</a></li><li><a href="../reference/cli/stats-tokens/">lazy stats tokens</a></li><li><a href="../reference/cli/stats-tools/">lazy stats tools</a></li><li><a href="../reference/cli/status/">lazy status</a></li><li><a href="../reference/cli/stop/">lazy stop</a></li><li><a href="../reference/cli/submit/">lazy submit</a></li><li><a href="../reference/cli/sync/">lazy sync</a></li><li><a href="../reference/cli/system/">lazy system</a></li><li><a href="../reference/cli/system-agent/">lazy system agent</a></li><li><a href="../reference/cli/system-build/">lazy system build</a></li><li><a href="../reference/cli/system-eject-dockerfile/">lazy system eject-dockerfile</a></li><li><a href="../reference/cli/system-export-dockerfile/">lazy system export-dockerfile</a></li><li><a href="../reference/cli/system-guest-init-script/">lazy system guest-init-script</a></li><li><a href="../reference/cli/system-machine/">lazy system machine</a></li><li><a href="../reference/cli/system-offline/">lazy system offline</a></li><li><a href="../reference/cli/system-online/">lazy system online</a></li><li><a href="../reference/cli/system-passphrase/">lazy system passphrase</a></li><li><a href="../reference/cli/system-repair-commits/">lazy system repair-commits</a></li><li><a href="../reference/cli/system-runner-image/">lazy system runner-image</a></li><li><a href="../reference/cli/system-source-id/">lazy system source-id</a></li><li><a href="../reference/cli/system-status/">lazy system status</a></li><li><a href="../reference/cli/system-store-backup/">lazy system store-backup</a></li><li><a href="../reference/cli/system-store-backups/">lazy system store-backups</a></li><li><a href="../reference/cli/system-store-check/">lazy system store-check</a></li><li><a href="../reference/cli/system-store-rehome/">lazy system store-rehome</a></li><li><a href="../reference/cli/system-store-restore/">lazy system store-restore</a></li><li><a href="../reference/cli/tag/">lazy tag</a></li><li><a href="../explanation/lazy-teams/">Lazy Teams</a></li><li><a href="../lazy-teams-setup/">Lazy Teams first-run setup</a></li><li><a href="../reference/teams/index/">Lazy Teams screens</a></li><li><a href="../slack-rooms/">Lazy Teams Slack rooms</a></li><li><a href="../reference/cli/unblock/">lazy unblock</a></li><li><a href="../reference/cli/untag/">lazy untag</a></li><li><a href="../reference/cli/upgrade/">lazy upgrade</a></li><li><a href="../reference/cli/url/">lazy url</a></li><li><a href="../reference/cli/wait/">lazy wait</a></li><li><a href="../reference/cli/watch/">lazy watch</a></li><li><a href="../lazy-md/">LAZY.md — instructions for agents running lazy tasks</a></li><li><a href="../lazy-toml/">lazy.toml Configuration Reference</a></li><li><a href="../teams-login/">Logging a machine in to Lazy Teams</a></li><li><a href="../managed-config/">Managed mode: which parts of lazy.toml a shared host honours</a></li><li><a href="../mcp-tools/">MCP tools for agents and builders</a></li><li><a href="../reference/teams/members/">Members</a></li><li><a href="../reference/teams/memory/">Memory</a></li><li><a href="../reference/teams/messages/">Messages</a></li><li><a href="../store-ownership/">One store per project checkout</a></li><li><a href="../pairing/">Pairing</a></li><li><a href="../task-env/">Per-task environment variables</a></li><li><a href="../reference/teams/project-environment/">Project environment</a></li><li><a href="../reference/teams/project-machine/">Project machine</a></li><li><a href="../reference/teams/project-overview/">Project overview</a></li><li><a href="../reference/teams/project-settings/">Project settings</a></li><li><a href="../protected-branches/">Protected branches and human approvals</a></li><li><a href="../proxy-plugins/">Proxy request plugins</a></li><li><a href="../reference/teams/raised/">Raised by agents</a></li><li><a href="../raised-items/">Raised items</a></li><li><a href="../reference/dashboard/raised/">Raised items screen</a></li><li><a href="../serve-ports/">Reaching a task's dev server</a></li><li><a href="../renaming-tasks/">Renaming a task</a></li><li><a href="../explanation/review-and-accept/">Review and accept</a></li><li><a href="../reference/dashboard/review-queue/">Review queue</a></li><li><a href="../reference/teams/review-queue/">Review queue</a></li><li><a href="../review-regions/">Review regions</a></li><li><a href="../lazy-teams-task-review/">Reviewing tasks in Lazy Teams</a></li><li><a href="../reference/teams/run/">Run</a></li><li><a href="../pi-agent/">Running tasks with the Pi coding agent</a></li><li><a href="../running-a-commit/">Running the product at any commit</a></li><li><a href="../reference/dashboard/scratch/">Scratch screen</a></li><li><a href="../reference/teams/search/">Search</a></li><li><a href="../reference/dashboard/search/">Search screen</a></li><li><a href="../search/">Searching tasks</a></li><li><a href="../self-hosting-lazy-teams/">Self-hosting Lazy Teams</a></li><li><a href="../reference/dashboard/settings/">Settings screen</a></li><li><a href="../memory/">Shared memory</a></li><li><a href="../start-here/">Start here</a></li><li><a href="../store-backups/">Store backups before every upgrade</a></li><li><a href="../turn-reports/">Structured turn reports</a></li><li><a href="../surface-asymmetries/">Surface asymmetries: CLI vs MCP</a></li><li><a href="../system-messages/">System messages</a></li><li><a href="../tutorials/lazy-teams/">Take your first task from creation to accept in Lazy Teams</a></li><li><a href="../tutorials/dashboard/">Take your first task from creation to accept in the dashboard</a></li><li><a href="../reference/teams/task/">Task</a></li><li><a href="../artifacts/">Task artifacts</a></li><li><a href="../reference/dashboard/task/">Task page</a></li><li><a href="../reference/teams/tasks/">Tasks</a></li><li><a href="../explanation/tasks-and-turns/">Tasks and turns</a></li><li><a href="../reference/dashboard/tasks/">Tasks screen</a></li><li><a href="../reference/teams/team/">Team</a></li><li><a href="../accept-check/">The accept check</a></li><li><a href="../agent-container/">The agent container</a></li><li><a href="../explanation/the-builder/">The builder</a></li><li><a href="../architecture/daemon-and-state/">The daemon and its clients</a></li><li><a href="../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a></li><li><a href="../resurrection-guard/">The deleted-file resurrection guard</a></li><li><a href="../lfs-guard/">The git LFS guard</a></li><li><a href="../low-high-loop/">The low-high loop</a></li><li><a href="../playground/">The playground</a></li><li><a href="../review-paradigm/">The review paradigm — what lazy does by default, and why</a></li><li><a href="../state-machine/">The task state machine</a></li><li><a href="../token-budgets/">Token budgets</a></li><li><a href="../troubleshooting/">Troubleshooting</a></li><li><a href="../web-review/">Web review surface</a></li><li><a href="../web-shell/">Web shell</a></li><li><a href="../architecture/what-runs-where/">What runs where</a></li><li><a href="../identity/">Who lazy says did it</a></li></ul></details>
+</nav>
+</div>
+</body>
+</html>
