@@ -72,6 +72,10 @@ export interface AgentMcpServerStatus {
 
 export interface AgentActivityEvent {
   kind: AgentActivityKind;
+  /** Actual model output, as opposed to retry notices or lifecycle chatter. */
+  modelOutput?: boolean;
+  /** Provider diagnostic from a structured error/retry event; never generated prose. */
+  failureMessage?: string;
   /** Present on `session_start` (and on `result`, which repeats it). */
   sessionId?: string;
   /**
@@ -209,6 +213,7 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
         kind: 'result',
         sessionId: typeof msg.session_id === 'string' ? msg.session_id : undefined,
         raw: trimmed,
+        ...(msg.is_error === true ? { failureMessage: String(msg.result ?? (Array.isArray(msg.errors) ? msg.errors.join('; ') : '')) } : {}),
       };
     }
 
@@ -221,6 +226,13 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
       };
     }
 
+    // SDK 0.3.310: api_retry and assistant.error are provider diagnostics.
+    if (type === 'system' && msg.subtype === 'api_retry') {
+      return { kind: 'heartbeat', failureMessage: `API Error: ${msg.error_status ?? ''} ${msg.error_status === null ? 'network error' : msg.error ?? 'network error'}` };
+    }
+    if (type === 'assistant' && msg.error) {
+      return { kind: 'heartbeat', failureMessage: `API Error: ${msg.error === 'server_error' ? '500 server_error' : msg.error}` };
+    }
     if (type === 'system') {
       if (msg.subtype === 'init' && typeof msg.session_id === 'string') {
         // The init line is the only place the agent tells us what it actually
@@ -287,7 +299,8 @@ export class ClaudeCodeActivityStream implements AgentActivityStream {
           return { kind: 'tool_end', toolUseId: block.tool_use_id };
         }
       }
-      return { kind: 'progress' };
+      const modelOutput = type === 'assistant' && blocks.some(b => (b.type === 'text' && typeof b.text === 'string' && b.text.length > 0) || (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.length > 0));
+      return { kind: 'progress', ...(modelOutput ? { modelOutput: true } : {}) };
     }
 
     return { kind: 'progress' };

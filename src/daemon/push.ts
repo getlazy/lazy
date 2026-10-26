@@ -21,9 +21,19 @@ import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
 import { deliveredFilesRefusal } from '../git/delivered-files';
 import { deliveredSecretsToPush } from './task-files';
+import type { Storage } from '../storage/interface';
+import { recordPushOutcome } from './push-failure';
 
 /** Branches that failed to push and should be retried. Keyed by project root. */
 const retryQueues = new Map<string, Set<string>>();
+
+/**
+ * Which task each queued branch belongs to, and the store to record its
+ * outcome in (src/daemon/push-failure.ts) — so a failed push reaches the task
+ * page and Messages instead of only the daemon log. Absent for a caller that
+ * did not say.
+ */
+const branchOwners = new Map<string, { taskId: string; storage: Storage }>();
 
 /** Tracks whether a push is currently in progress for a project. */
 const pushingProjects = new Set<string>();
@@ -40,7 +50,9 @@ const pushingProjects = new Set<string>();
 export async function pushBranchAfterStateChange(
   projectRoot: string,
   branch: string,
+  owner?: { taskId: string; storage: Storage },
 ): Promise<void> {
+  if (owner) branchOwners.set(`${projectRoot}\0${branch}`, owner);
   // Queue this branch for pushing
   let queue = retryQueues.get(projectRoot);
   if (!queue) {
@@ -137,9 +149,13 @@ async function drainPushQueue(projectRoot: string): Promise<void> {
         }
         await driver.pushBranch(branch);
         logger.debug(`Pushed branch ${branch} after state change`);
+        const owner = branchOwners.get(`${projectRoot}\0${branch}`);
+        if (owner) await recordPushOutcome(owner.storage, owner.taskId, branch, null);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn(`Push failed for branch ${branch}: ${msg}`);
+        const owner = branchOwners.get(`${projectRoot}\0${branch}`);
+        if (owner) await recordPushOutcome(owner.storage, owner.taskId, branch, msg);
         // Re-queue for retry on next reconcile tick
         queue.add(branch);
       }
@@ -177,4 +193,5 @@ export function getPendingPushCount(projectRoot: string): number {
 export function _resetPushState(): void {
   retryQueues.clear();
   pushingProjects.clear();
+  branchOwners.clear();
 }

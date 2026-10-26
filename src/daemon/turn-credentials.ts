@@ -19,7 +19,6 @@
 
 import { randomBytes } from 'crypto';
 import { logger } from '../utils/logger';
-import { memberInsideTask, memberInsideLaunchMessage } from '../server/member-terminals';
 import { RpcError } from './rpc-error';
 import {
   teamModeEnabled,
@@ -223,11 +222,10 @@ export async function planTurnCredential(
 /**
  * The profile a task's turn runs on, or null when the launch is held to the
  * principal's CLAUDE credential instead: a spender's launch (a member's
- * terminal, a builder session, a one-shot beside the task) always rides the
- * session placeholder to the proxy's primary upstream whatever the project's
- * profiles say — resolving one here once let a configured profile's credential
- * rules decide what a member's own `claude` spends — and a key that names no
- * task has no profile at all.
+ * terminal, a builder session, a one-shot beside the task) supplies its profile
+ * explicitly with spenderProfile. Without one it uses raw Claude on the
+ * primary upstream, rather than borrowing the task's profile. A key that names
+ * no task has no profile at all.
  */
 async function turnProfile(
   projectRoot: string,
@@ -242,7 +240,7 @@ async function turnProfile(
   return profileForAgentNameOrNull(config, input.agentId ?? task?.agent_id);
 }
 
-/** Member terminals run plain Claude on the primary, independent of a configured task profile. */
+/** A side launch without an explicit profile runs plain Claude on the primary. */
 function rawClaudeProfile(): AgentProfile {
   return resolveAgentProfiles(undefined).get('claude-code')!;
 }
@@ -422,48 +420,8 @@ export async function mustRecreateForCredentialPlan(
   taskId: string,
   plan: TurnCredentialPlan,
 ): Promise<boolean> {
-  // A MEMBER IS WORKING IN THE TASK (a Teams terminal): no turn starts until
-  // they leave. Here because every turn-launching path reaches this function
-  // under the task's lifecycle lock — the same lock a member's entry takes.
-  await refuseLaunchWhileMemberInside(projectRoot, taskId);
   if (plan.mode === 'session') return workContainerLaunchedWithoutSessionPlaceholder(projectRoot, taskId);
   return (await getTaskSessionBinding(projectRoot, taskId)) !== null;
-}
-
-/**
- * Refuse a turn launch while a member has a terminal open on the task
- * (../server/member-terminals.ts). The member's terminals run in a container
- * of their own, so the two never share a process space or a credential — but
- * they would share the worktree's files, mid-edit, and a member pairing on a
- * task is not asking for an agent to work underneath them.
- *
- * Throws RpcError(409), naming the member. Before throwing it RELEASES the
- * binding this launch has just planned: left live, the task would read as
- * "running a turn" to the member's next terminal while no turn runs at all.
- * Call it under the task's lifecycle lock, where a member's entry cannot
- * interleave with it.
- */
-export async function refuseLaunchWhileMemberInside(projectRoot: string, taskId: string): Promise<void> {
-  const holder = memberInsideTask(taskId);
-  if (!holder) return;
-  await releaseTurnCredential(projectRoot, taskId);
-  throw new RpcError(409, memberInsideLaunchMessage(holder));
-}
-
-/**
- * The same refusal, for a launch that has not planned a credential yet — and
- * so has nothing to release. Every launch that RECORDS A TURN before it plans
- * its credential (unblock, ask, review, start, manual resume) calls this
- * first, right after its in-lock status re-read: refusing after the turn is
- * written would leave a half-dispatched human turn behind, which the
- * redelivery path would later hand the agent as unconsumed feedback. The
- * human's words are not lost by refusing here — every surface keeps them
- * until a delivery succeeds (the CLI's recovery file, the review draft,
- * Teams' ask record).
- */
-export function assertNoMemberInside(taskId: string): void {
-  const holder = memberInsideTask(taskId);
-  if (holder) throw new RpcError(409, memberInsideLaunchMessage(holder));
 }
 
 /**

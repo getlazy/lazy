@@ -123,6 +123,7 @@ export function buildLiveStatusPayload(
     raised: [],
     commits: [],
     headSha: null,
+    chat: [],
   };
   const keys = buildLiveStatusKeys(input, sources ?? empty);
   return {

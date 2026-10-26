@@ -36,7 +36,7 @@ import { resolveOneRaisedItem } from './raised-items';
 import { latestViolationTurn } from '../utils/turns';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
 import { mergedViolationRecords } from '../protection/outstanding';
-import { askUnavailableReason, isPendingDelivery, withdrawRefusalReason } from '../server/review-actions';
+import { askUnavailableReason, awaitsAnswer, isPendingDelivery, withdrawRefusalReason } from '../server/review-actions';
 import { buildAskContext } from '../task/ask-context';
 import type { ReviewActions, PostReviewCommentInput, PromoteDiscussionResult, ReviewQueueEntry, FileLinesQuery, FileLinesResult, DiffBlobQuery, DiffBlobResult } from '../server/review-actions';
 import { createPromotedTask } from '../raised/promote-task';
@@ -48,6 +48,10 @@ import proseAskPromptTemplate from '../prompts/review-prose-ask.md' with { type:
 import { isTaskLevelReviewAnchor } from '../review/task-level-anchor';
 import { isProseReviewAnchor, proseAnchorAgentWhere } from '../review/prose-anchor';
 import { quotedProse, buildUnblockPrompt } from '../review/unblock-prompt';
+import {
+  QUEUED_ASKS_METADATA_KEY, mayDispatchQueuedAsks, queueAsk, queuedAskOwner, shouldQueueAsk, waitingQueuedAsks,
+} from './queued-asks';
+import { runAsTurnOwnerRequest } from './turn-owner';
 
 /**
  * Per-task serialization of everything that resumes the agent.
@@ -162,7 +166,7 @@ export async function reviewQueueEntries(
       storage.getSessionByTaskId(task.id),
     ]);
     const unanswered = comments.filter(
-      (c) => c.role === 'human' && c.ask_state === 'pending',
+      (c) => c.role === 'human' && awaitsAnswer(c),
     ).length;
     return {
       id: task.id,
@@ -813,6 +817,14 @@ async function dispatchAsk(
 ): Promise<void> {
   const storage = await getOrCreateStorage();
   try {
+    // Mid-turn: the question WAITS for the agent's own session rather than
+    // being answered from the stored record by somebody else. Dispatched once
+    // the task parks, as the person who asked (src/daemon/queued-asks.ts).
+    const task = await storage.getTask(taskId);
+    if (task && shouldQueueAsk(task, await storage.getSessionByTaskId(taskId))) {
+      await queueAsk(storage, task, comment);
+      return;
+    }
     const all = await storage.getTaskReviewComments(taskId);
     const thread = all.filter((c) => c.thread_id === comment.thread_id);
     const prompt = buildAskPrompt(thread, comment);
@@ -820,6 +832,8 @@ async function dispatchAsk(
     const result = await launchAskTaskAwaited(projectRoot, {
       taskId,
       message: prompt,
+      // The reviewer's words, not the thread framing: what the task's Chat shows.
+      chatText: comment.content,
       actor: 'human',
       // The dashboard's signed-in person: may use the one-shot usage-pause override.
       usagePauseOverrideEligible: true,
@@ -901,4 +915,39 @@ export async function discussionPromotions(
     if (seed) promotions[threadId] = seed;
   }
   return promotions;
+}
+
+/**
+ * Send the questions that waited for a task's turn to end (src/daemon/
+ * queued-asks.ts). Called by the daemon's reconcile loop. Dispatches ASKS only
+ * — never a work turn — each inside the request scope of the person who typed
+ * it, through the same per-task chain as an ask posted now, so they run one at
+ * a time in the order they were asked.
+ */
+export async function dispatchQueuedAsks(projectRoot: string): Promise<number> {
+  const storage = await getOrCreateStorage();
+  const flagged = (await storage.listTasks()).filter((t) => t.metadata?.[QUEUED_ASKS_METADATA_KEY] === '1');
+  let sent = 0;
+  for (const task of flagged) {
+    const session = await storage.getSessionByTaskId(task.id);
+    if (!mayDispatchQueuedAsks(task, session)) continue;
+    const waiting = waitingQueuedAsks(await storage.getTaskReviewComments(task.id));
+    for (const comment of waiting) {
+      await storage.updateReviewComment(task.id, comment.id, { askState: 'pending', askError: null });
+      const owner = queuedAskOwner(comment);
+      const work = () => enqueue(task.id, () => dispatchAsk(projectRoot, task.id, comment));
+      const run = owner ? runAsTurnOwnerRequest({ taskId: task.id, owner }, work) : work();
+      // dispatchAsk records its own failure on the comment.
+      void run.catch(() => {});
+      sent++;
+    }
+    // Cleared only AFTER every waiting question was marked pending and handed to
+    // the chain: a crash before this point leaves the flag set, so the next
+    // tick finds them again instead of stranding them as queued. (An ask that
+    // meets the task mid-turn again re-queues itself and sets the flag back —
+    // possibly before this line; re-check so that is not undone.)
+    const stillWaiting = waitingQueuedAsks(await storage.getTaskReviewComments(task.id));
+    if (stillWaiting.length === 0) await storage.updateTaskMetadata(task.id, QUEUED_ASKS_METADATA_KEY, '');
+  }
+  return sent;
 }

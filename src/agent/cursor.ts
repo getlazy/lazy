@@ -62,7 +62,7 @@ const LAUNCH_BINARY = new CursorPackaging().binaryName();
  * way it depends on other headless Cursor flags. If a future cursor-agent drops
  * the flag, buildExecArgs will still pass it and the turn will fail loudly.
  */
-const EXCLUDED_TOOLS_IN_PLAN_MODE =
+export const EXCLUDED_TOOLS_IN_PLAN_MODE =
   'shellToolCall,editToolCall,deleteToolCall,writeShellStdinToolCall';
 
 /**
@@ -354,13 +354,19 @@ export class CursorActivityStream implements AgentActivityStream {
       };
     }
 
+    // Verified cursor-agent 2026.10.22 retry lifecycle (no provider reason).
+    if (type === 'retry') return { kind: 'heartbeat', failureMessage: 'network error: harness reconnecting' };
     // Everything else — the echoed user message, thinking deltas, assistant
     // text, interaction queries, other system subtypes — is evidence the turn
     // is advancing. Unknown future event types count as progress for the same
     // reason ClaudeCodeActivityStream counts them: mistaking real progress for
     // silence is the expensive error, and it is the exact bug this stream was
     // added to fix.
-    return { kind: 'progress' };
+    const message = msg.message as { content?: Array<{ type?: string; text?: string }> } | undefined;
+    const modelOutput = (type === 'thinking' && typeof msg.text === 'string' && msg.text.length > 0) ||
+      (type === 'assistant' && Array.isArray(message?.content) &&
+        message.content.some(block => block.type === 'text' && typeof block.text === 'string' && block.text.length > 0));
+    return { kind: 'progress', ...(modelOutput ? { modelOutput: true } : {}) };
   }
 }
 

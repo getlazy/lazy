@@ -57,6 +57,9 @@ export interface SandboxConfig {
   sandboxPath: string;
 }
 
+/** No container in the mock, so nothing to re-pin. */
+export async function repinLaunchGrantsToContainer(_binary: string, _containerName: string): Promise<void> {}
+
 export function checkDocker(): void {
   // No-op in tests
 }
@@ -250,6 +253,11 @@ export async function inspectConventionalDockerfile(lazyRoot: string): Promise<C
   const { autoBuildsRootDockerfile } = await import('../../src/config/managed-mode');
   if (!autoBuildsRootDockerfile()) return { kind: 'not-built-on-backend', branch: 'HEAD', blob };
   return { kind: 'used', branch: 'HEAD', blob, path };
+}
+
+/** The mock builds nothing, so a build-context override has nothing to override: it just runs `fn`. */
+export function runWithBuildContext<T>(_dir: string, fn: () => Promise<T>, _builtFrom?: unknown): Promise<T> {
+  return fn();
 }
 
 /** Mirrors the real label helper: the mock resolves plain paths, so the path is the label. */

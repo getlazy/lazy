@@ -68,6 +68,8 @@ import type { ParsedConversation } from '../../import/claude-code-logs';
 import { markMachineOneshotPrompt } from '../../import/machine-oneshot';
 import { getActor } from '../../constants';
 import { getAgent } from '../../agent/registry';
+import { interactiveChatRefusal } from '../../agent/interactive-modes';
+import type { Task } from '../../types';
 import { profileForAgentName, DEFAULT_AGENT_PROFILE_NAME } from '../../config/agent-profiles';
 import { parkTaskPaused } from '../../utils/paused-status';
 import { boundCloneLogin, commandTaskTerminalBound } from './bound-session';
@@ -577,7 +579,7 @@ export async function commandPair(args: string[]): Promise<void> {
       console.error('What works instead:');
       console.error(`  lazy show ${displayId(task)}              # the task's turns, safe to read`);
       console.error(`  lazy unblock ${displayId(task)} -m "..."  # steer the agent with feedback`);
-      console.error(`  lazy chat ${displayId(task)}              # read-only conversation about the work`);
+      console.error(readOnlyAlternative(task, taskHarness, 23));
       console.error(noTaskHint);
       process.exit(1);
     }
@@ -627,7 +629,7 @@ export async function commandPair(args: string[]): Promise<void> {
       } else {
         console.error(`  lazy start ${displayId(task)} --runner docker  # give the task a container to pair in`);
       }
-      console.error(`  lazy chat ${displayId(task)}                 # read-only conversation about the work`);
+      console.error(readOnlyAlternative(task, taskHarness, 26));
       console.error(noTaskHint);
       process.exit(1);
     }
@@ -1193,4 +1195,15 @@ Examples:
   lazy pair --host --no-task         # Pair here on the host, ignoring any task for this branch
   lazy pair --host --resume abc123   # Resume a previous branchless session, on the host
   lazy pair abc123 --autonomous      # Run without permission prompts, in the container`);
+}
+
+// The read-only way to ask about a task's work, for a refusal's "what works
+// instead": `lazy chat`, unless the harness refuses Chat (Codex, which has no
+// read-only interactive mode in a container) — then `lazy ask`. `width` lines
+// the comment up with the hint's other lines.
+function readOnlyAlternative(task: Task, harness: string, width: number): string {
+  const chat = interactiveChatRefusal(harness) === null;
+  const cmd = chat ? `lazy chat ${displayId(task)}` : `lazy ask ${displayId(task)} "<question>"`;
+  const comment = chat ? '# read-only conversation about the work' : '# read-only question about the work';
+  return `  ${cmd.padEnd(width + displayId(task).length)} ${comment}`;
 }

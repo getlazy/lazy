@@ -95,7 +95,7 @@ function pushCodexModel(args: string[], modelId: string | null | undefined): voi
 
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
 
-function codexEffort(effort: string): string | null {
+export function codexEffort(effort: string): string | null {
   const normalized = effort.trim().toLowerCase();
   if (CODEX_EFFORTS.has(normalized)) return normalized;
   if (normalized === 'max') return 'xhigh';
@@ -192,6 +192,10 @@ export class CodexActivityStream implements AgentActivityStream {
     if (!obj) return null;
     const type = typeof obj.type === 'string' ? obj.type : '';
 
+    if (type === 'error' || type === 'turn.failed') {
+      const error = obj.error as Record<string, unknown> | undefined;
+      return { kind: 'heartbeat', failureMessage: String(obj.message ?? error?.message ?? '') };
+    }
     if (type === 'thread.started') {
       this.threadStartedLine = line.trim();
       return {
@@ -217,8 +221,9 @@ export class CodexActivityStream implements AgentActivityStream {
       const itemType = item && typeof item.type === 'string' ? item.type : '';
       if (item && itemType === 'agent_message' && type === 'item.completed') {
         this.agentMessageLines.push(line.trim());
-        return { kind: 'progress' };
+        return { kind: 'progress', modelOutput: typeof item.text === 'string' && item.text.length > 0 };
       }
+      if (itemType === 'reasoning' && typeof item?.text === 'string' && item.text.length > 0) return { kind: 'progress', modelOutput: true };
       if (item && TOOL_ITEM_TYPES.has(itemType)) {
         const toolUseId = typeof item.id === 'string' ? item.id : undefined;
         if (type === 'item.started') {
@@ -236,7 +241,7 @@ export class CodexActivityStream implements AgentActivityStream {
       return { kind: 'progress' };
     }
 
-    // turn.started, error (in-stream reconnect notices), turn.failed, and any
+    // turn.started and any
     // event a future codex release adds: evidence the turn is advancing (or at
     // least the CLI is alive and reporting) — mistaking real activity for
     // silence is the expensive error. turn.failed deliberately does NOT emit
@@ -635,10 +640,26 @@ export class CodexAgent implements Agent {
     // Interactive TUI: `codex [PROMPT]` with no subcommand; resume is the
     // top-level `codex resume <id>`. No --json (that is the machine surface).
     const args = opts.sessionId ? [LAUNCH_BINARY, 'resume', opts.sessionId] : [LAUNCH_BINARY];
+    // --no-daemon: on codex-cli 0.164.0 the interactive TUI (fresh and resume) routes
+    // through a shared background app-server that only a "packaged" install
+    // provides. The image installs the bare release binaries, and that mode
+    // refuses with "this CLI has no complete local package". --no-daemon is
+    // the fix codex's own error names; it keeps fresh sessions and thread
+    // resume (into the same rollout) working — verified against the
+    // real binary by test/e2e/pair-real-binaries.test.ts.
+    args.push('--no-daemon');
     if (opts.dangerouslySkipPermissions) {
       // Same trust decision as a supervised turn: this runs in the task's
       // container, so codex's own sandbox is redundant and breaks git/network.
       args.push('--dangerously-bypass-approvals-and-sandbox');
+    } else {
+      // Approvals stay on, but codex's own sandbox goes: pairing only ever runs
+      // inside a container (host pairing is Claude Code only), and there that
+      // sandbox is bubblewrap, which cannot create a user namespace — every
+      // shell command the session ran failed, so the agent could not even read
+      // a file. The container is the boundary, as for read-only turns
+      // (docs/codex-readonly-turns.md).
+      args.push('--sandbox', 'danger-full-access');
     }
     pushCodexModel(args, opts.modelId);
     return args;

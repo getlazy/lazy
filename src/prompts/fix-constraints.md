@@ -73,7 +73,7 @@ Only write the fix after you have concrete evidence of the root cause. The evide
 
 After implementing the fix:
 - Run the reproduction again — it must pass
-- Run the full test suite — no regressions
+- Run only tests covering the fix, typecheck/lint, and the project's named repo-wide guard tests; never the project's full test suite during active work
 - Leave a regression test that would catch this bug if reintroduced
 - Verify the fix addresses the root cause, not just the symptom
 

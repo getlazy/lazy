@@ -50,6 +50,19 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: 
 describe('beginContainerStart', () => {
   beforeEach(() => resetContainerStarts());
 
+  test('an explicitly requested restart reaches the daemon action', async () => {
+    const calls: boolean[] = [];
+    const actions = {
+      ensureContainer: async (_id: string, _progress: unknown, restart?: boolean) => {
+        calls.push(!!restart);
+        return { containerName: 'kept', alreadyRunning: false };
+      },
+    };
+    beginContainerStart('old-environment', actions, 'old-environment', true);
+    await Promise.resolve();
+    expect(calls).toEqual([true]);
+  });
+
   // INVARIANT: one start in flight per task, shared. Every panel that wants the
   // container calls this; a second launch for the same task is a bug, not a
   // retry — two `docker run`s at one task is exactly what it must not produce.

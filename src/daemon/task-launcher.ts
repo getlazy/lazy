@@ -1,3 +1,4 @@
+import { refreshEnvironmentReplacedCommand } from './environment-replaced-command';
 /**
  * Daemon-side task launch orchestration.
  *
@@ -18,6 +19,7 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { keptRunNote, reuseOrStartTaskRun } from '../runner/start-or-recreate';
 import { confirmRunnerImageForLaunch, mustRecreateForRunnerImage } from './runner-image-choice';
 import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
 import { deliverTaskFilesForLaunch } from './task-files';
@@ -48,7 +50,6 @@ import { mintMcpToken, type McpIdentity, type MintMcpTokenOptions } from './mcp-
 import {
   planTurnCredential,
   sessionCredentialCommandField,
-  refuseLaunchWhileMemberInside,
   TurnCredentialUnavailableError,
   type TurnCredentialPlan,
 } from './turn-credentials';
@@ -69,7 +70,7 @@ import { buildLazyMdSection } from '../task/lazy-md';
 import { checkOrphanedChild, retargetOrphanedChild } from '../task/orphan';
 import { typeConstraintsSection } from '../task/type-constraints';
 import { lazyFold, neutralizeLazyMarkers } from '../task/wrapper-fold';
-import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
+import { recordContainerBeforeLaunch, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { pinnedBaseOf } from '../task/base-pin';
 import { parentTaskIdOf, branchTarget } from '../task-target';
 import { syncChildrenAfterParentStart } from './parent-started-sync';
@@ -320,7 +321,7 @@ async function buildLinkedTaskPreamble(
 export async function writeDaemonMcpConfig(
   projectRoot: string,
   containerName: string,
-  identity: McpIdentity,
+  identity: Exclude<McpIdentity, { kind: 'member-pair' }>,
   options: MintMcpTokenOptions = {},
 ): Promise<string> {
   const { webPort } = getDaemonContext();
@@ -1275,18 +1276,10 @@ async function launchTaskRun(
       config: branchConfig,
     });
 
-    // UNDER THE TASK'S LIFECYCLE LOCK, like every other launch path: the
-    // member check, the MCP config this turn's container reads, turn 1 and the
-    // flip to `working`. A member's entry (src/daemon/member-entry.ts) takes
-    // the same lock and refuses a session with no turn yet, so it sees either
-    // the turnless session before this block or the `working` task after it.
+    // UNDER THE TASK'S LIFECYCLE LOCK, like every other launch path: the MCP
+    // config this turn's container reads, turn 1 and the flip to `working`.
     let daemonConfigPath: string | null = null;
     await withTaskLifecycleLock(t.id, async () => {
-      // No turn starts while a member has a terminal open on the task
-      // (./turn-credentials.ts). A first start cannot meet one — entry needs a
-      // turn — but a restart of a started task can.
-      await refuseLaunchWhileMemberInside(projectRoot, t.id);
-
       // --- Generate daemon MCP config ---
       // The daemon knows its own webPort — no health check, no fallback.
       // Skip when running outside the daemon (in-process RPC fallback) since
@@ -1404,7 +1397,7 @@ async function launchTaskRun(
     // mustRecreateForCredentialPlan. A kind change alone never recreates.
     const mustRecreateForCredential = credentialPlan.mode === 'session'
       && await workContainerLaunchedWithoutSessionPlaceholder(projectRoot, t.id);
-    await recordRecreationIfRunning(
+    await recordContainerBeforeLaunch(
       storage,
       t.id,
       recreationReason(
@@ -1415,7 +1408,7 @@ async function launchTaskRun(
       ),
       runner, containerName,
     );
-    const envNotice = await environmentReplacedPrefix(storage, t.id);
+    let envNotice = await environmentReplacedPrefix(storage, t.id);
 
     const startCommand: StartCommand = {
       type: 'start',
@@ -1434,7 +1427,7 @@ async function launchTaskRun(
       ...(lowHighLoop ? { low_high_loop: { review_effort: lowHighLoop.reviewEffort } } : {}),
       ...wrapUpFields,
       ...sessionCredentialCommandField(credentialPlan, () => roleTargetForProfile(profile)),
-      ...commonCommandFields(branchConfig),
+      ...commonCommandFields(branchConfig, { runner: runner.type }),
     };
     writeCommand(protoDir, startCommand);
 
@@ -1455,11 +1448,13 @@ async function launchTaskRun(
     }
 
     if (mustRecreateForImage) phases.note('recreating container: the runner image this task runs on changed');
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForImage && (await runner.isRunning(containerName))) {
+    const kept = await reuseOrStartTaskRun(runner, storage, sess, containerName, mustRecreateForCredential || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForImage, t.agent_id);
+    if (kept) {
       // Supervisor already running — it will pick up the new command
-      phases.note(`reusing running container ${containerName}`);
+      phases.note(keptRunNote(kept, containerName));
     } else {
       await removeTaskRun(runner, storage, sess, containerName);
+      envNotice = await refreshEnvironmentReplacedCommand(storage, protoDir, startCommand, envNotice);
 
       try {
         await withSpan('docker.launch_supervisor', {

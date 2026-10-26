@@ -51,7 +51,8 @@ describe('lazy-agent placeholder self-healing', () => {
 
   test('install:local re-runs ensure:agent-placeholder after moving the binary out', async () => {
     const pkg = JSON.parse(await readRepoFile('package.json'));
-    const installLocal: string = pkg.scripts['install:local'];
+    expect(pkg.scripts['install:local']).toBe('bun run scripts/build-entry.ts install:local');
+    const installLocal = await readRepoFile('scripts/build-entry.ts');
 
     // The mv to ~/.lazy/bin/lazy-agent must happen, and ensure:agent-placeholder
     // must run afterward so the repo root is left buildable.

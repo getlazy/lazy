@@ -14,7 +14,8 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { initDaemonStorage, getOrCreateStorage, closeAllStorage, handleRpc } from '../../src/daemon/rpc-handlers';
-import { resetUsagePauseStateForTest } from '../../src/daemon/usage-pause';
+import { admitOneshotCommand, getUsagePauseOverride, resetUsagePauseStateForTest, setUsagePauseOverride } from '../../src/daemon/usage-pause';
+import { mcpActor } from '../../src/mcp/tools';
 import { resetUsageReadingsForTest } from '../../src/daemon/usage-readings';
 import { clearUserCredentialCache, putUserCredential } from '../../src/daemon/user-credentials';
 import { daemonUsageLimits, memberEndpointUsageKey } from '../../src/proxy/usage-limits';
@@ -82,5 +83,30 @@ describe('usagePause get with ownerEmail', () => {
     expect(asMember.task.credential).toBe(memberEndpointUsageKey(MEMBER, 'builtin:anthropic'));
     expect(asMember.task.verdict?.credential).toBe(memberEndpointUsageKey(MEMBER, 'builtin:anthropic'));
     expect(asMember.task.verdict?.usedPercent).toBe(97);
+  });
+
+  // INVARIANT: a Pair assistant's one-shot admission checks the authenticated
+  // member's account, and the agent channel cannot consume a human override.
+  test('member Pair admission respects the member pause without a service credential', async () => {
+    const actor = mcpActor({
+      taskId, worktreePath: root, projectRoot: root,
+      memberPair: true, actorPerson: { email: MEMBER },
+    });
+    expect(actor).toEqual({ role: 'agent', email: MEMBER });
+    setUsagePauseOverride(0);
+    const refused = await admitOneshotCommand(root, actor).then(() => null, err => err);
+    expect(refused).toMatchObject({ status: 429, code: 'usage_paused' });
+    expect(refused.message).toContain('97%');
+    expect(getUsagePauseOverride()).toBe(0);
+
+    daemonUsageLimits.observeReading({
+      credential: memberEndpointUsageKey(MEMBER, 'builtin:anthropic'), ts: Date.now() + 1,
+      upstream: 'https://api.anthropic.com', backend: 'proxy',
+      status: 200, taskId: null, model: null,
+      headers: { 'anthropic-ratelimit-unified-5h-utilization': '0.10' },
+    });
+    expect(await admitOneshotCommand(root, actor)).toEqual(expect.any(String));
+    expect(getUsagePauseOverride()).toBe(0);
+    await expect(admitOneshotCommand(root, 'agent')).rejects.toThrow(/service/i);
   });
 });

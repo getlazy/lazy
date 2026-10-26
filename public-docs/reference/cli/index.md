@@ -12,7 +12,7 @@ Every `lazy` command, generated from the usage text each command prints for `--h
 | [`lazy blocked`](blocked.md) | List tasks waiting on a person: blocked, conflict or submitted. |
 | [`lazy branch`](branch.md) | Create a child task branching from a parent task's current state and start it immediately. |
 | [`lazy browse`](browse.md) | Browse a task's artifacts. |
-| [`lazy builder`](builder.md) | Launch an interactive Claude Code session with Lazy builder instructions. |
+| [`lazy builder`](builder.md) | Launch an interactive Claude Code session (or a Codex one, with --agent) with Lazy builder instructions. |
 | [`lazy chat`](chat.md) | Interactive, read-only chat with a task's agent — ask it what it did and why. |
 | [`lazy clone`](clone.md) | The second form clones a project hosted on a Lazy Teams install and binds the clone to it in one step, logging this machine in first if it is not already (see lazy login --help; --device and --device-name work as they do there). |
 | [`lazy close`](close.md) | Close a task — stop work and mark it as abandoned. |
@@ -72,6 +72,7 @@ Every `lazy` command, generated from the usage text each command prints for `--h
 | [`lazy rework`](rework.md) | Create a follow-up task to rework previously accepted work. |
 | [`lazy scratch`](scratch.md) | Read the builder scratch sandbox. |
 | [`lazy search`](search.md) | Search across tasks, prompts, turns, commits, notes, raised items, conversations, and shared memory records. |
+| [`lazy sessions`](sessions.md) | Show who else is in a task and what runs in its own environment. |
 | [`lazy shell`](shell.md) | Open an interactive shell in a task's CONTAINER — the same environment the agent works in, with its toolchain — or run a one-off command there. |
 | [`lazy show`](show.md) | Show detailed information about a task, conversation, or file. |
 | [`lazy start`](start.md) | Start an existing task. |
@@ -104,6 +105,7 @@ Every `lazy` command, generated from the usage text each command prints for `--h
 | [`lazy system store-backup`](system-store-backup.md) | Save a lazy store as one compressed archive (store.tar.gz) in <store>.backups/ beside it, verify it (the archive read back and every file compared by size and sha256), and keep the newest verified ones. |
 | [`lazy system store-backups`](system-store-backups.md) | List a store's backups, newest first: when, which upgrade, size, and where. |
 | [`lazy system store-check`](system-store-check.md) | Report what a lazy store directory holds, without opening it: its schema version, whether anything is holding its lock, how many tasks it has, and which actor ids its rows carry. |
+| [`lazy system store-rehome`](system-store-rehome.md) | Explicitly give this project's configured store to this checkout after stopping the previous daemon. |
 | [`lazy system store-restore`](system-store-restore.md) | Put a verified backup back. |
 | [`lazy tag`](tag.md) | Add one or more tags to a task for lightweight, non-hierarchical grouping. |
 | [`lazy unblock`](unblock.md) | Unblock a task by providing feedback, or interactively review and act on it. |

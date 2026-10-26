@@ -340,3 +340,74 @@ describe('task container and a changed per-task environment', () => {
     expect((await ensure()).alreadyRunning).toBe(true);
   });
 });
+
+// INVARIANT: an external stop is evidence of an exit, not lost files.
+// Run services must report replacement only when it cannot keep the environment.
+describe('Run services after an external stop', () => {
+  for (const starts of [true, false]) {
+    test(starts ? 'starts in place without a loss notice' : 'an unstartable container still records replacement', async () => {
+      containerRunning = false;
+      const storage = await deps.getStorage!();
+      storage.getSessionByTaskId = async () => ({ id: 'session', task_id: task.id, container_name: 'lazy-recovery', container_agent_id: 'claude-code', runner_type: 'docker' }) as any;
+      storage.updateSessionContainerName = async () => {};
+      runner.getRunInfo = async () => ({ running: false, exitCode: 137, oomKilled: true, finishedAt: '2026-10-23T10:00:00Z' });
+      runner.startStoppedRun = async () => { calls.push('start'); containerRunning = starts; return starts; };
+      const result = await ensure();
+      expect(result.alreadyRunning).toBe(false);
+      expect(journal[0]).toContain('Container stopped');
+      expect(journal[0]).toContain('code 137');
+      expect(journal[0]).toContain('OOM-killed');
+      if (starts) {
+        expect(calls).not.toContain('remove');
+        expect(calls).not.toContain('launch');
+        expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toBeFalsy();
+        expect(metadata.get('last_environment_replaced')).toBeFalsy();
+        expect(journal).toHaveLength(1);
+      } else {
+        expect(calls).toContain('remove');
+        expect(calls).toContain('launch');
+        expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toContain('code 137');
+        expect(journal[1]).toContain('Container replaced');
+      }
+    });
+  }
+  test('a genuinely missing recorded container still produces a loss notice', async () => {
+    containerRunning = false;
+    const storage = await deps.getStorage!();
+    storage.getSessionByTaskId = async () => ({ id: 'session', task_id: task.id, container_name: 'lazy-recovery', container_agent_id: 'claude-code', runner_type: 'docker' }) as any;
+    storage.updateSessionContainerName = async () => {};
+    runner.getRunInfo = async () => null;
+    runner.startStoppedRun = async () => false;
+    await ensure();
+    expect(calls).toContain('launch');
+    expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toContain('disappeared');
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toContain('Container replaced');
+  });
+
+  // INVARIANT: Run services can create a container before the first turn.
+  // That environment's loss is still recorded even though there is no session.
+  for (const starts of [true, false]) {
+    test('services before the first session: ' + (starts ? 'keeps the stopped environment' : 'reports its replacement'), async () => {
+      containerRunning = false;
+      runner.getRunInfo = async () => ({ running: false, exitCode: 137, oomKilled: true, finishedAt: '2026-10-23T10:00:00Z' });
+      runner.startStoppedRun = async () => { containerRunning = starts; return starts; };
+      expect(await (await deps.getStorage!()).getSessionByTaskId(task.id)).toBeNull();
+      await ensure();
+      expect(journal[0]).toContain('Container stopped');
+      if (starts) {
+        expect(calls).not.toContain('remove');
+        expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toBeFalsy();
+        expect(journal).toHaveLength(1);
+      } else {
+        expect(calls).toContain('remove');
+        expect(calls).toContain('launch');
+        expect(metadata.get(ENVIRONMENT_REPLACED_KEY)).toContain('code 137');
+        expect(metadata.get('last_environment_replaced')).toContain('code 137');
+        expect(metadata.get('observed_environment_exit')).toBeFalsy();
+        expect(journal[1]).toContain('Container replaced');
+      }
+    });
+  }
+
+});

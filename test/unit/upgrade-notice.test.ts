@@ -18,6 +18,10 @@ import { maybePostUpgradeNotice } from '../../src/daemon/upgrade-notice';
 import { getDaemonDir } from '../../src/daemon/paths';
 import { VERSION } from '../../src/version';
 import { runningBuildIdentity, resetRunningBuildProvenanceCache } from '../../src/utils/build-provenance';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('daemon upgrade notice', () => {
   let testDir: string;
@@ -39,7 +43,7 @@ describe('daemon upgrade notice', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {

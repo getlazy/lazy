@@ -45,7 +45,10 @@ export class QaAgent implements Agent {
     // The supervisor sets cwd to the worktree path, so we pass '.' as the worktree arg.
     // QA_AGENT_SCRIPT is an absolute path resolved at import time via import.meta.dir.
     // The prompt goes on stdin (`-p` with no value), never argv.
-    return Object.assign(['bun', 'run', QA_AGENT_SCRIPT, '-p', '--worktree', '.'], { stdinInput: opts.prompt });
+    const prompt = opts.systemPrompt
+      ? `<system>\n${opts.systemPrompt}\n</system>\n\n${opts.prompt}`
+      : opts.prompt;
+    return Object.assign(['bun', 'run', QA_AGENT_SCRIPT, '-p', '--worktree', '.'], { stdinInput: prompt });
   }
 
   parseResponse(stdout: string, _opts?: { workingDir?: string }): AgentResponse {

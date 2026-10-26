@@ -30,6 +30,7 @@ import type { Storage } from '../storage/interface';
 import { realignAfterDaemonWrite } from '../utils/worktree-ownership';
 import { INTERNAL_GIT_TOOL_NAME } from '../mcp/types';
 import { runWithGitAuthor } from '../identity/git-author';
+import { assertMemberPairTool, type MemberPairIdentity } from './member-pair-mcp';
 import { isReadOnlyTool } from '../mcp/tool-access';
 
 /**
@@ -218,6 +219,8 @@ export async function handleMcpToolCall(
   builderTokenLabel?: string | null,
   /** Collects effects to run once the answer reached a connected caller. */
   afterDelivery?: (effect: () => Promise<void>) => void,
+  /** Resolved from the authenticated token by the HTTP route, never the body. */
+  memberPair?: MemberPairIdentity | null,
 ): Promise<unknown> {
   if (!existsSync(projectRoot)) {
     throw new RpcError(400, `Project root does not exist: ${projectRoot}`);
@@ -278,9 +281,18 @@ export async function handleMcpToolCall(
     // reconciler had resumed would have started answering "somebody else" to its
     // own children — and woken itself forever. Widening these rows means giving
     // each such reader the distinction first.
-    authority = await resolveMcpTurnAuthority(storage, task);
+    if (memberPair) {
+      if (memberPair.taskId !== task.id) throw new RpcError(403, 'Member pairing task mismatch.');
+      assertMemberPairTool(memberPair, toolName);
+      // Still the agent CHANNEL, but not the supervised task agent: ctx below
+      // carries the authenticated connection's provenance separately so child
+      // creation can wake the cluster and interrupt its wait.
+      actorPerson = memberPair.member;
+    } else {
+      authority = await resolveMcpTurnAuthority(storage, task);
+    }
     callerTask = task;
-    actorPerson = authority.kind === 'turn' ? authority.owner ?? undefined : undefined;
+    if (!memberPair) actorPerson = authority?.kind === 'turn' ? authority.owner ?? undefined : undefined;
   } else {
     // Builder/project-wide mode: use project root
     worktreePath = projectRoot;
@@ -298,6 +310,7 @@ export async function handleMcpToolCall(
     progress,
     ...(afterDelivery ? { afterDelivery } : {}),
     ...(taskId ? { actorPerson } : {}),
+    ...(memberPair ? { memberPair: true } : {}),
   };
 
   const handlers = createAllHandlers(ctx);
@@ -325,7 +338,7 @@ export async function handleMcpToolCall(
   // A read writes no commit, so it needs no lookup.
   const builderMember = taskId || isReadOnlyTool(toolName) ? null : await builderSessionMember(storage, projectRoot, builderTokenLabel ?? null);
   return runWithGitAuthor(ctx.actorPerson ?? null, () => runWithGitAuthor(builderMember, () =>
-    launch(() => dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args))));
+    launch(() => dispatchMcpHandler(storage, taskId, toolName, worktreePath, handler, args, !!memberPair))));
 }
 
 /**
@@ -476,12 +489,13 @@ async function dispatchMcpHandler(
   worktreePath: string,
   handler: (args: Record<string, unknown>) => Promise<unknown>,
   args: Record<string, unknown>,
+  memberPair = false,
 ): Promise<unknown> {
   // A task agent making a BLOCKING call is parked, not working. Record it for
   // the duration so read surfaces can say `working(waiting on <task>)` and so
   // the waited time is subtractable from the turn's wall-clock. Builder calls
   // (taskId === '') have no task to attribute anything to.
-  if (!taskId || !BLOCKING_WAIT_TOOLS.has(toolName)) {
+  if (!taskId || memberPair || !BLOCKING_WAIT_TOOLS.has(toolName)) {
     if (taskId && WORKTREE_WRITING_TOOLS.has(toolName)) {
       try {
         return await handler(args);

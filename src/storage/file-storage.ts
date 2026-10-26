@@ -1,3 +1,6 @@
+import type { StoredImageBuild, StoredImageBuildLogPage } from './image-build';
+import type { DiskSpaceState } from './disk-space-state';
+import type { TerminalCleanupState } from './terminal-cleanup-state';
 /**
  * File-based storage implementation
  *
@@ -25,9 +28,10 @@ import { pinnedBaseOf } from '../task/base-pin';
 import { conversationForReading } from '../import/local-command-cleanup';
 import { mapLimit, STORE_SCAN_CONCURRENCY } from '../utils/map-limit';
 import { createHash, randomUUID } from 'crypto';
-import { mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
-import type { Dirent } from 'fs';
-import { dirname, join } from 'path';
+import { open, mkdir, readdir, readFile, writeFile, rename, rm, stat, unlink } from 'fs/promises';
+import { createReadStream, type Dirent } from 'fs';
+import { createInterface } from 'readline';
+import { basename, dirname, join } from 'path';
 import { durableFsOps } from './durable-write';
 import type { Storage, CreateTurnOptions, NewTaskInitialState, TaskTurnLatency } from './interface';
 import {
@@ -48,6 +52,7 @@ import {
   type WaitIntervalFilter,
 } from './wait-intervals';
 import { getDataDir } from '../project-paths';
+import { assertStoreOwner, claimStoreOwner, identifyCheckout, readStoreOwner, refreshStoreOwner, writeStoreOwner, type StoreOwner } from './store-owner';
 import { assertArtifactWithinLimits } from '../artifacts/limits';
 import { normalizeArtifactName, guessMimeType, isBinaryContent } from '../artifacts/name';
 import {
@@ -371,6 +376,8 @@ interface TaskStoreIndex {
 }
 
 export interface FileStorageOptions {
+  /** Project-bound opens check ownership before taking the storage lock. */
+  enforceOwnership?: boolean;
   /** Override the base path instead of computing from lazyRoot + dataDir */
   basePath?: string;
   /**
@@ -393,6 +400,7 @@ interface SearchableConversationFile {
 }
 
 export class FileStorage implements Storage {
+  private checkoutIdentity: Promise<StoreOwner> | null = null;
   private readonly basePath: string;
   private readonly tasksPath: string;
   private readonly lock: StorageLock;
@@ -402,7 +410,7 @@ export class FileStorage implements Storage {
   /** In-flight build, so concurrent callers share one full scan. */
   private indexBuild: Promise<TaskStoreIndex> | null = null;
 
-  constructor(lazyRoot: string, options?: FileStorageOptions) {
+  constructor(private readonly lazyRoot: string, private readonly options?: FileStorageOptions) {
     this.basePath = options?.basePath ?? join(lazyRoot, getDataDir(lazyRoot));
     this.tasksPath = join(this.basePath, 'tasks');
     this.lock = new StorageLock(lazyRoot, options?.basePath, {
@@ -479,8 +487,24 @@ export class FileStorage implements Storage {
    * Read and normalize a task.json, handling legacy fields.
    * Persists migrations back to disk on first read (self-healing).
    */
-  private async readTask(path: string): Promise<Task | null> {
-    const raw = await this.readJson<Record<string, unknown>>(path);
+  private async readTask(path: string, strict = false): Promise<Task | null> {
+    let raw: Record<string, unknown> | null;
+    if (strict) {
+      try {
+        raw = JSON.parse(await readFile(path, 'utf-8'));
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
+            raw.id !== basename(dirname(path)) || typeof raw.status !== 'string' ||
+            (raw.code != null && typeof raw.code !== 'string') ||
+            (raw.metadata != null && (typeof raw.metadata !== 'object' || Array.isArray(raw.metadata) ||
+              Object.values(raw.metadata).some(value => typeof value !== 'string')))) {
+          throw new Error('invalid task identity, status or metadata');
+        }
+      } catch (err) {
+        throw new Error(`Cannot safely list tasks: unreadable task record ${path}: ${(err as Error).message}`);
+      }
+    } else {
+      raw = await this.readJson<Record<string, unknown>>(path);
+    }
     if (!raw) return null;
 
     let needsWrite = false;
@@ -1295,7 +1319,40 @@ export class FileStorage implements Storage {
 
   // --- Lifecycle ---
 
+  private identifyCheckout(): Promise<StoreOwner> {
+    return this.checkoutIdentity ??= identifyCheckout(this.lazyRoot);
+  }
+
+  async checkOwnership(): Promise<void> {
+    await assertStoreOwner(this.basePath, await this.identifyCheckout());
+  }
+
+  async claimOwnership(): Promise<void> {
+    await claimStoreOwner(this.basePath, await this.identifyCheckout());
+  }
+
+  async rehomeOwnership(previousProject: string): Promise<void> {
+    const current = await this.identifyCheckout();
+    // An explicit transfer still cannot displace a running daemon. The lock
+    // serializes it with a racing start, and the owner is re-read inside it.
+    // A holder on another kernel may still be running: never judge its PID
+    // locally and reclaim it just because that PID is absent here.
+    const transferLock = new StorageLock(this.lazyRoot, this.basePath, {
+      acquireTimeoutMs: this.options?.lockTimeoutMs,
+      foreignHolder: 'refuse',
+    });
+    await transferLock.withLock(async () => {
+      const previous = await readStoreOwner(this.basePath);
+      const expected = previous?.projectRoot ?? 'unowned';
+      if (previousProject !== expected) {
+        throw new Error(`Store ${this.basePath} belongs to "${expected}", not the --from value "${previousProject}". No ownership was changed.`);
+      }
+      await writeStoreOwner(this.basePath, current, true);
+    });
+  }
+
   async initialize(): Promise<void> {
+    if (this.options?.enforceOwnership) await this.claimOwnership();
     // Ensure basePath exists BEFORE acquiring the lock.
     // The storage lock checks that its directory exists, so we must create
     // the basePath first. This is safe without a lock because mkdir with
@@ -1303,6 +1360,7 @@ export class FileStorage implements Storage {
     await mkdir(this.basePath, { recursive: true });
 
     return this.lock.withLock(async () => {
+      if (this.options?.enforceOwnership) await refreshStoreOwner(this.basePath, await this.identifyCheckout());
       // Create subdirectories
       await mkdir(this.tasksPath, { recursive: true });
 
@@ -1482,6 +1540,13 @@ export class FileStorage implements Storage {
     } catch {
       return [];
     }
+  }
+
+  async listTasksStrict(): Promise<Task[]> {
+    const dirs = await this.listTaskDirNames('Cannot safely list tasks');
+    const tasks = await mapLimit(dirs, STORE_SCAN_CONCURRENCY, async (dir) =>
+      (await this.readTask(join(this.tasksPath, dir, 'task.json'), true))!);
+    return tasks.sort((a, b) => b.created_at - a.created_at);
   }
 
   /**
@@ -4792,6 +4857,16 @@ export class FileStorage implements Storage {
         if (update.askError === null) delete existing.ask_error;
         else existing.ask_error = update.askError;
       }
+      if (update.askOwner !== undefined) {
+        delete existing.ask_owner_email;
+        delete existing.ask_owner_name;
+        delete existing.ask_owner_spendable;
+        if (update.askOwner) {
+          existing.ask_owner_email = update.askOwner.email;
+          if (update.askOwner.name) existing.ask_owner_name = update.askOwner.name;
+          existing.ask_owner_spendable = update.askOwner.spendable;
+        }
+      }
 
       await this.atomicWriteTask(fullId, { 'review-comments.json': { review_comments: comments } });
       return existing;
@@ -5417,6 +5492,96 @@ export class FileStorage implements Storage {
 
   private get projectSettingsPath(): string {
     return join(this.basePath, 'project-settings.json');
+  }
+
+  private imageBuildPath(id: string, extension: string): string {
+    if (!/^[a-z]+-\d+-[a-f0-9]+$/.test(id)) throw new Error('Invalid image build id: ' + id);
+    return join(this.basePath, 'image-builds', id + extension);
+  }
+
+  async listImageBuilds(): Promise<StoredImageBuild[]> {
+    const dir = join(this.basePath, 'image-builds');
+    await mkdir(dir, { recursive: true });
+    const rows = await Promise.all((await readdir(dir)).filter(n => n.endsWith('.json')).map(n => this.readJson<StoredImageBuild>(join(dir, n))));
+    return rows.filter((r): r is StoredImageBuild => r !== null).sort((a, b) => String(b.build.startedAt).localeCompare(String(a.build.startedAt)));
+  }
+
+  async saveImageBuild(build: StoredImageBuild): Promise<void> {
+    await this.taskMutex.withLock('image-build:' + build.id, async () => {
+      const path = this.imageBuildPath(build.id, '.json');
+      await mkdir(dirname(path), { recursive: true });
+      await this.writeJson(path, build);
+    });
+  }
+
+  async appendImageBuildLog(id: string, lines: string): Promise<void> {
+    await this.guardUnlockedWrite();
+    const path = this.imageBuildPath(id, '.jsonl');
+    await mkdir(dirname(path), { recursive: true });
+    await this.taskMutex.withLock('image-build-log:' + id, async () => {
+      const file = await open(path, 'a+');
+      try {
+        const { size } = await file.stat();
+        try {
+          await file.writeFile(lines);
+        } catch (error) {
+          // ENOSPC may append only part of a JSON line. Roll back before retrying
+          // the batch, so neither duplicate nor malformed lines become durable.
+          await file.truncate(size);
+          throw new Error('Could not append image build log ' + id + ': ' + String(error));
+        }
+      } finally {
+        await file.close();
+      }
+    });
+  }
+
+  async readImageBuildLog(id: string, after: number, limit: number): Promise<StoredImageBuildLogPage> {
+    const summary = await this.readJson<StoredImageBuild>(this.imageBuildPath(id, '.json'));
+    const page: StoredImageBuildLogPage = { lines: [], firstSeq: 1, lastSeq: Number(summary?.build.lastSeq ?? 0), truncatedBefore: false };
+    if (!summary?.logsRetained || after >= page.lastSeq) return page;
+    const stream = createReadStream(this.imageBuildPath(id, '.jsonl'), { encoding: 'utf8' });
+    const reader = createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+      for await (const line of reader) {
+        if (!line) continue;
+        const parsed = JSON.parse(line);
+        if (parsed.seq > after) page.lines.push(parsed);
+        if (page.lines.length >= limit) break;
+      }
+      return page;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return page;
+      throw new Error('Could not read image build log ' + id + ': ' + String(error));
+    } finally {
+      reader.close();
+      stream.destroy();
+    }
+  }
+
+  async pruneImageBuildLogs(keep: number): Promise<void> {
+    const builds = await this.listImageBuilds();
+    for (const row of builds.slice(keep)) {
+      if (!row.logsRetained || row.build.outcome === 'running') continue;
+      await rm(this.imageBuildPath(row.id, '.jsonl'), { force: true });
+      await this.saveImageBuild({ ...row, logsRetained: false });
+    }
+  }
+
+  async getDiskSpaceState(): Promise<DiskSpaceState | null> {
+    return (await this.readJson<DiskSpaceState>(join(this.basePath, 'disk-space.json'))) ?? null;
+  }
+
+  async getTerminalCleanupState(): Promise<TerminalCleanupState | null> {
+    return (await this.readJson<TerminalCleanupState>(join(this.basePath, 'terminal-cleanup.json'))) ?? null;
+  }
+
+  async saveTerminalCleanupState(state: TerminalCleanupState): Promise<void> {
+    await this.writeJson(join(this.basePath, 'terminal-cleanup.json'), state);
+  }
+
+  async saveDiskSpaceState(state: DiskSpaceState): Promise<void> {
+    await this.writeJson(join(this.basePath, 'disk-space.json'), state);
   }
 
   async getProjectSettings(): Promise<ProjectSettings | null> {

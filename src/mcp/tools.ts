@@ -70,6 +70,7 @@
  */
 
 import { withPromotedTaskCodes } from '../task/show-sections';
+import { MEMBER_PAIR_CREATION_KEY } from '../task/created-by-own-agent';
 import { isParkedStatus, isStoppedParked } from '../task/user-stop';
 import { pinChosenEffort } from '../daemon/effort';
 import {
@@ -116,7 +117,7 @@ import {
 import type { McpTool, McpToolHandler } from './types';
 import { protocolDir as taskProtocolDir } from '../protocol/io';
 import { recordPresentationDeclared } from '../protocol/presentation-marker';
-import { buildNotesState, buildShowChunks, buildShowConversation, buildShowFinal, buildShowReviews } from '../task/show-sections';
+import { buildNotesState, buildShowChunks, buildShowConversation, buildShowChat, buildShowFinal, buildShowReviews } from '../task/show-sections';
 import type { ActorInput, Turn, SystemMessageKind, RaisedItemInput, ActiveRaisedResolveAction } from '../types';
 import { ACTIVE_RAISED_ACTIONS } from '../types';
 import { reviewReportIsUnparsed, UNPARSED_REVIEW_LABEL } from '../review/parse-report';
@@ -222,6 +223,7 @@ import {
   queryLinkTask,
   queryDiff,
   queryRegions,
+  queryTaskSessions,
   expandPresentation,
   queryCloneTask,
   queryCreateTask,
@@ -290,6 +292,8 @@ import {
  * createReparentHandler.
  */
 export interface McpToolContext {
+  /** Authenticated member pairing: annotations may target the paired task itself. */
+  memberPair?: boolean;
   /** Full UUID of the current task (empty string for builder context) */
   taskId: string;
   /** Worktree path for git operations (repo root for builder context) */
@@ -481,6 +485,7 @@ function annotationSelfRefusal(action: string): Error {
 }
 
 function assertAgentMayAnnotate(ctx: McpToolContext, task: Task, action: string): void {
+  if (ctx.memberPair && task.id === ctx.taskId) return;
   if (!ctx.taskId) return; // builder: unrestricted
   if (parentTaskIdOf(task) === ctx.taskId) return; // a direct subtask of the agent's task
   if (task.id === ctx.taskId) {
@@ -726,7 +731,7 @@ async function gateAgentTarget(
  * entirely for the builder.
  */
 async function assertAgentNotWaitingOnSelf(ctx: McpToolContext, taskIdInputs: string[]): Promise<void> {
-  if (!ctx.taskId) return; // builder: unrestricted
+  if (!ctx.taskId || ctx.memberPair) return; // members are not the task's running agent
   const storage = await getStorage(ctx);
   try {
     for (const input of taskIdInputs) {
@@ -949,9 +954,9 @@ export const showTool: McpTool = {
         type: 'array',
         items: {
           type: 'string',
-          enum: ['turns', 'chunks', 'conversation', 'commits', 'comments', 'review-comments', 'journal', 'children', 'status-history', 'tag-history', 'notes', 'reviews'],
+          enum: ['turns', 'chunks', 'conversation', 'chat', 'commits', 'comments', 'review-comments', 'journal', 'children', 'status-history', 'tag-history', 'notes', 'reviews'],
         },
-        description: 'Sections to include in full; without this, only counts. With "chunks", offset/limit page over chunks rather than turns. "status-history" and "tag-history" are audit trails (transition/tag, actor, timestamp); current tags are always in the summary as `tags`. "notes": which comments the agent has seen and which the next prompt carries; "comments" repeat it as `delivered`. "reviews": the reviews that COUNT (no raises, no parseable sweeps = never happened), newest first. "conversation": per chunk, prompt, reply, follow_ups (mid-turn comments), mechanical.',
+        description: 'Sections to include in full; else only counts. With "chunks", offset/limit page over chunks rather than turns. "status-history" and "tag-history" are audit trails (transition/tag, actor, timestamp); current tags are always in the summary as `tags`. "notes": which comments the agent has seen and which the next prompt carries; "comments" repeat it as `delivered`. "reviews": the reviews that COUNT (no raises, no parseable sweeps = never happened), newest first. "conversation": per chunk, prompt, reply, follow_ups (mid-turn comments), mechanical.',
       },
       offset: {
         type: 'number',
@@ -1234,7 +1239,7 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
         };
 
         // Include latest turn in summary (untruncated) when not drilling into turns/chunks
-        if (!sectionsSet.has('turns') && !sectionsSet.has('chunks') && !sectionsSet.has('conversation') && !sectionsSet.has('review-comments') && allTurns.length > 0) {
+        if (!sectionsSet.has('turns') && !sectionsSet.has('chunks') && !sectionsSet.has('conversation') && !sectionsSet.has('chat') && !sectionsSet.has('review-comments') && allTurns.length > 0) {
           result.latest_turn = mapShowTurn(allTurns[allTurns.length - 1]);
         }
 
@@ -1445,6 +1450,12 @@ export function createShowHandler(ctx: McpToolContext): McpToolHandler {
           mechanical: ex.mechanical,
           mechanical_label: ex.mechanical_label,
         }));
+      }
+
+      // Chat: what people asked the agent and its answers (src/task/chat.ts).
+      if (sectionsSet.has('chat')) {
+        const all = buildShowChat(allTurns, await storage.getTaskReviewComments(task.id));
+        result.chat = all.slice(offset, offset + limit);
       }
 
       if (sectionsSet.has('commits') && allCommits.length > 0) {
@@ -1728,7 +1739,12 @@ export function createCreateHandler(ctx: McpToolContext): McpToolHandler {
           taskType,
         }, agentConfig, projectSettings).agentId;
 
-        const task = await storage.createTask(goal, ctx.taskId, undefined, code, taskType, subtaskAgentId, mcpActor(ctx)); // channel actor on the initial backlog entry: 'builder' or 'agent'
+        // Pair keeps the agent channel, but its children are outside work for
+        // the supervised agent. Persist that distinction with the creation.
+        const task = await storage.createTask(
+          goal, ctx.taskId, undefined, code, taskType, subtaskAgentId, mcpActor(ctx),
+          ctx.memberPair ? { metadata: { [MEMBER_PAIR_CREATION_KEY]: 'true' } } : undefined,
+        );
         if (prompt) {
           await storage.updateTaskPrompt(task.id, prompt);
         }
@@ -2446,7 +2462,12 @@ export function createUsageLimitsHandler(ctx: McpToolContext): McpToolHandler {
       const { describeUsageLimitsView } = await import('../daemon/usage-pause');
       const { describeTokenBudgetFor } = await import('../daemon/token-budget');
       const storage = await getStorage(ctx);
-      const caller = ctx.taskId
+      if (ctx.memberPair && !ctx.actorPerson?.email) {
+        throw new RpcError(403, 'Member usage limits require the authenticated member identity.');
+      }
+      const caller = ctx.memberPair
+        ? { kind: 'member-pair' as const, email: ctx.actorPerson!.email, taskId: ctx.taskId }
+        : ctx.taskId
         ? { kind: 'task' as const, taskId: ctx.taskId }
         : { kind: 'builder' as const, label: ctx.builderTokenLabel ?? null };
       const view = await describeUsageLimitsView(ctx.projectRoot, storage, caller);
@@ -4090,14 +4111,15 @@ export function createArtifactAddHandler(ctx: McpToolContext): McpToolHandler {
 
       // An agent's publish-back should be attributable to the run that produced
       // it; best-effort, and only for the task the agent is actually running.
+      // A paired member supplies an attachment independently of that run.
       let sessionId: string | null = null;
-      if (ctx.taskId && taskId === ctx.taskId) {
+      if (!ctx.memberPair && ctx.taskId && taskId === ctx.taskId) {
         const session = await storage.getSessionByTaskId(ctx.taskId);
         sessionId = session?.id ?? null;
       }
 
       const origin: TaskArtifactOrigin =
-        (originArg as TaskArtifactOrigin | undefined) ?? (ctx.taskId ? 'output' : 'input');
+        (originArg as TaskArtifactOrigin | undefined) ?? (ctx.taskId && !ctx.memberPair ? 'output' : 'input');
 
       // INVARIANT: a passive storage write. No comment, no status change, no
       // signal — attaching an artifact never triggers an auto-turn. Same
@@ -5006,10 +5028,10 @@ export function createConversationAskHandler(ctx: McpToolContext): McpToolHandle
     // model, not on `[models] default`.
     //
     // [usage_pause]: one tool call is one command of several model calls,
-    // judged once — as the channel asking, so an agent never spends a
-    // person's one-shot override.
+    // judged once — on the authenticated person's account, keeping the channel
+    // asking so an agent never spends a person's one-shot override.
     const { admitOneshotCommand, runAsOneshotPayer } = await import('../oneshot');
-    const oneshotCommand = await admitOneshotCommand({ actor: mcpRole(ctx) });
+    const oneshotCommand = await admitOneshotCommand({ actor: mcpActor(ctx) });
     // Paid by the person this caller acts for (a task turn's owner, a builder's
     // member), else the project's service holder — never the daemon's own.
     const result = await runAsOneshotPayer(ctx.actorPerson?.email ?? null, () =>
@@ -5803,8 +5825,8 @@ async function executeAccept(
     // The agent's own task id, when an agent is the caller. The daemon uses it
     // to recognise "the merge destination is the caller's own branch" — the one
     // case where merging into a `working` parent is intentional rather than a
-    // race. Empty for the builder, which never gets that exemption.
-    callerTaskId: ctx.taskId || undefined,
+    // race. Members and builders never get that exemption.
+    ...(!ctx.memberPair && ctx.taskId ? { callerTaskId: ctx.taskId } : {}),
   };
 
   const result = await queryAcceptTask(params, ctx.progress);
@@ -7071,6 +7093,55 @@ export function createRegionsHandler(ctx: McpToolContext): McpToolHandler {
 }
 
 // ---------------------------------------------------------------------------
+// lazy_sessions
+// ---------------------------------------------------------------------------
+
+export const sessionsTool: McpTool = {
+  name: 'lazy_sessions',
+  description:
+    'A task\'s long-running terminal sessions ("services" runs Start services). ' +
+    'No name: list them. With name: its live screen and log tail. Read-only; ' +
+    'running: false means nothing runs.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: { type: 'string' },
+      name: { type: 'string' },
+      lines: { type: 'number' },
+      log_bytes: { type: 'number' },
+    },
+    required: [],
+  },
+};
+
+/**
+ * lazy_sessions — a READ: an agent reads its services' output without
+ * attaching, and it answers outside a turn too. The daemon owns the reading
+ * (src/daemon/task-sessions.ts); this only shapes the answer.
+ */
+export function createSessionsHandler(ctx: McpToolContext): McpToolHandler {
+  return async (args) => {
+    const taskId = (args.task_id as string | undefined) || ctx.taskId;
+    if (!taskId) throw new Error('task_id is required outside a task.');
+    const name = args.name as string | undefined;
+    const result = await queryTaskSessions({
+      taskId,
+      ...(name !== undefined ? { name } : {}),
+      ...(args.lines !== undefined ? { lines: args.lines as number } : {}),
+      ...(args.log_bytes !== undefined ? { logBytes: args.log_bytes as number } : {}),
+    });
+    // Who else is in the task is for the PEOPLE in it: members' addresses and
+    // when they were last active are not an agent's to read (the agent's own
+    // state it already knows).
+    if ('members' in result) {
+      const { members: _members, agent: _agent, ...sessions } = result;
+      return sessions;
+    }
+    return result;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // lazy_wait
 // ---------------------------------------------------------------------------
 
@@ -7141,9 +7212,9 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
     // return. Engineer decision 2026-08-07 — see assertAgentNotWaitingOnSelf.
     await assertAgentNotWaitingOnSelf(ctx, taskIdInputs);
 
-    // A task agent is told when a subtask is added under it mid-wait; the id
-    // comes from the authenticated context, never from a tool argument.
-    const interrupt = ctx.taskId ? { interruptOnNewChildOf: ctx.taskId } : {};
+    // Only the task agent receives new-child interrupts and claims its notes.
+    // A member connection is beside that turn and must leave its notes queued.
+    const interrupt = !ctx.memberPair && ctx.taskId ? { interruptOnNewChildOf: ctx.taskId } : {};
     const result = await queryWait(
       taskIdInputs.length === 1
         ? { taskId: taskIdInputs[0], timeout: timeoutSecs, ...interrupt }
@@ -7157,7 +7228,7 @@ export function createWaitHandler(ctx: McpToolContext): McpToolHandler {
     // delivery signal (no heartbeat framing) nothing is acked: the batch stays
     // claimed and the next claim re-issues it, uncounted — at-least-once.
     const { claim, ...interrupted } = result.interrupted ?? ({} as NonNullable<typeof result.interrupted>);
-    if (claim && ctx.taskId && ctx.afterDelivery) {
+    if (!ctx.memberPair && claim && ctx.taskId && ctx.afterDelivery) {
       const taskId = ctx.taskId;
       ctx.afterDelivery(() => ackWaitComments({ taskId, through: claim.through, claim_id: claim.claim_id }));
     }
@@ -8002,7 +8073,7 @@ export function createSyncHandler(ctx: McpToolContext): McpToolHandler {
       // daemon compares it with the target and, only when they are the same task,
       // allows the sync to run while that task is `working` — merging in place
       // instead of dispatching a supervisor. See src/daemon/self-sync.ts.
-      ...(ctx.taskId && resolvedId === ctx.taskId ? { callerTaskId: ctx.taskId } : {}),
+      ...(!ctx.memberPair && ctx.taskId && resolvedId === ctx.taskId ? { callerTaskId: ctx.taskId } : {}),
     };
 
     // A conflicting merge runs the task's agent: while the project's runner
@@ -8243,6 +8314,7 @@ export const allTools: McpTool[] = [
   activeTool,
   diffTool,
   regionsTool,
+  sessionsTool,
   waitTool,
   editTool,
   cloneTool,
@@ -8379,6 +8451,7 @@ export function createAllHandlers(ctx: McpToolContext): Map<string, McpToolHandl
   handlers.set('lazy_active', createActiveHandler(ctx));
   handlers.set('lazy_diff', createDiffHandler(ctx));
   handlers.set('lazy_regions', createRegionsHandler(ctx));
+  handlers.set('lazy_sessions', createSessionsHandler(ctx));
   handlers.set('lazy_wait', createWaitHandler(ctx));
   handlers.set('lazy_edit', createEditHandler(ctx));
   handlers.set('lazy_clone', createCloneHandler(ctx));

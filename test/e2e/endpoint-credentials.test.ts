@@ -36,11 +36,15 @@ named_endpoint = "reserve"
 `);
     controlDir = await mkdtemp(join(tmpdir(), 'endpoint-control-plane-'));
     const controlConfig = join(controlDir, 'lazy.toml');
-    await writeFile(controlConfig, await readFile(configPath, 'utf8'));
     await ctx.restartDaemon({ LAZY_TEST_FORCE_MANAGED: '1', LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root), LAZY_MANAGED_CONFIG_PATH: controlConfig });
     const target = getDaemonTcpTarget(ctx.root), token = readToken(ctx.root);
     if (!target || !token) throw new Error('Test daemon did not publish its TCP target and control token.');
     control = DaemonClient.fromTarget(target, token);
+    // Provision through the owner's save boundary: a copied file alone has
+    // repository provenance, so its custom connections are withheld.
+    expect(await control.rpc('applyProjectConfig', ctx.root, {
+      toml: await readFile(configPath, 'utf8'), origin: 'control-plane',
+    })).toMatchObject({ applied: true, changed: true });
     const minted = await control.rpc('mintActorToken', ctx.root, { kind: 'user', email: MEMBER, name: 'Ada' }) as { token: string };
     member = DaemonClient.fromTarget(target, minted.token);
   });

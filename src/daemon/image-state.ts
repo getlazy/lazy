@@ -87,6 +87,8 @@ export interface ImageFailure {
 }
 
 interface ImageRef {
+  /** Concrete tag, including for the default runner. */
+  tag?: string;
   /** The image name launches use, or lazy's default image. */
   name: string;
   /** Where its Dockerfile comes from, in words. */
@@ -95,6 +97,8 @@ interface ImageRef {
   defaultImage: string | null;
   /** False when the project has no custom image and runs on lazy's default. */
   custom: boolean;
+  /** The branch commit the image was last rebuilt from (the project image follows its acting branch); null before the first advance. */
+  builtFrom: { branch: string; sha: string } | null;
 }
 
 interface AdoptionRef {
@@ -258,7 +262,7 @@ function failedImageOf(job: ImageBuildJob | null): string | null {
 }
 
 function imageRef(s: Exclude<RunnerImageState, { state: 'none' }>): ImageRef {
-  return { name: s.imageName, dockerfile: s.dockerfile, defaultImage: s.defaultImage, custom: true };
+  return { name: s.imageName, dockerfile: s.dockerfile, defaultImage: s.defaultImage, custom: true, builtFrom: s.state !== 'checking' ? s.builtFrom ?? null : null };
 }
 
 function adoptionFailedEscalation(a: Extract<AdoptionBuildState, { state: 'failed' }>, failure: ImageFailure, job: ImageBuildJob | null, defaultImage: string | null): Escalation {
@@ -401,5 +405,7 @@ export async function projectImageState(
   }
   // A project on lazy's default image: the build shown is a running Rebuild of
   // that image (a project admin's way out of a broken one), if any.
-  return { state: 'ready', image: { name: 'lazy\'s default runner image', dockerfile: null, defaultImage: null, custom: false }, build: summarize(defaultImageRebuildJob()) };
+  const { resolveImageRepository, IMAGE_TAG } = await import('../capture/claude');
+  const { repository } = await resolveImageRepository(projectRoot, true);
+  return { state: 'ready', image: { name: 'lazy\'s default runner image', tag: `${repository}:${IMAGE_TAG}`, dockerfile: null, defaultImage: null, custom: false, builtFrom: null }, build: summarize(defaultImageRebuildJob()) };
 }

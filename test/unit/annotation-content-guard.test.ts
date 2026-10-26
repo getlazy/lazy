@@ -34,6 +34,10 @@ import {
 } from '../../src/utils/turn-content';
 import { buildNavItemsForTask, type ReviewData } from '../../src/cli/tui/review';
 import type { Task, Comment, JournalEntry, RaisedItem } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('annotation content helpers', () => {
   test('repairRecordContents substitutes a visible placeholder for a missing content', () => {
@@ -81,7 +85,7 @@ describe('storage reads over content-less annotation records', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     task = await storage.createTask('Test task', undefined, undefined, 'test-task');
   });
 

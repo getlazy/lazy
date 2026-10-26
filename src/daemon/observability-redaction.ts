@@ -83,7 +83,7 @@ export const STRUCTURAL_FIELDS: Readonly<Record<string, (value: string) => boole
     'succeeded',
   ),
   phase: oneOf('checking', 'building'),
-  outcome: oneOf('running', 'succeeded', 'failed', 'cancelled'),
+  outcome: oneOf('running', 'succeeded', 'failed', 'cancelled', 'interrupted'),
   status: oneOf('pending', 'running', 'done', 'cached', 'failed', 'cancelled'),
   kind: oneOf('project', 'adoption', 'lazy', 'docker', 'microvm', 'local-docker', 'host'),
   source: oneOf('lazy', 'docker'),

@@ -346,7 +346,7 @@ async function runExportCommand(
 }
 
 /** Export `commit`'s tree into `dir` — the build context, never a worktree. */
-async function exportTree(projectRoot: string, commit: string, dir: string, signal?: AbortSignal): Promise<void> {
+export async function exportTree(projectRoot: string, commit: string, dir: string, signal?: AbortSignal): Promise<void> {
   const tar = join(dir, '..', `${dir.split('/').pop()}.tar`);
   // A whole tree can take far longer than a ref lookup; note that `git archive`
   // omits `export-ignore` paths, so such a path is not in the context.
@@ -468,6 +468,7 @@ async function validateAndStartAdoption(
   };
   const short = candidate.commit.substring(0, 12);
   const job = startImageBuildJob('adoption', `Adopt ${candidate.dockerfile} from ${candidate.branch} (${short})`, projectRoot);
+  job.metadata = { trigger: 'admin adoption', commit: candidate.commit, dockerfile: candidate.dockerfile, requestedBy: req.adoptedBy.name || req.adoptedBy.email || undefined };
   // A previous adoption's job still running cannot exist (the slot refuses),
   // but its record is replaced: this is the adoption the admin watches now.
   adoptionJob = job;
@@ -545,6 +546,7 @@ async function runAdoption(
         if (current() && build.state === 'building') build = { ...build, progress: line };
       },
     })));
+    job.metadata.image = imageName;
     if (!current()) {
       // Cancelled, or superseded by a test reset. Never publish; the context
       // is removed below.
@@ -575,6 +577,7 @@ async function runAdoption(
     published = true;
     forgetAdoptionUnavailability();
     build = { state: 'none' };
+    job.metadata.imageProduced = true;
     job.finish('succeeded');
     logger.info(`Image adoption: ${imageName} from ${candidate.branch} is now the project's image`);
     await removeAdoptedContexts(projectRoot, finalDir).catch((e) =>

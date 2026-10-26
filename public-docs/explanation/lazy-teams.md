@@ -1,5 +1,22 @@
 # Lazy Teams
 
+```mermaid
+%% caption: A member reaches the project daemon through Teams; the host shares only the task store with its microVM
+flowchart LR
+  Member[Member browser] --> Teams[Lazy Teams web app]
+  Teams --> Fleet[Fleet supervisor]
+  Store[(Project task store on host)]
+  subgraph VM[Project microVM]
+    Daemon[Project daemon]
+    Daemon --> Proxy[Model proxy]
+    Daemon --> Task[Task container and agent]
+  end
+  Fleet --> Daemon
+  Teams --> Daemon
+  Store <--> Daemon
+```
+
+
 > **Lazy Teams is in private alpha.** It is not yet generally released, and details can change.
 
 Lazy Teams is a web application your team runs on a server you control. It puts the same tasks, reviews and agents you use from the command line behind a browser, so several people can work on one project together.

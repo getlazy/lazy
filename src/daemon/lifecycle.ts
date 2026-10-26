@@ -21,6 +21,7 @@
  * See: https://github.com/oven-sh/bun/issues/18546
  * Until Bun adds support, we use Bun FFI to call flock(2) directly from libc.
  */
+import type { RuntimeFacts } from '../runtime-context';
 
 import { existsSync, readFileSync, unlinkSync, mkdirSync, writeFileSync, openSync, closeSync, statSync, constants } from 'fs';
 import { randomBytes } from 'crypto';
@@ -101,6 +102,7 @@ export interface DaemonStatus {
   dashboardUrl?: string | null;
   /** True when the daemon runs in managed (Lazy Teams) mode; absent on older daemons. */
   managed?: boolean;
+  runtimeFacts?: RuntimeFacts;
   autoReactBudget?: AutoReactBudgetEntry[];
   /** Anthropic passthrough proxy status. Absent only when the daemon could not
    *  read its own config while answering the health probe. */
@@ -620,7 +622,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; managed?: boolean; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
+    const data = await response.json() as { runtimeFacts?: RuntimeFacts; projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; managed?: boolean; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
     if (data.projectRoot !== projectRoot) {
       // A daemon answered, but for a different project — our port marker is
       // stale and another project's daemon now holds the port.
@@ -631,6 +633,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       pid: pid ?? undefined,
       uptime: data.uptime,
       version: data.version,
+      runtimeFacts: data.runtimeFacts,
       instanceId: data.instanceId,
       buildTime: data.buildTime,
       buildSha: data.buildSha,

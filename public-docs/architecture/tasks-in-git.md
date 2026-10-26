@@ -1,10 +1,31 @@
 # Git integration
 
+```mermaid
+%% caption: A child task branches from its parent, syncs from origin and the parent, then merges back on accept
+flowchart LR
+  Parent[Parent branch] -->|start child| Child[Child task branch and worktree]
+  Remote[Origin task branch] -->|sync step 1| Child
+  Parent -->|sync step 2| Child
+  Child -->|accept| Parent
+```
+
+
 Every task is a branch and a worktree, and the task tree is a tree of branches.
 
 ## Worktrees and branches
 
 Starting a task creates a branch named with the `[git] default_branch_prefix` (default `lazy/`, for example `lazy/fix-bug`) and a git worktree for it under `.lazy/worktrees/` in the project. The agent works only in that worktree. Many tasks run side by side without sharing a working directory. See [Tasks and turns](../explanation/tasks-and-turns.md).
+
+In Lazy Teams, a project admin can choose a different branch namespace under
+**Settings → Configuration**:
+
+```toml
+[git]
+default_branch_prefix = "wip"
+```
+
+New task branches then use names such as `wip/fix-bug`; existing branches keep
+their names.
 
 ## The task tree
 

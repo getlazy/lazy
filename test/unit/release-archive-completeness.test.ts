@@ -1,7 +1,8 @@
 import { describe, test, expect } from 'bun:test';
-import { readFile } from 'fs/promises';
+import { readFile, mkdtemp, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname, relative, resolve } from 'path';
+import { tmpdir } from 'os';
 
 /**
  * Guards what the PUBLIC release archive contains against silent drift.
@@ -55,6 +56,52 @@ function parseReleaseShGeneratedList(script: string): string[] {
 }
 
 describe('release archive completeness', () => {
+  // INVARIANT: the published archive must run the build bootstrap before dependencies exist. A working dev checkout cannot prove that build resources ship.
+  test('the public archive runs the build preflight and refuses an unsupported Bun before installing', async () => {
+    const archiveRoot = await mkdtemp(join(tmpdir(), 'lazy-release-build-'));
+    try {
+      const patterns = parseReleaseInclude(await readRepoFile('.releaseinclude'));
+      const archive = Bun.spawn(['git', 'archive', '--format=tar', 'HEAD', '--', ...patterns], {
+        cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+      });
+      const unpack = Bun.spawn(['tar', '-xf', '-', '-C', archiveRoot], {
+        stdin: archive.stdout, stdout: 'pipe', stderr: 'pipe',
+      });
+      const [archiveError, unpackError, archiveCode, unpackCode] = await Promise.all([
+        new Response(archive.stderr).text(), new Response(unpack.stderr).text(), archive.exited, unpack.exited,
+      ]);
+      expect({ archiveCode, archiveError, unpackCode, unpackError }).toEqual({
+        archiveCode: 0, archiveError: '', unpackCode: 0, unpackError: '',
+      });
+      const check = Bun.spawn([process.execPath, 'run', 'scripts/build-entry.ts', 'check'], {
+        cwd: archiveRoot, stdout: 'pipe', stderr: 'pipe',
+      });
+      const checkError = await new Response(check.stderr).text();
+      expect({ code: await check.exited, stderr: checkError }).toEqual({ code: 0, stderr: '' });
+
+      // An intentionally unavailable pin exercises package-script ordering without downloading tools or running a build.
+      await writeFile(join(archiveRoot, '.bun-version'), '99.0.0\n');
+      const mise = join(archiveRoot, 'mise');
+      await writeFile(mise, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+      for (const entry of ['build', 'install:local']) {
+        const build = Bun.spawn([process.execPath, 'run', entry], {
+          cwd: archiveRoot,
+          env: { ...process.env, PATH: `${archiveRoot}:${dirname(process.execPath)}`, HOME: archiveRoot },
+          stdout: 'pipe', stderr: 'pipe',
+        });
+        const output = await new Response(build.stderr).text();
+        expect(await build.exited).toBe(1);
+        expect(output).toContain('Cannot build lazy:');
+        expect(output).toContain('requires Bun 99.0.0');
+        expect(output).not.toContain('generate:version');
+        expect(output).not.toContain('tsc.js');
+        expect(await Bun.file(join(archiveRoot, 'node_modules/typescript/lib/tsc.js')).exists()).toBe(false);
+      }
+    } finally {
+      await rm(archiveRoot, { recursive: true, force: true });
+    }
+  });
+
   /**
    * INVARIANT: every module the version generator writes into src/ must appear
    * in release.sh's GENERATED_SRC_FILES, because `git archive` cannot carry a

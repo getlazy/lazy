@@ -75,7 +75,7 @@ Everything else is a profile you declare:
   ```toml
   [agents.openai-pi]
   harness = "pi"
-  model = "gpt-6-sol"
+  model = "gpt-6.1-sol"
   endpoint = "https://api.openai.com"
   credential = "openai"
   ```

@@ -24,9 +24,8 @@
  * WHAT STOPS
  *   fatal_auth / fatal_config      — immediately. Nothing heals without a human.
  *   transient_unreachable          — after UNREACHABLE_MAX_ATTEMPTS (see below).
- *   transient_overload / _network  — never. These genuinely recover, and a task
- *                                    waiting on a rate limit must not need a
- *                                    human to un-stick it.
+ *   transient_overload / _network  — six failures or five minutes of recovery.
+ *                                    Ends the turn as transient for auto-resume.
  *   unknown                        — after UNKNOWN_MAX_ATTEMPTS. Ends the TURN
  *                                    only: the reconciler treats `unknown` as
  *                                    non-fatal, so the task is `interrupted` and
@@ -45,6 +44,9 @@ import { isFatalFailureClass, type AgentFailure, type AgentFailureClass } from '
 /** Capped exponential ladder for classes that recover quickly. */
 export const TRANSIENT_BACKOFF_MS = [5_000, 10_000, 20_000, 40_000];
 export const TRANSIENT_BACKOFF_CAP_MS = 60_000;
+export const TRANSIENT_MAX_ATTEMPTS = 6;
+export const TRANSIENT_RECOVERY_MS = 5 * 60_000;
+export const TRANSIENT_ATTEMPT_MS = 60_000;
 
 /** Slower ladder for failures we could not classify. */
 export const UNKNOWN_BACKOFF_MS = [15_000, 30_000];
@@ -109,6 +111,9 @@ export function decideRetry(failure: AgentFailure, attempt: number): RetryDecisi
   }
 
   if (failure.class === 'transient_overload' || failure.class === 'transient_network') {
+    if (attempt >= TRANSIENT_MAX_ATTEMPTS) {
+      return { action: 'stop', reason: `${failure.class}: ${failure.reason} — exhausted ${attempt} attempts; ending this turn as a transient failure` };
+    }
     return {
       action: 'retry',
       delayMs: ladderDelay(attempt, TRANSIENT_BACKOFF_MS, TRANSIENT_BACKOFF_CAP_MS),

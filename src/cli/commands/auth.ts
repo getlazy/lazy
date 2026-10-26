@@ -28,7 +28,9 @@
  * decision and agents must never do it. See public-docs/surface-asymmetries.md.
  */
 
-import { requireLazyRoot } from '../helpers';
+import { requireLazyRoot, parseFlags } from '../helpers';
+import { type CredentialScope, validateSetName } from '../../credentials/scope';
+import { bindCredentialSet, readCredentialSetBinding, listCredentialSets, projectsUsingCredentialSet, requireCredentialPerson } from '../../credentials/set-binding';
 import { loadConfig } from '../../config/loader';
 import {
   type CredentialName,
@@ -57,6 +59,7 @@ import {
   deleteCredential,
   purgeOrphanCredential,
   readCredentialIndex,
+  effectiveCredentialIndex,
   setCredential,
 } from '../../credentials/store';
 import { agentProfilesFor, NO_CREDENTIAL } from '../../config/agent-profiles';
@@ -153,8 +156,9 @@ async function resolveTarget(
   root: string,
   config: ResolvedConfig | null,
   name: CredentialName,
+  scope: CredentialScope = root,
 ): Promise<CredentialTarget> {
-  const stored = new Set((await readCredentialIndex(root)).map(e => e.provider));
+  const stored = new Set((await readCredentialIndex(scope)).map(e => e.provider));
   try {
     return resolveCredentialTarget(config, name, stored);
   } catch (err) {
@@ -213,17 +217,25 @@ function credentialsToList(
   return { names: [...PROVIDERS, ...extra], usedBy };
 }
 
-async function listView(root: string): Promise<void> {
+async function listView(root: string, setName?: string): Promise<void> {
   const config = await loadConfig(root);
   const required = new Set<string>(requiredProviders(config));
-  const index = await readCredentialIndex(root);
+  const scope: CredentialScope = setName ? { set: setName } : root;
+  const index = setName ? await readCredentialIndex(scope) : await effectiveCredentialIndex(root);
   const { names, usedBy } = credentialsToList(config, index.map(e => e.provider));
 
-  console.log(`Credentials for ${root}\n`);
+  console.log(setName ? `Credentials in set ${setName}\n` : `Credentials for ${root}\n`);
+  if (!setName) {
+    const binding = await readCredentialSetBinding(root);
+    console.log(binding
+      ? `Credential set: ${binding.set ?? 'none'}; binding changed ${binding.updatedAt}\n`
+      : 'Credential set: none (never bound)\n');
+    console.log(`Existing sets: ${(await listCredentialSets()).join(', ') || '(none)'}\n`);
+  }
 
   for (const provider of names) {
-    const env = envSourceFor(provider);
-    const stored = await credentialPresence(root, provider);
+    const env = setName ? null : envSourceFor(provider);
+    const stored = index.find(entry => entry.provider === provider);
     const users = usedBy.get(provider) ?? [];
     const marker = required.has(provider)
       ? theme.success('● required by this project')
@@ -235,7 +247,7 @@ async function listView(root: string): Promise<void> {
     if (env) {
       console.log(`  ${theme.label('In effect:')}  environment (${env})`);
     } else if (stored) {
-      console.log(`  ${theme.label('In effect:')}  store (${stored.backend})`);
+      console.log(`  ${theme.label('In effect:')}  ${setName || stored.setName ? `set ${setName ?? stored.setName}` : 'project store'} (${stored.backend})`);
     } else {
       console.log(`  ${theme.label('In effect:')}  ${theme.warning('none')} — ${credentialHowToGet(provider)}`);
     }
@@ -243,16 +255,16 @@ async function listView(root: string): Promise<void> {
       const hint = stored.hint ? ` …${stored.hint}` : '';
       console.log(
         `  ${theme.label('Stored:')}     ${stored.kind}${hint} in ${stored.backend}, updated ${stored.updatedAt}` +
-        (env ? theme.separator('  (overridden by the environment)') : ''),
+        (env ? theme.separator(`  (overridden by ${env})`) : ''),
       );
     } else {
-      console.log(`  ${theme.label('Stored:')}     none — store one with: lazy ${credentialSetupCommand(provider)}`);
+      console.log(`  ${theme.label('Stored:')}     none — store one with: lazy ${credentialSetupCommand(provider)}${setName ? ` --set ${setName}` : ''}`);
     }
     console.log('');
   }
 
   console.log(theme.separator(
-    'The environment always wins over the store, so an existing export keeps working unchanged.',
+    'Credential order: environment → project → bound set. An exported variable always wins.',
   ));
 }
 
@@ -298,9 +310,11 @@ function parseCredentialName(value: string | undefined, verb: string): Credentia
   return value;
 }
 
-async function setView(root: string, providerArg: string | undefined, rest: string[]): Promise<void> {
+async function setView(root: string, providerArg: string | undefined, rest: string[], setName?: string, requestedKind?: string): Promise<void> {
   const typed = parseCredentialName(providerArg, 'set');
-  const provider = announceTarget(await resolveTarget(root, await tryLoadConfig(root), typed));
+  const scope: CredentialScope = setName ? { set: setName } : root;
+  const config = await tryLoadConfig(root);
+  const provider = announceTarget(await resolveTarget(root, config, typed, scope));
 
   // A secret typed as an argument is already in shell history and in `ps`. Say
   // both things outright rather than silently ignoring the extra word — the
@@ -320,16 +334,11 @@ async function setView(root: string, providerArg: string | undefined, rest: stri
 
   const kinds = credentialKinds(provider);
   let kind = kinds[0];
-  const kindIdx = rest.indexOf('--kind');
-  if (kindIdx !== -1) {
-    const requested = rest[kindIdx + 1];
-    if (!requested || !kinds.includes(requested as CredentialKind)) {
-      console.error(
-        `Invalid --kind for ${provider}. Valid kinds: ${kinds.join(', ')}.`,
-      );
-      process.exit(1);
+  if (requestedKind !== undefined) {
+    if (!kinds.includes(requestedKind as CredentialKind)) {
+      throw new Error(`Invalid --kind for ${provider}. Valid kinds: ${kinds.join(', ')}.`);
     }
-    kind = requested as CredentialKind;
+    kind = requestedKind as CredentialKind;
   }
 
   const secret = await obtainSecret(provider, kind);
@@ -361,13 +370,15 @@ async function setView(root: string, providerArg: string | undefined, rest: stri
     }
   }
 
-  const entry = await setCredential(root, { provider, kind, secret });
+  if (setName) console.log(`Storing in credential set ${setName}.`);
+  const entry = await setCredential(scope, { provider, kind, secret }, config?.credentials.backend);
   const hint = credentialHint(secret);
   console.log(theme.success(
     `Stored the ${credentialLabel(provider)} ${kind}${hint ? ` …${hint}` : ''}.`,
   ));
   console.log(theme.separator(`  ${BACKEND_DESCRIPTIONS[entry.backend]}`));
   for (const line of effectAdvice(provider)) console.log(line);
+  if (setName) console.log(`Use this set from each project with: lazy auth use ${setName}`);
 
   const env = envSourceFor(provider);
   if (env) {
@@ -399,10 +410,11 @@ async function setView(root: string, providerArg: string | undefined, rest: stri
  * than at the first turn hours later. Piped stdin is accepted too, for a session
  * arriving from somewhere other than a file on this machine.
  */
-async function importView(root: string, nameArg: string | undefined, rest: string[]): Promise<void> {
+async function importView(root: string, nameArg: string | undefined, rest: string[], setName?: string): Promise<void> {
+  const scope: CredentialScope = setName ? { set: setName } : root;
   const typed = parseCredentialName(nameArg, 'import');
   const config = await tryLoadConfig(root);
-  const target = await resolveTarget(root, config, typed);
+  const target = await resolveTarget(root, config, typed, scope);
   const name = target.credential;
 
   // A ChatGPT session in a slot that bills something else is stored, reported as
@@ -480,7 +492,8 @@ async function importView(root: string, nameArg: string | undefined, rest: strin
   }
 
   const secret = serializeChatGptTokens(tokens);
-  const entry = await setCredential(root, { provider: name, kind: 'oauth', secret });
+  if (setName) console.log(`Storing in credential set ${setName}.`);
+  const entry = await setCredential(scope, { provider: name, kind: 'oauth', secret }, config?.credentials.backend);
   console.log(theme.success(
     `Stored the ChatGPT subscription session from ${source}` +
     `${tokens.accountId ? ` (account ${tokens.accountId})` : ''}.`,
@@ -491,7 +504,7 @@ async function importView(root: string, nameArg: string | undefined, rest: strin
   // that name — an earlier lazy stored one there and failed before recording it,
   // so no command could name it afterwards. Clear it as part of the import that
   // supersedes it, rather than sending the user to `security` by hand.
-  if (typed !== name && (await purgeOrphanCredential(root, typed))) {
+  if (typed !== name && (await purgeOrphanCredential(scope, typed))) {
     console.log(theme.separator(
       `  Cleared a leftover "${typed}" item in the ${entry.backend} store — an earlier failed import.`,
     ));
@@ -508,6 +521,7 @@ async function importView(root: string, nameArg: string | undefined, rest: strin
   // `work-chatgpt` does not), so importing under any other name told the user to
   // restart the daemon, interrupting every running task to achieve nothing.
   for (const line of effectAdvice(name, true)) console.log(line);
+  if (setName) console.log(`Use this set from each project with: lazy auth use ${setName}`);
 
   // Renewing a ChatGPT token RETIRES the one it renewed, and the codex CLI on
   // this machine still holds that retired copy in ~/.codex/auth.json. Say so at
@@ -610,11 +624,17 @@ async function refreshView(root: string, nameArg: string | undefined): Promise<v
   }
 }
 
-async function removeView(root: string, providerArg: string | undefined): Promise<void> {
+async function removeView(root: string, providerArg: string | undefined, setName?: string): Promise<void> {
+  const scope: CredentialScope = setName ? { set: setName } : root;
   const provider = announceTarget(
-    await resolveTarget(root, await tryLoadConfig(root), parseCredentialName(providerArg, 'rm')),
+    await resolveTarget(root, await tryLoadConfig(root), parseCredentialName(providerArg, 'rm'), scope),
   );
-  const removed = await deleteCredential(root, provider);
+  if (setName) {
+    const projects = await projectsUsingCredentialSet(setName);
+    console.log(theme.warning(`Removing ${provider} from set ${setName}: projects bound to it lose this credential unless they have their own or an environment fallback.`));
+    if (projects.length) console.log(projects.map(p => `  ${p}`).join('\n'));
+  }
+  const removed = await deleteCredential(scope, provider);
   console.log(removed
     ? theme.success(`Removed the stored ${credentialLabel(provider)} credential.`)
     : `No stored ${credentialLabel(provider)} credential.`);
@@ -626,25 +646,48 @@ async function removeView(root: string, providerArg: string | undefined): Promis
 
 export async function commandAuth(args: string[]): Promise<void> {
   const root = requireLazyRoot();
-  const sub = args[0];
+  const parsed = parseFlags(args, [
+    { name: 'set', takesValue: true },
+    { name: 'kind', takesValue: true },
+    { name: 'none', takesValue: false },
+  ], 'auth');
+  const [sub, name, ...rest] = parsed.positional;
+  const setName = parsed.flags.get('set') as string | undefined;
+  if (setName !== undefined) validateSetName(setName);
+  const kind = parsed.flags.get('kind') as string | undefined;
+  const none = parsed.flags.has('none');
+  if (setName && !['set', 'import', 'list', 'rm', 'remove'].includes(sub ?? 'list')) throw new Error('--set is available with auth set, import, list and remove.');
+  if (kind && sub !== 'set') throw new Error('--kind is available only with auth set.');
+  if (none && sub !== 'use') throw new Error('--none is available only with auth use.');
+  if (sub === 'use' || (setName && sub !== 'list' && sub !== undefined)) requireCredentialPerson();
+  if (rest.length && sub !== 'set' && sub !== 'import') throw new Error(`Unexpected argument for lazy auth ${sub}: ${rest[0]}`);
+  if (sub === 'import' && rest.length > 1) throw new Error('lazy auth import accepts at most one session file.');
+  if ((sub === 'list' || sub === undefined) && name) throw new Error('lazy auth list takes no credential argument.');
 
   switch (sub) {
     case undefined:
     case 'list':
-      await listView(root);
+      await listView(root, setName);
       break;
+    case 'use': {
+      if ((!name && !none) || (name && none)) throw new Error('Use lazy auth use <set> or lazy auth use --none.');
+      const binding = await bindCredentialSet(root, none ? null : name!);
+      console.log(`Credential set: ${binding.set ?? 'none'}; binding changed ${binding.updatedAt}`);
+      console.log('If the daemon already loaded an Anthropic credential, restart it to switch: lazy daemon restart');
+      break;
+    }
     case 'set':
-      await setView(root, args[1], args.slice(2));
+      await setView(root, name, rest, setName, kind);
       break;
     case 'import':
-      await importView(root, args[1], args.slice(2));
+      await importView(root, name, rest, setName);
       break;
     case 'refresh':
-      await refreshView(root, args[1]);
+      await refreshView(root, name);
       break;
     case 'rm':
     case 'remove':
-      await removeView(root, args[1]);
+      await removeView(root, name, setName);
       break;
     default:
       console.error(`Unknown subcommand: auth ${sub}`);
@@ -678,6 +721,12 @@ Subcommands:
                      to age out mid-turn. A renewal RETIRES the token it used, so
                      do not run it idly.
   rm <name>          Remove the stored credential (the environment is untouched).
+  use <set>          Bind this project to an existing credential set.
+  use --none         Remove the binding (its change time remains visible).
+
+Options:
+  --set <name>       Use a shared set with set, import, list or remove.
+                     Secrets stay in the selected backend; bindings stay outside git.
 
 Providers: ${PROVIDERS.join(', ')}
 
@@ -709,6 +758,10 @@ Examples:
   lazy auth import codex-subscription          # same thing, named by agent profile
   lazy auth refresh chatgpt                    # prove the renewal works now
   lazy auth rm anthropic
+  lazy auth set openai --set personal
+  lazy auth use personal
+  lazy auth list --set personal
+  lazy auth use --none
 
 Human/CLI-only — agents must never write credentials, so there is no MCP tool.`);
 }

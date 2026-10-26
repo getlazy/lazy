@@ -112,6 +112,7 @@ export interface CredentialLocation {
    * store's index; null when absent.
    */
   source: 'env' | 'store' | null;
+  setName?: string;
   /** The env var NAME or the store backend id. Null when absent. */
   via: string | null;
   /**
@@ -122,7 +123,8 @@ export interface CredentialLocation {
    * between spending a subscription someone has already paid for and spending
    * metered credit, and nothing else a user checks before launching says which
    * one they are on. Known only for the STORE, whose non-secret index records it;
-   * an env var carries a bare value with no kind attached.
+   * an exported env var carries a bare value with no kind attached. A set
+   * credential hydrated into the daemon's environment retains its recorded kind.
    */
   kind: CredentialKind | null;
   /**
@@ -165,12 +167,10 @@ export async function locateProfileCredential(
     // opens no backend. An env-sourced credential has no kind to report: the
     // variable carries a bare value and says nothing about its form.
     //
-    // ...except on the DEGRADED path, where the resolver has already said which
-    // kind is being served and the index describes a record the backend will
-    // not hand over. Reading the index unconditionally there printed the new
-    // entry's kind beside "store UNREADABLE" — a report describing one
-    // credential while every request spends another.
-    if (located.stale) return { present: true, ...located, kind: located.kind ?? null };
+    // A degraded copy or a set credential loaded into the daemon's startup
+    // environment already names the served kind. The current index can describe
+    // a different credential, so never replace the loaded copy's metadata.
+    if (located.stale || located.kind) return { present: true, ...located, kind: located.kind ?? null };
     const stored = located.source === 'store' ? await credentialPresence(lazyRoot, credential) : null;
     return { present: true, ...located, kind: stored?.kind ?? null };
   }

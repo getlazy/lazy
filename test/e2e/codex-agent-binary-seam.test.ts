@@ -216,7 +216,10 @@ describe('codex turns through the fake-binary seam', () => {
     // Bypass permission mode → codex's own sandbox off; lazy only sets this
     // where the process is already isolated, which is what this seam runs as.
     expect(argv).toContain('--dangerously-bypass-approvals-and-sandbox');
-    // A task with no model runs Codex's declared default, passed explicitly.
+    // INVARIANT: an omitted task model runs lazy's current Codex default,
+    // passed explicitly so Codex's own default cannot select an older model.
+    expect(CODEX_LATEST_MODEL).toBe('gpt-6.1-sol');
+    expect(argv).toContain('-m');
     expect(argv[argv.indexOf('-m') + 1]).toBe(CODEX_LATEST_MODEL);
     // Fresh exec reads the full prompt from closed stdin.
     expect(argv).not.toContain('Do the codex thing');
@@ -274,4 +277,36 @@ describe('codex turns through the fake-binary seam', () => {
     expect(second[second.length - 1]).toBe('-');
   }, 180_000);
 
+
+  // INVARIANT (engineer, 2026-10-24: Ask on every harness): `lazy ask` on a
+  // Codex task resumes the agent's own thread read-only and answers. On this
+  // (host-process) runner Codex's native read-only sandbox is the boundary; in
+  // a container lazy enforces read-only instead (docs/codex-readonly-turns.md).
+  test('an ask resumes the thread read-only and answers', async () => {
+    const taskId = await createTask(ctx, 'Codex ask contract', 'Work then answer');
+    const thread = '01a00000-0000-7000-8000-00000000a5k1';
+    await ctx.setCodexScenario({
+      sequence: [
+        codexSuccessScenario({
+          sessionId: thread,
+          result: 'Work turn done.',
+          commit: { message: 'Codex work', files: [{ path: 'codex-ask.txt', content: 'w\n' }] },
+        }),
+        codexSuccessScenario({ sessionId: thread, result: 'CODEX-ASK-ANSWER' }),
+      ],
+    });
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const answer = await ctx.lazy(['ask', taskId, '-m', 'What did you do?']);
+    expectSuccess(answer);
+    expect(answer.stdout).toContain('CODEX-ASK-ANSWER');
+    const ask = (await turnInvocations()).at(-1)!.argv;
+    expect(ask.slice(0, 2)).toEqual(['exec', 'resume']);
+    expect(ask).toContain(thread);
+    expect(ask).toContain('sandbox_mode="read-only"');
+    expect(ask).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+  }, 180_000);
 });

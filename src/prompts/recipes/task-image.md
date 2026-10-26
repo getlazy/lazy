@@ -108,6 +108,13 @@ sudo apt-get update && sudo apt-get install -y <package>
 Say in your report that you did, and that the installation in this container is
 temporary — the image change is what makes it permanent.
 
+## Services' data
+
+A database or other service the task runs keeps its data in `$LAZY_TASK_DATA`
+(`/lazy/data`), not in the worktree: that directory survives the container
+being recreated and is never in git. For example
+`initdb -D "$LAZY_TASK_DATA/postgres"`.
+
 ## 5. Report it
 
 Tell the human, plainly:

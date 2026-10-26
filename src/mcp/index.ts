@@ -23,13 +23,15 @@ import {
   mcpToolsetFromFlags,
   type McpToolset,
 } from './tool-access';
-import { isToolCapabilityGranted, isToolForRole, roleForTaskId, type McpCapability, type McpRole } from './tool-roles';
+import { isToolCapabilityGranted, isToolForMemberPair, isToolForRole, roleForTaskId, type McpCapability, type McpRole } from './tool-roles';
 import { definitionForRole } from './tool-surface';
 import type { McpTool, McpToolHandler } from './types';
 import mcpServerInstructions from '../prompts/mcp-server-instructions.md' with { type: 'text' };
 
 /** Options shared by every MCP server entry point. */
 export interface McpServerOptions {
+  /** Narrow discovery for a member's Pair/Chat; the daemon enforces authority. */
+  memberPair?: boolean;
   /**
    * Capabilities the daemon granted this caller in its MCP config. A gated
    * tool is registered either way (its handler refuses) but advertised only
@@ -126,7 +128,9 @@ export function registerTools(
     }
     const handler = handlers.get(tool.name);
     if (handler) {
-      server.registerTool(definitionForRole(tool, role), handler, { advertise: isToolForRole(tool.name, role) });
+      server.registerTool(definitionForRole(tool, role), handler, {
+        advertise: isToolForRole(tool.name, role) && (!opts?.memberPair || isToolForMemberPair(tool.name)),
+      });
     }
   }
   // Capability tools: registered whenever a handler exists (so a stale call
@@ -142,7 +146,7 @@ export function registerTools(
     }
     const handler = handlers.get(tool.name);
     if (!handler) continue;
-    const advertise = role === 'agent' && isToolCapabilityGranted(tool.name, opts?.capabilities);
+    const advertise = !opts?.memberPair && role === 'agent' && isToolCapabilityGranted(tool.name, opts?.capabilities);
     server.registerTool(tool, handler, { advertise });
   }
 }
@@ -229,6 +233,7 @@ export async function startMcpServerDaemonProxy(
     toolset,
     role: opts?.role ?? roleForTaskId(config.taskId),
     capabilities: config.capabilities ?? [],
+    memberPair: config.memberPair === true,
   });
 
   // Run the server (blocks until stdin closes)

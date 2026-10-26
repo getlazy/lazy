@@ -29,6 +29,7 @@ export const TASK_TAB_SLUGS = [
   'changes',
   'verify',
   'turns',
+  'chat',
   'commits',
   'reviews',
   'subtasks',
@@ -167,6 +168,7 @@ const TAB_LABELS: Record<TaskTabId, string> = {
   changes: 'Changes',
   verify: 'Verify',
   turns: 'Turns',
+  chat: 'Chat',
   commits: 'Commits',
   reviews: 'Reviews',
   subtasks: 'Subtasks',
@@ -189,7 +191,7 @@ const TAB_LABELS: Record<TaskTabId, string> = {
  * the diff itself (Changes). Regions used to be a strip buried at the top of
  * Changes, which put the map after the territory.
  *
- * Sixteen tabs, nine digit keys (1–9). Services, Reviews, Commits, Comments,
+ * Seventeen tabs, nine digit keys (1–9). Services, Reviews, Commits, Comments,
  * Journal, Artifacts and Stats have no number — less visited than Shell / Current review,
  * and `[` / `]` still reach them. Keys stay stable when Shell is hidden (its
  * index is reserved).
@@ -204,6 +206,7 @@ export const TASK_TAB_ORDER: readonly TaskTabId[] = [
   'regions',
   'changes',
   'turns',
+  'chat',
   'commits',
   'reviews',
   'subtasks',

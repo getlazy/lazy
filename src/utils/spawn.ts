@@ -64,6 +64,26 @@ function diagnoseEnoent(
 }
 
 /**
+ * A child with no explicit `env` inherits the CURRENT `process.env`.
+ *
+ * Bun.spawn's own default is the environment the process STARTED with: a
+ * variable set on `process.env` at runtime never reaches a child that was not
+ * handed `env` explicitly (verified on Bun 1.4.3). A managed daemon is handed
+ * a member's forge token at runtime (`putForgeCredential`) and its git
+ * credential helper reads it from the child's environment, so with Bun's
+ * default a replaced token would reach nothing until a restart.
+ */
+function withLiveEnv<T extends { env?: unknown }>(options: T): T {
+  if (options.env !== undefined) return options;
+  // LAZY_IS_DAEMON is set by the daemon on ITSELF at runtime (src/daemon/
+  // server.ts) to stop it RPC-ing itself. Under Bun's startup-snapshot default
+  // no child ever inherited it; a lazy subprocess that did would switch off its
+  // own daemon RPC (tryRpc, requireDaemonStorage). Keep it that way.
+  const { LAZY_IS_DAEMON: _daemonOnly, ...env } = process.env;
+  return { ...options, env };
+}
+
+/**
  * Drop-in replacement for Bun.spawn that produces clear error messages on ENOENT
  * and enforces a default subprocess timeout.
  *
@@ -97,11 +117,11 @@ export function spawn<
   // support a native `timeout`, but we own the timer so the DEFAULT applies
   // uniformly (including when the caller passes no options at all) and so the
   // behaviour does not shift under us across Bun versions.
+  // Every other option — `detached` (own session via setsid, so a terminal's
+  // Ctrl+C or hangup never reaches the child) included — goes to Bun as given.
   const timeout = (options as any)?.timeout ?? DEFAULT_SUBPROCESS_TIMEOUT_MS;
-  const bunOptions = options ? { ...options } : undefined;
-  if (bunOptions) {
-    delete (bunOptions as any).timeout;
-  }
+  const bunOptions = withLiveEnv({ ...(options ?? {}) } as Record<string, unknown>);
+  delete bunOptions.timeout;
 
   try {
     const proc = Bun.spawn(cmd, bunOptions as any);
@@ -122,7 +142,7 @@ export function spawn<
     return proc as Bun.Subprocess<In, Out, Err>;
   } catch (err: unknown) {
     if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-      const diagnosis = diagnoseEnoent(cmd, bunOptions ?? {});
+      const diagnosis = diagnoseEnoent(cmd, bunOptions);
       if (diagnosis) {
         throw new Error(diagnosis, { cause: err });
       }
@@ -151,7 +171,7 @@ function spawnSyncImpl(cmd: string[], options: Record<string, unknown>): any {
   assertArgvSafe(cmd, cmd[0]);
 
   try {
-    return Bun.spawnSync(cmd, options as any);
+    return Bun.spawnSync(cmd, withLiveEnv(options) as any);
   } catch (err: unknown) {
     if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
       const diagnosis = diagnoseEnoent(cmd, options);

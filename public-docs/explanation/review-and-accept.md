@@ -1,5 +1,17 @@
 # Review and accept
 
+```mermaid
+%% caption: Review can return feedback; accept checks conditions, merges the branch, then retries follow-through work
+flowchart LR
+  Work[Task work] --> Review[Review task diff]
+  Review -->|feedback| Work
+  Review -->|accept| Gate[Check approvals and conditions]
+  Gate --> Merge[Merge task branch]
+  Merge --> Complete[Task complete]
+  Complete --> Follow[Push and cleanup retries]
+```
+
+
 Lazy puts a review between an agent's work and your branch, and makes the merge itself a single, recoverable step. This page explains why, and what you can rely on.
 
 ## Why it exists
@@ -21,6 +33,18 @@ lazy create --goal "…" --review separate
 | `off` | Nobody |
 
 A review is recorded on the task in the same shape in every mode. Whether it holds your accept is set by `[review] gate`, which takes `auto` (the mode decides), `always` or `never`. A review you ask for yourself with `lazy review` always counts. The reasoning behind the default and the cost trade-offs are in [the review paradigm](../review-paradigm.md); the phases of the default mode are in [the low-high loop](../low-high-loop.md); the separate reviewer is described in [agent reviews](../review.md). Review turns are read-only: they report, they do not change the branch.
+
+In Lazy Teams, a project admin sets the default on **Settings → Configuration**.
+For example:
+
+```toml
+[review]
+mode = "low_high"
+gate = "auto"
+```
+
+The writing agent reviews its work before it finishes, and the review mode
+decides whether a finding holds the merge.
 
 ## What accept checks first
 

@@ -75,6 +75,8 @@ export interface TaskShowData {
     failureReason?: string;
     /** Delay before the next attempt (ms), when the supervisor has scheduled one. */
     nextDelayMs?: number;
+    nextRetryAt?: string;
+    recoveryDeadline?: string;
   } | null;
   orphanStatus: OrphanCheckResult | null;
   autoReactStatus: { paused: boolean; reason: string | null; counts: Record<AutoReactTrigger, number>; consecutiveAutoTurns: number } | null;
@@ -174,6 +176,8 @@ export async function loadTaskShowData(
         failureClass: status.retry_failure_class,
         failureReason: status.retry_failure_reason,
         nextDelayMs: status.retry_next_delay_ms,
+        nextRetryAt: status.retry_next_at,
+        recoveryDeadline: status.retry_recovery_deadline,
       };
     }
 

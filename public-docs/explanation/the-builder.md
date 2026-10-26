@@ -8,7 +8,7 @@ A task's agent works on one task, in its own worktree, and can only change that 
 
 ## How it works
 
-The builder is an interactive Claude Code session started with lazy's builder instructions added to the system prompt. Your `CLAUDE.md` and `AGENTS.md` are not modified. It has no current task, and it reaches tasks through the same `lazy_*` tools task agents use (see [MCP tools](../mcp-tools.md)); every task operation goes through the daemon.
+The builder is an interactive Claude Code or Codex session started with lazy's builder instructions added to the system prompt. Your `CLAUDE.md` and `AGENTS.md` are not modified. It has no current task, and it reaches tasks through the same `lazy_*` tools task agents use (see [MCP tools](../mcp-tools.md)); every task operation goes through the daemon.
 
 It is deliberately limited in what it can touch:
 
@@ -39,7 +39,7 @@ Use the builder to decide and direct; use a cluster to hand off a defined pile o
 
 ## In each surface
 
-- **CLI:** `lazy builder` starts a session; `lazy builder --resume <id>` resumes one and `lazy builder list` lists earlier conversations.
+- **CLI:** `lazy builder` starts a session; `lazy builder --agent codex-subscription` selects Codex; `lazy builder --resume <id>` resumes one and `lazy builder list` lists earlier conversations.
 - **Daemon dashboard:** the **Builders** page lists and shows captured conversations. It does not start a builder. Each captured conversation is one row:
 
   ![The dashboard Builders page: a line explaining that past dialogues with the project's builder are captured as they happen, a search box, and a table with one builder conversation (id, started, ended, turns, title).](../images/dashboard/builders.png)
@@ -49,5 +49,7 @@ Use the builder to decide and direct; use a cluster to hand off a defined pile o
   ![The Lazy Teams Builders page. A Start a new builder button with a count of your running builders, a Your builders list with two running builders each offering Open and Stop, a transcript search box, and a list of every builder with its status.](../images/teams/teams-builders.png)
 
 ## Limits
+
+Codex builders use your Codex profile’s credential and keep that profile when resumed. Review-conversation replies still require a Claude Code builder profile. See [Codex builders](../how-to/use-a-builder.md#codex-builders) for permissions, runners and resume commands.
 
 - The builder cannot write to your repository and cannot hand files to task agents; to change code, create a task.

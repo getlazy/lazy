@@ -44,12 +44,8 @@ export function actionDialogChromeHtml(): string {
 /**
  * A button that opens the shared dialog onto `verb`'s template.
  *
- * `disabledReason` draws a disabled button with a title — same predicate
- * the POST route will refuse, so the page never offers a click the daemon
- * would 409. With `reenableable: true` the button keeps `data-lz-action-open`
- * so a live poll can clear `disabled` later without rewriting the markup
- * (Current review's Unblock / Accept busy gate). `extraAttrs` is raw
- * attribute text (already escaped) appended to the button.
+ * A refusal keeps the action clickable and displays the server's answer in
+ * place. The action hook stays attached so a fresh page can offer it again.
  */
 export function actionDialogButtonHtml(opts: {
   verb: string;
@@ -58,7 +54,7 @@ export function actionDialogButtonHtml(opts: {
   disabledReason?: string | null;
   primary?: boolean;
   extraClass?: string;
-  /** Keep data-lz-action-open while disabled so JS can re-enable in place. */
+  /** Retained for callers that refresh action availability in place. */
   reenableable?: boolean;
   /** Extra attribute text, e.g. `data-rv-busy-gate`. Caller escapes values. */
   extraAttrs?: string;
@@ -69,16 +65,9 @@ export function actionDialogButtonHtml(opts: {
     opts.extraClass ?? '',
   ].filter(Boolean).join(' ');
   const extra = opts.extraAttrs ? ` ${opts.extraAttrs}` : '';
-  // Hard-disabled: no open hook — the verb is unavailable for this page load
-  // (Sync while working, etc.). Soft-disabled (`reenableable`) keeps the hook
-  // so a status poll can flip the button without a reload.
-  if (opts.disabledReason && !opts.reenableable) {
-    return `<button type="button" class="${escapeAttr(cls)}" disabled title="${escapeAttr(opts.disabledReason)}"${extra}>${escapeHtml(opts.label)}</button>`;
-  }
-  const titleText = opts.disabledReason ?? opts.title;
-  const title = titleText ? ` title="${escapeAttr(titleText)}"` : '';
-  const disabled = opts.disabledReason ? ' disabled' : '';
-  return `<button type="button" class="${escapeAttr(cls)}" data-lz-action-open="${escapeAttr(opts.verb)}" data-lz-action-title="${escapeAttr(opts.title ?? opts.label)}"${title}${disabled}${extra}>${escapeHtml(opts.label)}</button>`;
+  const title = opts.title ? ` title="${escapeAttr(opts.title)}"` : '';
+  const refusal = opts.disabledReason ? ` data-control-refusal="${escapeAttr(opts.disabledReason)}"` : '';
+  return `<button type="button" class="${escapeAttr(cls)}" data-lz-action-open="${escapeAttr(opts.verb)}" data-lz-action-title="${escapeAttr(opts.title ?? opts.label)}"${title}${refusal}${extra}>${escapeHtml(opts.label)}</button>`;
 }
 
 /**
@@ -365,7 +354,7 @@ export function actionDialogScript(): string {
       return;
     }
     if (snap.status === 'failed') {
-      if (retrySubmit) { retrySubmit.disabled = false; retrySubmit = null; }
+      if (retrySubmit) { retrySubmit.removeAttribute('aria-busy'); retrySubmit = null; }
       var remedy = snap.remedy;
       if (remedy && remedy.uiAction === 'passphrase') {
         // The failed step already carries the gate text. Showing it again in
@@ -484,7 +473,7 @@ export function actionDialogScript(): string {
 
   document.addEventListener('click', function (e) {
     var btn = e.target && e.target.closest ? e.target.closest('[data-lz-action-open]') : null;
-    if (!btn || btn.disabled) return;
+    if (!btn || btn.getAttribute('aria-busy') === 'true') return;
     e.preventDefault();
     openAction(btn.getAttribute('data-lz-action-open'), btn.getAttribute('data-lz-action-title') || btn.textContent, btn);
   });
@@ -551,7 +540,7 @@ export function actionDialogScript(): string {
     hideRemedy();
     var submit = submitter || form.querySelector('[type=submit]');
     retrySubmit = form.hasAttribute('data-lz-action-retry') ? submit : null;
-    if (submit) submit.disabled = true;
+    if (submit) submit.setAttribute('aria-busy', 'true');
     setRunning(true);
     hideBodyForms();
     if (stepsEl) {
@@ -580,7 +569,7 @@ export function actionDialogScript(): string {
           location.assign(res.body.redirect || ('/tasks/' + encodeURIComponent(res.body.taskId)));
           return;
         }
-        if (submit) submit.disabled = false;
+        if (submit) submit.removeAttribute('aria-busy');
         showError((res.body && (res.body.error || res.body.message)) || ('Request failed (' + res.status + ')'));
         return;
       }
@@ -588,7 +577,7 @@ export function actionDialogScript(): string {
       if (!runId) {
         setRunning(false);
         showBodyForms();
-        if (submit) submit.disabled = false;
+        if (submit) submit.removeAttribute('aria-busy');
         showError('The server did not start an action run.');
         return;
       }
@@ -602,12 +591,12 @@ export function actionDialogScript(): string {
       var when = form.getAttribute && form.getAttribute('data-lz-action-when');
       if (when) {
         // The POST may have created the task before the response dropped.
-        // Leave the button disabled; refresh to try again after checking Tasks.
+        // Keep the request busy; refresh to try again after checking Tasks.
         showError((err.message || 'Could not start the action.') +
           ' If a task was created, do not submit again — open the Tasks list.');
         return;
       }
-      if (submit) submit.disabled = false;
+      if (submit) submit.removeAttribute('aria-busy');
       showError(err.message || 'Could not start the action.');
     });
   });

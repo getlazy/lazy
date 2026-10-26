@@ -71,6 +71,11 @@ const UNCOMPLETED_FLAGS: Record<string, Array<{ flag: string; why: string }>> = 
     // flag that does nothing.
     { flag: 'post', why: 'retired no-op, registered only to explain that lazy does not post reviews to a PR' },
   ],
+  'shell': [
+    // The ProxyCommand an `--ssh-config` block runs, never typed by a person.
+    { flag: 'stdio', why: 'hidden: the ssh ProxyCommand mode `--ssh-config` writes' },
+    { flag: 'root', why: 'hidden: anchors the ProxyCommand to its clone; only meaningful with --stdio' },
+  ],
   'start': [
     // Both registered only so a retired spelling gets a message naming its
     // replacement instead of a generic "unknown flag". Offering either for

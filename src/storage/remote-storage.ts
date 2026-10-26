@@ -1,3 +1,6 @@
+import type { StoredImageBuild, StoredImageBuildLogPage } from './image-build';
+import type { DiskSpaceState } from './disk-space-state';
+import type { TerminalCleanupState } from './terminal-cleanup-state';
 /**
  * RemoteStorage — Storage proxy that routes all calls through the daemon.
  *
@@ -107,6 +110,18 @@ export class RemoteStorage implements Storage {
     // No-op: the daemon's Storage instance is already initialized.
   }
 
+  async checkOwnership(): Promise<void> {
+    // The serving daemon checked ownership before opening its store.
+  }
+
+  async claimOwnership(): Promise<void> {
+    throw new Error('Store ownership is controlled by daemon startup, never by a remote client.');
+  }
+
+  async rehomeOwnership(_previousProject: string): Promise<void> {
+    throw new Error('Store re-homing requires a local operator and a stopped daemon.');
+  }
+
   async close(): Promise<void> {
     // No-op: the daemon owns the Storage lifecycle.
   }
@@ -143,6 +158,10 @@ export class RemoteStorage implements Storage {
 
   async listTasks(): Promise<Task[]> {
     return this.call<Task[]>('listTasks');
+  }
+
+  async listTasksStrict(): Promise<Task[]> {
+    return this.call<Task[]>('listTasksStrict');
   }
 
   async listTasksWithOptions(options: ListTasksOptions): Promise<Task[]> {
@@ -868,6 +887,28 @@ export class RemoteStorage implements Storage {
   }
 
   // --- Builder Resume Intents (durable upgrade↔builder handshake) ---
+
+  async listImageBuilds(): Promise<StoredImageBuild[]> { throw new Error('Image build history is daemon-owned; use imageBuildLog.'); }
+  async saveImageBuild(_build: StoredImageBuild): Promise<void> { throw new Error('Image build history is daemon-owned.'); }
+  async appendImageBuildLog(_id: string, _lines: string): Promise<void> { throw new Error('Image build history is daemon-owned.'); }
+  async readImageBuildLog(_id: string, _after: number, _limit: number): Promise<StoredImageBuildLogPage> { throw new Error('Image build history is daemon-owned; use imageBuildLog.'); }
+  async pruneImageBuildLogs(_keep: number): Promise<void> { throw new Error('Image build history is daemon-owned.'); }
+
+  async getDiskSpaceState(): Promise<DiskSpaceState | null> {
+    throw new Error('Disk recovery state is daemon-owned; use diskSpace for diagnostics.');
+  }
+
+  async getTerminalCleanupState(): Promise<TerminalCleanupState | null> {
+    throw new Error('Finished-task cleanup is daemon-owned; use diskSpace for diagnostics.');
+  }
+
+  async saveTerminalCleanupState(_state: TerminalCleanupState): Promise<void> {
+    throw new Error('Finished-task cleanup state cannot be written remotely.');
+  }
+
+  async saveDiskSpaceState(_state: DiskSpaceState): Promise<void> {
+    throw new Error('Disk recovery state is daemon-owned and cannot be written remotely.');
+  }
 
   async getProjectSettings(): Promise<ProjectSettings | null> {
     return this.call<ProjectSettings | null>('getProjectSettings', {});

@@ -10,11 +10,10 @@
  * (`planTurnCredential` with a `spender`). It is minted for the container and
  * revoked when the container is removed.
  *
- * ALWAYS the member's credential, on Anthropic's own wire. The target is the
- * built-in Anthropic default, never a configured profile: a profile naming its
- * own credential is preferred over the member's placeholder
- * (`getLaunchAuthEnvVars` resolves the profile's slot first), so resolving one
- * here would let a member's `claude` spend the project's key under their name.
+ * The task's Claude Code profile selects its endpoint and tiers. The same
+ * planner as a member-launched turn binds its payer, and launch auth turns
+ * that binding into the profile's proxy grant. No project secret is read here.
+ * Shell on another harness retains the built-in Claude environment.
  *
  * Keyed per container, not per task: the binding registry holds one binding per
  * key, and a task's own turn binding is keyed by the task id — sharing it would
@@ -32,7 +31,7 @@
 
 import { randomBytes } from 'crypto';
 import { loadConfig } from '../config/loader';
-import { ANTHROPIC_DEFAULT_TARGET } from '../config/default-target';
+import { ANTHROPIC_DEFAULT_TARGET, roleTargetForProfile } from '../config/default-target';
 import { withLiveProxyTarget } from '../daemon/auth-env';
 import {
   planTurnCredential,
@@ -40,11 +39,27 @@ import {
   releaseTurnCredential,
   TurnCredentialUnavailableError,
   NO_OWNER_CREDENTIAL_MARKER,
+  sideLaunchCredentialProblem,
 } from '../daemon/turn-credentials';
 import { getLaunchAuthEnvVars } from '../capture/claude';
-import { revokeBuilderCredentialGrant, revokeGrantsByLabelPrefix } from '../proxy/credential-broker';
-import { revokeBindingsByKeyPrefix, setSessionBindingOrigin } from '../daemon/session-credentials';
+import { revokeBuilderCredentialGrant, revokeGrantsByLabelPrefix, pinGrantsToAddresses } from '../proxy/credential-broker';
+import { getTaskSessionBinding, revokeBindingsByKeyPrefix, setSessionBindingOrigin } from '../daemon/session-credentials';
+import { memberCredentialFor, memberProfileCredentialProblem } from '../daemon/member-credentials';
+import { profileForAgentName, profileForAgentNameOrNull, resolveAgentProfiles } from '../config/agent-profiles';
+import { teamModeEnabled } from '../daemon/user-credentials';
+import { targetEnvOverrides } from '../utils/role-target';
 import { logger } from '../utils/logger';
+import { MEMBER_SESSION_HARNESSES } from '../agent/interactive-modes';
+import { AGENT_KEY_ENV } from '../agent/credentials';
+import { codexLaunchEnvVars } from '../proxy/codex-route';
+import { cursorLaunchEnvVars } from '../proxy/cursor-route';
+import { piLaunchEnvVars, piCredentialMirror } from '../agent/pi-turn-config';
+import { DEFAULT_UPSTREAM_TIMEOUT_SECONDS } from '../proxy/upstream-defaults';
+import { getDaemonContext, hasDaemonContext } from '../daemon/context';
+import type { ResolvedConfig } from '../config/types';
+import type { AgentProfile } from '../config/agent-profiles';
+import { blockMemberBinding, MEMBER_EXEC_BINDING_PREFIX } from '../daemon/member-recovery';
+export { MEMBER_EXEC_BINDING_PREFIX } from '../daemon/member-recovery';
 
 /**
  * Why a member's terminal is refused for want of their own credential. Starts
@@ -58,8 +73,36 @@ export function memberCredentialMissingMessage(email: string): string {
   );
 }
 
-/** Every env var that can carry a model credential into Claude Code. */
-export const MEMBER_EXEC_CREDENTIAL_KEYS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'];
+/**
+ * The task's profile, when its harness can run in a member's own session
+ * (Claude Code, Codex, Cursor, Pi): the member's container is created with
+ * that profile's credential for the member, exactly as a turn the member
+ * launches would be, and every Pair/Chat exec refreshes it. Any other harness
+ * keeps Shell's plain Claude environment.
+ */
+export async function memberTerminalProfile(root: string, agentId?: string | null): Promise<string | undefined> {
+  const profile = profileForAgentNameOrNull(await loadConfig(root), agentId);
+  return profile && MEMBER_SESSION_HARNESSES.includes(profile.harness) ? profile.name : undefined;
+}
+
+/** Same member/profile gate as a turn, without allocating a binding during discovery. */
+export async function memberTerminalCredentialProblem(root: string, email: string, profile?: string): Promise<string | null> {
+  // Outside team mode a member must never inherit the daemon's service credential.
+  if (!(await teamModeEnabled(root))) return memberCredentialMissingMessage(email);
+  const problem = profile
+    ? await sideLaunchCredentialProblem(root, email, profile)
+    : await memberProfileCredentialProblem(root, email, resolveAgentProfiles(undefined).get('claude-code')!, await loadConfig(root));
+  return problem
+    ? `${problem} Connect the named endpoint in Lazy Teams under Connections (account, team, or project), then reopen the terminal.`
+    : null;
+}
+
+/**
+ * Every env var that can carry a model credential into an agent a member's
+ * session runs: Claude Code's (Pi reads the same ones) and the Codex and
+ * Cursor keys. Whichever the member's placeholder does not use is set EMPTY.
+ */
+export const MEMBER_EXEC_CREDENTIAL_KEYS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', ...Object.values(AGENT_KEY_ENV)];
 
 export interface MemberContainerCredential {
   /**
@@ -75,6 +118,30 @@ export interface MemberContainerCredential {
    * proxy refuses it from anywhere else. Throws when it cannot be pinned.
    */
   pinOrigin: (address: string) => Promise<void>;
+  /**
+   * The binding key ({@link memberExecBindingKey}), recorded on the container
+   * so a later daemon can re-adopt it. Absent: the container is never re-adopted.
+   */
+  key?: string;
+}
+
+/** The JIT grant label of one member container's credential. */
+export function memberTerminalGrantLabel(memberEmail: string, container: string): string {
+  return `${MEMBER_TERMINAL_GRANT_PREFIX}${memberEmail}:${container}`;
+}
+
+/**
+ * Revoke one member container's binding and grant. Never throws. A fresh
+ * container's `release`, and a re-adopted one's removal, both end here.
+ */
+export async function releaseMemberContainerCredential(root: string, key: string, label: string): Promise<void> {
+  blockMemberBinding(root, key);
+  await releaseTurnCredential(root, key);
+  try {
+    await revokeBuilderCredentialGrant(root, label);
+  } catch (err) {
+    logger.warn(`member terminal grant ${label} could not be revoked: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**
@@ -85,22 +152,94 @@ export function memberExecBindingKey(taskId: string): string {
   return `${MEMBER_EXEC_BINDING_PREFIX}${taskId}:${randomBytes(6).toString('hex')}`;
 }
 
-/** Every member container's binding key starts with this, and nothing else's does. */
-export const MEMBER_EXEC_BINDING_PREFIX = 'member-exec:';
 /** Every member container's JIT grant label starts with this, and nothing else's does. */
 export const MEMBER_TERMINAL_GRANT_PREFIX = 'member-terminal:';
 
+/** Refresh a reused container's Pair/Chat environment without rebinding its payer. */
+export async function memberContainerProfileEnv(opts: {
+  root: string; taskId: string; memberEmail: string; container: string; key: string; profile: string;
+}): Promise<string[]> {
+  const problem = await memberTerminalCredentialProblem(opts.root, opts.memberEmail, opts.profile);
+  if (problem) throw new Error(problem);
+  const binding = await getTaskSessionBinding(opts.root, opts.key);
+  if (!binding || binding.revokedAt !== null || binding.ownerUserId !== opts.memberEmail.trim().toLowerCase()) {
+    throw new Error('Your terminal credential is no longer active. Close this environment and reopen it.');
+  }
+  // The binding fixes the payer, not the current endpoint's auth form. A
+  // retained gateway container may now launch an Anthropic OAuth profile.
+  const config = await loadConfig(opts.root);
+  const profile = profileForAgentName(config, opts.profile, 'member terminal');
+  const credential = await memberCredentialFor(opts.root, binding.ownerUserId, profile, config);
+  if (credential.kind === 'missing') throw new Error(credential.detail);
+  const kind = credential.kind === 'credential' ? credential.record.kind : 'api-key';
+  const credEnv = credentialEnvForPlan({ mode: 'session', token: binding.token, kind, ownerUserId: binding.ownerUserId, kindChanged: false })!;
+  const env = await memberCredentialEnvironment(opts, credEnv);
+  if (binding.origin) await pinGrantsToAddresses(opts.root, memberTerminalGrantLabel(opts.memberEmail, opts.container), [binding.origin]);
+  return env.map(({ key, value }) => `${key}=${value}`);
+}
+
+async function memberCredentialEnvironment(opts: {
+  root: string; taskId: string; memberEmail: string; container: string; key: string; profile?: string;
+}, credEnv: Array<{ key: string; value: string }>): Promise<Array<{ key: string; value: string }>> {
+  const config = await loadConfig(opts.root);
+  const profile = opts.profile ? profileForAgentName(config, opts.profile, 'member terminal') : null;
+  const rawTarget = profile ? roleTargetForProfile(profile) : ANTHROPIC_DEFAULT_TARGET;
+  const target = await withLiveProxyTarget(rawTarget, config);
+  const identity = {
+    role: 'builder' as const, taskId: opts.taskId,
+    label: memberTerminalGrantLabel(opts.memberEmail, opts.container),
+    profile: rawTarget.profile, bindingKey: opts.key, projectRoot: opts.root,
+  };
+  const vars = targetEnvOverrides(await getLaunchAuthEnvVars(identity, target, { role: 'builder' }, 'container', credEnv));
+  if (profile) vars.push(...harnessSessionEnv(profile, config, vars));
+  const set = new Set(vars.map((v) => v.key));
+  return [...MEMBER_EXEC_CREDENTIAL_KEYS.filter((k) => !set.has(k)).map((k) => ({ key: k, value: '' })), ...vars];
+}
+
 /**
- * Revoke every member container's binding and grant. Run at DAEMON STARTUP:
- * a container's credential is otherwise revoked only when the daemon removes
- * the container, which a restart (every fleet roll) interrupts. No member
- * terminal survives a restart (its socket dies with the process, and the
- * startup sweep removes the containers too), so everything this matches is a
- * leftover.
+ * What a Codex, Cursor or Pi session needs beside its credential, the same
+ * values a task turn on that profile is launched with (src/capture/claude.ts):
+ * Codex's and Cursor's proxy endpoints (the Cursor one carries the session's
+ * own key placeholder) and Pi's provider and timeout settings plus the mirror
+ * of an OAuth placeholder into the variable Pi reads. Nothing for Claude Code.
+ * A member container runs on the container engine, so the proxy address is a
+ * container's.
  */
-export async function revokeLeftoverMemberTerminalCredentials(root: string): Promise<{ bindings: number; grants: number }> {
-  const bindings = await revokeBindingsByKeyPrefix(root, MEMBER_EXEC_BINDING_PREFIX);
-  const grants = await revokeGrantsByLabelPrefix(root, MEMBER_TERMINAL_GRANT_PREFIX);
+function harnessSessionEnv(
+  profile: AgentProfile,
+  config: ResolvedConfig,
+  vars: Array<{ key: string; value: string }>,
+): Array<{ key: string; value: string }> {
+  const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
+  const common = { harness: profile.harness, runnerType: 'docker' as const, proxyPort, bind: config.proxy.bind };
+  return [
+    ...codexLaunchEnvVars({ ...common, endpoint: profile.endpoint }),
+    ...cursorLaunchEnvVars({ ...common, token: vars.find((v) => v.key === AGENT_KEY_ENV.cursor)?.value ?? null }),
+    ...piLaunchEnvVars({
+      harness: profile.harness,
+      profile,
+      upstreamTimeoutMs: (config.proxy.upstreamTimeoutSeconds ?? DEFAULT_UPSTREAM_TIMEOUT_SECONDS) * 1000,
+    }),
+    ...(profile.harness === 'pi' ? piCredentialMirror(vars) : []),
+  ];
+}
+
+/**
+ * Revoke every member container's binding and grant except the ones `keep`
+ * names — those of the containers the startup sweep re-adopted
+ * (src/daemon/member-leftovers.ts), whose environment cannot be changed and
+ * whose placeholder must therefore keep resolving. Run at DAEMON STARTUP,
+ * after that sweep: a container's credential is otherwise revoked only when
+ * the daemon removes the container, which a restart (every fleet roll)
+ * interrupts, so everything else this matches belongs to a container that is
+ * gone.
+ */
+export async function revokeLeftoverMemberTerminalCredentials(
+  root: string,
+  keep: { bindingKeys: ReadonlySet<string>; grantLabels: ReadonlySet<string> } = { bindingKeys: new Set(), grantLabels: new Set() },
+): Promise<{ bindings: number; grants: number }> {
+  const bindings = await revokeBindingsByKeyPrefix(root, MEMBER_EXEC_BINDING_PREFIX, keep.bindingKeys);
+  const grants = await revokeGrantsByLabelPrefix(root, MEMBER_TERMINAL_GRANT_PREFIX, keep.grantLabels);
   return { bindings, grants };
 }
 
@@ -111,7 +250,11 @@ export async function planMemberContainerCredential(opts: {
   memberEmail: string;
   /** The container this credential is minted for — names its grant. */
   container: string;
+  /** Claude Code profile of the task, resolved by the daemon. */
+  profile?: string;
 }): Promise<{ ok: true; credential: MemberContainerCredential } | { ok: false; status: number; message: string }> {
+  const problem = await memberTerminalCredentialProblem(opts.root, opts.memberEmail, opts.profile);
+  if (problem) return { ok: false, status: 400, message: problem };
   const key = memberExecBindingKey(opts.taskId);
   let plan;
   try {
@@ -119,6 +262,7 @@ export async function planMemberContainerCredential(opts: {
       taskId: key,
       sessionId: opts.sessionId,
       spender: { email: opts.memberEmail },
+      ...(opts.profile ? { spenderProfile: opts.profile } : {}),
     });
   } catch (err) {
     if (err instanceof TurnCredentialUnavailableError) return { ok: false, status: 400, message: err.message };
@@ -135,36 +279,26 @@ export async function planMemberContainerCredential(opts: {
 
   // Should anything on the way ever placeholderize a real value, the JIT grant
   // it mints is labelled for this container and dies with it.
-  const label = `${MEMBER_TERMINAL_GRANT_PREFIX}${opts.memberEmail}:${opts.container}`;
+  const label = memberTerminalGrantLabel(opts.memberEmail, opts.container);
   let released = false;
   const release = async () => {
     if (released) return;
     released = true;
-    await releaseTurnCredential(opts.root, key);
-    try {
-      await revokeBuilderCredentialGrant(opts.root, label);
-    } catch (err) {
-      logger.warn(`member terminal grant ${label} could not be revoked: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    await releaseMemberContainerCredential(opts.root, key, label);
   };
 
   try {
-    const config = await loadConfig(opts.root);
-    const target = await withLiveProxyTarget(ANTHROPIC_DEFAULT_TARGET, config);
-    const identity = {
-      role: 'builder' as const,
-      taskId: opts.taskId,
-      label,
-      profile: ANTHROPIC_DEFAULT_TARGET.profile,
-      projectRoot: opts.root,
+    const env = await memberCredentialEnvironment({ ...opts, key }, credEnv);
+    return {
+      ok: true,
+      credential: {
+        env, release, key,
+        pinOrigin: async (address) => {
+          await setSessionBindingOrigin(opts.root, key, address);
+          await pinGrantsToAddresses(opts.root, label, [address]);
+        },
+      },
     };
-    const vars = await getLaunchAuthEnvVars(identity, target, { role: 'builder' }, 'container', credEnv);
-    const set = new Set(vars.map((v) => v.key));
-    const env = [
-      ...MEMBER_EXEC_CREDENTIAL_KEYS.filter((k) => !set.has(k)).map((k) => ({ key: k, value: '' })),
-      ...vars,
-    ];
-    return { ok: true, credential: { env, release, pinOrigin: (address) => setSessionBindingOrigin(opts.root, key, address) } };
   } catch (err) {
     await release();
     logger.warn(`member terminal credential could not be prepared: ${err instanceof Error ? err.message : String(err)}`);

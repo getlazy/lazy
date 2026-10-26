@@ -32,6 +32,7 @@ Start options:
   --foreground    Run in foreground (don't detach)
   --background    Run in background (default, explicit flag for auto-start)
   --project PATH  Explicit project root (default: auto-detect from cwd)
+  --yes           Suppress the ownership claim prompt; never claims a store
 
 status options:
   --json          Print the status as JSON

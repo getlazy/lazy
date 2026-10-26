@@ -1,22 +1,31 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { writeFileSync } from 'fs';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
 import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { seedFinal } from '../helpers/final';
+import { installFakeDocker } from '../helpers/fake-docker';
 
 describe('lazy reopen', () => {
   let ctx: TestContext;
+  let runtimeDir: string;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    runtimeDir = await mkdtemp(join(tmpdir(), 'lazy-reopen-runtime-'));
+    const docker = await installFakeDocker(runtimeDir);
+    // The module mock handles agent launches, but close/accept really ask the
+    // runtime to remove the environment. Keep that boundary deterministic too.
+    ctx = await setupTestLazy({ inheritedEnv: { ...process.env, PATH: `${docker.binDir}:${process.env.PATH ?? ''}` } });
     // Daemonless suite: nothing here can execute the pre-accept agent turn.
     disablePreAccept(ctx.root);
   });
 
   afterEach(async () => {
     await ctx.cleanup();
+    await rm(runtimeDir, { recursive: true, force: true });
   });
 
   test('reopens an abandoned task (no session)', async () => {

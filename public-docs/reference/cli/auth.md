@@ -27,6 +27,12 @@ Subcommands:
                      to age out mid-turn. A renewal RETIRES the token it used, so
                      do not run it idly.
   rm <name>          Remove the stored credential (the environment is untouched).
+  use <set>          Bind this project to an existing credential set.
+  use --none         Remove the binding (its change time remains visible).
+
+Options:
+  --set <name>       Use a shared set with set, import, list or remove.
+                     Secrets stay in the selected backend; bindings stay outside git.
 
 Providers: anthropic, chatgpt, cursor, fireworks, ollama, openai, openrouter
 
@@ -58,6 +64,10 @@ Examples:
   lazy auth import codex-subscription          # same thing, named by agent profile
   lazy auth refresh chatgpt                    # prove the renewal works now
   lazy auth rm anthropic
+  lazy auth set openai --set personal
+  lazy auth use personal
+  lazy auth list --set personal
+  lazy auth use --none
 
 Human/CLI-only — agents must never write credentials, so there is no MCP tool.
 ```

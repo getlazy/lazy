@@ -173,6 +173,17 @@ threshold and lazy stops starting turns on a credential whose subscription
 window is that full, until the window resets. `lazy stats limits` marks a
 paused credential `PAUSED`.
 
+In Lazy Teams, a project admin can set the threshold under **Settings →
+Configuration**:
+
+```toml
+[usage_pause]
+threshold_percent = 95
+```
+
+Once a subscription window reaches 95%, new turns using that credential wait
+until the window resets.
+
 ## Failure semantics
 
 Every failure is loud, per lazy's no-silent-fallback rule.

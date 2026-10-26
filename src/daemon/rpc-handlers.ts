@@ -88,7 +88,6 @@ import {
 } from './rpc-params';
 import { handleClearStartServicesCmd, handleClearStopServicesCmd, handleGetStartServicesCmd, handleSetStartServicesCmd, handleSetStopServicesCmd } from './serve-service';
 import { handleSetTeamsLinks } from './teams-links';
-import { mainServiceOf } from '../serve/ports';
 import { resolveProjectStartServicesCmd } from '../serve/start-cmd';
 import { parseTeamsServiceHostContext, parseTeamsServiceHostLabel, serviceForLabel, teamsServiceHostLabel } from '../serve/teams-host';
 import { taskHostLabel } from '../serve/subdomain';
@@ -139,6 +138,7 @@ import { getAuthEnvVars } from '../capture/claude';
 import { credentialFromEnv, profileCredentialRefusal } from './credential-gate';
 import { sessionCredentialEnvFor, turnCredentialProblem, TurnCredentialUnavailableError } from './turn-credentials';
 import { credentialLabel, requiredCredentials, requiredProviders } from '../credentials/providers';
+import { credentialOverrideReport } from '../credentials/store';
 import { locateProfileCredential } from '../agent/credentials';
 import type { DaemonCredentialEntry } from './auth-env';
 import { createStorage, resolveStorePath, type Storage, type StorageBackend } from '../storage';
@@ -176,6 +176,7 @@ import {
   buildNotesState,
   buildShowChunks,
   buildShowConversation,
+  buildShowChat,
   buildShowTurns,
   buildShowFinal,
   buildShowReviews,
@@ -207,6 +208,8 @@ import { revokeBuilderMcpToken } from './mcp-tokens';
 import { LOGIN_TICKET_TTL_MS, mintDashboardLoginTicket } from './dashboard-sessions';
 import { DASHBOARD_LOGIN_PARAM } from './dashboard-auth';
 import { isManagedMode } from '../config/managed';
+import { failingFollowThrough, readFollowThrough } from './accept-intent';
+import { shownPushFailure } from './push-failure';
 import { describeIdentity, resolveGitIdentity } from '../identity';
 import { actorEmail, actorName, actorRole, canonicalPersonEmail, isPersonEmail } from '../actor-ref';
 import { reviewerKey } from '../review-draft';
@@ -217,6 +220,8 @@ import {
   revokeDaemonTokens,
   lookupDaemonIdentity,
   lookupDaemonTokenLabel,
+  lookupDaemonTokenBuilderProfile,
+  BuilderProfileMismatchError,
   type ActorIdentity,
 } from './actor-tokens';
 import { runWithGitAuthor } from '../identity/git-author';
@@ -253,6 +258,7 @@ import {
 import { hasDaemonContext, getDaemonContext } from './context';
 import type { ProgressEmitter } from './progress';
 import { handleWatchProxyActivity } from './proxy-watch';
+import { codexProxyEnvVars } from '../proxy/codex-route';
 import { proxyBaseUrlForRunner, LOCAL_BACKEND_CREDS, resolveProfileLaunchCreds, resolveRoleTarget, roleTargetForProfile, targetEnvVars, teamModeLaunchCreds, usesSyntheticCreds, type LaunchSurface } from '../utils/role-target';
 import { isSessionPlaceholderToken } from './session-credentials';
 import { placeholderizeAuthEnv, type LaunchIdentity } from '../proxy/placeholder-env';
@@ -455,6 +461,7 @@ export async function getOrCreateStorage(): Promise<Storage> {
         storage = await createStorage(root, {
           backend: config.storage.backend as StorageBackend,
           externalPath: config.storage.external_path || undefined,
+          configuredPath: config.storage.configured_path,
         });
         // Acquire storage lock once and hold forever. The daemon is the sole writer
         // (CLI uses RemoteStorage, agents run in containers with their own data dir).
@@ -462,6 +469,14 @@ export async function getOrCreateStorage(): Promise<Storage> {
         storeLockPath = (storage as unknown as { lock?: { path?: string } }).lock?.path ?? null;
         stage('acquiring the storage lock');
         await (storage as any).lock?.acquireForLife?.();
+        // A local operator may have re-homed the store after initialize's
+        // short lock ended. Never publish a handle for the previous owner.
+        try {
+          await storage.checkOwnership();
+        } catch (err) {
+          await storage.close();
+          throw new Error(`Store ownership changed while the daemon was starting: ${err instanceof Error ? err.message : err}`, { cause: err });
+        }
       } catch (err) {
         // A restore owns the store — its marker appeared after startDaemon's own
         // check. The lock refused BEFORE touching the lock file (whose holder may
@@ -588,6 +603,10 @@ async function awaitStoreOpen(init: Promise<Storage>): Promise<Storage> {
 export async function closeAllStorage(): Promise<void> {
   if (daemonStorage) {
     logger.debug('Closing daemon storage...');
+    const { listImageBuildJobs } = await import('./image-build-job');
+    for (const result of await Promise.allSettled(listImageBuildJobs().map(job => job.flushArchive()))) {
+      if (result.status === 'rejected') logger.error('Image build archive could not be flushed before shutdown: ' + String(result.reason));
+    }
     try {
       // The owned instance: the borrowed one's close() is a no-op.
       await daemonOwnedStorage?.close();
@@ -623,6 +642,7 @@ export async function openProjectStorage(projectRoot: string): Promise<Storage> 
   return createStorage(projectRoot, {
     backend: config.storage.backend as StorageBackend,
     externalPath: config.storage.external_path || undefined,
+    configuredPath: config.storage.configured_path,
   });
 }
 
@@ -810,6 +830,11 @@ async function dispatchRpc(
     case 'dismissImageAdoptionFailure': return handleDismissImageAdoptionFailure(projectRoot);
     case 'imageBuildLog': return handleImageBuildLog(projectRoot, params, caller);
     case 'machineState': return handleMachineState(projectRoot, params, caller);
+    case 'machineNetworkCheck': return handleMachineNetworkCheck(projectRoot, params, caller);
+    case 'machineRestartPreview': return handleMachineRestartPreview(projectRoot, caller);
+    case 'diskSpace': return handleDiskSpace(projectRoot, params, caller, 'view');
+    case 'reclaimDiskSpace': return handleDiskSpace(projectRoot, params, caller, 'reclaim');
+    case 'acknowledgeDiskGrowth': return handleDiskSpace(projectRoot, params, caller, 'grown');
     case 'restartMachineService': return handleRestartMachineService(projectRoot, params, caller);
     case 'resetMachineDockerStorage': return handleResetMachineDockerStorage(projectRoot, params, caller);
     // Teams' way out of a failing Dockerfile.lazy: adopt a branch's or task's
@@ -845,6 +870,9 @@ async function dispatchRpc(
     // Both take `taskId` OR `runId` (a commit run, ./commit-run.ts).
     case 'serve.run': return runStartServices(projectRoot, serveSubjectParams(params), { progress });
     case 'serve.stop': return stopStartServices(projectRoot, serveSubjectParams(params));
+    // A task's tmux sessions and their output (./task-sessions.ts). Reads.
+    case 'taskSessions': return (await import('./task-sessions')).listTaskSessions(projectRoot, params);
+    case 'taskSessionOutput': return (await import('./task-sessions')).readTaskSession(projectRoot, params);
     // The product at one commit without a task (./commit-run.ts). Shapes for
     // clients: docs/design/run-any-commit.md.
     case 'listBranches': return (await import('./commit-run')).handleListBranches(projectRoot, params);
@@ -868,6 +896,7 @@ async function dispatchRpc(
     case 'listReparentTargets': return handleListReparentTargets(projectRoot, params);
     case 'taskEnv': return handleTaskEnv(projectRoot, params);
     case 'taskFiles': return handleTaskFiles(projectRoot, params);
+    case 'taskData': return handleTaskData(projectRoot, params);
     case 'taskEnvSeed': return handleTaskEnvSeed(projectRoot, params);
     case 'resumeTask': return handleResumeTask(projectRoot, params, progress);
     case 'syncTask': return handleSyncTask(projectRoot, params, progress);
@@ -929,11 +958,17 @@ async function dispatchRpc(
       return (await import('./builder-sessions')).handleEndBuilderSession(projectRoot, params);
     case 'attachSession':
       return (await import('./session-attach')).handleAttachSession(projectRoot, params);
+    case 'sshHostKey':
+      return (await import('./session-attach')).handleSshHostKey(projectRoot, params);
     case 'mintDashboardTicket': return handleMintDashboardTicket(projectRoot);
     case 'mintActorToken': return handleMintActorToken(projectRoot, params, caller);
     case 'revokeActorToken': return handleRevokeActorToken(projectRoot, params, caller);
     case 'putUserCredential': return handlePutUserCredential(projectRoot, params, caller);
     case 'revokeUserCredential': return handleRevokeUserCredential(projectRoot, params, caller);
+    case 'putForgeCredential': return handlePutForgeCredential(projectRoot, params, caller);
+    case 'revokeForgeCredential': return handleRevokeForgeCredential(projectRoot, caller);
+    case 'checkPushAccess': return handleCheckPushAccess(projectRoot, caller);
+    case 'forgeStatus': return handleForgeStatus(projectRoot, caller);
     case 'listUserCredentials': return handleListUserCredentials(projectRoot, caller);
     case 'checkUserCredential': return handleCheckUserCredential(projectRoot, params, caller);
     // Read-only, and answerable precisely when the answer is "nobody": this is
@@ -1558,6 +1593,9 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
   const reviews = buildShowReviews(data.turns, review);
   const chunks = buildShowChunks(data.turns);
   const conversation = buildShowConversation(data.turns);
+  // Built on every call, served or not: `counts.chat` is the section's whole
+  // size, so a caller can tell an empty Chat from one it did not ask for.
+  const chat = buildShowChat(data.turns, await storage.getTaskReviewComments(result.task.id));
   const final = buildShowFinal(data.turns);
   const fileViolations = await outstandingFileViolations(storage, result.task, projectRoot, data.turns);
   const turnBudgetMax = config.limits.max_turns_without_human;
@@ -1595,6 +1633,9 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
     // The same chunks read as person -> reply, mechanical turns labelled
     // (src/task/conversation.ts) — the default way a surface reads history.
     conversation: page('conversation', conversation),
+    // The person's words and the agent's answers to its asks, never lazy's
+    // framing (src/task/chat.ts) — what the task's Chat tab renders.
+    chat: page('chat', chat),
     reviews: page('reviews', reviews),
 
     /**
@@ -1642,6 +1683,7 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
       turns: data.turns.length,
       chunks: chunks.length,
       conversation: conversation.length,
+      chat: chat.length,
       commits: data.commits.length,
       comments: data.comments.length,
       journal: data.journal.length,
@@ -1678,6 +1720,35 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
      * a header. Never section-gated; null only when it cannot be resolved.
      */
     launchIdentity: await launchIdentityOf(storage, result.task, config),
+
+    /**
+     * Post-accept follow-through that is still owed and FAILED — a parent
+     * push, a PR close — with the forge's own error text, or null when nothing
+     * is failing. The ANSWER from the record the daemon retries from
+     * (src/daemon/accept-intent.ts), so a surface can say why accepted work has
+     * not reached the forge instead of "push failed". Never section-gated.
+     */
+    acceptFollowThrough: (() => {
+      const record = readFollowThrough(result.task!);
+      const failing = failingFollowThrough(record);
+      if (!record || !failing) return null;
+      return {
+        attempts: failing.attempts,
+        failingSteps: failing.steps,
+        pushPending: failing.pushPending,
+        lastError: failing.steps.map((s) => `${s.step}: ${s.error}`).join('; '),
+        done: record.done,
+        nextAttemptAt: record.nextAttemptAt ? new Date(record.nextAttemptAt).toISOString() : null,
+      };
+    })(),
+
+    /**
+     * The latest failed push of this task's branch (the push after a turn, or
+     * sync's) with the forge's own words — `{branch, error, attempts,
+     * firstFailedAt, lastFailedAt}` — or null once a push succeeds or the task is
+     * accepted, closed or rejected (src/daemon/push-failure.ts). Never section-gated.
+     */
+    pushFailure: shownPushFailure(result.task),
 
     /**
      * Which accept a reopen superseded (`{ accept_commit, reopened_at }`), or
@@ -3110,14 +3181,20 @@ async function imageStateAnswer<T extends Record<string, unknown>>(projectRoot: 
  */
 export async function handleRebuildRunnerImage(projectRoot: string, params: Record<string, unknown>) {
   const noCache = optionalBoolean(params, 'noCache') === true;
-  const { adoptionBuildStatus, dismissImageAdoptionFailure } = await import('./image-adoption');
-  const adoption = adoptionBuildStatus();
-  if (adoption.state === 'building') {
-    throw new RpcError(409, `An adoption of ${adoption.branch} is building; cancel it before rebuilding the project's image.`);
-  }
-  const { rebuildRunnerImage } = await import('./runner-image');
+  const { dismissImageAdoptionFailure } = await import('./image-adoption');
+  const { rebuildRunnerImage, runningImageBuildRefusal } = await import('./runner-image');
+  const refuseRunning = () => {
+    const busy = runningImageBuildRefusal();
+    if (busy) throw new RpcError(409, busy.message, 'image_build_running', { buildId: busy.buildId });
+  };
+  refuseRunning();
+  const { currentDiskSpaceManager } = await import('../docker/disk-space');
+  const hold = await currentDiskSpaceManager()?.buildRetryHold();
+  refuseRunning();
+  if (hold) throw new RpcError(409, hold, 'image_build_disk_hold');
   const r = await rebuildRunnerImage({ noCache });
-  if (!r.ok) throw new RpcError(409, r.message);
+  if (!r.ok) throw new RpcError(409, r.message, r.buildId ? 'image_build_running' : undefined,
+    r.buildId ? { buildId: r.buildId } : undefined);
   dismissImageAdoptionFailure();
   if (r.defaultBuild) {
     // A project on lazy's default image: the Rebuild is of that image, and its
@@ -3187,20 +3264,85 @@ export async function handleImageBuildLog(projectRoot: string, params: Record<st
   const limit = Math.min(2000, Math.max(1, Math.floor(optionalNumber(params, 'limit') ?? 500)));
   const waitMs = Math.min(25_000, Math.max(0, Math.floor(optionalNumber(params, 'waitMs') ?? 0)));
   const { findImageBuildJob } = await import('./image-build-job');
+  const storage = getDaemonProjectRoot() === projectRoot ? await getOrCreateStorage() : null;
+  const { redactAnswer } = await import('./observability-redaction');
+  if (optionalBoolean(params, 'list') === true) {
+    const { readImageBuildHistory } = await import('./image-build-job');
+    return redactAnswer(projectRoot, { builds: await readImageBuildHistory(storage, { flush: false }), logsKept: 20 });
+  }
   let job = buildId ? findImageBuildJob(buildId) : null;
-  if (buildId && !job) throw new RpcError(404, `No image build ${buildId} (builds are kept in memory; a daemon restart starts a fresh log).`);
+  if (job) await job.flushArchive();
+  if (buildId && !job) {
+    const stored = (storage ? await storage.listImageBuilds() : []).find(b => b.id === buildId);
+    if (!stored) throw new RpcError(404, 'No image build ' + buildId + '.');
+    const page = await storage!.readImageBuildLog(buildId, after, limit);
+    return redactAnswer(projectRoot, { build: { ...stored.build, ...(stored.build.outcome === 'running' ? { outcome: 'interrupted' } : {}) }, ...page, next: page.lines.at(-1)?.seq ?? after, logsRetained: stored.logsRetained });
+  }
   if (!job) {
     const { projectImageState } = await import('./image-state');
     const state = await projectImageState(projectRoot);
     const id = 'build' in state ? state.build?.id : undefined;
     job = (id ? findImageBuildJob(id) : null) ?? findImageBuildJob();
   }
-  const { redactAnswer } = await import('./observability-redaction');
   if (!job) return redactAnswer(projectRoot, { build: null, lines: [], firstSeq: 0, lastSeq: 0, next: after, truncatedBefore: false });
   await job.waitForLines(after, waitMs);
-  const page = job.read(after, limit);
+  await job.flushArchive();
+  const page = storage ? await storage.readImageBuildLog(job.id, after, limit) : job.read(after, limit);
   const next = page.lines.length > 0 ? page.lines[page.lines.length - 1].seq : Math.max(after, page.firstSeq - 1);
   return redactAnswer(projectRoot, { build: job.view(), ...page, next });
+}
+
+function requireMicrovmNetworkRead(caller: ActorIdentity, command: string) {
+  requireControlForMachineRead(caller, command);
+  if (!isManagedMode() || process.env.LAZY_MANAGED_BACKEND !== 'microvm') {
+    throw new RpcError(400, 'Network diagnostics and machine restart previews require a Lazy Teams microVM.');
+  }
+}
+
+export async function handleMachineNetworkCheck(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  requireMicrovmNetworkRead(caller, 'machineNetworkCheck');
+  const { checkMachineNetwork, networkHostname } = await import('./machine-network');
+  let hostname: string | undefined;
+  try { hostname = networkHostname(params.hostname); }
+  catch (error) { throw new RpcError(400, error instanceof Error ? error.message : String(error)); }
+  const { redactAnswer } = await import('./observability-redaction');
+  return redactAnswer(projectRoot, await checkMachineNetwork(hostname));
+}
+
+export async function handleMachineRestartPreview(projectRoot: string, caller: ActorIdentity) {
+  requireMicrovmNetworkRead(caller, 'machineRestartPreview');
+  const { machineRestartPreview } = await import('./machine-network');
+  const { findImageBuildJob } = await import('./image-build-job');
+  const { daemonRedactor, redactDeep } = await import('./observability-redaction');
+  const redactor = await daemonRedactor(projectRoot);
+  if (!redactor.complete) {
+    throw new RpcError(503, 'Cannot safely show running work because the credential registries could not be read. Ask the installation maintainer to repair them before retrying. Nothing has been restarted.');
+  }
+  return redactDeep({ ...await machineRestartPreview(), build: findImageBuildJob()?.view() ?? null }, redactor);
+}
+
+/** Disk operations stay on the control plane: member containers cannot prune
+ * their engine or erase a pending growth request. Rails authorizes project
+ * admins for safe reclaim and god mode for growth controls. */
+export async function handleDiskSpace(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity, operation: 'view' | 'reclaim' | 'grown') {
+  requireControlForMachineRead(caller, operation === 'view' ? 'diskSpace' : operation === 'reclaim' ? 'reclaimDiskSpace' : 'acknowledgeDiskGrowth');
+  const { currentDiskSpaceManager, DiskSpaceError } = await import('../docker/disk-space');
+  const { projectDiskSpace, reclaimProjectDiskSpace } = await import('./project-disk-space');
+  const storage = await getOrCreateStorage();
+  const manager = currentDiskSpaceManager();
+  try {
+    if (operation === 'view') return await projectDiskSpace(projectRoot, storage, params.recoveryOnly === true);
+    if (operation === 'grown') {
+      if (!manager) throw new RpcError(400, 'Disk growth is available only on this project’s private microVM engine.');
+      const generation = requireNumber(params, 'growthGeneration');
+      if (!Number.isSafeInteger(generation) || generation < 0) throw new RpcError(400, 'growthGeneration must be a nonnegative safe integer.');
+      return { acknowledged: await manager.acknowledgeGrowth(generation), buildHold: await manager.buildRetryHold() };
+    }
+    return await reclaimProjectDiskSpace(projectRoot, storage, requireString(params, 'planId'));
+  } catch (error) {
+    if (error instanceof DiskSpaceError) throw new RpcError(error.status, error.message);
+    throw error;
+  }
 }
 
 /** The machine's services, their recent logs and its resource use — read-only. */
@@ -3509,6 +3651,7 @@ export async function handleRejectTask(projectRoot: string, params: Record<strin
     taskId: requireString(params, 'taskId'),
     reason: requireString(params, 'reason'),
     acceptDirtyWorktree: optionalBoolean(params, 'acceptDirtyWorktree'),
+    endMemberSessions: optionalBoolean(params, 'endMemberSessions'),
     actor: optionalActorInput(params),
     onProgress: progress,
   };
@@ -3523,6 +3666,7 @@ export async function handleCloseTask(projectRoot: string, params: Record<string
     taskId: requireString(params, 'taskId'),
     reason: requireString(params, 'reason'),
     acceptDirtyWorktree: optionalBoolean(params, 'acceptDirtyWorktree'),
+    endMemberSessions: optionalBoolean(params, 'endMemberSessions'),
     actor: optionalActorInput(params),
     onProgress: progress,
   };
@@ -3694,8 +3838,7 @@ export async function handleServePorts(projectRoot: string, params: Record<strin
     }))
     : probed;
   // The service a PR/MR description links to (`[serve] main_service`, else the first).
-  const serveConfig = (await loadConfig(projectRoot)).serve;
-  const mainService = mainServiceOf(serveConfig.services, serveConfig.main_service)?.port ?? null;
+  const mainService = state.mainService ?? null;
   // Whether Start services is running in the container, and its output — read
   // from the container itself, only while it is up. null when nothing is
   // running or the container could not be asked ("not known"). It costs an
@@ -3712,7 +3855,7 @@ export async function handleServePorts(projectRoot: string, params: Record<strin
   if (state.containerRunning && optionalBoolean(params, 'includeServicesRun') === true) {
     servicesRun = await readServicesRunState(await containerBinaryFor(projectRoot, state.runnerType), state.containerName, undefined,
       logBytes !== undefined ? { logBytes } : {})
-      .then((run) => run && linkProcessesToServices(run, services))
+      .then((run) => run && linkProcessesToServices(run, services, mainService))
       .catch((err) => {
         logger.debug(`servePorts: could not read Start services in ${state.containerName}: ${err instanceof Error ? err.message : String(err)}`);
         return null;
@@ -4373,6 +4516,21 @@ export async function handleTaskEnvSeed(projectRoot: string, params: Record<stri
  * refused: [{ path, reason }] }) so a refusal (a path the branch tracks) is
  * visible to the caller now, not only at the next launch.
  */
+/**
+ * A task's persistent data directory ($LAZY_TASK_DATA, src/runner/task-data.ts):
+ * where it is inside the task's containers, whether it exists yet and its size.
+ * A read: never creates, chowns or removes it.
+ */
+export async function handleTaskData(projectRoot: string, params: Record<string, unknown>) {
+  const storage = await getOrCreateStorage();
+  const ref = requireString(params, 'taskId');
+  const resolved = await storage.resolveTask(ref);
+  if (!resolved.task) throw new RpcError(resolved.ambiguousMatches?.length ? 409 : 404, `Task not found: ${ref}`);
+  const task = resolved.task;
+  const { taskDataView } = await import('./task-data-view');
+  return taskDataView(projectRoot, task, await storage.getSessionByTaskId(task.id));
+}
+
 export async function handleTaskFiles(projectRoot: string, params: Record<string, unknown>) {
   const action = requireString(params, 'action');
   const subject = await resolveEnvSubject(projectRoot, params);
@@ -4660,13 +4818,31 @@ export async function handleGetDaemonMcpConfig(projectRoot: string, params: Reco
   if (ownerPid !== undefined && (!Number.isInteger(ownerPid) || ownerPid <= 0)) {
     throw new RpcError(400, `ownerPid must be a positive integer, got ${ownerPid}`);
   }
+  // The agent profile this builder session runs on, recorded on its token so
+  // every later launch-env refresh answers for the same profile
+  // (src/builder/builder-profile.ts). Validated here, at the boundary: an
+  // unknown name or a harness that cannot run a builder is a 400 naming why.
+  const requestedProfile = optionalString(params, 'profile');
+  let builderProfile: string | undefined;
+  if (requestedProfile !== undefined) {
+    const { resolveBuilderProfileName } = await import('../builder/builder-profile');
+    try {
+      builderProfile = resolveBuilderProfileName(await loadConfig(projectRoot), requestedProfile);
+    } catch (err) {
+      throw new RpcError(400, err instanceof Error ? err.message : String(err));
+    }
+  }
   try {
     // Builder identity: no task id. A builder token is refused on any
     // task-scoped MCP claim, and a task token is refused on the builder
     // surface — see src/daemon/mcp-tokens.ts.
-    const configPath = await writeDaemonMcpConfig(projectRoot, name, { kind: 'builder' }, { ownerPid });
+    const configPath = await writeDaemonMcpConfig(
+      projectRoot, name, { kind: 'builder' },
+      { ownerPid, ...(builderProfile !== undefined ? { builderProfile } : {}) },
+    );
     return { configPath };
   } catch (err) {
+    if (err instanceof BuilderProfileMismatchError) throw new RpcError(409, err.message);
     // Safety net: if writeDaemonMcpConfig hits an uninitialized daemon
     // context (web bind failed on startup), surface a 503 with a clear,
     // actionable message instead of the opaque "Daemon context not
@@ -4922,6 +5098,7 @@ export async function handleUsagePause(
       actor,
       peek: optionalBoolean(params, 'peek'),
       overrideUsagePause: optionalBoolean(params, 'overrideUsagePause'),
+      builderProfile: optionalString(params, 'builderProfile'),
     });
   }
   // The CLI pre-flight judges as its launch will: a caller that may not take
@@ -5187,6 +5364,11 @@ export async function handleRevokeUserCredential(
   // one connected for that agent profile.
   const profile = optionalString(params, 'profile');
   const revoked = await revokeUserCredential(projectRoot, userId, profile);
+  // Sent only for a member who LEFT the team: a credential revoked for any
+  // other reason leaves their running environments alone.
+  if (optionalBoolean(params, 'endEnvironments')) {
+    await (await import('../server/member-terminals')).endMemberEnvironmentsOf(userId);
+  }
   const what = profile ? `credential for agent profile "${profile}"` : 'credential';
   logger.info(
     revoked
@@ -5194,6 +5376,98 @@ export async function handleRevokeUserCredential(
       : `No stored ${what} for user ${userId} to revoke`,
   );
   return { revoked };
+}
+
+/**
+ * Replace the forge token this daemon pushes and opens PRs with
+ * (src/daemon/forge-credential.ts). Control-plane only: Rails resolves whose
+ * token a project acts with and pushes it here whenever that changes, so a
+ * replaced or newly connected token reaches a RUNNING project without a
+ * restart. Never logs the token.
+ */
+export async function handlePutForgeCredential(projectRoot: string, params: Record<string, unknown>, caller: ActorIdentity) {
+  requireControlActor(caller, 'putForgeCredential');
+  const { putForgeCredential, persistForgeCredential, isForgeKind, ensureForgeCredentialHelper } = await import('./forge-credential');
+  const kind = requireNonBlankString(params, 'kind');
+  if (!isForgeKind(kind)) throw new RpcError(400, `kind must be 'github' or 'gitlab'. Got '${kind}'.`);
+  const token = requireNonBlankString(params, 'token');
+  const source = optionalString(params, 'source') ?? 'user';
+  if (source !== 'user' && source !== 'integration') {
+    throw new RpcError(400, `source must be 'user' or 'integration'. Got '${source}'.`);
+  }
+  const handle = optionalString(params, 'handle');
+  // Kept across a restart nobody told Teams about (a shell `lazy daemon
+  // restart`): written BEFORE the environment changes, so a failed write is a
+  // refused push Teams retries rather than a token only this process holds.
+  await persistForgeCredential(projectRoot, { kind, token, handle, source });
+  const summary = putForgeCredential({ kind, token, handle, source });
+  logger.info(`Forge credential replaced: ${kind} ${source === 'user' ? `@${handle ?? '?'}` : 'integration'}`);
+  // git reads the token only through the clone's credential helper, which the
+  // fleet installs at start for a SEEDED token: a project started with none has
+  // no helper, so install it now or this token never reaches a push. A failure
+  // refuses the push (Teams retries it); the environment already holds the
+  // token, which is harmless and replaced by the retry.
+  const helper = await ensureForgeCredentialHelper(projectRoot, kind, { remote: (await loadConfig(projectRoot)).remote.git_remote });
+  if (helper.outcome === 'installed') logger.info(`Installed the ${kind} credential helper in the clone so git pushes with the new token`);
+  if (helper.outcome === 'skipped') logger.info(`No credential helper installed: ${helper.reason}`);
+  return { ...summary, credentialHelper: helper.outcome };
+}
+
+/** Withdraw the forge token: pushes and PR calls run with none until one is pushed again. */
+export async function handleRevokeForgeCredential(projectRoot: string, caller: ActorIdentity) {
+  requireControlActor(caller, 'revokeForgeCredential');
+  const { revokeForgeCredential, forgetForgeCredential } = await import('./forge-credential');
+  await forgetForgeCredential(projectRoot);
+  const result = revokeForgeCredential();
+  logger.info(result.revoked ? 'Forge credential withdrawn' : 'No forge credential to withdraw');
+  return result;
+}
+
+/**
+ * What a project page shows about its forge identity, from the daemon: the
+ * `[remote] driver` (a `local` project never pushes), the credential last
+ * pushed, and the fingerprint of the token this daemon actually HOLDS — so a
+ * page can show at a glance when that is not the token the connection was
+ * saved with. Never a secret. Control-plane only, like the rest of the forge
+ * credential surface.
+ */
+export async function handleForgeStatus(projectRoot: string, caller: ActorIdentity) {
+  requireControlActor(caller, 'forgeStatus');
+  const { currentForgeCredential, heldTokenFingerprint, forgeForRemote, isForgeKind } = await import('./forge-credential');
+  const { localDriverMirrorsOrigin } = await import('../remote/origin-mirror');
+  const { runGit } = await import('../utils/git');
+  const config = await loadConfig(projectRoot);
+  const driver = config.remote.driver;
+  // A managed `local`-driver project mirrors task branches and accepts to its
+  // origin (src/remote/origin-mirror.ts): it pushes, with the seeded token.
+  const pushes = driver !== 'local' || localDriverMirrorsOrigin(config);
+  const url = await runGit(['remote', 'get-url', config.remote.git_remote], projectRoot);
+  const fallback = isForgeKind(driver) ? driver : undefined;
+  const forge = url.exitCode === 0 ? forgeForRemote(url.stdout.trim(), process.env, fallback) : fallback;
+  return {
+    driver,
+    pushes,
+    credential: currentForgeCredential(),
+    heldFingerprint: heldTokenFingerprint(forge),
+  };
+}
+/**
+ * Ask the forge, as the project's current identity, whether the repository can
+ * be pushed to — the same question doctor's push check asks. Control-plane
+ * only: Rails decides which member may see what of the answer.
+ */
+export async function handleCheckPushAccess(projectRoot: string, caller: ActorIdentity) {
+  requireControlActor(caller, 'checkPushAccess');
+  const { checkPushAccess, currentForgeCredential, isForgeKind } = await import('./forge-credential');
+  const config = await loadConfig(projectRoot);
+  // The forge is decided from the remote URL inside the check (forgeForRemote),
+  // never from the driver name.
+  const driver = config.remote.driver;
+  const access = await checkPushAccess(projectRoot, {
+    remote: config.remote.git_remote,
+    fallbackForge: isForgeKind(driver) ? driver : undefined,
+  });
+  return { ...access, credential: currentForgeCredential() };
 }
 
 /**
@@ -5755,7 +6029,17 @@ export async function handleGetBuilderLaunchEnv(
   }
 
   const config = await loadConfig(projectRoot);
-  const target = resolveRoleTarget('builder', config);
+  // The profile this session was STARTED on (recorded on its token), never the
+  // role's current default: a Codex builder relaunched after a daemon restart
+  // must come back as Codex, on the same credential.
+  const { builderTargetForProfile } = await import('../builder/builder-profile');
+  const sessionProfile = await lookupDaemonTokenBuilderProfile(projectRoot, presentedToken);
+  let target: ReturnType<typeof builderTargetForProfile>;
+  try {
+    target = builderTargetForProfile(config, sessionProfile);
+  } catch (err) {
+    throw new RpcError(409, err instanceof Error ? err.message : String(err));
+  }
 
   // TEAM MODE: the session's member pays, exactly as at launch — the env comes
   // from the session binding the launch planned, never from getAuthEnv, which
@@ -5773,20 +6057,48 @@ export async function handleGetBuilderLaunchEnv(
       );
     }
     const { builderSessionRefreshAuthEnv } = await import('./builder-sessions');
-    const authEnvVars = await builderSessionRefreshAuthEnv(projectRoot, label, config);
+    const authEnvVars = await builderSessionRefreshAuthEnv(projectRoot, label, config, target);
     const proxyBaseUrl = proxyBaseUrlForRunner(config.runner.type, proxyPort, config.proxy.bind);
     return {
-      authEnvVars,
+      authEnvVars: [...authEnvVars, ...builderHarnessLaunchEnv(target, proxyBaseUrl)],
       proxyBaseUrl,
       lazyVersion: VERSION,
-      directive: resolveBuilderLaunchDirective(config),
+      directive: resolveBuilderLaunchDirective(config, target),
+    };
+  }
+
+  // A Codex builder takes its key the way a Codex task turn does — an
+  // OPENAI_API_KEY placeholder for the session's profile — never getAuthEnv's
+  // Claude-spelled answer. See src/builder/codex-launch-env.ts.
+  if (target.harness === 'codex') {
+    const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
+    if (!proxyPort) {
+      throw new RpcError(
+        503,
+        'The daemon proxy is not running, so this builder cannot refresh its launch environment. ' +
+        'Check `lazy daemon status` and retry.',
+      );
+    }
+    const { codexBuilderAuthEnv } = await import('../builder/codex-launch-env');
+    let codexCreds: AuthEnvVar[];
+    try {
+      codexCreds = await codexBuilderAuthEnv(projectRoot, config, target, label);
+    } catch (err) {
+      throw new RpcError(400, err instanceof Error ? err.message : String(err));
+    }
+    const proxyBaseUrl = proxyBaseUrlForRunner(config.runner.type, proxyPort, config.proxy.bind);
+    return {
+      authEnvVars: [...codexCreds, ...builderHarnessLaunchEnv(target, proxyBaseUrl)],
+      proxyBaseUrl,
+      lazyVersion: VERSION,
+      directive: resolveBuilderLaunchDirective(config, target),
     };
   }
 
   // The builder has no task and therefore no task-level agent: the profile its
-  // relaunch is routed by is the one the builder ROLE defaults to — the same
-  // one `docker run` used at initial launch, so the refreshed environment lands
-  // on the same upstream with the same credential.
+  // relaunch is routed by is the session's own — the same one `docker run` used
+  // at initial launch, so the refreshed environment lands on the same upstream
+  // with the same credential.
   const authResult = await handleGetAuthEnv(projectRoot, {
     proxied: true,
     role: 'builder',
@@ -5817,11 +6129,22 @@ export async function handleGetBuilderLaunchEnv(
   );
 
   return {
-    authEnvVars,
+    authEnvVars: [...authEnvVars, ...builderHarnessLaunchEnv(target, proxyUrl)],
     ...(proxyUrl ? { proxyBaseUrl: proxyUrl } : {}),
     lazyVersion: VERSION,
-    directive: resolveBuilderLaunchDirective(config),
+    directive: resolveBuilderLaunchDirective(config, target),
   };
+}
+
+/**
+ * The harness-specific launch env a builder needs beyond its credential: a
+ * Codex builder's COMPLETE proxy base URL (codex ignores OPENAI_BASE_URL and
+ * reads it from the config.toml its supervisor writes — src/proxy/codex-route.ts).
+ * Nothing for Claude Code, whose ANTHROPIC_BASE_URL is already in the
+ * credential env.
+ */
+function builderHarnessLaunchEnv(target: { harness: string; endpoint: string }, proxyUrl: string | undefined): AuthEnvVar[] {
+  return target.harness === 'codex' ? codexProxyEnvVars(proxyUrl, target.endpoint) : [];
 }
 
 interface AuthEnvVar { key: string; value: string }
@@ -5988,7 +6311,9 @@ export async function handleGetCredentialState(projectRoot: string, _params: Rec
     };
     const harnesses = required.requiredBy.map((name) => agentProfileOrThrow(profiles, name).harness);
     try {
-      providers.push({ ...entry, ...(await locateProfileCredential(projectRoot, required.name, harnesses)) });
+      const located = await locateProfileCredential(projectRoot, required.name, harnesses);
+      const override = located.source === 'env' ? await credentialOverrideReport(projectRoot, required.name) : {};
+      providers.push({ ...entry, ...located, ...override });
     } catch (err) {
       providers.push({
         ...entry,
@@ -6102,6 +6427,7 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   getTask: (s, a) => s.getTask(a.taskId as string),
   resolveTask: (s, a) => s.resolveTask(a.input as string),
   listTasks: (s) => s.listTasks(),
+  listTasksStrict: (s) => s.listTasksStrict(),
   listTasksWithOptions: (s, a) => s.listTasksWithOptions(a.options as any),
   listTaskCodes: (s) => s.listTaskCodes(),
   countDescendants: (s, a) => s.countDescendants(a.taskIds as string[]),

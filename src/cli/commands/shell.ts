@@ -9,6 +9,14 @@ import { spawnSyncInteractive } from '../../utils/spawn';
 import { boundCloneLogin, commandTaskTerminalBound } from './bound-session';
 
 export async function commandShell(args: string[]): Promise<void> {
+  // SSH into the task (`--ssh-config`, the hidden `--stdio`): solo and in a
+  // clone bound to Lazy Teams alike (./shell-ssh.ts). First, because `--root`
+  // chooses the project before anything looks for one.
+  const { wantsShellSsh, commandShellSsh } = await import('./shell-ssh');
+  if (wantsShellSsh(args)) {
+    await commandShellSsh(args);
+    return;
+  }
   // A clone bound to Lazy Teams opens a shell in the task's container ON THE
   // SERVER, through Teams — never one here (design doc §5.1).
   const boundRoot = findLazyRoot();
@@ -217,27 +225,31 @@ async function runInContainer(
   console.log(`Entering container for task ${displayId(task)}: ${task.goal}`);
   console.log(`  Container: ${containerName}`);
   console.log(`  Branch:    ${sess.git_branch}`);
-  console.log(`  Type 'exit' to return.\n`);
+  console.log(`  Type 'exit' to end the shell; with tmux in the image, Ctrl-b d leaves it running for next time.`);
+  // Who else is working here right now: other shells, services, the agent.
+  const { printPresenceBanner } = await import('./sessions');
+  const notice = await printPresenceBanner(task.id);
+  console.log('');
 
-  // Prefer bash, fall back to sh — the image is the user's, and it may not have
-  // bash. Deciding that INSIDE the container beats guessing out here.
-  //
-  // No `-l`: a login shell would cd to HOME, and the container's working
-  // directory is already the worktree, which is where the user means to be.
-  const code = await runner.execInRun(
-    containerName,
-    ['sh', '-c', 'if command -v bash >/dev/null 2>&1; then exec bash; fi; exec sh'],
-    { interactive: true },
-  );
+  // The container's `shell` tmux session — created by the first `lazy shell`,
+  // re-entered by every later one, so a dropped connection loses nothing — or
+  // a plain shell when the image has no tmux (../../terminal/shell-session.ts).
+  const { shellSessionCommand } = await import('../../terminal/shell-session');
+  const code = await runner.execInRun(containerName, shellSessionCommand(undefined, notice), { interactive: true });
   return code ?? 0;
 }
 
 export function shellUsage(): void {
   console.log(`Usage: lazy shell <task_id> [--host | --local | --restart] [-- <command> [args...]]
+       lazy shell <task_id> --ssh-config [--install] [--yes]
 
 Open an interactive shell in a task's CONTAINER — the same environment the
 agent works in, with its toolchain — or run a one-off command there. If the
-container is not running it is started first (with a notice).
+container is not running it is started first (with a notice). On entry it
+says who else is in the task right now — other people's terminals (session
+names and whether they are attached or idle, never what they run), the
+task's own sessions such as its services, and whether the agent is running a
+turn. \`lazy sessions <task>\` asks again.
 
 Arguments:
   <task_id>           ID of the task (prefix matching works)
@@ -261,6 +273,18 @@ Flags:
                       so this is how a [serve] change takes effect on a task
                       that is already up. Anything running inside stops.
                       Refused while the agent is working; not with --host.
+      --ssh-config    Print the ~/.ssh/config Host block that reaches this
+                      task over SSH (an SSH-only name), for tools that
+                      speak SSH: VS Code Remote-SSH, JetBrains Gateway, scp,
+                      sftp and port forwards. In Lazy Teams it lands in your own
+                      environment for the task, as the Shell does; locally,
+                      in the task's container.
+      --install       With --ssh-config: make this machine's key
+                      (~/.lazy/ssh/id_ed25519), register it with Lazy Teams,
+                      pin the task's host key and write the block to
+                      ~/.lazy/ssh/config. Ask to add its Include at the top
+                      of ~/.ssh/config, backing up the old file first.
+      --yes           Add the SSH Include without prompting (with --install).
   -c, --container     DEPRECATED no-op: the container is the default now. This
                       alias is kept for one release so scripts do not break —
                       drop it.
@@ -278,5 +302,6 @@ Examples:
   lazy shell my-task -- npm run dev       # Start a dev server in the container
   lazy shell my-task --restart            # Recreate the container, then enter
   lazy shell my-task --host               # Shell in the worktree on this machine
-  lazy shell my-task --host -- code .     # Open an IDE in the worktree`);
+  lazy shell my-task --host -- code .     # Open an IDE in the worktree
+  lazy shell my-task --ssh-config --install && ssh my-task.<project>.<team>.<teams-host>`);
 }

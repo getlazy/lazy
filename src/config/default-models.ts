@@ -25,7 +25,7 @@ export const CLAUDE_DEFAULT_MODEL = 'claude-sonnet-5-5';
 export const BUILDER_DEFAULT_MODEL = 'claude-opus-5-5';
 
 /** Codex. */
-export const CODEX_LATEST_MODEL = 'gpt-6-sol';
+export const CODEX_LATEST_MODEL = 'gpt-6.1-sol';
 
 /** Cursor: `auto` — Cursor picks the model (its catalog is server-side and per plan). */
 export const CURSOR_DEFAULT_MODEL = 'auto';

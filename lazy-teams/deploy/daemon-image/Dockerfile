@@ -64,11 +64,13 @@ FROM docker.io/oven/bun:${BUN_VERSION} AS lazy-checkout
 WORKDIR /opt/lazy
 
 COPY package.json bun.lock ./
+COPY .bun-version ./
+COPY scripts/build-entry.ts ./scripts/build-entry.ts
 # Dependencies on their own layer, from the lockfile alone, so a release whose
 # lockfile did not change takes this layer from the build cache. The root
 # `prepare` script needs scripts/ and src/, which are not here yet — it runs
 # explicitly below (generate:version, ensure:agent-placeholder).
-RUN bun install --ignore-scripts
+RUN bun run scripts/build-entry.ts check && bun install --ignore-scripts
 COPY scripts ./scripts
 COPY src ./src
 COPY public-docs ./public-docs

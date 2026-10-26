@@ -18,6 +18,8 @@ The title is **Builders**, with the project name above it as a link back to the 
 
 **Start a new builder** is always there. Each press starts another builder of yours with a fresh conversation; builders you already have keep running. The project can run a limited number of builders at once across all its members; a start beyond that is refused with a message saying so. Beside the button, a count says how many of yours are running and how many are stopped.
 
+**Runs on**, beside the button, picks the agent the new builder runs on: the project's builder profile (the default), or any Claude Code or Codex profile the project has. A Codex builder is paid with your own connection for that profile; with none, the start is refused and says which profile needs one. A builder keeps the agent it started on, Resume included, and **Your builders** names it for a builder not on the project's builder profile. When the project has a Codex profile, a line under the button says what is different about a Codex builder.
+
 If you are not allowed to open a builder, the button is replaced by a notice that a builder runs on the account of the person using it, so it can only be opened in your own name.
 
 ## Your builders

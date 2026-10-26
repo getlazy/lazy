@@ -1,5 +1,27 @@
 # What runs where
 
+```mermaid
+%% caption: The daemon, store, proxy, and git tools run outside each task container; the agent runs inside it
+flowchart LR
+  Person[Person] --> CLI[CLI or browser]
+  subgraph Host[Project host or project machine]
+    CLI --> Daemon[Project daemon]
+    Daemon --> Store[(Task store)]
+    Daemon --> Proxy[Model proxy]
+    Daemon --> Git[Git and forge tools]
+  end
+  subgraph Container[One container per task]
+    Supervisor --> Agent[Agent]
+    Agent --> MCP[Lazy MCP server]
+    Agent --> Worktree[Task worktree]
+  end
+  Daemon --> Supervisor
+  MCP --> Daemon
+  Agent --> Proxy
+  Proxy --> Provider[Model provider]
+```
+
+
 Two places run lazy's code: your machine (the host) and one container per task.
 
 ## On the host

@@ -53,6 +53,30 @@ describe('rebuilding lazy\'s default runner image', () => {
     return client.rpc(command, ctx.root, params);
   }
 
+// INVARIANT: concurrent rebuild clicks start one job and the losing click
+// names its log, rather than cancelling the first request's work.
+test('overlapping cached and uncached rebuild clicks share one running build', async () => {
+  await docker.slowBuilds(2);
+  const before = (await docker.builds()).length;
+  const outcomes = await Promise.allSettled([
+    rpc('rebuildRunnerImage', { noCache: false }),
+    rpc('rebuildRunnerImage', { noCache: true }),
+  ]);
+  const successes = outcomes.filter(r => r.status === 'fulfilled');
+  const refusals = outcomes.filter(r => r.status === 'rejected');
+  expect(successes).toHaveLength(1);
+  expect(refusals).toHaveLength(1);
+  const reply = successes[0]!.value;
+  const buildId = reply.defaultBuild?.id ?? reply.imageState.build.id;
+  expect(refusals[0]!.reason).toMatchObject({ status: 409, details: { buildId } });
+  const finished = await until(
+    () => rpc('imageBuildLog', { buildId }),
+    page => page.build.outcome !== 'running', 30_000, 'the winning rebuild to finish',
+  );
+  expect(finished.build.outcome).not.toBe('cancelled');
+  expect((await docker.builds()).length - before).toBe(1);
+});
+
   // INVARIANT: on a project with no custom image, Rebuild rebuilds lazy's
   // default image — a fresh local build, watchable by its build id. A project
   // admin's way out of "claude in the runner image doesn't run" must never be

@@ -617,8 +617,13 @@ When a task comes back blocked:
 3. Evaluate the changes — does it match the intent? Is the code clean? Scan for deletions or
    reverts in files the task had no reason to touch, and for existing tests or comments
    rewritten to assert what the change now does — both hide broken work behind a green run.
-   Before recommending accept, confirm the project's FULL test suite is green on the task's
-   head, not only the tests the task touched. Check the branch's commits and uncommitted state
+   During active work and child accepts into a cluster or hub, use diff review, targeted
+   tests, typecheck/lint, and the project's named repo-wide guard tests. Never request the
+   project's full test suite during active work or send a child back to prove an unrelated
+   failure is not theirs; such breaks are acceptable until protected-branch acceptance.
+   Only for acceptance into the protected branch, confirm the project's full test suite is
+   green on the task's head. For a cluster, run it once at its final, before it parks for
+   that accept, and fix failures at their cause. Check the branch's commits and uncommitted state
    before reading the agent's report, and check any design authority it cites actually exists.
    Review on a model at least as strong as the one that wrote the work — save on the writer or
    on fix rounds, never by weakening the reviewer.

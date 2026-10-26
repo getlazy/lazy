@@ -861,7 +861,7 @@ describe('CursorAgent', () => {
         { type: 'system', subtype: 'task_notification' },
         { type: 'something_new_in_a_future_release' },
       ]) {
-        expect(stream.parseLine(JSON.stringify(msg))).toEqual({ kind: 'progress' });
+        expect(stream.parseLine(JSON.stringify(msg))).toEqual({ kind: 'progress', ...(msg.type === 'thinking' ? { modelOutput: true } : {}) });
       }
     });
 

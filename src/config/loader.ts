@@ -59,7 +59,7 @@ import { lastKnownGoodFor, rememberGoodConfig } from './last-good';
 import { profilesAwaitingConfirmation } from './connection-consent';
 import { controlPlaneTextOrigin, describeConfigText, noteConfigLoaded, repositoryAgentNames } from './config-provenance';
 
-const CONFIG_FILENAME = process.env.LAZY_CONFIG || 'lazy.toml';
+const CONFIG_FILENAME = 'lazy.toml';
 
 /**
  * The directory whose lazy.toml governs a project: ALWAYS the project root.
@@ -578,7 +578,7 @@ export async function resolveConfigSource(lazyRoot: string): Promise<ConfigSourc
     return { path: process.env.LAZY_CONFIG, rule: 'LAZY_CONFIG' };
   }
   return {
-    path: join(findConfigDir(lazyRoot), CONFIG_FILENAME),
+    path: join(findConfigDir(lazyRoot), process.env.LAZY_CONFIG || CONFIG_FILENAME),
     rule: process.env.LAZY_CONFIG ? 'LAZY_CONFIG' : 'project-root',
   };
 }
@@ -1157,6 +1157,14 @@ export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = 
   return config;
 }
 
+/** Resolve an explicitly configured store path using the project's authority. */
+export function resolveStoragePath(lazyRoot: string, configuredPath: string): string {
+  // INVARIANT: relative store paths resolve against the project root, never cwd.
+  // CLI validation, initialization and every config consumer must agree.
+  const expanded = expandTilde(configuredPath);
+  return isAbsolute(expanded) ? expanded : resolve(lazyRoot, expanded);
+}
+
 /**
  * Resolve the effective store dir once, with the project root in hand, so
  * consumers that must agree on it — the host sandbox deny list, built by both
@@ -1168,7 +1176,9 @@ export async function loadConfig(lazyRoot: string, options: LoadConfigOptions = 
 async function resolveStorePathOnto(lazyRoot: string, config: ResolvedConfig): Promise<void> {
   if (config.storage.backend !== 'external') return;
   if (config.storage.external_path) {
-    config.storage.resolved_path = resolve(lazyRoot, expandTilde(config.storage.external_path));
+    config.storage.configured_path = config.storage.external_path;
+    config.storage.external_path = resolveStoragePath(lazyRoot, config.storage.external_path);
+    config.storage.resolved_path = config.storage.external_path;
   } else if (isHostRunnerType(config.runner.type)) {
     // Dynamic import: storage/index imports this module.
     const { getProjectName } = await import('../storage/index');
@@ -1319,8 +1329,9 @@ export function resolveConfigText(
     );
   }
 
-  // Reject removed storage backends with clear migration guidance
-  const storageSection = raw.storage as Record<string, unknown> | undefined;
+  // Solo projects must migrate removed backends. Teams always supplies its own
+  // external store; the repository value is import-only input, never consumed.
+  const storageSection = isManagedMode() ? undefined : raw.storage as Record<string, unknown> | undefined;
   if (storageSection?.backend === 'in-repo') {
     throw new Error(
       'Storage backend "in-repo" is no longer supported. ' +
@@ -1400,15 +1411,6 @@ export function resolveConfigText(
       );
     }
     config.server.dashboard_url = dashboardUrl.origin;
-  }
-
-  // Expand leading `~/` in user-configured paths. Lazy accepts `~/...` as a
-  // valid value in lazy.toml, but downstream consumers pass the string to
-  // mkdir/writeFile/join, which do not expand tildes. Without this step, a
-  // configured `external_path = "~/.lazy/foo"` creates a literal `~` directory
-  // under the process cwd.
-  if (config.storage.external_path) {
-    config.storage.external_path = expandTilde(config.storage.external_path);
   }
 
   // `[credentials] backend` is a closed set. A typo here would otherwise be

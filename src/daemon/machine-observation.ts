@@ -667,7 +667,7 @@ export function restartMachineService(service: string, deps: MachineDeps = {}, p
     throw new MachineRestartError(409, 'A reset of Docker storage is running; wait for it to finish.');
   }
   if (lastRestart?.state === 'running') {
-    throw new MachineRestartError(409, `A restart of ${lastRestart.service} is already running.`);
+    throw new MachineRestartError(409, `A restart of ${lastRestart.service} is already running. Wait for it to finish before trying again.`);
   }
   const name = service as 'dockerd' | 'forwarder';
   const view: RestartView = { service: name, state: 'running', startedAt: new Date().toISOString(), finishedAt: null, output: null };
@@ -762,7 +762,7 @@ export function resetMachineDockerStorage(confirm: unknown, deps: MachineDeps = 
     throw new MachineRestartError(409, 'lazy-guest-init is not installed on this machine, so its Docker storage cannot be reset from here.');
   }
   if (lastStorageReset?.state === 'running') {
-    throw new MachineRestartError(409, 'A reset of Docker storage is already running.');
+    throw new MachineRestartError(409, 'A reset of Docker storage is already running. Wait for it to finish before trying again.');
   }
   if (lastRestart?.state === 'running') {
     throw new MachineRestartError(409, `A restart of ${lastRestart.service} is running; wait for it to finish.`);

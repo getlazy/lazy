@@ -8,6 +8,7 @@
  */
 
 import type { SandboxConfig } from '../capture/claude';
+import type { AgentStopOutcome } from './agent-stop';
 import type { AgentResponse } from '../types';
 import type { RunnerType, RoleTarget } from '../config/types';
 import type { HealthCheck } from '../remote/driver';
@@ -417,8 +418,45 @@ export interface Runner {
    */
   stopRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<boolean>;
 
+  /**
+   * Stop only the AGENT in a task's run — its supervisor and every process
+   * descended from it — and keep the run (the container, its tmux sessions,
+   * whatever else runs in it). See src/runner/agent-stop.ts, which also holds
+   * `stopTaskAgent`, the caller-side helper that falls back to {@link stopRun}.
+   *
+   * Absent on runners whose run IS the agent (host-process). `failed` means
+   * the stop could not be carried out in the run; the caller decides.
+   */
+  stopAgentInRun?(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<AgentStopOutcome>;
+
+  /**
+   * Start a task's STOPPED run again (`docker start`), keeping everything in
+   * it, instead of removing it and creating a new one. Returns true when the
+   * run is running afterwards; false when there is no such run, it cannot be
+   * restarted in place (created by a lazy that predates kept containers), or
+   * it did not come up — the caller then recreates it. See
+   * src/runner/start-or-recreate.ts.
+   */
+  startStoppedRun?(runName: string): Promise<boolean>;
+
   /** Remove/cleanup a stopped run (container rm, PID file cleanup). */
-  removeRun(runName: string): Promise<void>;
+  /** Strict teardown surfaces runtime errors so mounted files can be kept. */
+  removeRun(runName: string, options?: { strict?: boolean }): Promise<void>;
+
+  /**
+   * Remove the persistent data directory ($LAZY_TASK_DATA,
+   * src/runner/task-data.ts) of the task with this UUID. Called only from a
+   * TERMINAL teardown or a person's finished-task cleanup — never while the
+   * task is open. Absent on runners that have no such directory.
+   */
+  removeTaskData?(taskUuid: string): Promise<void>;
+
+  /**
+   * True when a kept run was created before this lazy's container layout
+   * ($LAZY_TASK_DATA mount, root-only adopt). Informational only: a person
+   * chooses whether to restart it, preserving its installed tools and services.
+   */
+  lacksCurrentLayout?(runName: string): Promise<boolean>;
 
   /** List all running lazy runs (container names or run names). */
   discoverRunningRuns(): Promise<string[]>;

@@ -17,6 +17,17 @@ Project memory, services and installation health (**Settings** in the navigation
 
 `/settings/services`. The project-wide **Start services** command: the one command a task's **Start services** runs inside that task's environment, with the ports declared under `[serve]` published. It is the same for every task. The tab shows the current command, a box to change it and a **Clear command** button; with none set, no task offers Start services. The command is saved to the project's store, not to `lazy.toml`. See [Reaching a task's dev server](../../serve-ports.md).
 
+For example, declare a web service in the project root's `lazy.toml`:
+
+```toml
+[serve.services]
+web = 3000
+```
+
+Then set the Start services command on this tab to launch the app on port 3000.
+In Lazy Teams, a project admin edits the same port under **Settings →
+Configuration**.
+
 ## Doctor
 
 `/settings/doctor`. The same checks as `lazy doctor`.

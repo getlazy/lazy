@@ -31,9 +31,10 @@ describe('shellPanelHtml', () => {
     expect(html).not.toContain('data-lz-shell-term');
   });
 
-  test('an unavailable shell renders a disabled button carrying the reason', () => {
+  test('an unavailable shell renders a clickable button carrying the refusal', () => {
     const html = shellPanelHtml('task-1', { available: false, reason: 'Container is not running.' });
-    expect(html).toContain('disabled');
+    expect(html).not.toMatch(/<button[^>]*\sdisabled/);
+    expect(html).toContain('data-control-refusal');
     expect(html).toContain('Container is not running.');
     expect(html).not.toContain('data-lz-shell-open');
   });
@@ -176,7 +177,7 @@ describe('shellTabHtml', () => {
     expect(html).toContain('data-lz-shell-mode="pair"');
     expect(html).toContain('data-lz-shell-mode="chat"');
     expect(html).toContain('data-lz-shell-index');
-    expect(html).toContain('Sessions close when you reload');
+    expect(html).toContain('the shell keeps running in the container');
     expect(html).toContain('lazy shell fix-hub');
     expect(html).toContain('does not lock the task');
   });
@@ -194,7 +195,7 @@ describe('shellTabHtml', () => {
     expect(html).not.toContain('Start container');
     expect(html).toContain('data-lz-shell-mode="pair"');
     expect(html).toContain('data-lz-shell-index');
-    expect(html).toContain(' disabled title="Container for this task is not running."');
+    expect(html).toContain(' data-control-refusal="Container for this task is not running."');
     expect(html).toContain('lazy shell fix-hub');
   });
 });

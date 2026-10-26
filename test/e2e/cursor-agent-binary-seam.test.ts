@@ -492,4 +492,34 @@ describe('cursor turns through the fake-binary seam', () => {
         .toBe('claude-opus-4-5-20251101');
     }
   }, 180_000);
+
+  // INVARIANT (engineer, 2026-10-24: Ask on every harness): `lazy ask` on a
+  // Cursor task resumes the agent's own chat read-only — its write tools
+  // excluded, never Cursor's --mode plan, which would also refuse lazy's read
+  // tools — and answers.
+  test('an ask resumes the chat read-only and answers', async () => {
+    const taskId = await createTask(ctx, 'Cursor ask contract', 'Work then answer');
+    await ctx.setCursorScenario({
+      sequence: [
+        cursorSuccessScenario({
+          sessionId: 'fake-chat-ask-1',
+          result: 'Work turn done.',
+          commit: { message: 'Cursor work', files: [{ path: 'cursor-ask.txt', content: 'w\n' }] },
+        }),
+        cursorSuccessScenario({ sessionId: 'fake-chat-ask-1', result: 'CURSOR-ASK-ANSWER' }),
+      ],
+    });
+    expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
+    expectSuccess(await ctx.lazy(['wait', taskId]));
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+
+    const answer = await ctx.lazy(['ask', taskId, '-m', 'What did you do?']);
+    expectSuccess(answer);
+    expectOutput(answer, 'CURSOR-ASK-ANSWER');
+    const ask = (await turnInvocations()).at(-1)!.argv;
+    expect(ask[ask.indexOf('--resume') + 1]).toBe('fake-chat-ask-1');
+    expect(ask[ask.indexOf('--exclude-tools') + 1]).toBe('shellToolCall,editToolCall,deleteToolCall,writeShellStdinToolCall');
+    expect(ask).not.toContain('--mode');
+    expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+  }, 180_000);
 });

@@ -34,6 +34,8 @@ export function makeRetryStatusHandler(
       delete status.retry_failure_class;
       delete status.retry_failure_reason;
       delete status.retry_next_delay_ms;
+      delete status.retry_next_at;
+      delete status.retry_recovery_deadline;
       if (status.phase === 'retrying') {
         status.phase = entryPhase;
         status.phase_started_at = now;
@@ -61,6 +63,8 @@ export function makeRetryStatusHandler(
       delete status.retry_next_delay_ms;
     }
 
+    status.retry_next_at = retryState.nextRetryAt;
+    status.retry_recovery_deadline = retryState.recoveryDeadline;
     writeStatus(protocolDir, status);
     // Include the error itself: a log line that says only "attempt 7" tells the
     // human watching the stream nothing about what keeps failing.

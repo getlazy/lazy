@@ -9,7 +9,7 @@
  * own.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -27,9 +27,12 @@ import {
 } from '../../src/proxy/credential-broker';
 import { isFireworksEndpoint, isOpenRouterEndpoint, DEFAULT_OPENAI_UPSTREAM } from '../../src/utils/openai-compat';
 import { isCredentialEnvKey } from '../../src/utils/redact';
-import { pinDaemonBaseDir, makeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { pinDaemonBaseDir, makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
 import { knownEndpointWires, resolveAgentProfiles, cacheAgentProfiles } from '../../src/config/agent-profiles';
 import { roleTargetForProfile, ANTHROPIC_DEFAULT_TARGET } from '../../src/config/default-target';
+
+isolateLazyEnv();
 
 type ProfileInput = { harness: string; model?: string; endpoint?: string; credential?: string };
 
@@ -207,11 +210,12 @@ describe('profile upstream resolution', () => {
 
 describe('credential resolution for the proxy target map', () => {
   let root: string;
+  let daemonBase: string;
   let undoDaemonBase: () => void;
   const savedConfig = process.env.LAZY_CONFIG;
   const savedCredentialEnv = new Map<string, string | undefined>();
 
-  beforeAll(async () => {
+  beforeEach(async () => {
     // INVARIANT: credential-store fixtures own their credential inputs. An
     // inherited API key must neither satisfy "missing" nor override a stored key.
     for (const key of ['OPENAI_API_KEY', 'OPENROUTER_API_KEY']) {
@@ -219,14 +223,15 @@ describe('credential resolution for the proxy target map', () => {
       delete process.env[key];
     }
     root = await mkdtemp(join(tmpdir(), 'lazy-openai-cred-'));
-    undoDaemonBase = pinDaemonBaseDir(await makeDaemonBaseDir());
+    daemonBase = await makeDaemonBaseDir();
+    undoDaemonBase = pinDaemonBaseDir(daemonBase);
     // A file-backed credential store, isolated from the developer's own.
     const configPath = join(root, 'lazy.toml');
     await writeFile(configPath, '[credentials]\nbackend = "file"\n');
     process.env.LAZY_CONFIG = configPath;
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     undoDaemonBase();
     for (const [key, value] of savedCredentialEnv) {
       if (value === undefined) delete process.env[key];
@@ -235,6 +240,7 @@ describe('credential resolution for the proxy target map', () => {
     if (savedConfig === undefined) delete process.env.LAZY_CONFIG;
     else process.env.LAZY_CONFIG = savedConfig;
     await rm(root, { recursive: true, force: true });
+    await removeDaemonBaseDir(daemonBase);
   });
 
   test('a missing key resolves to `missing` with an actionable remedy — never a silent none', async () => {

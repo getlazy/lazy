@@ -218,12 +218,12 @@ describe('Run in the task container', () => {
     expect(html).not.toContain('rv-cmd-run');
   });
 
-  test('an unavailable shell disables Run with the same reason the Shell button shows', () => {
+  test('an unavailable shell explains Run with the same reason the Shell button shows', () => {
     const html = verifyReportBlockHtml(verifyBody('bash'), {
       available: false,
       reason: 'Container for this task is not running.',
     });
-    expect(html).toContain('class="rv-cmd-run" disabled title="Container for this task is not running."');
+    expect(html).toContain('class="rv-cmd-run" data-control-refusal="Container for this task is not running."');
     expect(html).not.toContain('data-run=');
   });
 

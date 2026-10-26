@@ -29,7 +29,9 @@
  * The fact is cleared only after the work turn that carries it has been
  * launched, so a launch that fails after the old container was removed does not
  * lose it. An exited container is recorded before removal too, with its runtime
- * exit code, OOM flag and finish time. A first launch has nothing to replace.
+ * exit code, OOM flag and finish time. Observing an exit alone records only
+ * a journal entry: starting that same container keeps its files and tools.
+ * A first launch has nothing to replace.
  */
 
 import type { Storage } from '../storage';
@@ -43,6 +45,8 @@ export const ENVIRONMENT_REPLACED_KEY = 'environment_replaced';
 export const LAST_ENVIRONMENT_REPLACED_KEY = 'last_environment_replaced';
 /** Deduplicate observations only until the old environment is torn down. */
 export const RECORDED_ENVIRONMENT_EXIT_KEY = 'recorded_environment_exit';
+/** Exit observations do not consume a later replacement notice. */
+export const OBSERVED_ENVIRONMENT_EXIT_KEY = 'observed_environment_exit';
 
 /** Reason: the turn's credential needs a different launch environment. */
 export const REASON_CREDENTIAL_CHANGED = "the credential this task's turns run on changed";
@@ -110,20 +114,26 @@ export async function recordRecreationIfRunning(
     probeRunInfo?(runName: string): Promise<RunInfoProbe>;
   },
   runName: string,
+  observationOnly = false,
 ): Promise<void> {
   if (!runner.usesSandbox()) return;
+  const exitKey = observationOnly ? OBSERVED_ENVIRONMENT_EXIT_KEY : RECORDED_ENVIRONMENT_EXIT_KEY;
   if (!(await runner.isRunning(runName))) {
     const probe = runner.probeRunInfo ? await runner.probeRunInfo(runName) : null;
-    if (probe?.kind === 'no-answer') throw new Error(`Cannot inspect ${runName} before replacing it: ${probe.reason}`);
+    if (probe?.kind === 'no-answer') throw new Error(`Cannot inspect ${runName} before ${observationOnly ? "recording its exit" : "replacing it"}: ${probe.reason}`);
     const info = probe?.kind === 'answered' ? probe.info : await runner.getRunInfo?.(runName);
     if (info && !info.running) {
       const death = `the previous environment exited with code ${info.exitCode}` +
         (info.oomKilled === true ? ', OOM-killed (out of memory)' : info.oomKilled === false ? ', not OOM-killed' : ', OOM status unknown') +
         (info.finishedAt ? `, at ${info.finishedAt}` : ', exit time unknown');
       const fingerprint = `${runName}:${info.finishedAt}:${info.exitCode}:${info.oomKilled}`;
-      if (await storage.getTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY) !== fingerprint) {
-        await recordRecreation(storage, taskId, [death, reason].filter(Boolean).join('; '));
-        await storage.updateTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY, fingerprint);
+      if (await storage.getTaskMetadata(taskId, exitKey) !== fingerprint) {
+        if (observationOnly) {
+          await storage.appendJournalEntry?.(taskId, `**Container stopped** — ${death}. The container has not been replaced; its files and installed tools are kept.`, 'system');
+        } else {
+          await recordRecreation(storage, taskId, [death, reason].filter(Boolean).join('; '));
+        }
+        await storage.updateTaskMetadata(taskId, exitKey, fingerprint);
       }
     } else if (!info && (await storage.getSessionByTaskId?.(taskId))?.container_name === runName &&
       !await storage.getTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY)) {
@@ -135,7 +145,24 @@ export async function recordRecreationIfRunning(
   if (await storage.getTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY)) {
     await storage.updateTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY, '');
   }
+  if (await storage.getTaskMetadata(taskId, OBSERVED_ENVIRONMENT_EXIT_KEY)) {
+    await storage.updateTaskMetadata(taskId, OBSERVED_ENVIRONMENT_EXIT_KEY, '');
+  }
   if (reason) await recordRecreation(storage, taskId, reason);
+}
+
+/** Observe an exit before deciding whether to keep the container. A named
+ * recreate reason already decides replacement; an exit alone does not.
+ * Missing containers still represent a lost environment, on either path.
+ */
+export async function recordContainerBeforeLaunch(
+  storage: Parameters<typeof recordRecreationIfRunning>[0],
+  taskId: string,
+  reason: string | null,
+  runner: Parameters<typeof recordRecreationIfRunning>[3],
+  runName: string,
+): Promise<void> {
+  await recordRecreationIfRunning(storage, taskId, reason, runner, runName, reason === null);
 }
 
 /**

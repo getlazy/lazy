@@ -1,0 +1,1 @@
+Get its branch and recorded commit SHA from `lazy_show` (including `sections: ["commits"]`). `lazy_diff` can show the task’s diff, narrowed with `files`, even when its worktree is hidden or gone. Land a child’s work with `lazy_accept`.

@@ -17,6 +17,7 @@ Read-only tools (safe to call freely — every one of these works on ANY task in
 - `lazy_raised_items` — List every raised item across tasks, with a blocking filter, recurrences and promotion hints. Cross-task triage complement to per-task `raised_items` on `lazy_show`.
 - `lazy_artifact_list` — List a task's artifacts: files attached to it, and files it published back. Metadata only (name, size, mime type, origin) — cheap to call.
 - `lazy_artifact_get` — Read one artifact's content by name. As a task agent, prefer reading the file straight out of `.lazy-task-sandbox/artifacts/<name>` in your worktree — every artifact of your task is materialized there at turn launch, so it costs no context. Binary and large artifacts return a file `path` (never base64); tar/tgz/zip also return a member listing, and `member` reads one text member inline.
+- `lazy_sessions` — A task's long-running terminal sessions (its services): list them, or read one's live screen and log without attaching. Never starts anything.
 - `lazy_conversations` — List past builder conversations with timestamps and summaries.
 - `lazy_conversation_search` — Search across past builder conversations by keyword.
 - `lazy_conversation_read` — Read a full past builder conversation by `session_id`.

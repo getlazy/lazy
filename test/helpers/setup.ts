@@ -264,6 +264,8 @@ export interface SetupOptions {
    * activated via `LAZY_MOCK_CLAUDE_RESPONSE` (see preload-mocks.ts).
    */
   withDaemon?: boolean;
+  /** Explicit temporary store for suites that must not use HOME's default. */
+  externalPath?: string;
   /** Base process environment, before harness pins; hardware suites strip ambient LAZY_* state. */
   inheritedEnv?: Record<string, string | undefined>;
   /**
@@ -908,7 +910,9 @@ export async function setupTestLazy(options: SetupOptions = {}): Promise<TestCon
   spawnGit(root, 'commit', '-m', 'Initial commit');
 
   // Run `lazy init` (skip auth/github checks, non-interactive for piped test env)
-  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive'], protocolBase, withDaemon, undefined, undefined, baseEnv, inheritedEnv);
+  const initResult = await runLazy(root, ['init', '--skip-auth-check', '--skip-github-check', '--non-interactive',
+    ...(options.externalPath ? ['--external-path', options.externalPath] : []),
+  ], protocolBase, withDaemon, undefined, undefined, baseEnv, inheritedEnv);
   if (initResult.exitCode !== 0) {
     throw new Error(`lazy init failed: ${initResult.stderr}\n${initResult.stdout}`);
   }

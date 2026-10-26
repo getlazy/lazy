@@ -135,3 +135,8 @@ Field rules:
 - `security` and `data_integrity` are required strings. Use `"none found"` when
   that sweep was clean; otherwise briefly say what you found, **and** file it
   as a finding too.
+
+During this review, run only tests covering the touched code, the project's named repo-wide
+guard tests, and typecheck/lint where appropriate. Never run or request the project's full
+test suite during active work or child accepts. A seemingly unrelated test failure may wait
+until acceptance into the protected branch; do not demand a full-suite run to prove it is unrelated.

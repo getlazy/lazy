@@ -12,10 +12,13 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { pinConfig } from '../helpers/pin-config';
 import { makeDaemonBaseDir, pinDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile, rename } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { readSystemMessagesFile } from '../helpers/storage';
+import { readSystemMessagesFile, taskFilePath, tasksDirFor } from '../helpers/storage';
+import { installFakeDocker } from '../helpers/fake-docker';
+import { applyRemedy } from '../../src/doctor/remedies';
+import { withTaskLifecycleLock, isTaskLifecycleLocked } from '../../src/daemon/task-lifecycle-lock';
 
 const TOKEN = 'test-token-doctor-rpc';
 
@@ -82,6 +85,184 @@ describe('doctor RPC', () => {
     });
     return { status: resp.status, body: await resp.json() };
   }
+
+  // INVARIANT: the remedy Teams applies unattended cannot delete an open
+  // task's container, running or stopped. Exercise the real daemon boundary.
+  test('Teams unattended orphan cleanup keeps open tasks and removes only finished or deleted tasks', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'lazy-doctor-orphans-'));
+    const docker = await installFakeDocker(scratch);
+    const savedPath = process.env.PATH;
+    try {
+      const storage = await import('../../src/daemon/rpc-handlers').then(m => m.getOrCreateStorage());
+      const open = await storage.createTask('Paused work');
+      await storage.updateTaskStatus(open.id, 'working', 'system');
+      await storage.updateTaskStatus(open.id, 'blocked', 'system');
+      const finished = await storage.createTask('Finished work');
+      await storage.updateTaskStatus(finished.id, 'abandoned', 'system');
+      const runner = await import('../../src/runner').then(m => m.createRunnerFromType('docker'));
+      const { taskRef } = await import('../../src/task/identity');
+      const openName = runner.runNameForTask(taskRef(open));
+      const finishedName = runner.runNameForTask(taskRef(finished));
+      const gateName = `lazy-gate-${taskRef(open)}`;
+      process.env.PATH = `${docker.binDir}:${savedPath ?? ''}`;
+      for (const state of ['running', 'exited']) {
+        await docker.seedContainer(openName, { state, project: ctx.root });
+        await docker.seedContainer(gateName, { state, project: ctx.root });
+        await docker.seedContainer(finishedName, { state, project: ctx.root });
+        await docker.seedContainer('lazy-deleted-task', { state, project: ctx.root });
+        const preview = await rpc('doctor.previewRemedy', { flag: 'clean-orphaned-containers' });
+        expect(preview.status).toBe(200);
+        expect(JSON.stringify(preview.body)).not.toContain(openName);
+        expect(JSON.stringify(preview.body)).not.toContain(gateName);
+        const result = await rpc('doctor.applyRemedy', { flag: 'clean-orphaned-containers' });
+        expect(result.status).toBe(200);
+        expect(result.body.failed).toBe(false);
+        expect(result.body.done).toBe(2);
+        expect(await docker.containers()).toEqual([openName, gateName]);
+      }
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  // INVARIANT: an incomplete task scan must refuse unattended destruction.
+  // Exercise enumeration AFTER the daemon opened its store, so init cannot
+  // mask the very listTasks error that formerly turned live tasks into deleted ones.
+  test('unattended orphan cleanup refuses unreadable records and task enumeration failures', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'lazy-doctor-unreadable-'));
+    const docker = await installFakeDocker(scratch);
+    const savedPath = process.env.PATH;
+    const storage = await import('../../src/daemon/rpc-handlers').then(m => m.getOrCreateStorage());
+    const task = await storage.createTask('Paused work');
+    const record = taskFilePath(ctx.root, task.id, 'task.json');
+    const original = await readFile(record, 'utf8');
+    const tasksDir = tasksDirFor(ctx.root);
+    try {
+      process.env.PATH = `${docker.binDir}:${savedPath ?? ''}`;
+      await docker.seedContainer(`lazy-${task.id.slice(0, 8)}`, { project: ctx.root });
+      await writeFile(record, '{broken json');
+      const unreadable = await rpc('doctor.applyRemedy', { flag: 'clean-orphaned-containers' });
+      expect(unreadable.status).toBe(500);
+      expect(JSON.stringify(unreadable.body)).toContain('unreadable task record');
+      await writeFile(record, original);
+      await rename(tasksDir, `${tasksDir}-saved`);
+      try {
+        await writeFile(tasksDir, 'not a directory');
+        const unlisted = await rpc('doctor.applyRemedy', { flag: 'clean-orphaned-containers' });
+        expect(unlisted.status).toBe(500);
+        expect(JSON.stringify(unlisted.body)).toContain('could not read tasks directory');
+      } finally {
+        await rm(tasksDir, { force: true });
+        await rename(`${tasksDir}-saved`, tasksDir);
+      }
+      expect(await docker.containers()).toEqual([`lazy-${task.id.slice(0, 8)}`]);
+      expect((await docker.invocations()).some(line => line.startsWith('rm '))).toBe(false);
+    } finally {
+      await writeFile(record, original);
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  // INVARIANT: the scan is a proposal, never permission to delete after a
+  // task reopens. Re-read ownership under the lifecycle lock before removal.
+  test('orphan cleanup preserves a task reopened after scanning, including its session pointer', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'lazy-doctor-reopen-'));
+    const docker = await installFakeDocker(scratch);
+    const savedPath = process.env.PATH;
+    const storage = await import('../../src/daemon/rpc-handlers').then(m => m.getOrCreateStorage());
+    const task = await storage.createTask('Reopened during cleanup');
+    const name = `lazy-${task.id.slice(0, 8)}`;
+    const head = (await ctx.git('rev-parse', 'HEAD')).stdout.trim();
+    const session = await storage.createSession(task.id, 'claude-code', 'lazy/reopen-fixture', head);
+    await storage.updateSessionContainerName(session.id, name);
+    await storage.updateTaskStatus(task.id, 'abandoned', 'system');
+    let reopening: Promise<unknown> | undefined;
+    try {
+      process.env.PATH = `${docker.binDir}:${savedPath ?? ''}`;
+      await docker.seedContainer(name, { project: ctx.root });
+      const result = await applyRemedy('clean-orphaned-containers', {
+        root: ctx.root,
+        storage,
+        onProgress: event => {
+          if (event.state === 'start' && event.label.startsWith('Removing ')) {
+            // Queue the reopen transition first, deterministically, after the
+            // candidate scan. Fixture writes use the real Storage backend.
+            reopening = withTaskLifecycleLock(task.id, () => storage.reopenTask(task.id));
+          }
+        },
+      });
+      await reopening;
+      expect(reopening).toBeDefined();
+      expect((await storage.getTask(task.id))?.status).toBe('blocked');
+      expect(result.failed).toBe(false);
+      expect(result.done).toBe(0);
+      expect(result.lines.join('\n')).toContain(`Kept ${name}`);
+      expect(await docker.containers()).toEqual([name]);
+      expect((await storage.getSession(session.id))?.container_name).toBe(name);
+      expect((await docker.invocations()).some(line => line.startsWith('rm '))).toBe(false);
+    } finally {
+      await reopening;
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  // INVARIANT: reopening and destruction cannot interleave after the final
+  // ownership check. A reopen arriving during runtime removal waits for it.
+  test('reopen waits until an in-flight orphan removal and pointer update finish', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'lazy-doctor-removing-'));
+    const docker = await installFakeDocker(scratch);
+    const savedPath = process.env.PATH;
+    const storage = await import('../../src/daemon/rpc-handlers').then(m => m.getOrCreateStorage());
+    const task = await storage.createTask('Reopen behind removal');
+    const name = `lazy-${task.id.slice(0, 8)}`;
+    const branch = `lazy/${task.id.slice(0, 8)}`;
+    expect((await ctx.git('branch', branch)).exitCode).toBe(0);
+    const head = (await ctx.git('rev-parse', 'HEAD')).stdout.trim();
+    const session = await storage.createSession(task.id, 'claude-code', branch, head);
+    await storage.updateSessionContainerName(session.id, name);
+    await storage.updateTaskStatus(task.id, 'abandoned', 'system');
+    const marker = join(scratch, 'removing');
+    const release = join(scratch, 'release');
+    // Paths are generated temporary paths, shell-quoted rather than JSON-quoted.
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    await docker.onRm(`touch ${quote(marker)}\nfor i in {1..1000}; do\n  test -f ${quote(release)} && exit 0\n  sleep 0.01\ndone\nexit 1\n`);
+    let cleaning: ReturnType<typeof applyRemedy> | undefined;
+    let reopening: ReturnType<typeof rpc> | undefined;
+    try {
+      process.env.PATH = `${docker.binDir}:${savedPath ?? ''}`;
+      await docker.seedContainer(name, { project: ctx.root });
+      cleaning = applyRemedy('clean-orphaned-containers', { root: ctx.root, storage });
+      const deadline = Date.now() + 5000;
+      while (!(await Bun.file(marker).exists()) && Date.now() < deadline) await Bun.sleep(10);
+      expect(await Bun.file(marker).exists()).toBe(true);
+      expect(isTaskLifecycleLocked(task.id)).toBe(true);
+      reopening = rpc('reopenTask', { taskId: task.id, reason: 'More work' });
+      const settled = await Promise.race([
+        reopening.then(() => true),
+        Bun.sleep(100).then(() => false),
+      ]);
+      expect(settled).toBe(false);
+      expect((await storage.getTask(task.id))?.status).toBe('abandoned');
+      await writeFile(release, 'go');
+      expect((await cleaning).done).toBe(1);
+      expect((await reopening).status).toBe(200);
+      expect((await storage.getTask(task.id))?.status).toBe('blocked');
+      expect((await storage.getSession(session.id))?.container_name).toBeNull();
+      expect(await docker.containers()).toEqual([]);
+    } finally {
+      await writeFile(release, 'go');
+      await Promise.allSettled([cleaning, reopening]);
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
 
   /** Point the project at a local bare \`origin\` with driver = "github"; returns a git-only PATH dir. */
   async function githubProjectWithGitOnlyPath(scratch: string): Promise<string> {

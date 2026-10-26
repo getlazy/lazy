@@ -334,6 +334,7 @@ export interface AskCommand {
  * conflicts if needed, then stop. No agent work phase runs.
  */
 export interface SyncCommand {
+  runtime_context?: string;
   type: 'sync';
   agent_extra_args?: string[];         // host OS-sandbox `--settings` for the conflict-resolution agent; see commonCommandFields
   task_id: string;
@@ -494,7 +495,7 @@ export interface AcceptGateResult {
   output?: string;
 }
 
-export type Command = StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand | AcceptGateCommand | ReviewCommand;
+export type Command = (StartCommand | UnblockCommand | AskCommand | SyncCommand | StopCommand | AcceptGateCommand | ReviewCommand) & { runtime_context?: string };
 
 /** Supervisor-bound commands that carry a correlation id (every type except stop). */
 export type CorrelatedCommand = Exclude<Command, StopCommand>;
@@ -1077,6 +1078,8 @@ export interface SupervisorStatus {
   retry_failure_reason?: string;
   /** Delay before the next attempt (ms) — lets the UI say when the retry lands. */
   retry_next_delay_ms?: number;
+  retry_next_at?: string;
+  retry_recovery_deadline?: string;
 }
 
 // --- Legacy spellings (the loop's pre-rename names) ---

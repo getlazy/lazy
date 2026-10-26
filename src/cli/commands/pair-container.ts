@@ -33,7 +33,7 @@
 
 import { readFile, rm } from 'fs/promises';
 import { containerCliForType } from '../../runner/container-cli';
-import { resolveInteractiveLaunch, launchEnvOverlay } from '../../credentials/interactive-auth';
+import { resolveInteractiveContainerEnv } from '../../credentials/interactive-auth';
 import { profileNameForAgent } from '../../config/agent-profiles';
 import { pairPidFilePath, pairInContainerCmd } from '../../supervisor/pair';
 import { queryEnsureTaskContainer } from '../../daemon/rpc-fallback';
@@ -211,6 +211,12 @@ export function createContainerPairLauncher(opts: {
   /** True when the agent writes Claude-format session JSONL we can read back. */
   claudeSessions: boolean;
   extraEnv?: Record<string, string>;
+  /**
+   * A read-only Chat rather than a pairing (`lazy chat` on a task whose agent
+   * is not Claude Code): the in-container session locks the agent read-only
+   * and its lazy tools are the read-only set (src/agent/interactive-modes.ts).
+   */
+  chat?: boolean;
 }): InteractiveLauncher {
   let containerName = opts.containerName;
   let runnerType = opts.runnerType;
@@ -231,10 +237,8 @@ export function createContainerPairLauncher(opts: {
       // machine — a bare `docker` would reach this host's engine instead.
       binary = await containerCliForType(opts.root, ensured.runnerType);
 
-      const { envVars } = await resolveInteractiveLaunch(opts.root, 'lazy pair', {
-        // The session runs in the container, so every address it is handed must
-        // be container-reachable — the same conversion a supervised turn gets.
-        surface: 'container',
+      const sessionEnv = await resolveInteractiveContainerEnv(opts.root, opts.chat ? 'lazy chat' : 'lazy pair', {
+        harness: opts.harness,
         // Task-scoped JIT identity: the audit log attributes these model calls
         // to this task, not to an anonymous host builder session.
         // The profile is the TASK's agent, not the builder's: pairing runs that
@@ -243,7 +247,7 @@ export function createContainerPairLauncher(opts: {
         identity: {
           role: 'builder',
           taskId: opts.taskId,
-          label: `pair:${opts.taskId}`,
+          label: `${opts.chat ? 'chat' : 'pair'}:${opts.taskId}`,
           profile: profileNameForAgent(opts.profile),
         },
       });
@@ -259,8 +263,9 @@ export function createContainerPairLauncher(opts: {
           tty: opts.tty,
           sessionId: resumeSessionId,
           modelId: opts.model,
-          autonomous,
-          env: { ...launchEnvOverlay(envVars), ...(opts.extraEnv ?? {}) },
+          autonomous: opts.chat ? false : autonomous,
+          ...(opts.chat ? { chat: true } : {}),
+          env: { ...sessionEnv, ...(opts.extraEnv ?? {}) },
         }),
         // The docker CLI itself runs on the host; where it runs is irrelevant to
         // the session, but the worktree is a stable, existing directory.

@@ -102,12 +102,6 @@ describe('environment replaced notice', () => {
     try {
       const entered = await enterTaskAsMember({
         projectRoot: '/p', storage, taskId: task.id, email,
-        deps: {
-          bindingFor: async () => null,
-          pairing: async () => ({ pairing: false, webPairEmail: null }),
-          worktreeHolders: async () => ({ webChat: { held: false, email: null }, lock: null }),
-          supervisorOwnsTurn: async () => null,
-        },
       });
       expect(entered).toEqual({ ok: true });
     } finally {

@@ -99,6 +99,14 @@ interface DaemonTokenRecord {
    * one thing — eviction order (see MAX_BUILDER_TOKENS). Never for auth.
    */
   ownerPid?: number;
+  /**
+   * The agent profile a BUILDER session runs on, recorded when its token is
+   * minted. Builder tokens only. The launch environment the builder asks for
+   * before every (re)launch (`/builder/launch-env`) is resolved for THIS
+   * profile, so a builder started with `lazy builder --agent codex-subscription`
+   * (or a Teams member's choice) never relaunches on the role's default.
+   */
+  builderProfile?: string;
 }
 
 interface DaemonTokenFile {
@@ -305,6 +313,12 @@ export interface MintDaemonTokenOptions {
    * caller, never evidence of identity, and no auth decision reads it.
    */
   ownerPid?: number;
+  /**
+   * The agent profile a builder session runs on (builder identities only). A
+   * reuse naming a DIFFERENT profile is refused: the label is one session, and
+   * a session does not change what it runs on mid-life.
+   */
+  builderProfile?: string;
   /** Replace the secret bound to an existing identity (control-plane rotation). */
   rotate?: boolean;
 }
@@ -340,6 +354,14 @@ export async function mintDaemonToken(
       // live session it belongs to would stay first in line for eviction.
       if (options.ownerPid !== undefined && existing.ownerPid !== options.ownerPid) {
         existing.ownerPid = options.ownerPid;
+        changed = true;
+      }
+
+      if (options.builderProfile !== undefined && existing.builderProfile !== options.builderProfile) {
+        if (existing.builderProfile !== undefined) {
+          throw new BuilderProfileMismatchError(label, existing.builderProfile, options.builderProfile);
+        }
+        existing.builderProfile = options.builderProfile;
         changed = true;
       }
 
@@ -386,6 +408,9 @@ export async function mintDaemonToken(
       label,
       createdAt: new Date().toISOString(),
       ...(options.ownerPid !== undefined ? { ownerPid: options.ownerPid } : {}),
+      ...(identity.kind === 'builder' && options.builderProfile !== undefined
+        ? { builderProfile: options.builderProfile }
+        : {}),
     };
     registry.tokens.push(record);
 
@@ -433,6 +458,31 @@ export async function lookupDaemonTokenLabel(
   const registry = await getRegistry(projectRoot);
   const record = registry.tokens.find(t => t.token === token);
   return record?.label ?? null;
+}
+
+/**
+ * The agent profile a builder token was minted for, or null when it names
+ * none (a token minted before profiles were recorded, or any non-builder
+ * token). Callers fall back to the builder role's configured profile.
+ */
+export async function lookupDaemonTokenBuilderProfile(
+  projectRoot: string,
+  token: string,
+): Promise<string | null> {
+  const registry = await getRegistry(projectRoot);
+  const record = registry.tokens.find(t => t.token === token);
+  return record?.kind === 'builder' ? record.builderProfile ?? null : null;
+}
+
+/** A builder session's token re-minted for a different agent profile. */
+export class BuilderProfileMismatchError extends Error {
+  constructor(label: string, recorded: string, requested: string) {
+    super(
+      `Builder session ${label} runs on the "${recorded}" agent profile; it cannot be re-issued for ` +
+      `"${requested}". Start a new builder to use a different profile.`,
+    );
+    this.name = 'BuilderProfileMismatchError';
+  }
 }
 
 export async function lookupDaemonIdentity(

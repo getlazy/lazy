@@ -39,6 +39,9 @@ import { manualHeadRemedy, repairTaskWorktreeHead, repairWorktreeGitPointers, sc
 import { taskWorktreeBranches } from '../../task/worktree-branches';
 import { describeNestedGit, notUnderLiveTurn, QUARANTINE_INFIX, quarantineReport, scanProjectNestedGit } from '../../git/nested-git';
 import { queryResumeTask } from '../../daemon/rpc-fallback';
+import { tryRpc } from '../../daemon/client';
+import { RemoteStorage } from '../../storage/remote-storage';
+import { applyRemedy, type DoctorRemedyResult } from '../../doctor/remedies';
 import {
   applyLocalCommandCleanup,
   deleteEmptiedConversations,
@@ -319,42 +322,17 @@ export async function commandDoctorCleanOrphanedContainers(
       return;
     }
 
-    // `createRunnerFromType`, not `createRunner`: the latter resolves live proxy
-    // targets and THROWS `ProxyUnavailableError` when the daemon is unreachable
-    // — after the human had already confirmed the removal. Removing a container
-    // needs no proxy, and a cleanup remedy that only works while the daemon is
-    // up would be useless in exactly the wedged state it exists for.
-    const runner = createRunnerFromType(runnerType);
-    let removed = 0;
-    for (const o of orphans) {
-      try {
-        // The runner owns container lifecycle, including force-removing a
-        // running one — doctor does not compose `docker rm -f`.
-        await runner.removeRun(o.name);
-        // `removeRun` reports failure by LOGGING it: `removeContainer` warns on a
-        // non-zero `rm` and returns normally, so a clean return is NOT evidence
-        // the container is gone, and printing `Removed …` on it is a false
-        // success. Ask the runner instead — it answered `ps -a` moments ago, so
-        // "still there" is unambiguous.
-        if (await runner.runExists(o.name)) {
-          console.log(theme.error(
-            `  Failed to remove ${o.name} — still present afterwards; ` +
-            `run ${theme.command(`${runnerType} rm -f ${o.name}`)} to see why`,
-          ));
-          continue;
-        }
-        // Keep the session record honest: a container_name pointing at a
-        // container that no longer exists is what makes later turns guess.
-        if (o.sessionId) await storage.updateSessionContainerName(o.sessionId, null);
-        console.log(theme.success(`  Removed ${o.name}`));
-        removed++;
-      } catch (err) {
-        console.log(
-          theme.error(`  Failed to remove ${o.name}: ${err instanceof Error ? err.message : String(err)}`),
-        );
-      }
+    // Destruction belongs to the daemon so its lifecycle lock also excludes
+    // reopen and launch. The direct path is for a daemonless diagnostic, whose
+    // FileStorage handle owns the inter-process storage lock.
+    const result = storage instanceof RemoteStorage
+      ? await tryRpc<DoctorRemedyResult>('doctor.applyRemedy', { flag: 'clean-orphaned-containers' })
+      : await applyRemedy('clean-orphaned-containers', { root, storage });
+    if (!result) throw new Error('Cannot clean containers: the daemon did not return a remedy result. Re-run lazy doctor.');
+    for (const line of result.lines) {
+      console.log(result.failed ? theme.error('  ' + line) : theme.success('  ' + line));
     }
-    reportRemedyOutcome('Removed', removed, orphans.length, 'container(s)');
+    reportRemedyOutcome('Removed', result.done, result.total, 'container(s)');
   });
 }
 

@@ -1,5 +1,17 @@
 # The daemon and its clients
 
+```mermaid
+%% caption: The CLI, web interface, agent tools, and supervisor all ask the daemon to apply task rules to the store
+flowchart LR
+  CLI[CLI] --> Daemon[Project daemon]
+  Browser[Dashboard or Teams] --> Daemon
+  MCP[Agent MCP server] --> Daemon
+  Supervisor[Task supervisor] --> Daemon
+  Daemon --> Rules[Task rules and transitions]
+  Rules --> Store[(Task store)]
+```
+
+
 Each project has one daemon. It owns every rule and all the state; everything else is a client that asks it to act.
 
 - **The CLI** parses what you type and prints the answer.
@@ -14,6 +26,17 @@ Clients ask the daemon to do things and never write the store themselves, so a r
 Tasks, sessions, turns, commits, comments, conversations and memory live in the project's store: by default a folder under `~/.lazy/<project-name>`, or the `[storage] external_path` you set. It sits outside the repository, so it is never committed, and task containers are not given it.
 
 Before a new lazy version first opens a store, lazy saves it as a verified compressed archive next to it and keeps the newest five (`[storage] backup_keep`). If the backup fails, the new version does not open the store. See [Store backups](../store-backups.md).
+
+On a single-person install, set backup retention in the project root's
+`lazy.toml`:
+
+```toml
+[storage]
+backup_keep = 10
+```
+
+This keeps the newest ten verified backups beside the project's store. Lazy
+Teams manages this count itself and keeps five.
 
 ## What the daemon also does
 

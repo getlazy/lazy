@@ -68,7 +68,8 @@ import {
   usesSyntheticCreds,
   type LaunchSurface,
 } from '../utils/role-target';
-import { resolveAuthEnvFromDaemon, withLiveProxyTarget, type AuthEnvVar } from '../daemon/auth-env';
+import { resolveAuthEnvFromDaemon, resolveLiveProxyUrl, withLiveProxyTarget, type AuthEnvVar } from '../daemon/auth-env';
+import { LIVE_PROXY_PORT_ENV } from '../supervisor/proxy-address-env';
 import { credentialFromEnv } from '../daemon/credential-gate';
 import type { LaunchIdentity } from '../proxy/placeholder-env';
 import type { RoleTarget } from '../config/types';
@@ -213,4 +214,36 @@ export async function resolveInteractiveLaunch(
 /** The resolved launch env as a spawn-ready `env` overlay. */
 export function launchEnvOverlay(envVars: AuthEnvVar[]): Record<string, string> {
   return Object.fromEntries(envVars.map(v => [v.key, v.value]));
+}
+
+/**
+ * The env a Pair or Chat session exec'd into a task's KEPT container is given,
+ * for any harness.
+ *
+ * Claude Code gets the overlay {@link resolveInteractiveLaunch} resolves, as it
+ * always has. Every other harness (Codex, Cursor, Pi) gets NO credential
+ * overlay: the container was created with the task profile's own placeholders
+ * — the same ones its turns spend — and the builder role's Anthropic
+ * credential is neither what that agent uses nor something a Codex- or
+ * Cursor-only project has. Requiring it refused those pairings outright.
+ *
+ * Every harness gets the live proxy port ({@link LIVE_PROXY_PORT_ENV}), which
+ * the in-container session uses to move the endpoint variables it inherited
+ * from container creation onto the proxy serving now.
+ */
+export async function resolveInteractiveContainerEnv(
+  root: string,
+  command: string,
+  opts: { harness: string; identity: LaunchIdentity },
+): Promise<Record<string, string>> {
+  const config = await loadConfig(root);
+  const env: Record<string, string> = opts.harness === 'claude-code'
+    ? launchEnvOverlay((await resolveInteractiveLaunch(root, command, { surface: 'container', identity: opts.identity })).envVars)
+    : {};
+  const live = await resolveLiveProxyUrl(config);
+  if (live) {
+    const port = new URL(live).port;
+    if (port) env[LIVE_PROXY_PORT_ENV] = port;
+  }
+  return env;
 }

@@ -34,7 +34,7 @@ import { logger } from '../utils/logger';
 import { mustRecreateForTaskEnv } from './task-env';
 import {
   recordRecreation,
-  recordRecreationIfRunning,
+  recordContainerBeforeLaunch,
   REASON_CHECKOUT_MISSING,
   REASON_GIT_POINTERS_BROKEN,
   REASON_RESTART_REQUESTED,
@@ -153,7 +153,7 @@ async function ensureTaskContainerClaimed(
   const worktreeMissing = !await pathExists(worktreePath);
   let containerRunning = await runner.isRunning(containerName);
   if (!containerRunning && !params.neverLaunch) {
-    await recordRecreationIfRunning(storage, task.id, null, runner, containerName);
+    await recordContainerBeforeLaunch(storage, task.id, null, runner, containerName);
   }
   if (params.neverLaunch && (!containerRunning || worktreeMissing)) {
     throw new RpcError(409, `Task ${displayId(task)}'s container is not running any more, and bringing one up was not asked for. Run services starts it.`);
@@ -176,6 +176,19 @@ async function ensureTaskContainerClaimed(
 
   await ensureTaskWorktree(projectRoot, task, sess?.git_branch, params.restoreProgress ?? params.notify);
 
+  // A container that stopped (a host reboot, a dockerd restart, `lazy stop`)
+  // is started again with everything in it, rather than recreated — then
+  // checked below exactly like one that was running all along
+  // (src/runner/start-or-recreate.ts).
+  let startedAgain = false;
+  if (!containerRunning && !params.restart && !worktreeMissing && runner.startStoppedRun) {
+    if (await runner.startStoppedRun(containerName)) {
+      params.notify?.(`Started the stopped container ${containerName} again (its files and installed tools are kept).`);
+      containerRunning = true;
+      startedAgain = true;
+    }
+  }
+
   if (containerRunning) {
     const pointers = await probeContainerGitPointers(projectRoot, worktreePath, runner, containerName);
     if (pointers.kind === 'unavailable') {
@@ -189,7 +202,15 @@ async function ensureTaskContainerClaimed(
     const envStale = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
     const recreateForEnv = envStale && task.status !== 'working';
     if (!params.restart && pointers.kind === 'healthy' && !recreateForEnv) {
-      return { containerName, worktreePath, runnerType: runner.type, alreadyRunning: true };
+      if (startedAgain && sess) {
+        // Its published ports were assigned afresh: re-record the name so the
+        // event tap emits `ports.changed` (see removeTaskRun) — with the
+        // container's ORIGINAL agent stamp, never the task's current agent.
+        const stamp = sess.container_agent_id ?? null;
+        await storage.updateSessionContainerName(sess.id, null);
+        await storage.updateSessionContainerName(sess.id, containerName, stamp);
+      }
+      return { containerName, worktreePath, runnerType: runner.type, alreadyRunning: !startedAgain };
     }
     if (recreateForEnv && pointers.kind === 'healthy') params.notify?.("Recreating container: the task's environment variables changed since it was created.");
     if (params.neverLaunch) {
@@ -234,7 +255,7 @@ async function ensureTaskContainerClaimed(
 
   // A stopped container of the same name would make `docker run --name` fail,
   // and would in any case carry the OLD published ports.
-  await removeTaskRun(runner, storage, sess, containerName);
+  await removeTaskRun(runner, storage, sess, containerName, task.id);
 
   // INVARIANT: set the task's agent profile on the runner before launch.
   // ensureTaskContainer used to launch with no agent set, so launchSupervisorAsync

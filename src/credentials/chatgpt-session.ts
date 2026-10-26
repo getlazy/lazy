@@ -28,7 +28,10 @@
  */
 
 import { logger } from '../utils/logger';
-import { resolveCredential, setCredential } from './store';
+import { getStoredCredential, resolveCredential, setCredential } from './store';
+import { credentialIndexPath } from './scope';
+import { recordCredentialRenewalFailure } from './renewal-failure';
+import { withCredentialFileLock } from './file-updates';
 import {
   type ChatGptTokens,
   needsRefresh,
@@ -72,12 +75,12 @@ function chainKey(projectRoot: string, name: string): string {
  * the number of distinct (project, name) pairs a daemon serves, which is the
  * number of projects it has, and each entry is replaced rather than appended.
  */
-const renewed = new Map<string, { from: string; tokens: ChatGptTokens }>();
+const renewed = new Map<string, { from: string; tokens: ChatGptTokens; persistencePending?: boolean }>();
 
 /** A still-usable renewed session for this exact source value, or null. */
 function renewedFor(key: string, sourceValue: string): ChatGptTokens | null {
   const entry = renewed.get(key);
-  if (!entry || entry.from !== sourceValue) return null;
+  if (!entry || entry.from !== sourceValue || entry.persistencePending) return null;
   // A renewal that has itself aged out is no better than the source; drop it so
   // the next refresh starts from the newest refresh token we hold.
   if (needsRefresh(entry.tokens)) return null;
@@ -114,16 +117,45 @@ export async function resolveChatGptSession(
   name: string = CHATGPT_CREDENTIAL,
   opts: { force?: boolean } = {},
 ): Promise<ChatGptSession | null> {
-  return resolveChatGptSessionFrom({
-    key: chainKey(projectRoot, name),
-    read: () => resolveCredential(projectRoot, name),
-    describe: (source, envVar) =>
-      source === 'env' ? `the ${envVar} environment variable` : `the stored "${name}" credential`,
-    persist: async (secret) => {
-      await setCredential(projectRoot, { provider: name, kind: 'oauth', secret });
-    },
-    label: `"${name}"`,
-  }, opts);
+  for (;;) {
+    const initial = await resolveCredential(projectRoot, name);
+    if (!initial) return null;
+    const scope = initial.setName ? { set: initial.setName } : projectRoot;
+    const scopeChanged = new Error('Credential source changed while waiting for its renewal lock');
+    const resolve = () => resolveChatGptSessionFrom({
+      projectRoot,
+      key: chainKey(initial.source === 'env' ? `env:${projectRoot}` : typeof scope === 'string' ? scope : `set:${scope.set}`, name),
+      read: async () => {
+        const current = await resolveCredential(projectRoot, name);
+        // Every read, including the queued re-read, belongs to the lock held.
+        // Never exchange a token selected through another scope's fallback.
+        if (current && (current.source !== initial.source || current.setName !== initial.setName)) throw scopeChanged;
+        return current;
+      },
+      describe: (source, envVar) =>
+        source === 'env' ? `the ${envVar} environment variable` : `the stored "${name}" credential`,
+      persist: async (secret, renewedFrom) => {
+        const current = await getStoredCredential(scope, name, { inheritSet: false });
+        if (!current) throw new Error(`The ${name} credential was removed while renewing it. Reconnect the session.`);
+        await setCredential(scope, { provider: name, kind: 'oauth', secret, expectedValue: renewedFrom }, current.backend);
+      },
+      label: `"${name}" (${initial.setName ? `set ${initial.setName}` : 'project credential'})`,
+    }, opts);
+    try {
+      // Both project and shared sessions can be renewed by multiple processes.
+      // Release a stale scope's lock before resolving and locking the new one.
+      return initial.source === 'store'
+        ? await withCredentialFileLock(`${credentialIndexPath(scope)}.refresh`, resolve)
+        : await resolve();
+    } catch (err) {
+      if (err === scopeChanged) continue;
+      if (err instanceof Error) {
+        err.message = `Could not resolve ChatGPT credential "${name}": ${err.message}`;
+        throw err;
+      }
+      throw new Error(`Could not resolve ChatGPT credential "${name}": ${String(err)}`);
+    }
+  }
 }
 
 /**
@@ -134,6 +166,8 @@ export async function resolveChatGptSession(
  * hand-out — is the same for both, which is why it is one function.
  */
 export interface ChatGptSessionSource {
+  /** Project whose inbox receives a failed-persistence alert. */
+  projectRoot: string;
   /** Identifies this one session: renewals of it are serialized on this key. */
   key: string;
   read(): Promise<{ value: string; source: 'env' | 'store'; envVar: string } | null>;
@@ -169,7 +203,8 @@ export async function resolveChatGptSessionFrom(
   }
 
   const tokens = parseChatGptTokens(stored.value, describe(stored.source));
-  if (!opts.force && !needsRefresh(tokens)) {
+  const pendingSave = renewed.get(key);
+  if (!opts.force && !needsRefresh(tokens) && !(pendingSave?.from === stored.value && pendingSave.persistencePending)) {
     return { tokens, source: stored.source, refreshed: false };
   }
 
@@ -178,8 +213,15 @@ export async function resolveChatGptSessionFrom(
     // queued has already produced a fresh token, and refreshing again would
     // retire a perfectly good refresh token for nothing.
     const current = await src.read();
-    const source = current?.source ?? stored.source;
-    const sourceValue = current?.value ?? stored.value;
+    if (!current) return null;
+    const source = current.source;
+    const sourceValue = current.value;
+
+    const pending = renewed.get(key);
+    if (source === 'store' && pending?.from === sourceValue && pending.persistencePending) {
+      await persistRenewedSession(src, pending, sourceValue);
+      return { tokens: pending.tokens, source, refreshed: false };
+    }
 
     const renewedInFlight = opts.force ? null : renewedFor(key, sourceValue);
     if (renewedInFlight) {
@@ -204,12 +246,13 @@ export async function resolveChatGptSessionFrom(
     // Record it BEFORE handing it out, whichever source it came from: the
     // refresh token behind `base` is already retired upstream at this point, so
     // anything that loses the replacement loses the session.
-    renewed.set(key, { from: sourceValue, tokens: refreshed });
+    const replacement = { from: sourceValue, tokens: refreshed, persistencePending: source === 'store' };
+    renewed.set(key, replacement);
 
     if (source === 'store') {
       // Persisted too, so it survives this daemon. A failure here is loud rather
       // than deferred, for the same reason.
-      await src.persist(serializeChatGptTokens(refreshed), sourceValue);
+      await persistRenewedSession(src, replacement, sourceValue);
       logger.info(`[credentials] refreshed the ChatGPT subscription token (${src.label})`);
     } else {
       logger.warn(
@@ -221,6 +264,30 @@ export async function resolveChatGptSessionFrom(
     }
     return { tokens: refreshed, source, refreshed: true };
   });
+}
+
+/** A rotated token is never handed out while its required durable save is pending. */
+async function persistRenewedSession(
+  src: ChatGptSessionSource,
+  replacement: { tokens: ChatGptTokens; persistencePending?: boolean },
+  sourceValue: string,
+): Promise<void> {
+  try {
+    await src.persist(serializeChatGptTokens(replacement.tokens), sourceValue);
+    replacement.persistencePending = false;
+  } catch (err) {
+    const message = `ChatGPT renewed ${src.label}, but the replacement session could not be saved. ` +
+      `The previous refresh token may already be retired. Reconnect this credential from a fresh codex login before restarting Lazy.`;
+    // The warning is durable and visible in Teams, the dashboard and the CLI.
+    // Retain the replacement in memory so a later request retries its SAVE,
+    // never another exchange using the retired refresh token.
+    try {
+      await recordCredentialRenewalFailure(src.projectRoot, src.label, message);
+    } catch (noticeError) {
+      throw new Error(`${message} The alert could not be recorded: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`, { cause: err });
+    }
+    throw new Error(message, { cause: err });
+  }
 }
 
 /**

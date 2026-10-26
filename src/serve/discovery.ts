@@ -10,7 +10,7 @@
 
 import { createRunner } from '../runner';
 import { loadConfig } from '../config/loader';
-import { resolveServices, type ResolvedService, type ServicePort } from './ports';
+import { mainServiceOf, resolveServices, type ResolvedService, type ServicePort } from './ports';
 import { withPublicUrls } from './subdomain';
 import type { Session, Task } from '../types';
 import { taskRef } from '../task/identity';
@@ -35,6 +35,8 @@ export interface TaskServeState {
   unavailable: ServeUnavailableReason | null;
   containerName: string;
   runnerType: string;
+  /** The port used for the overall readiness answer; first declared by default. */
+  mainService?: number | null;
   /** Whether the task's container was seen running (false when not asked). */
   containerRunning?: boolean;
 }
@@ -100,6 +102,7 @@ async function serveStateFor(
 ): Promise<TaskServeState> {
   const config = await loadConfig(root);
   const declared = config.serve.services;
+  const mainService = mainServiceOf(declared, config.serve.main_service)?.port ?? null;
 
   // Nothing declared means nothing to look up — and every caller that renders
   // this opportunistically (`lazy show`) then pays no runtime call at all.
@@ -107,13 +110,13 @@ async function serveStateFor(
   // state (and what Start services is doing in it) whether or not any port
   // is declared: Start services needs no declaration.
   if (declared.length === 0 && !opts.alwaysProbe) {
-    return { declared, services: [], unavailable: null, containerName: '', runnerType: '', containerRunning: false };
+    return { declared, services: [], unavailable: null, containerName: '', runnerType: '', containerRunning: false, mainService };
   }
 
   const runner = await createRunner(root, subject.runnerType);
   const containerName = subject.containerName(runner);
 
-  const base = { declared, containerName, runnerType: runner.type };
+  const base = { declared, containerName, runnerType: runner.type, mainService };
 
   if (!runner.usesSandbox()) {
     return { ...base, services: [], unavailable: 'no-container-runner', containerRunning: false };

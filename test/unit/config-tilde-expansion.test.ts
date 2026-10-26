@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { loadConfig } from '../../src/config/loader';
 import { expandTilde, getHome } from '../../src/utils/home';
 
@@ -50,6 +50,16 @@ describe('tilde expansion in config', () => {
     expect(config.storage.external_path).toBe(`${getHome()}/.lazy/tilde-test`);
     // And NOT the literal form that would create <cwd>/~/...
     expect(config.storage.external_path.startsWith('~')).toBe(false);
+  });
+
+  // INVARIANT: the process cwd cannot change which store a project selects.
+  test('relative store paths resolve against the project root from another cwd', async () => {
+    await writeFile(join(dir, 'lazy.toml'), '[storage]\nbackend = "external"\nexternal_path = "../stores/portable"\n');
+    expect(process.cwd()).not.toBe(dir);
+    const config = await loadConfig(dir);
+    expect(config.storage.external_path).toBe(resolve(dir, '../stores/portable'));
+    expect(config.storage.configured_path).toBe('../stores/portable');
+    expect(config.storage.resolved_path).toBe(config.storage.external_path);
   });
 
   test('loadConfig leaves absolute external_path unchanged', async () => {

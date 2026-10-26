@@ -34,6 +34,10 @@ import {
 } from '../../src/memory';
 import { buildSystemPrompt } from '../../src/task/turn-context';
 import type { Task, MemoryRecord } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('shared memory', () => {
   let testDir: string;
@@ -50,7 +54,7 @@ describe('shared memory', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     task = await storage.createTask('Test task', undefined, undefined, 'test-task');
   });
 
@@ -195,7 +199,7 @@ describe('shared memory', () => {
   test('records survive a fresh storage instance', async () => {
     await storage.saveMemory({ name: 'topic', description: 'v1', type: 'project', body: 'first' }, 'human');
     await storage.close();
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
 
     expect((await storage.getMemory('topic'))!.body).toBe('first');
   });

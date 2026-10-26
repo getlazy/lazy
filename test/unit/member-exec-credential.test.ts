@@ -24,6 +24,8 @@ import {
 } from '../../src/server/member-exec-credential';
 import { bindTurnCredential } from '../../src/daemon/session-credentials';
 import { mintCredentialGrant, lookupCredentialGrant, clearCredentialGrantCache } from '../../src/proxy/credential-broker';
+import { beginMemberRecovery, allowMemberBinding, resetMemberRecoveryForTests } from '../../src/daemon/member-recovery';
+import { resolveMemberCredential } from '../../src/proxy/credential-deps';
 
 const TASK = '11111111-2222-3333-4444-555555555555';
 
@@ -174,6 +176,7 @@ describe('member terminal credentials across a daemon restart', () => {
   });
 
   afterEach(async () => {
+    resetMemberRecoveryForTests();
     if (prevLazyTest === undefined) delete process.env.LAZY_TEST;
     else process.env.LAZY_TEST = prevLazyTest;
     unpin();
@@ -182,6 +185,28 @@ describe('member terminal credentials across a daemon restart', () => {
     clearCredentialGrantCache();
     await rm(root, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
+  });
+
+  // INVARIANT: unknown startup inventory blocks both proxy credential paths
+  // without revoking durable bindings. Recovery can unblock only live bindings.
+  test('pending recovery blocks placeholders and JIT grants without revoking them', async () => {
+    const planned = await planMemberContainerCredential({ root, taskId: TASK, sessionId: 's1', memberEmail: 'alice@example.com', container: 'lazymember-t-1' });
+    if (!planned.ok) throw new Error(planned.message);
+    const key = planned.credential.key!;
+    const token = planned.credential.env.find(e => e.key === 'ANTHROPIC_API_KEY')!.value;
+    const grantToken = await mintCredentialGrant(root, { role: 'builder', taskId: TASK, bindingKey: key, label: 'member-terminal:alice@example.com:lazymember-t-1', envKey: 'ANTHROPIC_API_KEY' });
+    const grant = (await lookupCredentialGrant(root, grantToken))!;
+    beginMemberRecovery(root);
+    expect((await getTaskSessionBinding(root, key))?.revokedAt).toBeNull();
+    expect(await lookupSessionBinding(root, token)).toBeNull();
+    expect((await resolveMemberCredential(root, grant))?.outcome).toMatchObject({ kind: 'missing', reason: expect.stringContaining('no active member credential binding') });
+    allowMemberBinding(root, key);
+    expect(await lookupSessionBinding(root, token)).not.toBeNull();
+    expect((await resolveMemberCredential(root, grant))?.outcome.kind).not.toBe('missing');
+    await planned.credential.release();
+    allowMemberBinding(root, key);
+    expect(await lookupSessionBinding(root, token)).toBeNull();
+    expect((await resolveMemberCredential(root, grant))?.outcome.kind).toBe('missing');
   });
 
   test("a terminal's binding and grant left live by a dead daemon stop resolving at the next startup", async () => {
@@ -211,6 +236,31 @@ describe('member terminal credentials across a daemon restart', () => {
     expect(await lookupCredentialGrant(root, memberGrant)).toBeNull();
     expect(await lookupSessionBinding(root, turn.token)).not.toBeNull();
     expect(await lookupCredentialGrant(root, builderGrant)).not.toBeNull();
+  });
+
+  // INVARIANT: the startup revoke spares exactly the credentials of the
+  // containers the sweep re-adopted — their placeholder is fixed in their
+  // environment — and still ends every other member terminal's.
+  test('a re-adopted container keeps its binding and grant through the startup revoke', async () => {
+    const kept = await planMemberContainerCredential({ root, taskId: TASK, sessionId: 's1', memberEmail: 'alice@example.com', container: 'lazymember-t-1' });
+    const gone = await planMemberContainerCredential({ root, taskId: TASK, sessionId: 's1', memberEmail: 'alice@example.com', container: 'lazymember-t-2' });
+    if (!kept.ok || !gone.ok) throw new Error('expected member credentials');
+    const value = (p: typeof kept) => (p.ok ? p.credential.env.find((e) => e.key === 'ANTHROPIC_API_KEY')!.value : '');
+    const keptGrant = await mintCredentialGrant(root, { role: 'builder', taskId: TASK, label: 'member-terminal:alice@example.com:lazymember-t-1', envKey: 'CURSOR_API_KEY' });
+    const goneGrant = await mintCredentialGrant(root, { role: 'builder', taskId: TASK, label: 'member-terminal:alice@example.com:lazymember-t-2', envKey: 'CURSOR_API_KEY' });
+    clearSessionCredentialCache();
+    clearCredentialGrantCache();
+
+    const swept = await revokeLeftoverMemberTerminalCredentials(root, {
+      bindingKeys: new Set([kept.credential.key!]),
+      grantLabels: new Set(['member-terminal:alice@example.com:lazymember-t-1']),
+    });
+
+    expect(swept).toEqual({ bindings: 1, grants: 1 });
+    expect(await lookupSessionBinding(root, value(kept))).not.toBeNull();
+    expect(await lookupCredentialGrant(root, keptGrant)).not.toBeNull();
+    expect(await lookupSessionBinding(root, value(gone))).toBeNull();
+    expect(await lookupCredentialGrant(root, goneGrant)).toBeNull();
   });
 });
 
@@ -257,7 +307,7 @@ describe('member terminal credential outside team mode', () => {
 test('the daemon runs the member-terminal sweep at startup', async () => {
   const { readFile } = await import('fs/promises');
   const src = await readFile(join(import.meta.dir, '../../src/daemon/server.ts'), 'utf-8');
-  const sweep = src.indexOf('await revokeLeftoverMemberTerminalCredentials(projectRoot)');
+  const sweep = src.indexOf('await revokeLeftoverMemberTerminalCredentials(projectRoot');
   const loop = src.indexOf('startDaemonReconcileLoop(projectRoot');
   expect(sweep).toBeGreaterThan(-1);
   expect(sweep).toBeLessThan(loop);

@@ -79,9 +79,11 @@ export function buildMergeAgentArgs(
   useResume: boolean = false,
   effort?: string,
   extraArgs?: string[],
+  runtimeContext?: string,
 ): AgentExecArgs {
   return agent.buildExecArgs({
     prompt,
+    ...(runtimeContext ? { systemPrompt: runtimeContext } : {}),
     // The host OS-sandbox `--settings` (with the git-pointer denies the
     // supervisor added) — a merge agent is confined exactly like a work agent.
     ...(extraArgs?.length ? { extraArgs } : {}),
@@ -111,6 +113,7 @@ export function buildMergeAgentArgs(
  * arguments at call sites the compiler cannot always catch.
  */
 export interface MergeTurnOptions {
+  runtimeContext?: string;
   /**
    * Extra agent args from the command (`agent_extra_args`): on the host runner
    * the OS-sandbox `--settings`. Without them a conflict-resolution agent ran
@@ -350,7 +353,7 @@ export async function runSyncWithUpstream(
 
     function buildAgentArgs(shouldResume: boolean): AgentExecArgs {
       const prompt = shouldResume ? resumePrompt : standalonePrompt;
-      return buildMergeAgentArgs(agent, prompt, modelId, agentSessionId, shouldResume, opts?.effort, opts?.extraArgs);
+      return buildMergeAgentArgs(agent, prompt, modelId, agentSessionId, shouldResume, opts?.effort, opts?.extraArgs, opts?.runtimeContext);
     }
 
     // Track whether we should try resuming. Start with resume if session exists.
@@ -616,7 +619,7 @@ export async function runSyncWithRemote(
     log(`[remote-sync] Running ${agentName} for conflict resolution...`);
 
     const prompt = useResume ? resumePrompt : standalonePrompt;
-    let agentArgs = buildMergeAgentArgs(agent, prompt, modelId, agentSessionId, useResume, opts?.effort, opts?.extraArgs);
+    let agentArgs = buildMergeAgentArgs(agent, prompt, modelId, agentSessionId, useResume, opts?.effort, opts?.extraArgs, opts?.runtimeContext);
 
     let { stdout, stderr, exitCode, resultLine, sessionId, initModel, hung } = await runMergeAgent(
       agent,
@@ -642,7 +645,7 @@ export async function runSyncWithRemote(
         log(`[remote-sync] Resume failed — falling back to a standalone ${agentName} turn...`);
         useResume = false;
         const fallbackPrompt = standalonePrompt;
-        agentArgs = buildMergeAgentArgs(agent, fallbackPrompt, modelId, undefined, false, opts?.effort, opts?.extraArgs);
+        agentArgs = buildMergeAgentArgs(agent, fallbackPrompt, modelId, undefined, false, opts?.effort, opts?.extraArgs, opts?.runtimeContext);
 
         // Re-create the conflicted merge the fallback attempt is meant to resolve
         // (the failure path above aborted it). The agent can only RESOLVE a

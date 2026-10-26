@@ -507,6 +507,17 @@ export function targetEnvVars(
   return vars;
 }
 
+/**
+ * An exec inherits a retained container's environment. Clear profile flags
+ * absent from the new target so a previous target cannot govern this launch.
+ * Keep this list beside the code that emits those flags.
+ */
+export function targetEnvOverrides(vars: AuthEnvVar[]): AuthEnvVar[] {
+  const present = new Set(vars.map(v => v.key));
+  const flags = [ASSUME_FIRST_PARTY_ENV, ...LOCAL_BACKEND_STABILITY_ENV.map(v => v.key)];
+  return [...flags.filter(key => !present.has(key)).map(key => ({ key, value: '' })), ...vars];
+}
+
 // Moved to a leaf module so the config loader can reach it without closing an
 // import cycle (see src/utils/anthropic-models.ts); re-exported here because
 // every existing caller imports it from this module.

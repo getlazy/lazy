@@ -13,19 +13,20 @@
 import { join, basename } from 'path';
 import { mkdtempSync, rmSync, copyFileSync, existsSync, unlinkSync, writeFileSync, readFileSync, chmodSync } from 'fs';
 import { tmpdir } from 'os';
-import {
-  captureBuildProvenance,
-  formatBuildInfoContent,
-  formatSourceProvenanceLine,
-} from './build-info-content';
-import { computeSourceFingerprint } from '../src/utils/source-id';
-import { requireDockerRelayRuntime } from '../src/vm/docker-relay';
-import {
-  verifyAgentBinaryBytes,
-  verifyAgentBinarySelfcheckExec,
-  formatAgentBinaryError,
-} from '../src/agent/binary-identity';
 
+const pinnedBun = (await Bun.file(join(import.meta.dir, '../.bun-version')).text()).trim();
+if (!Bun.semver.satisfies(Bun.version, `>=${pinnedBun}`)) {
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, 'build-entry.ts'), 'compile'], {
+    stdin: 'inherit', stdout: 'inherit', stderr: 'inherit',
+  });
+  process.exit(await child.exited);
+}
+
+// This module reads generated version metadata; load it only after the check.
+const { computeSourceFingerprint } = await import('../src/utils/source-id');
+const { captureBuildProvenance, formatBuildInfoContent, formatSourceProvenanceLine } = await import('./build-info-content');
+const { requireDockerRelayRuntime } = await import('../src/vm/docker-relay');
+const { verifyAgentBinaryBytes, verifyAgentBinarySelfcheckExec, formatAgentBinaryError } = await import('../src/agent/binary-identity');
 const projectRoot = join(import.meta.dir, '..');
 
 // Compiled binaries embed the builder's runtime. Refuse before producing a

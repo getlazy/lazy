@@ -14,7 +14,6 @@ test("a member's Pair and Chat are refused for an oversized transcript; their Sh
   const r = await taskModeRefusals({
     projectRoot: '/p', task, callerEmail: 'alice@example.com', multiMember: true, binary: 'docker',
     deps: {
-      holder: () => null,
       runArgsRefusal: async () => null,
       credentialMissing: async () => false,
       pairOrChat: async () => null,
@@ -30,7 +29,6 @@ test('a transcript of ordinary size refuses nothing', async () => {
   const r = await taskModeRefusals({
     projectRoot: '/p', task, callerEmail: 'alice@example.com', multiMember: true, binary: 'docker',
     deps: {
-      holder: () => null,
       runArgsRefusal: async () => null,
       credentialMissing: async () => false,
       pairOrChat: async () => null,

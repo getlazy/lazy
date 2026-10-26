@@ -26,6 +26,10 @@ import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { VALID_EFFORT_LEVELS } from '../../src/config/types';
 import { listAgents } from '../../src/agent/registry';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 function toolNamed(name: string) {
   const tool = allTools.find((t) => t.name === name);
@@ -48,7 +52,7 @@ describe('MCP lazy_start agent/effort parity', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     ctx = { taskId: '', worktreePath: testDir, storage };
   });
 

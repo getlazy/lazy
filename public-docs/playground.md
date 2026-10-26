@@ -16,6 +16,23 @@ It lives at <https://github.com/getlazy/playground> and is already set up for la
 - **`tasks.md`** lists eight starter tasks, and **`tasks.json`** is the same list
   in a form lazy can create tasks from.
 
+For example, the service, protected schema and turn check are configured in
+the project's `lazy.toml` as focused sections like these:
+
+```toml
+[serve.services]
+web = 3000
+
+[permissions]
+protected = ["src/schema.sql"]
+
+[automation]
+post_turn = "bun run typecheck"
+```
+
+The task's web service is named `web`, changes to the existing schema require
+review, and a type check runs after each clean turn.
+
 ## Using it on your laptop
 
 For real agent turns, clone it and set it up like any other project:

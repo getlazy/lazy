@@ -19,6 +19,10 @@ import {
 } from '../../src/daemon/session-credentials';
 import { getTurnOwner, planTurnCredential } from '../../src/daemon/turn-credentials';
 import { runAsTurnOwnerRequest } from '../../src/daemon/turn-owner';
+import { openTestDaemonStorage } from '../helpers/daemon-storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 const TASK_ID = 'task-uuid-under-review';
 
@@ -26,6 +30,7 @@ describe('review conversation credential', () => {
   let root: string;
   let base: string;
   let unpin: () => void;
+  let closeStore: () => Promise<void>;
   let unpinConfig: () => void;
 
   beforeEach(async () => {
@@ -34,11 +39,13 @@ describe('review conversation credential', () => {
     unpin = pinDaemonBaseDir(base);
     await writeFile(join(root, 'lazy.toml'), '');
     unpinConfig = pinConfig(root);
+    closeStore = await openTestDaemonStorage(root);
     clearUserCredentialCache();
     clearSessionCredentialCache();
   });
 
   afterEach(async () => {
+    await closeStore();
     unpin();
     unpinConfig();
     clearUserCredentialCache();

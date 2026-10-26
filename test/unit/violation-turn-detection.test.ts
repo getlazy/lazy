@@ -45,6 +45,10 @@ import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { latestViolationTurn } from '../../src/utils/turns';
 import type { Turn, FileViolation } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 // --- Invariant 1: the helper itself ---
 
@@ -156,7 +160,7 @@ describe('lazy_unblock and protected-file violations', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     ctx = { taskId: '', worktreePath: testDir, storage };
 
     // A conflict task shaped like the original incident: violations on the work

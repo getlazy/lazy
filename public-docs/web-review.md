@@ -93,6 +93,17 @@ That origin then becomes the only host the dashboard accepts and the address its
 links use; the proxy must forward the original `Host` header, and `lazy doctor`
 shows which origin is in effect.
 
+For a single-person install served through a trusted proxy, set the project's
+root `lazy.toml` like this:
+
+```toml
+[server]
+dashboard_url = "https://lazy.example.com"
+```
+
+On Lazy Teams, the application serves the project UI, so its admin configures
+the Teams address instead of this daemon-dashboard setting.
+
 That is a security boundary, not a preference. Browser cookies are scoped by
 **hostname, not by port** — one cookie for `127.0.0.1` is sent to *everything*
 on `127.0.0.1`, whatever port it is on. Apps your tasks start under `[serve]`
@@ -165,6 +176,7 @@ and only when the runner has no container to enter.
 | **Regions** | The groups the agent's walkthrough declares — in the order it declared them, `Other changes` last, each with its tier and owner. Picking one scopes the Changes tab to it. See [Review regions](review-regions.md). |
 | **Changes** | The diff, presented when the agent declared a walkthrough, raw files one click away. A small card above it says how many regions there are and which one is in force. |
 | **Turns** | The record, reviewed a **chunk** at a time. A chunk is what happened since you last acted — your turn and every agent, nudge and auto-resume turn that followed, until you acted again — and it is one card: headed by the turn that opened it and the first line of what you asked for, with those turns, plus any comments and journal entries from the same window, inside it. Each agent turn lists the commits it made underneath, and each can be collapsed on its own. Ticking a chunk Viewed and the `j` / `k` keys both move a whole chunk. Newest first throughout. |
+| **Chat** | A conversation with the task's agent: every question asked of it — here, from Current review, on a line or on the report — and its answer, in the asker's own words. The box at the bottom sends the next one; the agent answers from the session that did the work and changes nothing. A message sent while the agent is mid-turn waits for that turn to end and is then sent automatically. To have it act, send feedback from Current review. |
 | **Commits** | Every commit on the task, newest first — the same rows as under each turn, in one list. |
 | **Reviews** | Every recorded agent review, newest first — when, verdict, raise count, links to the turn and Raises. A review whose report could not be parsed is listed too, so the failure is visible; check **Turns** for the unparsed banner. |
 | **Subtasks** | Direct children, grouped by status, each group listing the most recently updated child first. Click a column header to re-sort a group; the jump bar above the groups opens and scrolls to any group in one click. The **Nested** column counts everything under that child — its own subtasks, theirs, and so on — and links into that child's Subtasks tab; a dash means nothing is nested under it. |
@@ -174,8 +186,19 @@ and only when the runner has no container to enter.
 | **Artifacts** | Files attached to the task — screenshots and reports its agent published, inputs handed to it. Previews images, text and Markdown; **Add an input file** attaches one for the agent's next turn without starting it. See [artifacts.md](artifacts.md). |
 | **Stats** | Where this task's time and tokens went, and — for a task with subtasks — its whole subtree's. See [What the Stats tab means](#what-the-stats-tab-means) below. The tab's badge is the total tokens recorded across its own turns. |
 | **Shell** | Terminals in the task's container, plus Pair and Chat. See [Web shell](web-shell.md). |
-| **Services** | Declared ports, liveness, Start container / Start services. |
+| **Services** | Declared ports, liveness, Start container / Start services, and the **Sessions** running in the task's container — see below. |
 | **Current review** | Your in-progress review — queued comments, ticks, and the buttons that end the turn. |
+
+On the **Services** tab, **Sessions** lists what runs in the task's container, each
+in a named session — `services` for what Start services started, and any other
+long-running command. Each shows whether it is running or how it exited, how long it
+has been up, when it last printed, its current screen and the end of its log, all
+refreshed every few seconds. **Attach** opens a terminal that watches a session
+without typing into it; **Take control** opens one you can type into. Closing either
+leaves the session running, and neither waits for or holds up the agent's turn.
+`lazy sessions <task> [name]` reads the same from a terminal.
+
+![The Sessions list on the dashboard's Services tab: the services session running and a worker that exited with code 3, each with its screen, log and Attach / Take control buttons](images/dashboard/task-sessions.png)
 
 Clicking a tab with JavaScript on swaps the body in place, so a terminal you
 opened under a verification step keeps running. A full navigation or reload
@@ -240,7 +263,8 @@ never a second writer). The dashboard's base URL is printed by
 | `/review/:task/<action>` | POST | **308** → `/tasks/:task/review/<action>` (method and body preserved) |
 | `/tasks/:task/review` | GET | Current review tab — queued comments, accept checklist, Unblock / Ask / Accept (each a dialog), Reject / Sync / Submit. Review is a tab on the task page, not a separate page. |
 | `/tasks/:task/review/comment` | POST | Post a line-anchored message (JSON), `intent: 'ask' \| 'comment'` |
-| `/tasks/:task/review/ask` | POST | Ask a task-level reflective question (form or JSON; 303 → `/tasks/:task/review` without JS) |
+| `/tasks/:task/chat` | GET | Chat tab — every question asked of the agent and its answer, in your own words, with a box to send the next one |
+| `/tasks/:task/review/ask` | POST | Ask a task-level reflective question (form or JSON; 303 → `/tasks/:task/chat` without JS, where the question and its answer are shown) |
 | `/tasks/:task/review/thread/:thread/promote` | POST | Promote an answered discussion into a new backlog task — goal, code, prompt and subtask-vs-sibling from the form (303 → `/tasks/:task/review?promoted=<code>`) |
 | `/tasks/:task/review/comment/:id/retry` | POST | Re-send a saved question whose ask failed (form; 303 → `/tasks/:task/review`) |
 | `/tasks/:task/review/comment/:id/withdraw` | POST | Retract one of your own messages before it reaches the agent (form; 303 → `/tasks/:task/review`) |
@@ -276,7 +300,8 @@ never a second writer). The dashboard's base URL is printed by
 | `/tasks/:task/artifacts/upload` | POST | Attach an input file (multipart form: `file`, optional `name`) |
 | `/tasks/:task/stats` | GET | Stats tab — turn count, the time split, per-turn and cumulative token charts, and per-tool calls and result tokens when the proxy recorded any. `?scope=task` narrows it to the task alone; a task with descendants defaults to the whole subtree |
 | `/tasks/:task/shell` | GET | Shell tab — index of this page's terminals, Pair, Chat; hidden when the runner has no container |
-| `/tasks/:task/services` | GET | Services tab — declared ports, liveness, and ports this branch added that the project root does not publish |
+| `/tasks/:task/services` | GET | Services tab — declared ports, liveness, ports this branch added that the project root does not publish, and the Sessions running in the task's container (each with its screen, its log, and **Attach** / **Take control** terminals) |
+| `/tasks/:task/container/sessions` | GET | The Sessions list's current contents, which the Services tab asks for every few seconds |
 | `/tasks/:task/commits/:commit` | GET | One commit on its own page, with its diff |
 | `/tasks/:task/prompts/:version` | GET | One version of the task's prompt |
 | `/tasks/:task/edit` | GET | Edit form for a task's goal and prompt (and the model, effort and agent its next turn will use) |
@@ -764,7 +789,7 @@ shows **Open** and **Re-run** instead of stacking a second terminal. The
 a second copy. **Fill window** enlarges the same terminal to the whole window.
 
 Blocks tagged as data or source (`json`, `toml`, `ts`, …) are not runnable and
-show Copy only, and when no shell can be opened Run is disabled with the reason.
+show Copy only. When no shell can be opened, clicking Run explains why and what to do next.
 A stopped container is not one of those reasons: Run starts the container and
 narrates the start in the terminal it opens.
 
@@ -920,11 +945,10 @@ purpose:
   service, `http://<task>.<service>.lazy.localhost:<port>`. It is loopback-only,
   so it works from the machine the task runs on, which is the machine serving
   this page.
-- **Published, nothing listening** — a hollow red dot and the plain text
-  *nothing listening on port 3000*, deliberately **not** a link. The port is
-  mapped, but no server is behind it, and the URL would only send you back to
-  this same page with a banner on it — the card is already where that banner
-  would point.
+- **Published, nothing listening** — a hollow red dot. With a Start services
+  command, **Open when it answers** waits on that port, shows the live `services`
+  session, then opens the service. Without the command, the card says
+  *nothing listening on port 3000*.
 - **Container not running** — one line for the whole card, not one row per
   service, because every service is down for the same reason.
 
@@ -934,8 +958,9 @@ button when your browser allows clipboard access.
 If a task's own branch declares a `[serve]` port that the project root does
 not, the Services tab lists it separately and shows `lazy forward <task> <port>`
 as the way to reach it. A worktree `lazy.toml` never publishes the port itself —
-only the project root's config does. The banner you see after opening a dead
-service URL still lands on the task's first tab and links here.
+only the project root's config does. A direct visit to a starting service waits
+on one page and keeps the requested path and query. With no Start services
+command, it lands on the task's Services tab.
 
 ### Start container
 
@@ -1072,8 +1097,8 @@ one, next". Un-ticking is a correction, so it leaves you where you are. Use
 `j` / `n` to move without deciding anything.
 
 `s` / `w` / `f` click the same toolbar buttons your mouse would (below), so a
-disabled Split button below the 900px breakpoint stays disabled for the key
-too — there is no way around that layout limit from the keyboard. A page with
+Split button below the 900px breakpoint explains the width requirement when
+clicked or reached with the keyboard. A page with
 nothing to present has no Files control, so `f` simply does nothing there.
 
 To discover shortcuts without leaving the page, hold `Shift` for about half a
@@ -1273,8 +1298,8 @@ working on it straight away, along with any other comments you had queued. If th
 task cannot be unblocked right now (it is still working, say), the comment stays
 queued for your next unblock and the box says why nothing started.
 
-An action the task cannot take right now is shown disabled, with the reason when
-you hover over it, rather than hidden. The **Ask** dialog offers the same row: its
+Every action stays clickable. If the task cannot take it right now, clicking
+explains why and what to do next. The **Ask** dialog offers the same row: its
 **Add comment** saves a task comment (as `lazy comment` does, starting nothing) and
 its **Unblock** sends the text as unblock feedback. The steps on the **Verify** tab
 take the same **+** as the report, and each command block has a **Comment** button, so
@@ -1552,9 +1577,9 @@ terminal actions. Unblock, Ask and Accept are dialogs, not an in-card tab
 control; Submit sits on that same row. Reject and Sync sit beside them and also open dialogs. The
 action block is rendered **once**. The diff lives on Changes, so there is no
 second copy at the bottom of a long page and no script keeping two forms in
-sync. While the task is working or pairing, Unblock and Accept are disabled
-with a visible reason under the buttons; the sticky-bar poll flips that gate
-live so a mid-review page never offers a click the daemon will refuse. Without
+sync. While the task is working or pairing, Unblock and Accept stay clickable
+and explain the refusal when clicked; the visible reason refreshes as the
+task’s state changes. Without
 JavaScript, the noscript Unblock/Accept forms are omitted on that same first
 paint (Ask still works) so a no-JS browser cannot POST into a 409 either.
 
@@ -1643,9 +1668,8 @@ deliberate stopgap: polling is simple and adequate at this scale, and server
 push is the better answer once the surface justifies it.
 
 While the task is working or pairing (for example during an agent Review),
-Unblock and Accept stay disabled and the reason is visible under the buttons —
-not only a hover tooltip — so a page left open mid-review cannot offer a click
-the daemon will refuse.
+Unblock and Accept stay clickable. The reason is visible under the buttons,
+and clicking explains why the action cannot run yet.
 
 ### One diff renderer, shared by both pages
 
@@ -1722,8 +1746,8 @@ Two consequences worth knowing:
 Wrap and split are **independent and freely combined**: a paired row is as tall
 as its taller pane, so wrapping cannot drift the two sides apart — split is if
 anything more robust under Wrap than unified was. Below `900px` the layout
-**falls back to unified** and the Split button is disabled rather than scrolling
-horizontally into uselessness; the stored preference is untouched, so widening
+**falls back to unified** and clicking Split explains that it needs a wider
+window; the stored preference is untouched, so widening
 the window restores it. Switching layout swaps the whole `<tbody>`, so the review
 island re-renders threads on an `rv:layout` event instead of waiting for the next
 poll.

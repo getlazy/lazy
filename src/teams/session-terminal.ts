@@ -38,7 +38,7 @@ import {
 export const DETACH_BYTE = 0x1d;
 
 /** Which terminal mode the daemon's attach route should plan for this session. */
-export type RemoteAttachMode = 'attach' | 'shell' | 'pair' | 'chat';
+export type RemoteAttachMode = 'attach' | 'shell' | 'pair' | 'chat' | 'ssh';
 
 export interface RemoteAttachUrlInput {
   teamsUrl: string;

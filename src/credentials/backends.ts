@@ -26,7 +26,8 @@
 
 import { readFile } from 'fs/promises';
 import { replaceCredentialFile, withCredentialFileLock } from './file-updates';
-import { getCredentialsPath, projectSlug } from '../daemon/paths';
+import { projectSlug } from '../daemon/paths';
+import { type CredentialScope, credentialSecretsPath, validateSetName } from './scope';
 import { spawn } from '../utils/spawn';
 import type { CredentialName } from './providers';
 
@@ -56,10 +57,10 @@ export interface CredentialBackend {
   readonly id: BackendId;
   /** Is this backend usable on this host right now? Never throws. */
   available(): Promise<boolean>;
-  get(projectRoot: string, provider: CredentialName): Promise<string | null>;
-  set(projectRoot: string, provider: CredentialName, secret: string): Promise<void>;
+  get(projectRoot: CredentialScope, provider: CredentialName): Promise<string | null>;
+  set(projectRoot: CredentialScope, provider: CredentialName, secret: string): Promise<void>;
   /** Returns true when something was actually removed. */
-  remove(projectRoot: string, provider: CredentialName): Promise<boolean>;
+  remove(projectRoot: CredentialScope, provider: CredentialName): Promise<boolean>;
 }
 
 export interface RunResult {
@@ -118,8 +119,8 @@ export function quoteForSecurity(value: string): string {
 }
 
 /** Keychain item service name — per project. */
-export function keychainService(projectRoot: string): string {
-  return `lazy:${projectSlug(projectRoot)}`;
+export function keychainService(projectRoot: CredentialScope): string {
+  return typeof projectRoot === 'string' ? `lazy:${projectSlug(projectRoot)}` : `lazy:set:${validateSetName(projectRoot.set)}`;
 }
 
 /**
@@ -194,8 +195,8 @@ export function splitForSecurityLine(secret: string, budget: number): string[] {
 }
 
 /** libsecret lookup attributes — per project, per provider. */
-export function libsecretAttributes(projectRoot: string, provider: CredentialName): string[] {
-  return ['application', 'lazy', 'project', projectSlug(projectRoot), 'provider', provider];
+export function libsecretAttributes(projectRoot: CredentialScope, provider: CredentialName): string[] {
+  return ['application', 'lazy', ...(typeof projectRoot === 'string' ? ['project', projectSlug(projectRoot)] : ['set', validateSetName(projectRoot.set)]), 'provider', provider];
 }
 
 /**
@@ -243,7 +244,7 @@ export class KeychainBackend implements CredentialBackend {
    * The `add-generic-password` line for one part, secret included. `create`
    * adds `-A`; it defaults on so `budget` measures the longer line.
    */
-  private addLine(projectRoot: string, account: string, secret: string, create = true): string {
+  private addLine(projectRoot: CredentialScope, account: string, secret: string, create = true): string {
     return (
       `add-generic-password -U ${create ? '-A ' : ''}` +
       `-s ${quoteForSecurity(keychainService(projectRoot))} ` +
@@ -260,7 +261,7 @@ export class KeychainBackend implements CredentialBackend {
    * take, so every part shares one budget and `get` can reason about fullness
    * without being told how many parts there are.
    */
-  private budget(projectRoot: string, provider: CredentialName): number {
+  private budget(projectRoot: CredentialScope, provider: CredentialName): number {
     const widest = keychainPartAccount(provider, MAX_KEYCHAIN_PARTS);
     // -1: readline breaks at buffer_size - 1, so 4095 bytes is the most that
     // reaches one command. -16: headroom, so a future flag on this line cannot
@@ -294,7 +295,7 @@ export class KeychainBackend implements CredentialBackend {
   }
 
   /** One part's value, or null when there is no such item. */
-  private async getPart(projectRoot: string, account: string): Promise<string | null> {
+  private async getPart(projectRoot: CredentialScope, account: string): Promise<string | null> {
     const result = await this.run([
       'security', 'find-generic-password',
       '-s', keychainService(projectRoot),
@@ -308,7 +309,7 @@ export class KeychainBackend implements CredentialBackend {
   }
 
   /** Whether the item exists — an attribute lookup that never decrypts, so never prompts. */
-  private async hasPart(projectRoot: string, account: string): Promise<boolean> {
+  private async hasPart(projectRoot: CredentialScope, account: string): Promise<boolean> {
     const result = await this.run([
       'security', 'find-generic-password',
       '-s', keychainService(projectRoot),
@@ -317,7 +318,7 @@ export class KeychainBackend implements CredentialBackend {
     return result.exitCode === 0;
   }
 
-  private async removePart(projectRoot: string, account: string): Promise<boolean> {
+  private async removePart(projectRoot: CredentialScope, account: string): Promise<boolean> {
     const result = await this.run([
       'security', 'delete-generic-password',
       '-s', keychainService(projectRoot),
@@ -326,7 +327,7 @@ export class KeychainBackend implements CredentialBackend {
     return result.exitCode === 0;
   }
 
-  async get(projectRoot: string, provider: CredentialName): Promise<string | null> {
+  async get(projectRoot: CredentialScope, provider: CredentialName): Promise<string | null> {
     const first = await this.getPart(projectRoot, provider);
     if (first === null) return null;
 
@@ -342,7 +343,7 @@ export class KeychainBackend implements CredentialBackend {
     return value;
   }
 
-  async set(projectRoot: string, provider: CredentialName, secret: string): Promise<void> {
+  async set(projectRoot: CredentialScope, provider: CredentialName, secret: string): Promise<void> {
     // The secret rides in on stdin as part of an interactive command line —
     // never in this process's argv. See the module header. It is split across
     // items when one line cannot carry it — see SECURITY_LINE_LIMIT.
@@ -378,7 +379,7 @@ export class KeychainBackend implements CredentialBackend {
     }
   }
 
-  async remove(projectRoot: string, provider: CredentialName): Promise<boolean> {
+  async remove(projectRoot: CredentialScope, provider: CredentialName): Promise<boolean> {
     const removed = await this.removePart(projectRoot, provider);
     for (let part = 2; part <= MAX_KEYCHAIN_PARTS; part++) {
       if (!(await this.removePart(projectRoot, keychainPartAccount(provider, part)))) break;
@@ -422,7 +423,7 @@ export class LibsecretBackend implements CredentialBackend {
     }
   }
 
-  async get(projectRoot: string, provider: CredentialName): Promise<string | null> {
+  async get(projectRoot: CredentialScope, provider: CredentialName): Promise<string | null> {
     const result = await this.run(['secret-tool', 'lookup', ...libsecretAttributes(projectRoot, provider)]);
     if (result.exitCode !== 0) return null;
     // secret-tool prints the secret with no trailing newline of its own; trim
@@ -431,7 +432,7 @@ export class LibsecretBackend implements CredentialBackend {
     return value.length > 0 ? value : null;
   }
 
-  async set(projectRoot: string, provider: CredentialName, secret: string): Promise<void> {
+  async set(projectRoot: CredentialScope, provider: CredentialName, secret: string): Promise<void> {
     const result = await this.run(
       [
         'secret-tool', 'store',
@@ -448,7 +449,7 @@ export class LibsecretBackend implements CredentialBackend {
     }
   }
 
-  async remove(projectRoot: string, provider: CredentialName): Promise<boolean> {
+  async remove(projectRoot: CredentialScope, provider: CredentialName): Promise<boolean> {
     const result = await this.run(['secret-tool', 'clear', ...libsecretAttributes(projectRoot, provider)]);
     return result.exitCode === 0;
   }
@@ -473,22 +474,22 @@ export class FileBackend implements CredentialBackend {
     return true;
   }
 
-  async get(projectRoot: string, provider: CredentialName): Promise<string | null> {
+  async get(projectRoot: CredentialScope, provider: CredentialName): Promise<string | null> {
     const file = await this.read(projectRoot);
     const value = file[provider];
     return typeof value === 'string' && value.length > 0 ? value : null;
   }
 
-  async set(projectRoot: string, provider: CredentialName, secret: string): Promise<void> {
-    await withCredentialFileLock(getCredentialsPath(projectRoot), async () => {
+  async set(projectRoot: CredentialScope, provider: CredentialName, secret: string): Promise<void> {
+    await withCredentialFileLock(credentialSecretsPath(projectRoot), async () => {
       const file = await this.read(projectRoot);
       file[provider] = secret;
       await this.write(projectRoot, file);
     });
   }
 
-  async remove(projectRoot: string, provider: CredentialName): Promise<boolean> {
-    return withCredentialFileLock(getCredentialsPath(projectRoot), async () => {
+  async remove(projectRoot: CredentialScope, provider: CredentialName): Promise<boolean> {
+    return withCredentialFileLock(credentialSecretsPath(projectRoot), async () => {
       const file = await this.read(projectRoot);
       if (!(provider in file)) return false;
       delete file[provider];
@@ -497,8 +498,8 @@ export class FileBackend implements CredentialBackend {
     });
   }
 
-  private async read(projectRoot: string): Promise<Record<string, string>> {
-    const path = getCredentialsPath(projectRoot);
+  private async read(projectRoot: CredentialScope): Promise<Record<string, string>> {
+    const path = credentialSecretsPath(projectRoot);
     let raw: string;
     try {
       raw = await readFile(path, 'utf-8');
@@ -526,8 +527,8 @@ export class FileBackend implements CredentialBackend {
     }
   }
 
-  private async write(projectRoot: string, file: Record<string, string>): Promise<void> {
-    const path = getCredentialsPath(projectRoot);
+  private async write(projectRoot: CredentialScope, file: Record<string, string>): Promise<void> {
+    const path = credentialSecretsPath(projectRoot);
     await replaceCredentialFile(path, JSON.stringify(file, null, 2) + '\n');
   }
 }

@@ -72,8 +72,10 @@ What each one does:
   removes the image your current lazy version uses, an image this machine has
   adopted, or an image pinned on a task — deleting one of those would break the
   next launch.
-- **`--clean-orphaned-containers`** removes lazy containers no task references
-  any more.
+- **`--clean-orphaned-containers`** removes containers of finished or deleted
+  tasks. Open tasks keep their containers, running or stopped; the next turn or
+  **Run services** restarts a stopped container. Cleanup refuses unreadable task
+  records and keeps a container if its task reopens before removal.
 - **`--unset-upstream-tracking`** drops leftover upstream tracking config from
   lazy task branches. Tracking on a task branch is harmless in itself; doctor
   calls out the one case that is not — a branch whose tracking names a
@@ -667,14 +669,26 @@ fails loudly. If you are on a `lazy/*` branch whose task this store does not
 have (or cannot pair), `lazy pair --host --no-task` pairs in the current
 directory with no task context. See [Pairing](pairing.md).
 
-Cursor tasks pair too. Conversation capture and the
-end-of-session AI summary remain Claude Code only, and pairing says so when it
-starts.
+Claude Code, Codex, Cursor and Pi tasks all pair in their containers.
+Conversation capture and the end-of-session AI summary work on Claude Code
+and Pi; Cursor and Codex CLI pairing skip them and say so when they start.
 
 `--host` itself is claude-code-only, and refuses on a task running any other
 agent. The host launcher runs Claude Code whatever the task's agent is, so
 `--host` on a Cursor task would open the wrong agent against that task's work.
 Pair it in its container instead.
+
+## A turn keeps retrying after a model error
+
+Transient overload (529) and network failures retry after 5, 10, 20, 40 and
+60 seconds. Task status, Watch and Teams show the attempt, next retry time and
+recovery deadline. Recovery stops after six failed attempts or five minutes
+without recovery. A relaunched agent has at most 60 seconds to show useful
+model or tool activity; repeated error messages do not extend that time.
+
+After exhaustion, the failure remains transient: automatic recovery can resume
+the task if enabled, or you can resume it yourself. These bounds apply to
+Claude Code, Codex, Cursor and Pi.
 
 ## `lazy pair` or `lazy chat` asks me to `/login`
 
@@ -789,9 +803,10 @@ project from its page first; if the lock is still there afterwards, remove it
 with the `rm` command the message prints.
 
 Removing the lock by hand (`rm …/.storage-lock`) is safe **only** when no lazy
-process is running. If one is, wait for it instead — the path in the message is
-the store's, so a shared or misconfigured `[storage] external_path` can also
-mean two projects are contending for one lock.
+process is running. If one is, wait for it instead. A copied or misconfigured
+`[storage] external_path` can name another checkout's store; lazy refuses that
+checkout before taking the lock. See [Store ownership](store-ownership.md) for
+separate stores, moving a checkout, and claiming a store without an owner.
 
 ### When the daemon holds the lock
 
@@ -1044,10 +1059,10 @@ docker exec -it <container> bash
 lazy-agent doctor
 ```
 
-In a terminal you opened yourself in Lazy Teams, doctor says `member terminal
-session: no MCP, no daemon config by design` and marks the lazy-tool checks as
-not applicable (`–`). That environment is yours, not the agent's, and it never
-has lazy's tools — nothing there is broken.
+In your own Lazy Teams terminal, doctor explains that Pair and Chat supply
+their lazy tools per connection and marks the shared-config checks as not
+applicable (`–`). Those checks do not diagnose your paired agent's connection.
+If its tools are disconnected, close and reopen Pair or Chat to connect again.
 
 Everywhere else it walks the whole chain and marks each link, exiting non-zero if any fails. A failed link is printed as what is wrong (for example `✗ LAZY_DAEMON_CONFIG is not set`), not as the name of the thing checked:
 

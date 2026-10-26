@@ -243,7 +243,7 @@ export function hasAnyAsk(comments: ReviewComment[]): boolean {
  */
 export function askAwaitsAgent(c: ReviewComment): boolean {
   if (!isHumanAsk(c) || isWithdrawn(c)) return false;
-  return c.ask_state === 'pending' || c.ask_state === 'failed';
+  return c.ask_state === 'pending' || c.ask_state === 'failed' || c.ask_state === 'queued';
 }
 
 /**
@@ -333,7 +333,8 @@ export function withdrawRefusalReason(c: ReviewComment): string | null {
   // question never reached the agent. Anything else (answered, or a message old
   // enough to predate ask states) is treated as already read: the conversation
   // happened, and withdrawal is not the tool for taking back something said.
-  if (c.ask_state !== 'failed') {
+  // A QUEUED question has not reached the agent either: it waits for a turn.
+  if (c.ask_state !== 'failed' && c.ask_state !== 'queued') {
     return 'The agent has already answered this question — the conversation happened, so it cannot be withdrawn.';
   }
   return null;
@@ -723,4 +724,12 @@ export interface PromoteDiscussionResult {
   task: Task;
   /** The thread's root comment, now carrying the promotion link. */
   rootComment: ReviewComment;
+}
+
+/**
+ * A question still waiting for the agent's answer: in flight, or queued behind
+ * the agent's current turn. One rule for every "awaiting agent" counter.
+ */
+export function awaitsAnswer(c: ReviewComment): boolean {
+  return c.ask_state === 'pending' || c.ask_state === 'queued';
 }

@@ -91,6 +91,27 @@ or a list of tiers). The form writes the project's `lazy.toml`; the same checks
 as the raw editor apply, and nothing is saved while lazy rejects it. Members
 then connect their own key for each endpoint on **Your credentials**.
 
+For example, an admin can add this on **Settings → Configuration → Endpoints and
+agent profiles** to offer a Pi agent backed by a model server that does not
+support reasoning effort:
+
+```toml
+[endpoints.fast-model]
+url = "https://api.openai.com"
+credential = "openai"
+
+[agents.fast-pi]
+harness = "pi"
+model = "gpt-4o"
+named_endpoint = "fast-model"
+reasoning = false
+description = "Use for quick code changes"
+```
+
+Each member connects their own credential for `fast-model`; the task picker
+then offers **fast-pi**. The `reasoning = false` setting prevents Pi from
+sending an effort option to a model that does not accept one.
+
 ### Your Claude credential
 
 Open **Agent credentials** from your account menu (top right) and connect your
@@ -226,3 +247,15 @@ The lazy CLI chooses agents with `agent_id` in lazy.toml and `--agent` on
 (or via the daemon's project settings) applies when you omit `--agent` on
 `lazy create` and on MCP task creation too — the same overlay, not a separate
 Teams-only default.
+
+## Temporary model errors
+
+When a model provider is overloaded or a network request fails temporarily,
+Lazy retries after 5, 10, 20, 40 and 60 seconds. Teams and the task's status show
+the attempt, the next retry time and the recovery deadline. Once the agent
+resumes producing model output or using tools, normal work continues.
+
+After six failed attempts or five minutes without recovery, the turn ends with
+the temporary error recorded. A retry that produces no model activity is
+stopped after at most 60 seconds; process cleanup can take a few seconds more.
+The task can then resume through normal automatic recovery or human feedback.

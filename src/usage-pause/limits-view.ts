@@ -11,7 +11,7 @@
  */
 import type { CredentialFailure } from '../proxy/credential-health';
 import type { UsageLimitReading, UsageWindow } from '../proxy/usage-limits';
-import { isMemberEndpointUsageKey } from '../proxy/usage-limits';
+import { isMemberEndpointUsageKey, memberEndpointUsageKey, usageLimitCredentialKey } from '../proxy/usage-limits';
 import {
   describeReadingsStoreError,
   overageStatusOf,
@@ -107,6 +107,7 @@ export interface UsageLimitsView {
    * `project`: every credential the proxy has seen (the CLI and the builder).
    * `member`: a builder on a Lazy Teams host — the service credential, the
    *   builder session's own credential, and anything not tied to a member.
+   *   Pair/Chat is narrower: only the authenticated member's primary account.
    * `task`: only the credential the calling task's turn spends.
    */
   scope: 'project' | 'member' | 'task';
@@ -200,6 +201,17 @@ export function scopeUsageLimitsView(
       coverage: view.pause.coverage.filter((c) => own(c.credential)),
     },
     credentialHealth: view.credentialHealth.filter((f) => own(f.credential)),
+  };
+}
+
+/** Pair/Chat shows only its member's connections for the task's profile. */
+export function memberPairUsageLimitsView(view: UsageLimitsView, email: string, endpointIds: readonly string[] = ['builtin:anthropic']): UsageLimitsView {
+  const member = email.trim().toLowerCase();
+  if (!member) throw new Error('Member usage limits require the authenticated member identity.');
+  return {
+    ...scopeUsageLimitsView(view, usageLimitCredentialKey({ userId: member, upstream: '' }), '',
+      endpointIds.map(endpoint => memberEndpointUsageKey(member, endpoint))),
+    scope: 'member',
   };
 }
 

@@ -44,7 +44,7 @@
 # "The launching agent's own default" is why this key is not the last word: it
 # is one Anthropic model name for the whole project, so an agent with a
 # different catalog declares its own instead (a Cursor task runs `auto`,
-# Cursor's own choice; a Codex task `gpt-6-sol`). The project override
+# Cursor's own choice; a Codex task `gpt-6.1-sol`). The project override
 # sits below that for the same reason — it is also one project-wide name.
 # Pin a single task with `--model` to outrank both.
 default = "claude-sonnet-5-5"
@@ -147,7 +147,7 @@ default = "claude-sonnet-5-5"
 #
 # [agents.company-tokens-codex]   # `lazy create --agent company-tokens-codex`,
 # harness = "codex"               # or pick it in the web Agent profile dropdown
-# model = "gpt-6-sol"
+# model = "gpt-6.1-sol"
 # endpoint = "https://api.openai.com"
 # credential = "company-openai"   # `lazy auth set company-openai`
 # description = "Use when the task should run on the company's OpenAI account"
@@ -166,7 +166,7 @@ default = "claude-sonnet-5-5"
 #
 # [agents.openai-pi]            # pi speaks both wires: an api.openai.com or
 # harness = "pi"                # openrouter.ai endpoint runs pi's OpenAI
-# model = "gpt-6-sol"           # provider, any other endpoint its
+# model = "gpt-6.1-sol"           # provider, any other endpoint its
 # endpoint = "https://api.openai.com"   # Anthropic-wire one
 # credential = "openai"
 # reasoning = false             # only for a model with NO reasoning support (gpt-4o)
@@ -189,7 +189,7 @@ default = "claude-sonnet-5-5"
 #
 # [agents.openrouter-codex]
 # harness = "codex"
-# model = "gpt-6-sol"
+# model = "gpt-6.1-sol"
 # endpoint = "https://openrouter.ai/api"   # no /v1: lazy adds it
 # credential = "openrouter"     # `lazy auth set openrouter`
 #
@@ -201,7 +201,7 @@ default = "claude-sonnet-5-5"
 #
 # [agents.work-codex]           # same provider as the built-in codex profile,
 # harness = "codex"             # billed to a different key
-# model = "gpt-6-sol"
+# model = "gpt-6.1-sol"
 # credential = "work-openai"    # any name you choose: `lazy auth set work-openai`
 #
 # ---- Named endpoints and a tiered profile ----
@@ -318,12 +318,12 @@ default = "claude-sonnet-5-5"
 #
 # [agents.codex-complex]
 # harness = "codex"
-# model = "gpt-6-sol"
+# model = "gpt-6.1-sol"
 # description = "Complex tier on Codex: tasks that drive subtasks, cross-cutting design, large refactors"
 #
 # [agents.codex-security]
 # harness = "codex"
-# model = "gpt-6-sol"
+# model = "gpt-6.1-sol"
 # description = "Security tier on Codex: authentication, credentials, permissions, sandboxing, untrusted input"
 #
 # [agents.codex-on-demand]
@@ -354,6 +354,8 @@ path = ".lazy"
 backend = "external"
 # Path for external storage
 # Defaults to ~/.lazy/<project-name> if empty
+# Relative paths start at the project root, e.g. "../stores/my-project".
+# Absolute paths and ~/... are also supported.
 external_path = ""
 # Before a new lazy version first opens the store, it is copied to
 # <store>.backups/ beside it and the copy verified (see `lazy system store-backups`).
@@ -414,12 +416,13 @@ shortid_length = 8
 # `lazy auth import chatgpt`, then run the task on the built-in
 # "codex-subscription" agent.
 # Pi auth: none of its own — `lazy system agent set-key pi` is refused; Pi
-# turns ride lazy's Anthropic/Ollama credentials through the proxy, and its
-# providers are limited to those two (anything else refuses at launch).
+# turns use the profile’s endpoint and credential through the proxy.
 # `lazy pair` joins Cursor, Codex and Pi tasks inside the task's container (the
 # session stays on the sandbox home); only host pairing (`--host`) is
 # claude-code only — lazy will not copy agent-written history onto your host.
-# Conversation capture and the pairing summary stay Claude Code only.
+# Conversation capture and the pairing summary work on Claude Code and Pi.
+# Cursor and Codex CLI pairing records commits without a transcript or AI summary.
+# Read-only interactive Chat works on Claude Code, Cursor and Pi; on Codex use Ask.
 agent_id = "claude-code"
 
 # Per-task-type agent overrides. Unmapped types use agent_id above. An explicit
@@ -709,7 +712,9 @@ type = "docker"
 # are refused with the reading and when the window resets. The daemon's own
 # launches (auto-resume, auto-delivery, cluster restarts, automatic reviews,
 # a cluster's subtask starts) wait and go ahead by themselves after the reset.
-# A turn already running is never stopped. `lazy stats limits` shows the
+# Crossing this threshold does not kill a running process. Further launches
+# still face admission checks; a tiered profile can refuse model requests
+# when all its tiers are full. `lazy stats limits` shows the
 # readings and whether paid overage is on; `lazy doctor` explains an active
 # pause and warns "armed, NO READING" when it has nothing to act on.
 #
@@ -993,7 +998,7 @@ dockerfile = ""
 # It runs on CLEAN turns only. A turn that failed, timed out, or was stopped is
 # hard-killed, so post_turn is not a teardown hook — do not put cleanup that
 # must always happen in it.
-# post_turn = "bun test --bail"
+# post_turn = "bun run typecheck"
 #
 # Timeout in seconds for the post_turn command (default: 300 = 5 minutes).
 # If the command exceeds this, it is killed and recorded as exit code -2.

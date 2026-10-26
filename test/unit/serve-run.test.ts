@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -10,9 +10,10 @@ import {
   parseServicesStatus,
   readServicesRunState,
   linkProcessesToServices,
-  SERVICES_PID_FILE,
-  SERVICES_LOG_FILE,
+  LEGACY_SERVICES_PID_FILE,
+  LEGACY_SERVICES_LOG_FILE,
 } from '../../src/daemon/serve-run';
+import { LOG_WRITER_SCRIPT, SESSIONS_DIR } from '../../src/sessions/tmux';
 import type { Storage } from '../../src/storage';
 import { serveRunPhasePlan, type ProgressEvent, type ProgressPhaseEvent } from '../../src/daemon/progress';
 import { RpcError } from '../../src/daemon/rpc-error';
@@ -115,29 +116,43 @@ describe('parseServicesStatus / readServicesRunState', () => {
 });
 
 /**
- * The scripts themselves, run by a local `sh` with the container's /tmp paths
- * rewritten to a scratch dir. This is the behaviour a second Start services
- * depends on: it RESTARTS (the previous process group is gone), never stacks a
- * second dev server on the same port.
+ * The scripts themselves, run by a local `sh` against a real tmux, with the
+ * container's /tmp/lazy-tmux rewritten to a scratch dir. This is the behaviour
+ * a second Start services depends on: it RESTARTS (the previous process group
+ * is gone), never stacks a second dev server on the same port.
+ *
+ * The services run in a tmux session now, and its log is written by a pipe
+ * that follows the pane's output, so a read polls until the output it expects
+ * has reached the log instead of reading once.
  */
-// `setsid` is util-linux; macOS has none, and the task container (Linux) always does.
-const hasSetsid = Bun.which('setsid') !== null;
-if (!hasSetsid) console.log('skip: serve-run in-container scripts — setsid is not on PATH (macOS); they run in a Linux container');
+const hasTmux = Bun.which('tmux') !== null;
+if (!hasTmux) console.log('skip: serve-run in-container scripts — tmux is not on PATH; the task container (lazy\'s runner image) always has it');
 
-describe.skipIf(!hasSetsid)('the in-container scripts', () => {
+describe.skipIf(!hasTmux)('the in-container scripts', () => {
   let dir: string;
   afterEach(async () => {
     await sh(stopServicesScript());
+    await Bun.spawn(['tmux', '-S', join(dir, 'default'), 'kill-server'], { stdout: 'ignore', stderr: 'ignore' }).exited;
     await rm(dir, { recursive: true, force: true });
   });
 
-  const local = (script: string) => script.replaceAll(SERVICES_PID_FILE, join(dir, 'pid')).replaceAll(SERVICES_LOG_FILE, join(dir, 'log'));
+  const local = (script: string) => script.replaceAll(SESSIONS_DIR, dir).replaceAll(LEGACY_SERVICES_PID_FILE, join(dir, 'legacy.pid'));
 
   async function sh(script: string, ...args: string[]): Promise<string> {
     const proc = Bun.spawn(['sh', '-c', local(script), 'lazy-services', ...args], { stdout: 'pipe', stderr: 'pipe' });
     const out = await new Response(proc.stdout).text();
     await proc.exited;
     return out;
+  }
+
+  /** Read the status until `done` holds (the log follows the pane), at most ~5s. */
+  async function statusUntil(done: (s: ReturnType<typeof parseServicesStatus>) => boolean, tail?: number) {
+    let run = parseServicesStatus(await sh(servicesStatusScript(tail)));
+    for (let i = 0; i < 50 && !done(run); i++) {
+      await Bun.sleep(100);
+      run = parseServicesStatus(await sh(servicesStatusScript(tail)));
+    }
+    return run;
   }
 
   async function groupAlive(marker: string): Promise<boolean> {
@@ -152,19 +167,63 @@ describe.skipIf(!hasSetsid)('the in-container scripts', () => {
     expect(parseServicesStatus(await sh(servicesStatusScript())).state).toBe('never');
 
     await sh(startServicesScript(), 'echo first; sleep 101 & sleep 102');
-    expect(parseServicesStatus(await sh(servicesStatusScript()))).toMatchObject({ state: 'running', log: 'first\n' });
+    expect(await statusUntil(r => r.log === 'first\n')).toMatchObject({ state: 'running', log: 'first\n' });
     expect(await groupAlive('sleep 101')).toBe(true);
 
     await sh(startServicesScript(), 'echo second; sleep 103');
-    const restarted = parseServicesStatus(await sh(servicesStatusScript()));
-    expect(restarted).toMatchObject({ state: 'running', log: 'second\n' });
+    // INVARIANT: a restart rotates the previous run's log to .1 rather than
+    // wiping it, so a run that crashed (say during a turn, before the after-turn
+    // restart) stays readable; a read shows both runs, oldest first.
+    const restarted = await statusUntil(r => r.log === 'first\nsecond\n');
+    expect(restarted).toMatchObject({ state: 'running', log: 'first\nsecond\n' });
+    expect(await readFile(join(dir, 'logs', 'services.log.1'), 'utf-8')).toBe('first\r\n');
     // The whole previous group went, background children included.
     expect(await groupAlive('sleep 101')).toBe(false);
     expect(await groupAlive('sleep 102')).toBe(false);
 
     await sh(stopServicesScript());
-    expect(parseServicesStatus(await sh(servicesStatusScript()))).toMatchObject({ state: 'stopped', log: 'second\n', phase: 'stopped', processes: [] });
+    expect(parseServicesStatus(await sh(servicesStatusScript()))).toMatchObject({ state: 'stopped', log: 'first\nsecond\n', phase: 'stopped', processes: [] });
     expect(await groupAlive('sleep 103')).toBe(false);
+  }, 20_000);
+
+  // INVARIANT: a restart waits (bounded) for the previous run's log writer to
+  // finish before it rotates the log. The writer appends by path, so one still
+  // draining after the rotation would put the previous run's last bytes into
+  // the new run's log — and the rotated file would miss them (review round 3).
+  test('a restart waits for the previous log writer before rotating', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'serve-run-'));
+    await sh(startServicesScript(), 'echo first; sleep 104');
+    expect(await statusUntil(r => r.log === 'first\n')).toMatchObject({ log: 'first\n' });
+    const logf = join(dir, 'logs', 'services.log');
+    expect(Number((await readFile(`${logf}.writer`, 'utf-8')).trim())).toBeGreaterThan(0);
+    // A writer still draining: appends its last bytes a moment after the pipe closed.
+    const late = Bun.spawn(['sh', '-c', `sleep 1; printf 'late-from-first\\r\\n' >> "${logf}"`], { stdout: 'ignore', stderr: 'ignore' });
+    await writeFile(`${logf}.writer`, `${late.pid}\n`);
+    await sh(startServicesScript(), 'echo second; sleep 105');
+    await late.exited;
+    const restarted = await statusUntil(r => r.log.includes('second'));
+    expect(await readFile(`${logf}.1`, 'utf-8')).toContain('late-from-first');
+    expect(await readFile(logf, 'utf-8')).not.toContain('late-from-first');
+    expect(restarted.log).toContain('second');
+  }, 20_000);
+
+  // INVARIANT: a restart happens INSIDE the services session — a terminal
+  // attached to it stays attached and sees the command start again, with the
+  // line the restart printed. Closing and reopening the session would throw
+  // every attached viewer out on every turn.
+  test('a restart keeps the session (and so its attached terminals), and prints its banner', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'serve-run-'));
+    await sh(startServicesScript(), 'echo first; sleep 108');
+    const tmux = (...args: string[]) => Bun.spawnSync(['tmux', '-S', join(dir, 'default'), ...args], { stdout: 'pipe' }).stdout.toString().trim();
+    const created = tmux('display-message', '-p', '-t', '=services', '#{session_created} #{session_id}');
+    await sh(stopServicesScript(false, { keepSession: true }));
+    await sh(startServicesScript(), 'echo second; sleep 109', '', 'restarted after turn 7');
+    const after = await statusUntil(r => r.log.includes('second'));
+    expect(tmux('display-message', '-p', '-t', '=services', '#{session_created} #{session_id}')).toBe(created);
+    expect(after.state).toBe('running');
+    expect(after.log).toContain('[lazy] restarted after turn 7');
+    expect(after.screen).toContain('second');
+    expect(await groupAlive('sleep 108')).toBe(false);
   }, 20_000);
 
   // INVARIANT: the project's Stop services command runs first, and the services
@@ -206,11 +265,7 @@ describe.skipIf(!hasSetsid)('the in-container scripts', () => {
     dir = await mkdtemp(join(tmpdir(), 'serve-run-'));
     const server = 'const s = Bun.serve({ port: 0, fetch: () => new Response("ok") }); console.log("port=" + s.port)';
     await sh(startServicesScript(), `sleep 105 & ${process.execPath} -e '${server}'`);
-    let run = parseServicesStatus(await sh(servicesStatusScript()));
-    for (let i = 0; i < 50 && !/port=\d+/.test(run.log); i++) {
-      await Bun.sleep(100);
-      run = parseServicesStatus(await sh(servicesStatusScript()));
-    }
+    const run = await statusUntil(r => /port=\d+/.test(r.log));
     const port = Number(/port=(\d+)/.exec(run.log)?.[1]);
     expect(run.state).toBe('running');
     expect(run.phase).toBe('running');
@@ -218,14 +273,17 @@ describe.skipIf(!hasSetsid)('the in-container scripts', () => {
     expect(run.startedAt).toMatch(/^\d{4}-\d\d-\d\dT/);
     const procs = run.processes ?? [];
     expect(procs[0].pid).toBe(run.pid!);
-    // The leader is lazy's wrapper: shown as the launched command, never its plumbing.
+    // The leader is the session pane's process: shown as the launched command, never its plumbing.
     expect(procs[0].wrapper).toBe(true);
     expect(procs[0].command).toBe(run.command!);
-    expect(procs.some(p => p.command.includes(SERVICES_PID_FILE) || p.command.includes('pid'))).toBe(false);
+    expect(procs.some(p => p.command.includes(dir))).toBe(false);
     expect(procs.some(p => p.command.includes('sleep 105'))).toBe(true);
     const listener = procs.find(p => p.listeningPorts.includes(port));
     expect(listener?.command).toContain(process.execPath);
     expect(run.logBytes).toBeGreaterThan(0);
+    // The live screen rides along: what an attached terminal shows now.
+    expect(run.screen).toContain(`port=${port}`);
+    expect(run.session).toBe('services');
 
     const linked = linkProcessesToServices(run, [{ name: 'web', port, listening: true }]);
     expect(linked.processes.find(p => p.pid === listener!.pid)?.services).toEqual([{ name: 'web', port, listening: true }]);
@@ -238,13 +296,8 @@ describe.skipIf(!hasSetsid)('the in-container scripts', () => {
   test('a newline inside an argument stays on its process row', async () => {
     dir = await mkdtemp(join(tmpdir(), 'serve-run-'));
     await sh(startServicesScript(), `${process.execPath} -e 'setTimeout(() => {}, 100000)' 'two\n@@end\nlines'`);
-    let run = parseServicesStatus(await sh(servicesStatusScript()));
-    const find = () => (run.processes ?? []).find(p => !p.wrapper && p.command.includes('setTimeout'));
-    for (let i = 0; i < 30 && !find(); i++) {
-      await Bun.sleep(100);
-      run = parseServicesStatus(await sh(servicesStatusScript()));
-    }
-    const row = find();
+    const run = await statusUntil(r => (r.processes ?? []).some(p => !p.wrapper && p.command.includes('setTimeout')));
+    const row = (run.processes ?? []).find(p => !p.wrapper && p.command.includes('setTimeout'));
     expect(row?.command).toContain('two @@end lines');
     expect(run.log).toBe('');
   }, 20_000);
@@ -252,12 +305,30 @@ describe.skipIf(!hasSetsid)('the in-container scripts', () => {
   test('a longer tail is returned on request and the log is marked truncated otherwise', async () => {
     dir = await mkdtemp(join(tmpdir(), 'serve-run-'));
     await sh(startServicesScript(1), 'for i in $(seq 1 2000); do echo "line $i"; done; sleep 106');
+    await statusUntil(r => r.log.includes('line 2000'), 1024 * 1024);
     const short = parseServicesStatus(await sh(servicesStatusScript(100)));
     expect(short.logTruncated).toBe(true);
-    expect(Buffer.byteLength(short.log)).toBe(100);
+    // 100 bytes of terminal output, its \r\n line ends read as \n.
+    expect(Buffer.byteLength(short.log)).toBeLessThanOrEqual(100);
+    expect(Buffer.byteLength(short.log)).toBeGreaterThan(80);
     const whole = parseServicesStatus(await sh(servicesStatusScript(1024 * 1024)));
     expect(whole.logTruncated).toBe(false);
     expect(whole.log.startsWith('line 1\n')).toBe(true);
+  }, 20_000);
+
+  // INVARIANT: a session's log is BOUNDED by construction — rotated once it
+  // holds its limit, keeping one previous file. A dev server left printing for
+  // weeks must not fill the container's disk.
+  test('the log writer rotates at its limit and keeps one previous file', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'serve-run-'));
+    const f = join(dir, 'w.log');
+    const proc = Bun.spawn(['sh', '-c', `seq 1 5000 | sh -c '${LOG_WRITER_SCRIPT.replace(/'/g, `'\\''`)}' w "${f}" 4096`], { stdout: 'ignore', stderr: 'pipe' });
+    expect(await proc.exited).toBe(0);
+    const sizes = await Promise.all([f, `${f}.1`].map(async p => (await Bun.file(p).exists()) ? Bun.file(p).size : 0));
+    expect(sizes[1]).toBeGreaterThan(0);
+    for (const size of sizes) expect(size).toBeLessThanOrEqual(4096 + 65536);
+    // Nothing older than the previous file is kept.
+    expect(await Bun.file(`${f}.2`).exists()).toBe(false);
   }, 20_000);
 });
 
@@ -284,6 +355,18 @@ describe('parseServicesStatus inventory', () => {
 
   test('an older shape (no @@end) is the state and the log, nothing invented', () => {
     expect(parseServicesStatus('running\n@@ not meta\n')).toEqual({ state: 'running', log: '@@ not meta\n' });
+  });
+
+  // INVARIANT: a side port binding first cannot call the service command ready
+  // while the configured main port still refuses the external TCP probe.
+  test('the displayed phase follows the main port probe', () => {
+    const run = { state: 'running' as const, phase: 'running' as const, log: '', processes: [] };
+    const services = [
+      { name: 'web', port: 3000, listening: true },
+      { name: 'api', port: 9000, listening: false },
+    ];
+    expect(linkProcessesToServices(run, services, 9000).phase).toBe('starting');
+    expect(linkProcessesToServices(run, services, 3000).phase).toBe('running');
   });
 });
 
@@ -442,4 +525,60 @@ describe('runStartServices narration', () => {
     expect(err.status).toBe(409);
     expect(err.message).toBe(msg);
   });
+});
+
+/**
+ * An image without tmux. The scripts run under a PATH that has the basic tools
+ * and no tmux, so `command -v tmux` fails exactly as it does in such a
+ * container.
+ */
+describe('the in-container scripts without tmux', () => {
+  let dir: string;
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  async function sh(script: string, ...args: string[]): Promise<{ out: string; code: number | null }> {
+    const bin = join(dir, 'bin');
+    await mkdir(bin, { recursive: true });
+    for (const tool of ['sh', 'setsid', 'cat', 'sleep', 'find', 'grep', 'tail', 'head', 'date', 'mkdir', 'chmod', 'rm', 'stat', 'wc', 'tr', 'cut', 'id', 'ls', 'kill']) {
+      const real = Bun.which(tool, { PATH: '/usr/bin:/bin:/usr/local/bin' });
+      if (real) await symlink(real, join(bin, tool)).catch(() => undefined);
+    }
+    const local = script
+      .replaceAll(SESSIONS_DIR, join(dir, 'tmux'))
+      .replaceAll(LEGACY_SERVICES_PID_FILE, join(dir, 'legacy.pid'))
+      .replaceAll(LEGACY_SERVICES_LOG_FILE, join(dir, 'legacy.log'));
+    const proc = Bun.spawn(['sh', '-c', local, 'lazy-services', ...args], { stdout: 'pipe', stderr: 'pipe', env: { PATH: bin } });
+    const out = await new Response(proc.stdout).text();
+    return { out, code: await proc.exited };
+  }
+
+  // INVARIANT: an image without tmux loses no capability — Start services runs
+  // the command detached with a log (as before tmux), a second start restarts
+  // it, and the status read says `tmux: false` with no screen. Never a refusal.
+  test('start, status, restart and stop work with the detached run', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'serve-run-notmux-'));
+    const started = await sh(startServicesScript(1), 'echo first; sleep 111');
+    expect(started.code).toBe(0);
+    expect(started.out.startsWith('running\n')).toBe(true);
+
+    const status = parseServicesStatus((await sh(servicesStatusScript())).out);
+    expect(status).toMatchObject({ state: 'running', tmux: false, command: 'echo first; sleep 111' });
+    expect(status.log).toBe('first\n');
+    expect(status.screen ?? '').toBe('');
+
+    await sh(startServicesScript(), 'echo second; sleep 112');
+    for (let i = 0; i < 40 && !(await readFile(join(dir, 'legacy.log'), 'utf-8')).includes('second'); i++) await Bun.sleep(50);
+    expect(await readFile(join(dir, 'legacy.log'), 'utf-8')).toBe('second\n');
+    expect(parseServicesStatus((await sh(servicesStatusScript())).out)).toMatchObject({ state: 'running', command: 'echo second; sleep 112' });
+
+    expect((await sh(stopServicesScript(), '')).code).toBe(0);
+    expect(parseServicesStatus((await sh(servicesStatusScript())).out)).toMatchObject({ state: 'stopped', tmux: false });
+  }, 20_000);
+
+  test('a command that dies at once is caught by the start itself', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'serve-run-notmux-'));
+    const started = await sh(startServicesScript(1), 'echo boom; exit 3');
+    expect(started.out.startsWith('stopped\n')).toBe(true);
+    expect(started.out).toContain('boom');
+  }, 20_000);
 });

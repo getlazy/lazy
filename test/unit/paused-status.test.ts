@@ -40,6 +40,10 @@ import { createStorage, type Storage } from '../../src/storage';
 import { pausedStatusFor, parkTaskPaused } from '../../src/utils/paused-status';
 import { canTransition } from '../../src/task-state-machine';
 import type { Turn, FileViolation } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 function agentTurn(sequence: number, violations?: FileViolation[]): Turn {
   return {
@@ -106,7 +110,7 @@ describe('parkTaskPaused', () => {
   beforeEach(async () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-paused-status-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {
@@ -210,7 +214,7 @@ describe('parkTaskPaused — deferred to the parent', () => {
   beforeEach(async () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-paused-deferred-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {

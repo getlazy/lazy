@@ -8,10 +8,14 @@
  * Checks that used to be sync (statfs, docker inspect, directory scans) are
  * async or run in a Worker so they cannot pin the daemon event loop.
  */
+import { readCredentialSetBinding } from '../credentials/set-binding';
+import { recoverManagedSetup } from '../git/managed-setup';
 
+
+import { readBuiltFromLabel } from '../docker/image-built-from';
 import { access, readFile, readdir } from 'fs/promises';
 import { PhaseReporter } from '../daemon/progress';
-import { join } from 'path';
+import { isAbsolute, join } from 'path';
 import { tryRemoteStorage } from '../preconditions';
 import { logger } from '../utils/logger';
 import { shortId, displayId, taskRef } from '../task/identity';
@@ -45,6 +49,7 @@ import {
 import { lastKnownGoodState } from '../config/last-good';
 import { DaemonClient } from '../daemon/client';
 import { createRunner } from '../runner';
+import { OLD_TASK_ENVIRONMENT_NOTICE } from '../runner/task-data';
 import type { Runner } from '../runner';
 import {
   findUnknownConfigKeys,
@@ -77,7 +82,8 @@ import { detectShell, getCompletionSetupCommand, getShellConfigFile } from '../s
 import type { ShellInfo } from '../shell/detect';
 import { spawn } from '../utils/spawn';
 import { checkSmolvmSetup, smolvmRunnerSetupFailure } from './smolvm';
-import { isForgeDriver, managedRepositoryHostChecks } from './managed-repository-host';
+import { isForgeDriver, managedMirrorPushChecks, managedRepositoryHostChecks } from './managed-repository-host';
+import { localDriverMirrorsOrigin } from '../remote/origin-mirror';
 import { withholdRefused } from '../config/managed-withhold';
 import { REPOSITORY_PLUGINS_NOT_RUN } from '../config/managed-repo-code';
 import { listRepositoryPluginFiles, PLUGIN_DIR_RELATIVE } from '../proxy/plugins/loader';
@@ -132,7 +138,7 @@ import { BUILD_MATCH_ROW_ID, summarizeRows, type DaemonHealthReport } from '../d
 import { getSourceIdentity } from '../utils/source-id';
 import { resolveDashboardUrl } from '../daemon/dashboard-url';
 import { compareDashboardAddress, misplacedDashboardUrlTables } from '../daemon/dashboard-address';
-import { credentialInEnv, getStoredCredential, readCredentialIndex } from '../credentials/store';
+import { credentialInEnv, credentialOverrideReport, getStoredCredential, readCredentialIndex, effectiveCredentialIndex } from '../credentials/store';
 import {
   credentialHowToGet,
   credentialLabel,
@@ -367,11 +373,16 @@ const NO_ANTHROPIC_NEEDED = 'no Anthropic credential needed for this project';
 
 /** One credential's finding, as the daemon or the local fallback reported it. */
 interface CredentialReport {
+  /** Stored source overridden by the exported variable named in via. */
+  shadowed?: string;
+  /** A usable export remains present even if inspecting the store failed. */
+  shadowCheckError?: string;
   name: string;
   label: string;
   requiredBy: string[];
   present: boolean;
   source: 'env' | 'store' | null;
+  setName?: string;
   via: string | null;
   /** Credential FORM when the store records one; see credentialLabelLine. */
   kind?: 'oauth' | 'api-key' | null;
@@ -415,8 +426,11 @@ function credentialLabelLine(report: CredentialReport, envWord: 'daemon env' | '
   // keychain they actually need to unlock.
   const where = report.stale
     ? 'store UNREADABLE — using the copy loaded at daemon startup'
-    : `${credentialSourceWord(report.source, envWord)}: ${report.via}`;
-  return `${report.label} credential present (${kind}${where}; ${needed})`;
+    : report.source === 'env' && report.setName
+      ? `set ${report.setName} (loaded in ${envWord}: ${report.via})`
+      : `${report.source === 'store' ? report.setName ? `set ${report.setName}` : 'project credential store' : credentialSourceWord(report.source, envWord)}: ${report.via}`;
+  const shadow = report.shadowed ? `; ${report.shadowed} overridden by ${report.via}` : '';
+  return `${report.label} credential present (${kind}${where}${shadow}; ${needed})`;
 }
 
 /** The line for a credential whose presence could not be determined at all. */
@@ -551,7 +565,7 @@ async function checkStoredCredentialsParse(
   const label = 'Stored credentials are readable';
   let stored: Awaited<ReturnType<typeof readCredentialIndex>>;
   try {
-    stored = await readCredentialIndex(root);
+    stored = await effectiveCredentialIndex(root);
   } catch {
     // The index itself is unreadable — checkAuth already reports that, with the
     // file named. One cause, one failed check.
@@ -612,7 +626,7 @@ export function reportDaemonCredentials(entries: DaemonCredentialEntry[]): Check
         docs: 'troubleshooting-credential',
       };
     }
-    if (entry.present) return { ok: true, label: credentialLabelLine(entry, 'daemon env') };
+    if (entry.present) return { ok: true, label: credentialLabelLine(entry, 'daemon env'), ...(entry.shadowCheckError ? { warning: entry.shadowCheckError } : {}) };
     // A WARNING, not a failure: the daemon runs, clones, syncs and serves reads
     // with no model credential — only a TURN needs one, and a turn on these
     // profiles is refused at launch naming the profile (src/daemon/credential-gate.ts).
@@ -692,6 +706,7 @@ async function reportLocalCredentials(
       if (root) {
         const harnesses = profiles ? requiredBy.map((p) => profiles.get(p)?.harness ?? '') : [];
         Object.assign(report, await locateProfileCredential(root, name, harnesses));
+        if (report.source === 'env') Object.assign(report, await credentialOverrideReport(root, name));
       } else {
         const envVar = credentialInEnv(name);
         if (envVar) Object.assign(report, { present: true, source: 'env', via: envVar });
@@ -712,7 +727,7 @@ async function reportLocalCredentials(
       continue;
     }
     if (report.present) {
-      results.push({ ok: true, label: credentialLabelLine(report, 'shell env'), warning: caveat });
+      results.push({ ok: true, label: credentialLabelLine(report, 'shell env'), warning: [caveat, report.shadowCheckError].filter(Boolean).join('\n') });
       continue;
     }
     // A warning, for the reason reportDaemonCredentials gives: only turns need it.
@@ -984,7 +999,10 @@ async function checkDataDir(root: string): Promise<CheckResult> {
         externalPath = join(getHome(), '.lazy', projectName);
       }
       tasksDir = join(externalPath, 'tasks');
-      displayPath = externalPath;
+      const configured = config.storage.configured_path;
+      displayPath = configured && configured !== externalPath
+        ? `${externalPath}; configured as "${configured}"${!isAbsolute(configured) && !configured.startsWith('~') ? ' relative to project root' : ''}`
+        : externalPath;
       break;
     }
     default:
@@ -992,7 +1010,7 @@ async function checkDataDir(root: string): Promise<CheckResult> {
   }
 
   if (!(await pathExists(tasksDir))) {
-    return { ok: false, label: 'Data directory valid', problem: 'The data directory has no tasks folder', detail: `${displayPath}/tasks/ directory missing. Storage may be corrupted.` };
+    return { ok: false, label: 'Data directory valid', problem: 'The data directory has no tasks folder', detail: `${tasksDir}/ directory missing. Store: ${displayPath}. Storage may be corrupted.` };
   }
 
   return { ok: true, label: `Data directory valid (${displayPath})` };
@@ -1447,6 +1465,17 @@ export async function checkContainerImage(imageName: string, binary: string = 'd
     label: 'Container image exists',
     warning: `${imageName} is not built yet — it is built or pulled automatically on the first task start.`,
   };
+}
+
+/**
+ * Which branch commit the image was last rebuilt from (the daemon rebuilds the
+ * project image when its branch advances), read from the label that build
+ * wrote. Null when the image has none — built from the checkout, or not built.
+ */
+export async function checkImageBuiltFrom(imageName: string, binary: string = 'docker'): Promise<CheckResult | null> {
+  const from = await readBuiltFromLabel(imageName, binary);
+  if (!from) return null;
+  return { ok: true, label: `Runner image built from ${from.branch} @ ${from.sha.substring(0, 12)}` };
 }
 
 async function checkImageUpToDate(root: string, imageName: string, binary: string = 'docker'): Promise<CheckResult> {
@@ -2011,6 +2040,20 @@ export function formatTimeSince(isoDate: string): string {
 
 // ── crashed run detection ────────────────────────────────────────────────
 
+export async function checkOldTaskEnvironments(storage: Storage, root: string): Promise<CheckResult> {
+  const label = 'Task environments have the data directory';
+  const old: string[] = [];
+  for (const task of await storage.listTasksWithOptions({ nonTerminalOnly: true })) {
+    const session = await storage.getSessionByTaskId(task.id);
+    const runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
+    const name = session?.container_name ?? runner.runNameForTask(taskRef(task));
+    if (await runner.lacksCurrentLayout?.(name)) old.push(displayId(task));
+  }
+  return old.length
+    ? { ok: true, label, warning: old.join(', ') + ': ' + OLD_TASK_ENVIRONMENT_NOTICE + ' Use Restart environment on each task’s Services tab.' }
+    : { ok: true, label };
+}
+
 interface CrashedTask {
   taskCode: string;
   taskId: string;
@@ -2127,7 +2170,7 @@ async function checkOrphanedContainers(
   const parts: string[] = [];
   if (stopped.length > 0) parts.push(`${stopped.length} stopped: ${stopped.join(', ')}`);
   if (running.length > 0) {
-    parts.push(`${running.length} running for finished tasks: ${running.join(', ')}`);
+    parts.push(`${running.length} running for finished or deleted tasks: ${running.join(', ')}`);
   }
 
   return {
@@ -2578,6 +2621,9 @@ async function checkRemoteDriver(config: ResolvedConfig, root: string): Promise<
     const checks = isManagedMode() && isForgeDriver(driverName)
       ? await managedRepositoryHostChecks(config, root, undefined, process.env, () => driver!.checkHealth())
       : await driver.checkHealth();
+    // A managed `local` driver mirrors to origin (GitHub Enterprise and every
+    // other host no forge driver claims): ask the same push question there.
+    if (localDriverMirrorsOrigin(config)) checks.push(...await managedMirrorPushChecks(config, root));
 
     for (const check of checks) {
       const classification = REMOTE_DRIVER_DIAGNOSTIC_CLASS;
@@ -3880,6 +3926,17 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     results.push({ ok: true, label: 'Credentials (skipped — lazy.toml is stale; fix it first)' });
   } else {
     results.push(...(await checkAuth(config ?? null)));
+    if (root) {
+      try {
+        const binding = await readCredentialSetBinding(root);
+        results.push({ ok: true, label: binding
+          ? `Credential set: ${binding.set ?? 'none'}; binding changed ${binding.updatedAt}`
+          : 'Credential set: none (never bound)' });
+      } catch (err) {
+        results.push({ ok: false, label: 'Credential set binding is readable', problem: 'The local credential set binding cannot be read',
+          detail: err instanceof Error ? err.message : String(err) });
+      }
+    }
     // Presence is not validity: a stored session that will not parse passes
     // every check above and kills the turn that first presents it.
     if (root) results.push(...(await checkStoredCredentialsParse(root, config ?? null)));
@@ -3909,6 +3966,8 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     );
   } else if (root) {
     progress.begin(phases[4]);
+    const { checkStoreOwnership } = await import('./storage');
+    results.push(await checkStoreOwnership(root));
     results.push(await checkDataDir(root));
     results.push(await checkBuilderScratch(root));
     results.push(await checkDaemonStateFiles(root));
@@ -3968,6 +4027,8 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
       results.push(await checkContainerImage(imageName, runnerType));
       progress.note('Checking whether the image is up to date');
       results.push(await checkImageUpToDate(root, imageName, runnerType));
+      const builtFrom = await checkImageBuiltFrom(imageName, runnerType);
+      if (builtFrom) results.push(builtFrom);
       if (runner && config && (runnerType === 'docker' || runnerType === 'podman')) {
         progress.note('Checking running builders against the current image');
         results.push(await checkBuildersCurrent({ root, runner, binary: runnerType, imageName, config }));
@@ -4000,6 +4061,12 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     if (runner && lockBlocks) {
       results.push(skippedForLock('No missing task runs'));
     } else if (runner) {
+      try {
+        results.push(await withSweepStorage(root, (storage) => checkOldTaskEnvironments(storage, root)));
+      } catch (err) {
+        results.push({ ok: true, label: 'Task environments have the data directory',
+          warning: `Could not check environment layouts: ${err instanceof Error ? err.message : String(err)}` });
+      }
       try {
         crashedTasks = await findCrashedTasks(root, runner);
         if (crashedTasks.length === 0) {
@@ -4114,6 +4181,19 @@ export async function runDoctorReport(options: DoctorRunOptions): Promise<Doctor
     }
     if (rawConfig) {
       results.push(checkProtectionConfigInert(rawConfig));
+    }
+    if (isManagedMode()) {
+      const recovery = await recoverManagedSetup(root);
+      const files = [...recovery.restored, ...recovery.untouched];
+      if (!files.length) results.push({ ok: true, id: 'managed-checkout-setup', label: 'Project checkout has no pending setup edits' });
+      else results.push({
+        id: 'managed-checkout-setup', ok: false,
+        label: 'Project checkout has no pending setup edits',
+        problem: 'Project checkout changes need attention',
+        detail: recovery.untouched.length
+          ? 'Changes in ' + recovery.untouched.join(', ') + ' do not exactly match lazy setup. Nothing was overwritten. A project administrator must decide which changes to keep before updating main.'
+          : 'Setup-only edits in ' + recovery.restored.join(', ') + ' will be restored when the project next starts.',
+      });
     }
     // Managed (fleet) hosts only — a strict no-op otherwise.
     results.push(...checkManagedConfig(

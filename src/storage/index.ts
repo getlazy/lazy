@@ -63,6 +63,7 @@ import { getHome } from '../utils/home';
 import { existsSync, mkdirSync } from 'fs';
 import { runGit } from '../utils/git';
 import { logger } from '../utils/logger';
+import { assertStoreOwner, identifyCheckout } from './store-owner';
 
 /** Actionable error when lazy.toml still names the removed postgres backend. */
 export const POSTGRES_BACKEND_REMOVED =
@@ -104,6 +105,8 @@ export interface CreateStorageOptions {
   backend?: StorageBackend;
   /** External storage path (only used with 'external' backend) */
   externalPath?: string;
+  /** Original config spelling for errors when externalPath is already resolved. */
+  configuredPath?: string;
   /**
    * Fail after this long waiting for the storage lock instead of running the
    * default retry loop (only used with the 'external' backend, which is the
@@ -122,11 +125,13 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
   let backend = options?.backend;
   let externalPath = options?.externalPath;
 
+  let configuredPath = options?.configuredPath;
   let gitRemote = 'origin';
   if (!backend) {
     const config = await loadConfig(lazyRoot);
     backend = config.storage.backend;
     externalPath = config.storage.external_path;
+    configuredPath = config.storage.configured_path;
     gitRemote = config.remote.git_remote;
   }
 
@@ -185,6 +190,7 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
       storage = new FileStorage(lazyRoot, {
         basePath: externalPath,
         lockTimeoutMs: options?.lockTimeoutMs,
+        enforceOwnership: true,
       });
       break;
     }
@@ -193,7 +199,18 @@ export async function createStorage(lazyRoot: string, options?: CreateStorageOpt
       throw new Error(`Unknown storage backend: "${backend}". Valid backend is "external".`);
   }
 
-  await storage.initialize();
+  try {
+    await storage.initialize();
+  } catch (err: unknown) {
+    const context = `Cannot open storage "${configuredPath ?? externalPath}" (resolved to "${externalPath}")`;
+    // Preserve typed lock/restore failures: the daemon uses their identity to
+    // decide whether a restart can help and how to explain a restore.
+    if (err instanceof Error) {
+      err.message = `${context}: ${err.message}`;
+      throw err;
+    }
+    throw new Error(`${context}: ${String(err)}`, { cause: err });
+  }
   return storage;
 }
 
@@ -207,4 +224,10 @@ export async function resolveStorePath(lazyRoot: string): Promise<string> {
   const config = await loadConfig(lazyRoot);
   if (config.storage.external_path) return config.storage.external_path;
   return join(getHome(), '.lazy', await getProjectName(lazyRoot, config.remote.git_remote));
+}
+
+/** Read-only preflight, before startup backups or any other lock acquisition. */
+export async function checkProjectStoreOwnership(root: string): Promise<void> {
+  const checkout = await identifyCheckout(root);
+  await assertStoreOwner(await resolveStorePath(root), checkout);
 }

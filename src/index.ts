@@ -22,6 +22,7 @@ import {
   commandStatus, statusUsage,
   commandDiff, diffUsage,
   commandRegions, regionsUsage,
+  commandSessions, sessionsUsage,
   commandShell, shellUsage,
   commandDashboard, dashboardUsage,
   commandPlayground, playgroundUsage,
@@ -167,6 +168,7 @@ Customize:
 
 Inspect:
   diff <task_id>         Show changes made by task
+  sessions <task_id>     List the sessions running in a task's environment, or read one
   regions <task_id>      Show the review regions the task's walkthrough declared
   status <task_id>       Show worktree and commit state
   shell <task_id>        Open shell in task's container (--host for the worktree on this machine)
@@ -268,7 +270,7 @@ const commandMap: Record<string, {
       console.log('Requires an interactive terminal to display warnings and instructions.\n');
       console.log('If a supported remote (GitHub, etc.) is detected, offers to configure it.\n');
       console.log('Options:');
-      console.log('  --external-path PATH      Put the external store here instead of ~/.lazy/<project-name>.');
+      console.log('  --external-path PATH      Store path: absolute, ~/..., or relative to the project root.');
       console.log('                            Answers the storage prompt, so it also works without a TTY,');
       console.log('                            and rewrites storage.external_path in an existing lazy.toml.');
       console.log('  --runner docker|smolvm    Set [runner] type. smolvm also writes a [smolvm] section and');
@@ -304,6 +306,7 @@ const commandMap: Record<string, {
   'branch':   { run: commandBranch, usage: branchUsage },
   'diff':     { run: commandDiff, usage: diffUsage },
   'regions':  { run: commandRegions, usage: regionsUsage },
+  'sessions': { run: commandSessions, usage: sessionsUsage },
   'status':   { run: commandStatus, usage: statusUsage },
   'shell':    { run: commandShell, usage: shellUsage },
   'dashboard': { run: commandDashboard, usage: dashboardUsage },
@@ -613,11 +616,13 @@ const rewritesStoragePath = command === 'init' && args.includes('--external-path
 // one belonging to ANOTHER install, possibly still running — and writes
 // nothing. Probing the surrounding project's `.lazy` would refuse the fleet's
 // adoption preflight on exactly the machines it has to run on.
+// Re-homing also bypasses auto-start and storage preflight: it resolves the
+// project itself, and requires the old daemon to be stopped before it writes.
 //
 // `lazy system smolvm-install` installs into ~/.lazy and is run BEFORE a
 // project exists (the setup page has it ahead of `lazy init`).
 const isProjectFreeSystemQuery =
-  command === 'system' && ['source-id', 'guest-init-script', 'smolvm-build-image', 'smolvm-install', 'store-check', 'store-backup', 'store-backups', 'store-restore'].includes(args[1] ?? '');
+  command === 'system' && ['source-id', 'guest-init-script', 'smolvm-build-image', 'smolvm-install', 'store-check', 'store-rehome', 'store-backup', 'store-backups', 'store-restore'].includes(args[1] ?? '');
 
 // `lazy playground` (alias `demo`) is exempt for the same reason, and the failure is not
 // hypothetical either: the command exists to be run by an agent inside its own
@@ -721,7 +726,13 @@ if (!isHelpOrVersion && !isProjectFreeSystemQuery) {
   // its remote every time either. A bare `lazy login` reports the binding.
   if (root && !binding) {
     try {
-      await ensureDaemon(command, root);
+      if (command === 'doctor') {
+        // Diagnosis reports ownership and its remedy without claiming a store.
+        await ensureDaemon(command, root);
+      } else {
+        const { withStoreClaimPrompt } = await import('./cli/store-claim');
+        await withStoreClaimPrompt(root, args, () => ensureDaemon(command, root));
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // INVARIANT: `lazy doctor` never dies of the problem it exists to

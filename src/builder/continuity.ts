@@ -48,6 +48,14 @@ export interface BuilderContinuityDeps {
    * Called after Claude exits due to a generation change, before relaunching.
    */
   resolveResumeId?: () => Promise<string | null>;
+  /**
+   * Run before every launch with the env that launch gets — a Codex builder
+   * rewrites its managed config.toml here, because the proxy address it must
+   * name changes when the daemon restarts (src/supervisor/builder.ts).
+   */
+  prepareLaunch?: (env: Record<string, string>) => Promise<void>;
+  /** What the launched program is called in the human's terminal. */
+  agentName?: string;
 }
 
 export interface BuilderContinuityResult {
@@ -105,6 +113,8 @@ export async function runBuilderWithContinuity(
     fetchLaunchEnv = fetchBuilderLaunchEnv,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
     resolveResumeId = async () => null,
+    prepareLaunch,
+    agentName = 'Claude Code',
   } = deps;
 
   const readStatus = deps.readStatus
@@ -161,8 +171,18 @@ export async function runBuilderWithContinuity(
       const baseline = await baselineRead;
       const claudeArgs = buildClaudeArgs(resumeId, launchEnv.directive);
       const env = overlayLaunchEnv(baseEnv, launchEnv);
+      if (prepareLaunch) {
+        try {
+          await prepareLaunch(env);
+        } catch (err) {
+          errorOut('');
+          errorOut('This builder could not start.');
+          errorOut(err instanceof Error ? err.message : String(err));
+          return { exitCode: 1, restarts };
+        }
+      }
 
-      log(`[builder] Launching Claude Code${resumeId ? ` (--resume ${resumeId.substring(0, 8)})` : ''}...`);
+      log(`[builder] Launching ${agentName}${resumeId ? ` (--resume ${resumeId.substring(0, 8)})` : ''}...`);
 
       let restartDetected = false;
       let stopNoticeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -186,7 +206,7 @@ export async function runBuilderWithContinuity(
           try { child?.kill('SIGTERM'); } catch { /* ok */ }
           stopNoticeTimer = setTimeout(() => {
             errorOut('');
-            errorOut('The lazy daemon restarted. Claude Code was asked to exit so this builder can');
+            errorOut(`The lazy daemon restarted. ${agentName} was asked to exit so this builder can`);
             errorOut('resume against the new daemon — use /exit if it has not yet.');
           }, stopGraceMs);
           stopNoticeTimer.unref?.();

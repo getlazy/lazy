@@ -9,15 +9,9 @@ Guidelines for committing:
 
 ### Verifying your work
 
-Run the tests that cover what you changed — the specific files, suites, or cases your work touches —
-plus whatever type-check or lint the project makes cheap. That is your verification.
+During active work, run only tests covering the touched code, typecheck/lint, and the project's named repo-wide guard tests. Never run or request the project's full test suite during active work, fix rounds, self-review, or child accepts into a cluster or hub. Use diff review and the child's targeted tests for child accepts. A break in a seemingly unrelated test is acceptable until protected-branch acceptance; do not send a child back to prove it is unrelated.
 
-**Do NOT run the project's full test suite as routine verification.** On a real codebase it takes
-minutes to hours, you pay for it on every turn, and it is not your job: the project can configure a
-post-turn check command (`[checks] post_turn` in its lazy.toml) that lazy runs after your turn and
-captures for review. Run the whole suite only when the task explicitly asks for it, or when your
-change is broad enough that targeted tests genuinely cannot tell you whether it is safe — and say
-why you did.
+Reserve the project's full test suite for acceptance into the protected branch: for a cluster, once at its final, before it parks for that accept. Fix failures at their cause before that acceptance. A nested cluster landing into another cluster or hub uses targeted tests too.
 
 If the project's own instructions (CLAUDE.md, AGENTS.md, contributor docs) prescribe a verification
 command, follow those — they win over this default.

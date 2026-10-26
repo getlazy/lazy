@@ -9,12 +9,14 @@
  * error naming the config key and the value, not an opaque ENOENT/EACCES
  * deep inside storage or runner code.
  */
+import { isManagedMode, MANAGED_POLICY } from '../config/managed';
+
 import { stat, access } from 'fs/promises';
 import { constants } from 'fs';
 import { isAbsolute, resolve } from 'path';
 import { userInfo } from 'os';
 import { expandTilde } from '../utils/home';
-import { loadRawConfig, resolveConfigPath } from '../config/loader';
+import { loadRawConfig, resolveConfigPath, resolveStoragePath } from '../config/loader';
 
 /** A path-valued config key we know how to validate. */
 interface PathSpec {
@@ -67,11 +69,10 @@ function extractPathSpecs(raw: Record<string, unknown>, lazyRoot: string | null)
 
   const externalPath = readString(raw.storage, 'external_path');
   if (externalPath) {
-    const expanded = expandTilde(externalPath);
     specs.push({
       key: 'storage.external_path',
       rawValue: externalPath,
-      resolvedPath: isAbsolute(expanded) ? expanded : resolve(baseDir, expanded),
+      resolvedPath: resolveStoragePath(baseDir, externalPath),
       kind: 'dir',
       needsWrite: true,
     });
@@ -248,6 +249,8 @@ export async function validateConfigPaths(lazyRoot: string | null): Promise<void
 
   const configPath = await resolveConfigPath(lazyRoot);
   for (const spec of specs) {
+    // The repository's overridden paths are never consumed on a Teams machine.
+    if (isManagedMode() && MANAGED_POLICY[spec.key]?.disposition === 'overridden') continue;
     const failure = await validateOne(spec);
     if (failure) {
       console.error(formatFailure(failure, configPath));

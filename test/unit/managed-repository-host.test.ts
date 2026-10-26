@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { mkdtemp, rm, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { managedRepositoryHostChecks, defaultRunCommand, type RunCommand } from '../../src/doctor/managed-repository-host';
+import { managedRepositoryHostChecks, managedMirrorPushChecks, defaultRunCommand, type RunCommand } from '../../src/doctor/managed-repository-host';
 import type { ResolvedConfig } from '../../src/config';
 
 function cfg(driver: string): ResolvedConfig {
@@ -93,5 +93,32 @@ describe('managed repository-host check', () => {
     await sh(['git', 'init', '-q', bare], dir);
     const checks = await managedRepositoryHostChecks(cfg('github'), bare, noForgeCli, {});
     expect(checks).toEqual([expect.objectContaining({ state: 'fail', what: 'Git remote origin' })]);
+  });
+});
+
+describe('managed local-driver (mirror) push check', () => {
+  // INVARIANT: a managed project on a host no forge driver claims (GitHub
+  // Enterprise, a self-hosted GitLab) still pushes to its origin with the
+  // seeded token, so doctor asks the push question there too.
+  const ghe = (push: { exitCode: number; stderr: string }): RunCommand => async (argv) =>
+    argv[1] === 'remote' ? { exitCode: 0, stdout: 'https://ghe.acme.internal/acme/app.git\n', stderr: '' }
+      : { exitCode: push.exitCode, stdout: '', stderr: push.stderr };
+
+  test('a GHE remote with a seeded token: a refused push fails with the forge message and fix', async () => {
+    const checks = await managedMirrorPushChecks(cfg('local'), '/tmp',
+      ghe({ exitCode: 128, stderr: 'remote: Permission to acme/app.git denied to octo.\nfatal: The requested URL returned error: 403' }),
+      { GH_TOKEN: 'x' });
+    expect(checks).toHaveLength(1);
+    expect(checks[0]).toMatchObject({ state: 'fail', what: 'Git can push to remote origin' });
+    expect('reason' in checks[0] ? checks[0].reason : '').toContain('Permission to acme/app.git denied');
+  });
+
+  test('a GHE remote with a seeded token that can push is ok', async () => {
+    const checks = await managedMirrorPushChecks(cfg('local'), '/tmp', ghe({ exitCode: 0, stderr: '' }), { GH_TOKEN: 'x' });
+    expect(checks).toEqual([{ state: 'ok', what: 'Git can push to remote origin' }]);
+  });
+
+  test('no forge token seeded (a repository this install hosts): nothing to report', async () => {
+    expect(await managedMirrorPushChecks(cfg('local'), '/tmp', ghe({ exitCode: 0, stderr: '' }), {})).toEqual([]);
   });
 });

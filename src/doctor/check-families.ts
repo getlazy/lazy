@@ -53,11 +53,14 @@ interface FamilyRule extends DoctorCheckFamily {
  * scans the sweep so a renamed label cannot silently fall to the default.
  */
 export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
+  { prefix: 'Task environments have the data directory', family: 'task-environment-layout', remedyKind: 'manual', impact: 'setup' },
+  { prefix: 'Store belongs to this checkout', family: 'store-ownership', remedyKind: 'config', impact: 'work' },
   { prefix: 'Git installed', family: 'git-installed', remedyKind: 'host', impact: 'work' },
   { prefix: 'Actor identity', family: 'actor-identity', remedyKind: 'host', impact: 'work' },
   { prefix: 'Repository has commits', family: 'repository-has-commits', remedyKind: 'manual', impact: 'work' },
   { prefix: 'Model credential present', family: 'model-credential', remedyKind: 'credential', impact: 'work' },
   { prefix: 'Stored credentials are readable', family: 'stored-credentials', remedyKind: 'credential', impact: 'work' },
+  { prefix: 'Credential set', family: 'credential-set', remedyKind: 'credential', impact: 'work' },
   { prefix: 'Proxy audit log', family: 'proxy-audit-reach', remedyKind: 'config', impact: 'setup' },
   { prefix: 'Model API accepts lazy credential', family: 'credential-accepted', remedyKind: 'credential', impact: 'work' },
   { prefix: 'Usage pause', family: 'usage-pause', remedyKind: 'manual', impact: 'work' },
@@ -89,6 +92,7 @@ export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
   { prefix: 'Extra container run args', family: 'container-run-args', remedyKind: 'config', impact: 'setup' },
   // Never an error for an image not built yet (the first task start builds it): that is a warning, god mode only.
   { prefix: 'Container image exists', family: 'container-image', remedyKind: 'host', impact: 'work' },
+  { prefix: 'Runner image built from', family: 'runner-image-source', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'Container image up to date', family: 'container-image-current', remedyKind: 'host', impact: 'setup' },
   { prefix: 'Running builders match current config', family: 'builders-current', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'No stale runner images', family: 'stale-images', remedyKind: 'flag', impact: 'setup' },
@@ -130,6 +134,7 @@ export const DOCTOR_CHECK_FAMILIES: readonly FamilyRule[] = [
   { prefix: "lazy.toml '", family: 'managed-config', remedyKind: 'config', impact: 'setup' },
   { prefix: 'No lazy.toml setting is being overridden', family: 'managed-config', remedyKind: 'config', impact: 'setup' },
   { prefix: 'Managed mode', family: 'managed-config', remedyKind: 'config', impact: 'setup' },
+  { prefix: 'Project checkout', family: 'managed-checkout-setup', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'Repository plugins', family: 'repository-plugins', remedyKind: 'manual', impact: 'setup' },
   { prefix: 'Config ', family: 'config-keys', remedyKind: 'config', impact: 'setup' },
   { prefix: 'No unknown config options', family: 'config-keys', remedyKind: 'config', impact: 'setup' },

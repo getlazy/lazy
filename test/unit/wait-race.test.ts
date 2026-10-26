@@ -251,6 +251,20 @@ describe('raceWait interruption by a new subtask', () => {
 });
 
 describe('raceWait interruption details', () => {
+  // INVARIANT: a member Pair assistant is outside the supervised agent's turn,
+  // so its child interrupts that agent's wait despite sharing the agent channel.
+  test('a child created from member Pair interrupts the supervised agent wait', async () => {
+    const storage = makeStorage([{ id: 'aaaa1111', code: 'a', status: 'working', finishesAtPoll: 20 }]);
+    let reads = 0;
+    storage.getChildTasks = async () => (reads++ > 0
+      ? [{ id: 'agentmade-pair', status: 'backlog', metadata: { created_from_member_pair: 'true' } }]
+      : []) as unknown as Task[];
+    const result = await raceWait(storage, ['a'], { ...FAST, interruptOnNewChildOf: 'parent' });
+    expect(result.interrupted?.reason).toBe('subtask_added');
+    expect(result.interrupted?.new_tasks?.map(t => t.task_id)).toEqual(['agentmade-pair']);
+    expect(result.status).toBe('working');
+  });
+
   // INVARIANT: only children created from outside interrupt; the waiter's own
   // agent creating a child must never wake its own wait.
   test('a child created by the waiting agent itself does not interrupt', async () => {

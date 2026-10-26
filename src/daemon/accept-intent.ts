@@ -27,6 +27,7 @@
  *    transition, cleared when every follow-through step has succeeded.
  */
 
+import { maskUrlCredentials } from './push-failure';
 import type { ActorInput, Task } from '../types';
 
 /** Task metadata key: the persisted accept decision (JSON {@link AcceptIntent}). */
@@ -150,4 +151,35 @@ export function readResumeAttempts(task: Pick<Task, 'metadata'>): number {
 /** Retry backoff for follow-through: 1, 2, 4, … minutes, capped at 30. */
 export function followThroughBackoffMs(attempts: number): number {
   return Math.min(30, 2 ** Math.max(0, attempts - 1)) * 60_000;
+}
+
+/**
+ * The post-accept steps that are FAILING right now, each with its own error —
+ * what a surface shows for an accepted task. `lastError` is written as
+ * `step: message; step: message` and is not cleared when a later pass only
+ * leaves another step pending, so a step named there that has since completed
+ * is dropped. Null when nothing is failing.
+ */
+export function failingFollowThrough(record: AcceptFollowThrough | null): {
+  steps: Array<{ step: FollowThroughStep; error: string }>;
+  pushPending: boolean;
+  attempts: number;
+} | null {
+  if (!record?.lastError) return null;
+  const steps: Array<{ step: FollowThroughStep; error: string }> = [];
+  // Split only before a KNOWN step name: a forge message may itself contain "; word:".
+  const boundary = new RegExp(`;\\s+(?=(?:${FOLLOWTHROUGH_STEPS.join('|')}): )`);
+  for (const part of record.lastError.split(boundary)) {
+    const match = /^([a-z-]+): ([\s\S]*)$/.exec(part);
+    const step = match?.[1] as FollowThroughStep | undefined;
+    if (!step || !FOLLOWTHROUGH_STEPS.includes(step) || record.done.includes(step)) continue;
+    // Masked here too, for records written before the write side masked.
+    steps.push({ step, error: maskUrlCredentials(match![2]) });
+  }
+  if (steps.length === 0) return null;
+  return {
+    steps,
+    pushPending: steps.some((s) => s.step === 'push-parent' || s.step === 'fast-forward'),
+    attempts: record.attempts,
+  };
 }

@@ -23,6 +23,7 @@
 import type { ResolvedConfig } from '../config';
 import type { HealthCheck } from '../remote/driver';
 import { spawn } from '../utils/spawn';
+import { checkPushAccess, forgeForRemote, type ForgeKind } from '../daemon/forge-credential';
 
 export interface CommandResult { exitCode: number; stdout: string; stderr: string }
 export type RunCommand = (argv: string[], cwd: string) => Promise<CommandResult>;
@@ -106,6 +107,25 @@ export async function managedRepositoryHostChecks(
         `nothing to push with: the repository can be read, but pushes and accepts cannot authenticate. ` +
         `Connect a forge account for this project.`,
     });
+  } else if (lsRemote.exitCode === 0) {
+    // Reading is not writing: a token with read-only scopes, or an account
+    // without write access, passes ls-remote and is refused on the first real
+    // push. Ask the forge the push question itself, through the same helper.
+    const access = await checkPushAccess(root, {
+      remote,
+      forge: config.remote.driver as ForgeKind,
+      run,
+      env,
+    });
+    checks.push(access.ok
+      ? { state: 'ok', what: `Git can push to remote ${remote}` }
+      : {
+        state: 'fail',
+        what: `Git can push to remote ${remote}`,
+        problem: `Git can't push to remote ${remote}`,
+        reason: [access.summary, access.forgeMessage && `${forge.label} said: ${access.forgeMessage}.`, access.remedy]
+          .filter(Boolean).join(' '),
+      });
   }
 
   // Forge API features. Not needed to push or accept, so never a failure.
@@ -132,4 +152,39 @@ export async function managedRepositoryHostChecks(
     });
   }
   return checks;
+}
+
+/**
+ * The push check for a managed `local`-driver project, which MIRRORS its task
+ * branches and accepts to origin (src/remote/origin-mirror.ts) — a GitHub
+ * Enterprise or any other non-github.com/gitlab.com host lands here, because
+ * no forge driver claims its URL. Its pushes authenticate through the same
+ * credential helper with the forge token Teams seeded, so the same question
+ * applies; the forge comes from the remote and the token actually seeded
+ * (forgeForRemote). No remote, or no forge token seeded (a repository this
+ * install hosts authenticates with its own git token), is not this check's
+ * business: it reports nothing rather than a failure.
+ */
+export async function managedMirrorPushChecks(
+  config: ResolvedConfig,
+  root: string,
+  run: RunCommand = defaultRunCommand,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<HealthCheck[]> {
+  const remote = config.remote.git_remote;
+  const url = await run(['git', 'remote', 'get-url', remote], root);
+  if (url.exitCode !== 0) return [];
+  const forge = forgeForRemote(url.stdout.trim(), env);
+  if (!forge) return [];
+  const label = FORGES[forge].label;
+  const access = await checkPushAccess(root, { remote, forge, run, env });
+  return [access.ok
+    ? { state: 'ok', what: `Git can push to remote ${remote}` }
+    : {
+      state: 'fail',
+      what: `Git can push to remote ${remote}`,
+      problem: `Git can't push to remote ${remote}`,
+      reason: [access.summary, access.forgeMessage && `${label} said: ${access.forgeMessage}.`, access.remedy]
+        .filter(Boolean).join(' '),
+    }];
 }

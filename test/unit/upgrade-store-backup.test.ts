@@ -2,10 +2,11 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readdir, rm, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { backupStoreIfVersionChanged, backupStoreForUpgrade } from '../../src/daemon/upgrade-store-backup';
+import { backupOutcomeLine, backupStoreIfVersionChanged, backupStoreForUpgrade } from '../../src/daemon/upgrade-store-backup';
 import { getDaemonDir } from '../../src/daemon/paths';
 import { backupsDirFor } from '../../src/storage/store-backup';
 import { processNamespaceId } from '../../src/utils/process-identity';
+import { describeBackupProgress, phaseEta, readLiveBackupProgress, startingLine } from '../../src/daemon/store-backup-progress';
 
 let base: string;
 let root: string;
@@ -115,5 +116,68 @@ describe('reuse check progress', () => {
     const second = await backupStoreForUpgrade({ ...args, onProgress: p => phases.push(p.phase) });
     expect(second.kind).toBe('already');
     expect(phases).toContain('measuring');
+  });
+});
+
+describe('reuse across versions and interrupted backups', () => {
+  // INVARIANT: any verified backup of the store AS IT IS NOW is reused, whatever
+  // version pair took it. Swapping between binaries on an unchanged store
+  // recopied gigabytes for every new pair (4.2 GiB, three binaries, 2026-10-24).
+  test('a backup taken for another version pair is reused while the store is unchanged', async () => {
+    const first = await backupStoreForUpgrade({ projectRoot: root, fromVersion: '0.93.1205', toVersion: '0.93.1267', keep: 5, reason: 't' });
+    expect(first.kind).toBe('taken');
+    const second = await backupStoreForUpgrade({ projectRoot: root, fromVersion: '0.93.1205', toVersion: '0.92.1201', keep: 5, reason: 't' });
+    expect(second.kind).toBe('already');
+    await Bun.sleep(5);
+    await writeFile(join(store, 'tasks', 't1', 'task.json'), '{"goal":"changed"}');
+    const third = await backupStoreForUpgrade({ projectRoot: root, fromVersion: '0.92.1201', toVersion: '0.93.1210', keep: 5, reason: 't' });
+    expect(third.kind).toBe('taken');
+  });
+
+  // INVARIANT: an interrupted backup is restarted from scratch and the start
+  // SAYS so — a half-written copy is never silently thrown away or reused.
+  test('an interrupted copy is reported and the backup starts again', async () => {
+    await mkdir(join(backupsDirFor(store), '20261024-000000-a-to-b.partial'), { recursive: true });
+    const told: string[][] = [];
+    const out = await backupStoreForUpgrade({ projectRoot: root, fromVersion: 'a', toVersion: 'b', keep: 5, reason: 't', onInterruptedDiscarded: n => told.push(n) });
+    expect(out.kind).toBe('taken');
+    expect(told).toEqual([['20261024-000000-a-to-b.partial']]);
+    expect((await backups()).some(n => n.endsWith('.partial'))).toBe(false);
+  });
+});
+
+describe('progress lines', () => {
+  test('a copy line says how much of how much and roughly how long is left', () => {
+    const p = { phase: 'copying' as const, files: 10, bytes: 1024 ** 3, total_files: 40, total_bytes: 4 * 1024 ** 3 };
+    expect(describeBackupProgress(p, phaseEta(p, 0, 10_000))).toBe("copying: 1.00 GiB of 4.00 GiB (10 of 40 files), about 70 s left");
+    expect(describeBackupProgress(p, null)).not.toContain('left');
+  });
+
+  // INVARIANT: a marker whose writer is gone is not a daemon starting — status
+  // must not claim a backup is running for a process that died mid-backup.
+  test('a marker from a dead process is no backup in progress; a live one is', async () => {
+    const marker = { phase: 'copying', files: 1, bytes: 1, total_files: 2, total_bytes: 2, from_version: 'a', to_version: 'b',
+      updated_at: new Date().toISOString(), eta_seconds: null, line: 'copying: x' };
+    await writeFile(join(getDaemonDir(root), 'store-backup-progress.json'), JSON.stringify({ ...marker, pid: 999_999 }));
+    expect(await readLiveBackupProgress(root)).toBeNull();
+    await writeFile(join(getDaemonDir(root), 'store-backup-progress.json'), JSON.stringify({ ...marker, pid: process.pid }));
+    const live = await readLiveBackupProgress(root);
+    expect(live?.line).toBe('copying: x');
+    expect(startingLine(live!)).toBe(`starting (PID ${process.pid}). Backing up your store before lazy b opens it, so you can go back to a if you need to: copying: x`);
+  });
+});
+
+describe('how a backup ended', () => {
+  // INVARIANT: the end of a pre-upgrade backup says what the person now HAS —
+  // where it is, and the command back to the version they came from.
+  test('a reused backup says where it is, that nothing was copied, and how to go back', async () => {
+    const args = { projectRoot: root, fromVersion: '0.93.1', toVersion: '0.94.1', keep: 5, reason: 't' };
+    const taken = await backupStoreForUpgrade(args);
+    expect(backupOutcomeLine(taken, '0.93.1')).toMatch(/^Backup saved: \S+ \(\d+ files, .*\)\. To go back to lazy 0\.93\.1: `lazy daemon stop`, then `lazy system store-restore [^`]+`\.$/);
+    const reused = await backupStoreForUpgrade(args);
+    expect(reused.kind).toBe('already');
+    if (reused.kind !== 'already') throw new Error('expected reuse');
+    expect(backupOutcomeLine(reused, '0.93.1')).toBe(
+      `Store already backed up at ${reused.backup.path}; nothing to copy. To go back to lazy 0.93.1: \`lazy daemon stop\`, then \`lazy system store-restore ${reused.backup.name}\`.`);
   });
 });

@@ -34,6 +34,7 @@ describe('task tab slug set', () => {
       'changes',
       'verify',
       'turns',
+      'chat',
       'commits',
       'reviews',
       'subtasks',
@@ -51,7 +52,7 @@ describe('task tab slug set', () => {
   test('Landing is the bare path and is first in reading order', () => {
     expect(TASK_TAB_ORDER[0]).toBe('landing');
     expect(TASK_TAB_ORDER[TASK_TAB_ORDER.length - 1]).toBe('review');
-    expect(TASK_TAB_ORDER).toHaveLength(16);
+    expect(TASK_TAB_ORDER).toHaveLength(17);
     // INVARIANT: Regions comes before Changes, and Verify before both.
     // That is the reading order for a large branch — what was I asked to
     // check, what units of work are in here, then the diff itself. Regions

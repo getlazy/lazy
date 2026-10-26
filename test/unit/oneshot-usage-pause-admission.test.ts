@@ -65,4 +65,13 @@ describe('one-shot command admission', () => {
     await admitOneshotCommand({ actor: 'agent' });
     expect(calls[0]).toEqual({ method: 'usagePause', params: { action: 'admitOneshot', actor: 'agent' } });
   });
+
+  // INVARIANT: identity is authenticated by the daemon, never sent across RPC
+  // as a caller-controlled person. The asking channel still travels.
+  test('a client sends only the channel when given an actor ref', async () => {
+    calls.length = 0;
+    const actor = { role: 'agent' as const, email: 'alice@example.com', name: 'Alice' };
+    await admitOneshotCommand({ actor });
+    expect(calls[0]).toEqual({ method: 'usagePause', params: { action: 'admitOneshot', actor: 'agent' } });
+  });
 });

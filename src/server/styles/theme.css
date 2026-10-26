@@ -170,11 +170,9 @@
 /* A button is an anchor on most of this surface; Industry's `.btn` does not
    defend against the global `a:hover { text-decoration: underline }`. */
 a.btn:hover { text-decoration: none; }
-/* A disabled button says "this control exists, but there is nowhere to go" —
-   the end of a stepped sequence (the first or last turn). Keeping it in place
-   rather than dropping it stops the prev/next pair jumping between pages. */
-.btn[disabled] { opacity: 0.45; cursor: not-allowed; }
-.btn[disabled]:hover { border-color: var(--color-divider); }
+/* A request in flight stays visible and announces that it is busy. */
+.btn[aria-busy="true"] { cursor: progress; }
+.btn[aria-busy="true"]:hover { border-color: var(--color-divider); }
 /* `display` above is an author rule and beats the UA's `[hidden]`, so a
    button that ships hidden for an island to reveal needs this or it is
    simply always on screen — which the Reconnect buttons in the shell and
@@ -203,3 +201,5 @@ a.btn:hover { text-decoration: none; }
   font-size: 11px;
   color: color-mix(in srgb, var(--color-text) 55%, transparent);
 }
+
+button[aria-busy="true"]::after { content: " …"; }

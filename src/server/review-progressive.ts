@@ -358,7 +358,15 @@ export function progressiveLoaderScript(filesUrl: string): string {
   function pump() {
     if (busy || !document.contains(root)) return;
     var batch = nextBatch();
-    if (!batch.length) return;
+    if (!batch.length) {
+      if (allBtn && wantAll) {
+        allBtn.removeAttribute('aria-busy');
+        if (!root.querySelector('.rv-file-pending:not([data-rv-failed])')) {
+          allBtn.setAttribute('data-control-refusal', 'All available diffs are loaded. If a file failed to load, use its Retry button.');
+        }
+      }
+      return;
+    }
     busy = true;
     load(batch).then(function () { busy = false; pump(); });
   }
@@ -386,7 +394,7 @@ export function progressiveLoaderScript(filesUrl: string): string {
     var card = btn.closest('.rv-file-pending');
     if (!card || card.dataset.rvLoading === '1') return;
     card.removeAttribute('data-rv-failed');
-    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
     load([card]);
   });
   var list = document.querySelector('[data-rv-file-list]');
@@ -394,7 +402,7 @@ export function progressiveLoaderScript(filesUrl: string): string {
   if (allBtn) allBtn.addEventListener('click', function (ev) {
     ev.preventDefault();
     wantAll = true;
-    allBtn.disabled = true;
+    allBtn.setAttribute('aria-busy', 'true');
     pump();
   });
 })();

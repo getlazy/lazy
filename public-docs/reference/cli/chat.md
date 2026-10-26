@@ -10,7 +10,12 @@ Interactive, read-only chat with a task's agent — ask it what it did and why.
 The chat is "reflective": the agent reflects and answers, it does not act. No
 edits, no commands, no commits, no task state changes are possible.
 
-Works on any task whose agent has run at least once:
+Works after the task’s agent has run at least once:
+
+  Paused tasks: Claude Code, Cursor and Pi. Codex has no read-only
+  interactive mode that works in a container; use lazy ask instead.
+  Finished tasks: archived Claude Code sessions only.
+  The browser Chat tab uses Ask turns and also works on Codex.
 
   Paused task (blocked/conflict)  Resumes the agent's live session in its
                                   worktree. The task is left exactly as it was

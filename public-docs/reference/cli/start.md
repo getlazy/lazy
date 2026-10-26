@@ -73,7 +73,7 @@ Model Selection:
   Models are selected in this priority order:
   1. --model flag (session override)
   2. Task's model setting (if set during task creation)
-  3. The agent's own default, if it has one (Cursor: "auto" — Cursor picks; Codex: "gpt-6-sol")
+  3. The agent's own default, if it has one (Cursor: "auto" — Cursor picks; Codex: "gpt-6.1-sol")
   4. lazy.toml default model
   5. Built-in default (claude-sonnet-5-5)
 

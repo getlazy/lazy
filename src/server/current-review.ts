@@ -383,6 +383,7 @@ export function currentReviewHtml(input: CurrentReviewInput): string {
   // on the task page is built the same way for the same reason.
   const askBlock = `<div class="lz-review-asks">
     <h2 data-rv-asks-count>Asks (${currentAsks.length})</h2>
+    <p class="rv-hint"><a href="/tasks/${escapeHtml(seg)}/chat" data-lz-asked-in-chat>Asked in Chat →</a> every question and its answer, as one conversation with the agent.</p>
     <div data-rv-task-threads>${currentAsks.length === 0
       ? '<p class="rv-hint">No open questions — ask about the task below.</p>'
       : currentAsks.map((t) => `<div id="thread-${escapeHtml(t.threadId)}">${threadHtml(seg, t, { taskLevel: true, promoteFor: task, duplicatedCodes: input.duplicatedCodes })}</div>`).join('\n')}${filedBlock}</div>

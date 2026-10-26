@@ -63,7 +63,7 @@
  *    "presented a lazy placeholder that does not verify".
  */
 
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type { ResolvedConfig } from '../config/types';
 import type { ProxyAuditRecord, ProxyEnforcementAudit, ProxyReroute } from '../storage/types';
 import { extractRequest, classifyEndpoint } from './extractor';
@@ -169,7 +169,7 @@ export interface ProxyCredentialDeps {
    * is gone. Optional only for unit tests of the routing paths; without it a
    * Cursor key exchange's tokens are WITHHELD, never forwarded raw.
    */
-  bindDerived?(grantToken: string, pairs: ReadonlyArray<{ placeholder: string; real: string }>): Promise<boolean>;
+  bindDerived?(grantToken: string, pairs: ReadonlyArray<{ placeholder: string; real: string; sourceDigest?: string }>): Promise<boolean>;
   /** Per-upstream real credentials, resolved live at request time. */
   targets: TargetCredentials;
   /**
@@ -707,6 +707,7 @@ async function forwardCursor(
   let bodyOverride: Uint8Array | null = null;
   let cursorCredentialLabel: string | null = null;
   let cursorCredentialValue: string | null = null;
+  let cursorSourceDigest: string | null = null;
   let cursorUserId: string | null = null;
   let cursorEndpoint: string | null = null;
   const substitutions: Array<readonly [string, string]> = [];
@@ -746,6 +747,11 @@ async function forwardCursor(
       applyCredential(fwdHeaders, presented, caller.token, outcome.placement);
       cursorCredentialLabel = outcome.label;
       cursorCredentialValue = outcome.placement.value;
+      // Capture the credential used by THIS request, including its scope. An
+      // exchange can finish after a rebind; its reply still belongs to this key.
+      cursorSourceDigest = createHash('sha256').update(JSON.stringify([
+        cursorUpstream, outcome.sourceId ?? null, outcome.placement.value,
+      ])).digest('hex');
       // Body substitution only for an in-place placement: that value is the
       // bare credential. A header placement's value may carry wire framing
       // ("Bearer x"), which belongs in a header and nowhere else.
@@ -757,7 +763,10 @@ async function forwardCursor(
     // exchange returned (see cursorTokenResponse below); swap this grant's
     // back in. A derived placeholder this grant does not own is refused, not
     // forwarded: it is another task's, or revoked.
-    const derived = caller.grant.derived ?? [];
+    // Unscoped legacy pairs cannot prove which account minted them. Only
+    // sessions belonging to the currently selected source may be substituted.
+    const derived = (caller.grant.derived ?? []).filter(d =>
+      cursorSourceDigest !== null && d.sourceDigest === cursorSourceDigest);
     for (const d of derived) substitutions.push([d.placeholder, d.real]);
     // Collected first: Headers must not be mutated while being iterated.
     for (const [name, value] of [...fwdHeaders]) {
@@ -770,7 +779,7 @@ async function forwardCursor(
         return refuse(ctx, req, {
           path: route.upstreamPath, upstream: cursorUpstream, backend: 'cursor',
           role: caller.grant.role, taskId: caller.grant.taskId,
-          reason: 'a Cursor session placeholder this launch does not own (revoked, or another task\'s)',
+          reason: 'a Cursor session placeholder this launch cannot spend (revoked, another task\'s, or its credential source changed)',
           message: unknownPlaceholderMessage(),
         });
       }
@@ -896,7 +905,7 @@ async function forwardCursor(
   // the key exchange's access/refresh tokens are swapped for grant-bound
   // placeholders before the body leaves the proxy.
   if (caller && upstreamResp.ok && upstreamResp.body != null && !isStreamingContentType(upstreamResp.headers.get('content-type'))) {
-    return cursorTokenResponse(upstreamResp, respHeaders, caller, credentials, ctx);
+    return cursorTokenResponse(upstreamResp, respHeaders, caller, credentials, ctx, cursorSourceDigest);
   }
 
   return new Response(upstreamResp.body, {
@@ -942,6 +951,7 @@ async function cursorTokenResponse(
   caller: { grant: CredentialGrant; token: string },
   credentials: ProxyCredentialDeps | null,
   ctx: { seq: number },
+  sourceDigest: string | null,
 ): Promise<Response> {
   // Buffered as BYTES: unary Connect replies (`application/proto`) are binary,
   // and decoding them as text replaced invalid UTF-8 with U+FFFD — a corrupted
@@ -961,12 +971,12 @@ async function cursorTokenResponse(
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return passThrough();
   const body = parsed as Record<string, unknown>;
-  const pairs: Array<{ placeholder: string; real: string }> = [];
+  const pairs: Array<{ placeholder: string; real: string; sourceDigest?: string }> = [];
   for (const field of CURSOR_TOKEN_FIELDS) {
     const real = body[field];
     if (typeof real !== 'string' || real === '') continue;
     const placeholder = derivedPlaceholderFor(real);
-    pairs.push({ placeholder, real });
+    pairs.push({ placeholder, real, ...(sourceDigest ? { sourceDigest } : {}) });
     body[field] = placeholder;
   }
   if (pairs.length === 0) return passThrough();
@@ -1128,6 +1138,9 @@ export function createProxyServer(
     req: Request,
     srv?: { requestIP(req: Request): { address: string } | null },
     tierAttempt = 0,
+    // Cloned requests have no socket in Bun; retain the original trusted peer
+    // across in-process tier retries, never an address supplied by the client.
+    peerAddress: string | null = peerAddressOf(req, srv),
   ): Promise<Response> => {
       const url = new URL(req.url);
       // Liveness self-check (see PROXY_HEALTH_PATH). FIRST, ahead of the
@@ -1198,8 +1211,8 @@ export function createProxyServer(
               headers: { 'content-type': 'application/json' },
             });
           }
-          if (!grantAcceptsPeer(grant, peerAddressOf(req, srv))) {
-            return refuseWrongPeer({ id, seq: currentSeq, startMs, auditQueue }, req, grant, peerAddressOf(req, srv), {
+          if (!grantAcceptsPeer(grant, peerAddress)) {
+            return refuseWrongPeer({ id, seq: currentSeq, startMs, auditQueue }, req, grant, peerAddress, {
               path: `${CURSOR_PROXY_PREFIX}/<redacted>`, upstream: cursorUpstream, backend: 'cursor',
             });
           }
@@ -1238,8 +1251,8 @@ export function createProxyServer(
         for (const candidate of presented) {
           const grant = await credentials.lookup(candidate.value);
           if (grant) {
-            if (!grantAcceptsPeer(grant, peerAddressOf(req, srv))) {
-              return refuseWrongPeer({ id, seq: currentSeq, startMs, auditQueue }, req, grant, peerAddressOf(req, srv), {
+            if (!grantAcceptsPeer(grant, peerAddress)) {
+              return refuseWrongPeer({ id, seq: currentSeq, startMs, auditQueue }, req, grant, peerAddress, {
                 path, upstream, backend: 'proxy',
               });
             }
@@ -2101,7 +2114,7 @@ export function createProxyServer(
             durationMs: Date.now() - startMs, reroute, enforcement: null,
             usageLimitHeaders, credential: credentialKey,
           });
-          return handleRequest(tierRetryReq, srv, tierAttempt + 1);
+          return handleRequest(tierRetryReq, srv, tierAttempt + 1, peerAddress);
         }
       } else if (tierChoice && caller && status < 400) {
         // Only a refusal recorded BEFORE this request started is over: a

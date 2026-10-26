@@ -274,7 +274,7 @@ function runButtonHtml(
   origin?: string,
 ): string {
   if (!shell.available) {
-    return `<button type="button" class="rv-cmd-run" disabled title="${escapeHtml(shell.reason)}" hidden>Run in shell</button>`;
+    return `<button type="button" class="rv-cmd-run" data-control-refusal="${escapeHtml(shell.reason)}">Run in shell</button>`;
   }
   const title = `Run these commands in a new shell (${label}) in the task's container`;
   const originAttr = origin ? ` data-lz-shell-origin="${escapeAttr(origin)}"` : '';

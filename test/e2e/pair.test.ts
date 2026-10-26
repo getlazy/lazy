@@ -7,7 +7,7 @@ import { randomUUID } from 'crypto';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
-import { findFullTaskId, readTaskJson, readTaskStatus, readTurns, setTaskMetadata, setTaskStatus, storageDirFor, taskFilePath, worktreePathFor, writeTaskJson } from '../helpers/storage';
+import { findFullTaskId, readTaskJson, readTaskStatus, readTurns, setTaskMetadata, setTaskStatus, storageDirFor, taskFilePath, worktreePathFor, writeTaskJson, readSessionJson, writeSessionJson } from '../helpers/storage';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
 import { SANDBOX_DIR } from '../../src/utils/sandbox';
@@ -204,6 +204,27 @@ describe('lazy pair', () => {
     // It must not have started anything, nor claimed it was about to.
     expectOutputExcludes(result, 'Launching');
     expect(readTaskStatus(ctx.root, taskId)).toBe('blocked');
+    // Cursor has a read-only Chat, so that is the read-only alternative offered.
+    expectError(result, `lazy chat ${taskId}`);
+  });
+
+  // INVARIANT: a refusal's "what works instead" never names a command that
+  // refuses too. Chat is refused on Codex (no read-only interactive mode in a
+  // container), so a Codex task is pointed at `lazy ask` instead.
+  test('refuses --host on a codex task and offers lazy ask, not lazy chat', async () => {
+    const taskId = await createTask(ctx, 'Codex task', 'Some work');
+    createSessionManually(ctx, taskId);
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    const task = readTaskJson(ctx.root, taskId);
+    task.agent_id = 'codex';
+    writeTaskJson(ctx.root, taskId, task);
+
+    const result = await ctx.lazy(['pair', taskId, '--host']);
+
+    expectFailure(result);
+    expectError(result, 'Host pairing supports claude-code only');
+    expectError(result, `lazy ask ${taskId} "<question>"`);
+    expect(result.stderr).not.toContain('lazy chat');
   });
 
   // Legacy tasks may still carry a stored host-process runner_type from before
@@ -634,6 +655,73 @@ cp "${staged}" "${sessionsDir}/2026-09-05T12-00-00-000Z_${PI_FIXTURE_SESSION_ID}
     expectSuccess(result);
     expectOutput(result, 'transcript capture is not available for cursor');
     expectOutput(result, 'Pairing session ended');
+  });
+
+  // INVARIANT (engineer, 2026-10-24: "I cannot now pair with Codex"): a Codex
+  // pairing runs Codex in the task's container, resuming the agent's own
+  // thread, on the credential the container was created with for the task's
+  // profile — never the builder's Anthropic one, which it does not use — and
+  // carries the daemon's LIVE proxy port so the endpoint the container was
+  // created with follows a daemon restart.
+  test('a codex pairing resumes its thread in the container, on the live proxy', async () => {
+    await ctx.cleanup();
+    ctx = await setupTestLazy({
+      withDaemon: true,
+      daemonEnv: { PATH: pairEnv().PATH!, OPENAI_API_KEY: 'openai-test-fake-key' },
+    });
+
+    const taskId = await createTask(ctx, 'Codex pair task', 'Some work');
+    pairableTask(taskId, 'codex');
+    const session = readSessionJson(ctx.root, taskId)!;
+    session.agent_session_id = '01a16c74-0b56-7920-b442-9031f1fb5821';
+    writeSessionJson(ctx.root, taskId, session);
+
+    const result = await ctx.lazy(['pair', taskId], { env: pairEnv() });
+    expectSuccess(result);
+    expectOutput(result, 'Agent:     codex');
+    expectOutput(result, 'Pairing session ended');
+
+    const execs = await docker.execs();
+    expect(execs.length).toBe(1);
+    expect(execs[0]).toContain('lazy-agent pair');
+    expect(execs[0]).toContain('--agent codex');
+    expect(execs[0]).toContain('--resume 01a16c74-0b56-7920-b442-9031f1fb5821');
+    expect(execs[0]).toMatch(/-e LAZY_LIVE_PROXY_PORT=\d+/);
+    expect(execs[0]).not.toContain('ANTHROPIC_BASE_URL=');
+  });
+
+  // INVARIANT (engineer, 2026-10-24): `lazy chat` on a paused task whose
+  // agent is not Claude Code runs THAT agent read-only inside the task's
+  // container (the in-container session appends the per-agent lockdown), and
+  // leaves the task as it found it. Codex, whose read-only mode cannot run in
+  // a container, is refused with why and what to use instead — nothing runs.
+  test('lazy chat runs a cursor task read-only in its container; a codex task is refused with why', async () => {
+    await ctx.cleanup();
+    ctx = await setupTestLazy({
+      withDaemon: true,
+      daemonEnv: { PATH: pairEnv().PATH!, CURSOR_API_KEY: 'cursor-test-fake-key' },
+    });
+
+    const cursorTask = await createTask(ctx, 'Cursor chat task', 'Some work');
+    pairableTask(cursorTask, 'cursor');
+    const chatted = await ctx.lazy(['chat', cursorTask], { env: pairEnv() });
+    expectSuccess(chatted);
+    expectOutput(chatted, 'read-only');
+    const execs = await docker.execs();
+    expect(execs.length).toBe(1);
+    expect(execs[0]).toContain('lazy-agent pair');
+    expect(execs[0]).toContain('--agent cursor');
+    expect(execs[0]).toContain('--chat');
+    expect(execs[0]).not.toContain('--autonomous');
+    expect(readTaskStatus(ctx.root, cursorTask)).toBe('blocked');
+
+    const codexTask = await createTask(ctx, 'Codex chat task', 'Some work');
+    pairableTask(codexTask, 'codex');
+    const refused = await ctx.lazy(['chat', codexTask], { env: pairEnv() });
+    expectFailure(refused);
+    expectError(refused, 'Chat is not available for Codex');
+    expectError(refused, `lazy ask ${codexTask}`);
+    expect((await docker.execs()).length).toBe(1);
   });
 });
 

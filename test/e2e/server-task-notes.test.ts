@@ -11,9 +11,11 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { checkDaemonHealth } from '../../src/daemon';
-import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
+import { mintDashboardLoginUrl, signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
 import { readTaskStatus, taskDirFor } from '../helpers/storage';
-import { chmod } from 'fs/promises';
+import { chmod, mkdir } from 'fs/promises';
+
+import { recordContainerBeforeLaunch } from '../../src/task/environment-replaced';
 
 describe('web task page: Comments and Journal tabs', () => {
   let ctx: TestContext;
@@ -46,6 +48,45 @@ describe('web task page: Comments and Journal tabs', () => {
     }
     throw new Error(`task ${taskId} never reached the review queue`);
   }
+
+  // INVARIANT: keeping an exited container shows exit evidence in the
+  // dashboard journal without claiming the environment's files were lost.
+  test('a kept environment shows a stop, not a replacement', async () => {
+    const id = await createTask(ctx, 'Kept environment', 'Keep installed tools');
+    const entries: string[] = [];
+    const metadata = new Map<string, string>();
+    await recordContainerBeforeLaunch({
+      getTaskMetadata: async (_id, key) => metadata.get(key) ?? null,
+      updateTaskMetadata: async (_id, key, value) => { metadata.set(key, value); },
+      appendJournalEntry: async (_id, content) => { entries.push(content); return {} as any; },
+    }, id, null, {
+      usesSandbox: () => true,
+      isRunning: async () => false,
+      getRunInfo: async () => ({ running: false, exitCode: 137, oomKilled: false, finishedAt: '2026-10-23T10:00:00Z' }),
+    }, 'kept-container');
+    await ctx.lazy(['journal', id, '-m', entries[0]]);
+    const journal = await (await fetch(base + '/tasks/' + id + '/journal')).text();
+    expect(journal).toContain('Container stopped');
+    expect(journal).toContain('code 137');
+    expect(journal).toContain('files and installed tools are kept');
+    expect(journal).not.toContain('Container replaced before this turn');
+    expect(journal).not.toContain('anything installed outside the worktree is gone');
+
+    if (process.env.TASK_ENVIRONMENT_SCREENSHOTS === '1') {
+      const out = '/tmp/stopped-container-screenshots';
+      await mkdir(out, { recursive: true });
+      for (const [suffix, size] of [['', '1400,1000'], ['-phone', '390,844']]) {
+        const { loginUrl } = await mintDashboardLoginUrl(ctx);
+        const url = new URL(loginUrl);
+        url.pathname = '/tasks/' + id + '/journal';
+        const child = Bun.spawn([process.env.CHROME_BIN || 'chromium', '--headless', '--disable-gpu', '--no-sandbox', '--no-proxy-server',
+          '--user-data-dir=' + ctx.root + '/chrome' + suffix, '--window-size=' + size,
+          '--screenshot=' + out + '/dashboard-task-environment-kept' + suffix + '.png', url.href], { stdout: 'ignore', stderr: 'pipe' });
+        const error = await new Response(child.stderr).text();
+        expect(await child.exited, error).toBe(0);
+      }
+    }
+  }, 60_000);
 
   test('both tabs are in the strip and render their records', async () => {
     const id = await blockedTask('Notes tabs');

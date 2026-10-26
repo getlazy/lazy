@@ -28,6 +28,7 @@ function sources(overrides: Partial<TaskLiveRegionInput> = {}): TaskLiveRegionIn
     journal: [],
     raised: [],
     commits: [],
+    chat: [],
     headSha: null,
     ...overrides,
   };

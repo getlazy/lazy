@@ -125,6 +125,18 @@ describe('servicesCardHtml container controls', () => {
     canConfigure: false,
   };
 
+  // INVARIANT: a service name that cannot be a host label uses its port in
+  // the waiting route, as the service proxy does. Otherwise Open reaches 404.
+  test('a booting service opens its port-specific waiting route', () => {
+    const api = { ...base.services[1], name: 'api_v1' };
+    const html = servicesCardHtml(task, {
+      ...base,
+      declared: [base.declared[0], { name: 'api_v1', port: 8080 }],
+      services: [base.services[0], api],
+    }, { ...controls, startServicesCmd: 'bin/dev' });
+    expect(html).toContain(`href="/tasks/${task.id}/services/open/8080"`);
+  });
+
   test('a stopped container offers Start container on the same line', () => {
     const html = servicesCardHtml(task, { ...base, services: [], unavailable: 'not-running' }, controls);
     expect(html).toContain(`action="/tasks/${task.id}/container/start"`);

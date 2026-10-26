@@ -75,6 +75,9 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // Discovery for the session attach route: resolves which session and where
   // to upgrade, and checks the container is up. Writes nothing.
   'attachSession',
+  // The public half of a task's SSH host key for the caller (src/ssh/host-keys.ts),
+  // made on first ask. No attributed row; `--ssh-config --install` pins it.
+  'sshHostKey',
   // Normalizes a walkthrough and resolves its directory/glob items against the
   // task's own diff range. Reads the task and the range and answers; nothing is
   // stored, so there is no row for a person to be on.
@@ -83,6 +86,10 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'awaitClaimedTurn',
   'watchProxyActivity',
   'servePorts',
+  // A task's tmux sessions and their output, read off its running container
+  // (src/daemon/task-sessions.ts). Starts nothing, writes nothing.
+  'taskSessions',
+  'taskSessionOutput',
   // ENVIRONMENT-ONLY: opens loopback tunnels to a smolvm machine's published
   // services port (src/vm/solo-routes.ts) and answers their addresses. No row.
   'smolvmServiceBindings',
@@ -107,6 +114,8 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'taskEnv',
   'taskFiles',
   'taskEnvSeed',
+  // A task's persistent data directory: where it is and its size. No row.
+  'taskData',
   'describeLinkedTask',
   'getProjectSettings',
   // Which credential each agent profile takes from a member — the list a
@@ -192,6 +201,9 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // plane reads them and Rails decides which person may see them.
   'imageBuildLog',
   'machineState',
+  'machineNetworkCheck',
+  'machineRestartPreview',
+  'diskSpace',
   // A branch's or task's committed Dockerfile next to the project branch's,
   // for the "use Dockerfile.lazy from…" confirmation — a read.
   'imageAdoptionPreview',
@@ -235,6 +247,10 @@ export const READ_ONLY_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'revokeEndpointCredential',
   'setCredentialBillingMode',
   'revokeUserCredential',
+  'putForgeCredential',
+  'revokeForgeCredential',
+  'checkPushAccess',
+  'forgeStatus',
 ]);
 
 /**
@@ -264,6 +280,8 @@ export const STORE_WRITING_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // volume and build cache. No row; a WRITE for the identity gate, control-only
   // below (Rails decides which admins may ask).
   'resetMachineDockerStorage',
+  'reclaimDiskSpace',
+  'acknowledgeDiskGrowth',
   // Adopting a ref's Dockerfile for the whole project, and switching back: no
   // store row, but the adoption record NAMES who confirmed it, so like a row
   // it needs a person (src/daemon/image-adoption.ts).
@@ -510,6 +528,8 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   // Likewise the Docker storage reset: Rails gates who may ask; the daemon
   // refuses every member token.
   'resetMachineDockerStorage',
+  'reclaimDiskSpace',
+  'acknowledgeDiskGrowth',
   // --- The environment-only writes, which are also in READ_ONLY_RPC_COMMANDS
   // because the identity gate must not refuse them. Named here too so the
   // partition is complete and a reader does not have to infer it. ---
@@ -523,6 +543,10 @@ export const CONTROL_PLANE_RPC_COMMANDS: ReadonlySet<string> = new Set([
   'revokeEndpointCredential',
   'setCredentialBillingMode',
   'revokeUserCredential',
+  'putForgeCredential',
+  'revokeForgeCredential',
+  'checkPushAccess',
+  'forgeStatus',
   // Reads AND rewrites the environment injected into a task's agent container
   // (secrets included): operator configuration with no browser equivalent.
   'taskEnv',
@@ -610,6 +634,7 @@ export const READ_ONLY_STORAGE_METHODS: ReadonlySet<string> = new Set([
   'getTask',
   'resolveTask',
   'listTasks',
+  'listTasksStrict',
   'listTasksWithOptions',
   'listTaskCodes',
   'countDescendants',

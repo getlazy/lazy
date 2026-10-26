@@ -17,20 +17,21 @@
  *     an in-flight `git archive` export. BuildKit stops the build itself when
  *     its client goes away; layers already built stay in its cache.
  *
- * Jobs live in memory, like the build state they belong to: a daemon restart
- * starts the boot build again, with a fresh log. That is telemetry, not store
- * state (AGENTS.md "disposable telemetry is not storage state"), and it is
- * bounded by construction — MAX_LINES / MAX_BYTES per job, MAX_JOBS kept.
+ * Live tails are bounded in memory. The daemon archives complete redacted logs
+ * through Storage for the newest 20 builds, retaining older summaries. Teams
+ * copies that archive into its database independently of page visits.
  *
  * Nothing here decides what an admin may see: every answer leaves the daemon
  * through `redactAnswer` (./observability-redaction.ts). Lines are also scrubbed
  * as they arrive, so memory holds as few secrets as possible.
  */
+import type { StoredImageBuild } from '../storage/image-build';
+import type { Storage } from '../storage/interface';
 import { randomBytes } from 'crypto';
 import { runWithBuildObserver, type BuildObserver } from '../capture/build-observer';
 import { redactSecretValues } from '../utils/redact';
 import { logger } from '../utils/logger';
-import type { Redactor } from './observability-redaction';
+import { redactDeep, type Redactor } from './observability-redaction';
 
 export type ImageBuildJobKind = 'project' | 'adoption';
 export type ImageBuildOutcome = 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -106,6 +107,79 @@ const jobs: ImageBuildJob[] = [];
 
 export class ImageBuildJob {
   readonly id: string;
+  metadata: { trigger?: string; commit?: string; dockerfile?: string; image?: string; requestedBy?: string; imageProduced?: boolean } = {};
+  private archive: (() => Promise<Storage | null>) | null = null;
+  private writes: Promise<void> = Promise.resolve();
+  private archiveError: unknown = null;
+  private pendingLines: BuildLogLine[] = [];
+  private writing = false;
+
+  /** Every line is archived before the bounded live tail discards it. */
+  enableArchive(projectRoot: string, openArchive?: () => Promise<{ storage: Storage | null; redactor: Redactor }>): void {
+    this.archive = async () => {
+      const { storage, redactor } = await (openArchive ? openArchive() : Promise.all([
+        import('./rpc-handlers').then(m => m.getDaemonProjectRoot() === projectRoot ? m.getOrCreateStorage() : null),
+        import('./observability-redaction').then(m => m.daemonRedactor(projectRoot)),
+      ]).then(([storage, redactor]) => ({ storage, redactor })));
+      if (!redactor.complete) throw new Error('Secret redactor is unavailable; refusing to archive unredacted image logs.');
+      this.redactor = redactor;
+      return storage;
+    };
+    this.persist();
+  }
+
+  private persist(line?: BuildLogLine): void {
+    if (!this.archive) return;
+    if (line) this.pendingLines.push(line);
+    if (this.archiveError) return;
+    if (this.writing) return;
+    this.writing = true;
+    const archive = this.archive;
+    this.writes = this.writes.then(async () => {
+      const storage = await archive();
+      if (!storage) { this.pendingLines = []; return; }
+      do {
+        const batch = this.pendingLines.slice();
+        const view = this.view();
+        if (batch.length) {
+          await storage.appendImageBuildLog(this.id, batch.map(l => JSON.stringify({ ...l, text: this.redactor!.redact(l.text) })).join('\n') + '\n');
+          this.pendingLines.splice(0, batch.length);
+        }
+        await storage.saveImageBuild({ id: this.id, build: redactDeep(view, this.redactor!), logsRetained: true });
+        if (view.outcome !== 'running') {
+          await settleInterruptedImageBuilds(storage);
+          await storage.pruneImageBuildLogs(20);
+        }
+      } while (this.pendingLines.length);
+    }).catch(error => {
+      this.archiveError = error;
+      logger.error('Could not archive image build ' + this.id + ': ' + String(error));
+    }).finally(() => {
+      this.writing = false;
+      if (!this.archiveError && this.pendingLines.length) this.persist();
+    });
+  }
+
+  async flushArchive(): Promise<void> {
+    await this.writes;
+    // A read/collector retries a failed archive once; incoming lines remain queued.
+    // Reopen the redactor too: an unavailable secret registry must not poison a job.
+    this.retryArchive();
+    let pending: Promise<void>;
+    do { pending = this.writes; await pending; } while (pending !== this.writes);
+    if (this.archiveError) throw new Error('Image build archive failed: ' + String(this.archiveError));
+  }
+
+  archiveFailure(): string | null {
+    return this.archiveError ? 'Image build archive failed: ' + String(this.archiveError) : null;
+  }
+
+  retryArchive(): void {
+    if (!this.archiveError || this.writing) return;
+    this.archiveError = null;
+    this.persist();
+  }
+
   readonly startedAt = new Date().toISOString();
   finishedAt: string | null = null;
   outcome: ImageBuildOutcome = 'running';
@@ -121,7 +195,7 @@ export class ImageBuildJob {
   redactor: Redactor | null = null;
 
   constructor(readonly kind: ImageBuildJobKind, readonly title: string) {
-    this.id = `${kind}-${++jobCounter}-${randomBytes(3).toString('hex')}`;
+    this.id = `${kind}-${++jobCounter}-${randomBytes(12).toString('hex')}`;
   }
 
   get signal(): AbortSignal { return this.controller.signal; }
@@ -151,7 +225,9 @@ export class ImageBuildJob {
     // belongs: every answer goes through redactAnswer, which fails closed.
     const scrubbed = this.redactor?.complete ? this.redactor.redact(raw) : redactSecretValues(raw);
     const text = scrubbed.length > MAX_LINE_CHARS ? `${scrubbed.slice(0, MAX_LINE_CHARS)}… [line truncated]` : scrubbed;
-    this.lines.push({ seq: this.nextSeq++, at: new Date().toISOString(), source, image, text });
+    const line = { seq: this.nextSeq++, at: new Date().toISOString(), source, image, text };
+    this.lines.push(line);
+    this.persist({ ...line, text: scrubbed });
     this.bytes += text.length;
     while (this.lines.length > MAX_LINES || this.bytes > MAX_BYTES) {
       const dropped = this.lines.shift()!;
@@ -391,6 +467,7 @@ export class ImageBuildJob {
   /** What every surface shows about this job (lines are read separately). */
   view() {
     return {
+      ...this.metadata,
       id: this.id,
       kind: this.kind,
       title: this.title,
@@ -444,10 +521,8 @@ export function startImageBuildJob(kind: ImageBuildJobKind, title: string, proje
     jobs.splice(idx, 1);
   }
   if (projectRoot) {
-    void import('./observability-redaction')
-      .then(({ daemonRedactor }) => daemonRedactor(projectRoot))
-      .then((r) => { job.redactor = r; })
-      .catch((err) => logger.warn(`Image build log: could not load the redactor; lines are scrubbed of env credentials only until they are read: ${err instanceof Error ? err.message : String(err)}`));
+    job.enableArchive(projectRoot);
+
   }
   return job;
 }
@@ -464,6 +539,38 @@ export function findImageBuildJob(id?: string, kind?: ImageBuildJobKind): ImageB
 /** Every job still kept, newest first. */
 export function listImageBuildJobs(): ImageBuildJob[] {
   return [...jobs].reverse();
+}
+
+/** Archive failures remain attached to their build, never hide healthy history. */
+export async function readImageBuildHistory(storage: Storage | null, { flush = true } = {}): Promise<StoredImageBuild[]> {
+  const live = listImageBuildJobs();
+  const previousErrors = new Map(live.map(job => [job.id, job.archiveFailure()]));
+  if (flush) await Promise.allSettled(live.map(job => job.flushArchive()));
+  else live.forEach(job => job.retryArchive());
+  if (storage) {
+    await settleInterruptedImageBuilds(storage);
+    await storage.pruneImageBuildLogs(20);
+  }
+  const builds = storage ? await storage.listImageBuilds() : [];
+  for (const job of live) {
+    const archiveError = job.archiveFailure() ?? (!flush ? previousErrors.get(job.id) : null);
+    const index = builds.findIndex(row => row.id === job.id);
+    const row = { id: job.id, build: { ...job.view(), ...(archiveError ? { archiveError } : {}) }, logsRetained: index < 0 || builds[index].logsRetained };
+    if (index >= 0) builds[index] = row;
+    else builds.push(row);
+  }
+  return builds.sort((a, b) => String(b.build.startedAt).localeCompare(String(a.build.startedAt)));
+}
+
+/** No previous daemon generation can still own a live image build. */
+async function settleInterruptedImageBuilds(storage: Storage): Promise<StoredImageBuild[]> {
+  const builds = await storage.listImageBuilds();
+  for (const row of builds) {
+    if (row.build.outcome !== 'running' || findImageBuildJob(row.id)) continue;
+    row.build = { ...row.build, outcome: 'interrupted' };
+    await storage.saveImageBuild(row);
+  }
+  return builds;
 }
 
 /** Tests only. */

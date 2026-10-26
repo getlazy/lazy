@@ -17,6 +17,9 @@ import { join } from 'path';
 import { loadConfig } from '../config/loader';
 import { cleanupWorktree } from '../task/cleanup';
 import { createRunnerFromType } from '../runner';
+import { indexRunsByName } from '../runner/run-ownership';
+import { withTaskLifecycleLock } from '../daemon/task-lifecycle-lock';
+import { isTerminalStatus } from '../task-state-machine';
 import { removeLazyImage, resolveImageName } from '../capture/claude';
 import { runGit } from '../utils/git';
 import {
@@ -368,16 +371,35 @@ async function applyCleanOrphanedContainers(ctx: RemedyContext): Promise<DoctorR
   emit(ctx, { label: `Removing ${orphans.length} container(s)`, state: 'start' });
   const lines: string[] = [];
   let done = 0;
+  let kept = 0;
   for (const o of orphans) {
     try {
-      await runner.removeRun(o.name);
-      if (await runner.runExists(o.name)) {
-        const line = `Failed to remove ${o.name} — still present afterwards`;
-        lines.push(line);
-        emit(ctx, { label: o.name, state: 'error', detail: line });
+      const removed = await withTaskLifecycleLock(o.taskId ?? `orphan-container:${o.name}`, async () => {
+        // A scan is only a proposal. Reopen and launch share this lock, so a
+        // task that became open while we waited cannot lose its environment.
+        // Use a strict fresh ownership scan even for deleted-task candidates:
+        // a newly created task may now own a previously unclaimed name.
+        const current = (await indexRunsByName(ctx.storage, runner, { strict: true })).get(o.name);
+        if (current && (current.id !== o.taskId || !isTerminalStatus(current.status))) {
+          const line = `Kept ${o.name} — its task is now open or its owner changed`;
+          lines.push(line);
+          emit(ctx, { label: o.name, state: 'ok', detail: line });
+          return false;
+        }
+        await runner.removeRun(o.name);
+        if (await runner.runExists(o.name)) {
+          throw new Error('still present afterwards');
+        }
+        // Read the pointer again, under the same lock. Never clear a newer
+        // environment's pointer using a session captured by the first scan.
+        const session = current ? await ctx.storage.getSessionByTaskId(current.id) : null;
+        if (session?.container_name === o.name) await ctx.storage.updateSessionContainerName(session.id, null);
+        return true;
+      });
+      if (!removed) {
+        kept++;
         continue;
       }
-      if (o.sessionId) await ctx.storage.updateSessionContainerName(o.sessionId, null);
       const line = `Removed ${o.name}`;
       lines.push(line);
       emit(ctx, { label: o.name, state: 'ok', detail: line });
@@ -388,7 +410,7 @@ async function applyCleanOrphanedContainers(ctx: RemedyContext): Promise<DoctorR
       emit(ctx, { label: o.name, state: 'error', detail: line });
     }
   }
-  const result = resultOf('clean-orphaned-containers', 'Removed', done, orphans.length, 'container(s)', lines);
+  const result = resultOf('clean-orphaned-containers', 'Removed', done, orphans.length - kept, 'container(s)', lines);
   emit(ctx, { label: result.message, state: 'done' });
   return result;
 }

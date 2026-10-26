@@ -110,6 +110,30 @@ describe('pairPidFilePath', () => {
 });
 
 describe('buildInteractiveArgs', () => {
+  // INVARIANT: Pair keeps exactly one container sandbox choice with approvals
+  // on, and the bypass flag alone when autonomous.
+  test('codex: one sandbox choice for Pair', () => {
+    const codex = getAgent('codex');
+    const prompted = codex.buildInteractiveArgs({ modelId: 'gpt-5.5', dangerouslySkipPermissions: false })!;
+    expect(prompted.filter(arg => arg === '--sandbox' || arg === '-s')).toHaveLength(1);
+    expect(prompted.slice(prompted.indexOf('--sandbox'), prompted.indexOf('--sandbox') + 2))
+      .toEqual(['--sandbox', 'danger-full-access']);
+    const autonomous = codex.buildInteractiveArgs({ modelId: 'gpt-5.5', dangerouslySkipPermissions: true })!;
+    expect(autonomous.filter(arg => arg === '--sandbox' || arg === '-s')).toHaveLength(0);
+    expect(autonomous).toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+  // INVARIANT: every Codex interactive launch (fresh and resume) runs without
+  // the shared background server. The image's release-binary install cannot
+  // start it, so without --no-daemon Pair dies with "no complete local package".
+  test('codex: interactive argv runs without the background server', () => {
+    const codex = getAgent('codex');
+    expect(codex.buildInteractiveArgs({ modelId: 'gpt-5.5', dangerouslySkipPermissions: true })).toEqual([
+      'codex', '--no-daemon', '--dangerously-bypass-approvals-and-sandbox', '-m', 'gpt-5.5',
+    ]);
+    expect(codex.buildInteractiveArgs({ sessionId: 'thread-1', modelId: 'gpt-5.5', dangerouslySkipPermissions: false })).toEqual([
+      'codex', 'resume', 'thread-1', '--no-daemon', '--sandbox', 'danger-full-access', '-m', 'gpt-5.5',
+    ]);
+  });
   const originalEndpoint = process.env[CURSOR_ENDPOINT_ENV];
   afterEach(() => {
     if (originalEndpoint === undefined) delete process.env[CURSOR_ENDPOINT_ENV];

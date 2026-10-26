@@ -15,7 +15,7 @@ import { hasCommand } from '../protocol/io';
 import { log, logError } from './log';
 import type { Agent } from '../agent/interface';
 import type { AgentFailure, AgentFailureClass } from '../agent/failure-taxonomy';
-import { decideRetry, decideWatchdogRetry, appliesFastFailDetection } from './retry-policy';
+import { decideRetry, decideWatchdogRetry, appliesFastFailDetection, TRANSIENT_RECOVERY_MS, TRANSIENT_ATTEMPT_MS } from './retry-policy';
 import type { Runner } from '../runner/types';
 import { execWithWatchdog, WatchdogTimeoutError, GracefulExitTimeoutError } from './watchdog';
 import { findLatestSessionFile } from '../agent/session-discovery';
@@ -204,6 +204,8 @@ export interface RetryState {
   failureReason?: string;
   /** Delay before the next attempt (ms), so the UI can say when it will retry. */
   nextDelayMs?: number;
+  nextRetryAt?: string;
+  recoveryDeadline?: string;
 }
 
 /** Check whether an error message indicates the prompt/session is too large. */
@@ -384,6 +386,7 @@ async function executeAgent(
   windDownTimeoutMs?: number,
   extraArgs?: string[],
   registerKill?: (kill: (signal?: 'SIGTERM' | 'SIGKILL') => void) => void,
+  recovery?: { timeoutMs: number; initiallyArmed?: boolean; onFailure?: (message: string) => number | undefined; onProgress: () => void; message: string },
 ): Promise<WorkResult> {
   const claudeArgs = agent.buildExecArgs({
     prompt,
@@ -397,6 +400,7 @@ async function executeAgent(
     extraArgs,
   });
 
+  let liveFailureMessage: string | undefined;
   const launchTime = Date.now();
   const effectiveTimeout = watchdogTimeoutMs ?? 0;
   const effectiveWindDownMs = windDownTimeoutMs ?? 0;
@@ -421,6 +425,7 @@ async function executeAgent(
     sessionStartEvent,
     abortReason,
     backgroundLeftBehind,
+    recoveryTimedOut,
   } = await execWithWatchdog(claudeArgs, {
     cwd: worktreePath,
     env: process.env as Record<string, string>,
@@ -428,6 +433,23 @@ async function executeAgent(
     activityStream,
     windDownTimeoutMs: effectiveWindDownMs,
     registerKill,
+    recovery: recovery ? {
+      ...recovery,
+      onFailure: message => {
+        const duration = recovery.onFailure?.(message);
+        if (duration !== undefined) liveFailureMessage = message;
+        return duration;
+      },
+      isSuccessfulResult: raw => {
+        try {
+          agent.parseResponse(raw, { workingDir: worktreePath });
+          return true;
+        } catch {
+          // An error result is not recovery; retain the deadline until exit.
+          return false;
+        }
+      },
+    } : undefined,
     // Line 1 of the agent's own stream is the only place that says whether THIS
     // turn actually has its lazy tools. `prepareTurnMcp` proves we wrote a
     // config; this proves the agent loaded one. See supervisor/mcp-verify.ts.
@@ -457,6 +479,14 @@ async function executeAgent(
   });
 
   const runtime = Date.now() - launchTime;
+
+  if (recoveryTimedOut) {
+    throw new CrashError({
+      message: `Transient retry recovery timed out: ${liveFailureMessage ?? recovery?.message ?? 'no model activity'}`, exitCode: 1,
+      stderr, durationMs: runtime,
+      usage: salvageUsage(resultLine ?? output, 'retry recovery timeout'), sessionId: streamSessionId,
+    });
+  }
 
   // Positive evidence the turn had NO lazy tools. Kill first, then fail the
   // turn with the same error prepareTurnMcp uses, so both blind spots land in
@@ -787,8 +817,31 @@ export async function runWork(
     : (wt: string, p: string, sp?: string, mid?: string, sid?: string, eff?: string, pm?: 'plan' | 'default') =>
         executeAgent(
           agent, runner, wt, p, sp, mid, sid, watchdogTimeoutMs, eff, pm,
-          protocolDir, windDownTimeoutMs, agentExtraArgs, registerAgentKill,
+          protocolDir, windDownTimeoutMs, agentExtraArgs, registerAgentKill, {
+            initiallyArmed: recoveryStartedAt !== undefined,
+            onFailure: (message: string) => {
+              const failure = agent.classifyFailure({ message });
+              if (!failure.class.startsWith('transient_')) return undefined;
+              recoveryStartedAt ??= Date.now();
+              retryState.failureClass = failure.class;
+              retryState.failureReason = failure.reason;
+              retryState.errors = recordError(retryState.errors, message, failure.class);
+              retryState.recoveryDeadline = new Date(recoveryStartedAt + TRANSIENT_RECOVERY_MS).toISOString();
+              onRetryStateChange?.({ ...retryState, count: retryState.count + 1 });
+              return Math.max(1, Math.min(TRANSIENT_ATTEMPT_MS, recoveryStartedAt + TRANSIENT_RECOVERY_MS - Date.now()));
+            },
+            timeoutMs: Math.max(1, Math.min(TRANSIENT_ATTEMPT_MS, (recoveryStartedAt ?? Date.now()) + TRANSIENT_RECOVERY_MS - Date.now())),
+            message: `Retry recovery timed out after transient failure: ${retryState.errors.at(-1)?.message ?? retryState.failureReason}`,
+            onProgress: () => {
+              recoveryStartedAt = undefined;
+              retryState.nextDelayMs = undefined;
+              retryState.nextRetryAt = undefined;
+              retryState.recoveryDeadline = undefined;
+              onRetryStateChange?.(null);
+            },
+          },
         );
+  let recoveryStartedAt: number | undefined;
   let currentSessionId = claudeSessionId;
 
   let retryState: RetryState = {
@@ -868,6 +921,11 @@ export async function runWork(
       : null;
 
     const launchTime = Date.now();
+    if (isRetry && (retryState.nextDelayMs !== undefined || retryState.nextRetryAt !== undefined)) {
+      retryState.nextDelayMs = undefined;
+      retryState.nextRetryAt = undefined;
+      onRetryStateChange?.(retryState);
+    }
 
     try {
       const result = await execute(worktreePath, prompt, systemPrompt, modelId, currentSessionId, effort, permissionMode);
@@ -1075,7 +1133,11 @@ export async function runWork(
         retryState.consecutiveFastFails = 0;
       }
 
-      const decision = decideRetry(failure, retryState.count);
+      if (failure.class.startsWith('transient_') || failure.class === 'unknown') recoveryStartedAt ??= Date.now();
+      const exhausted = recoveryStartedAt !== undefined && Date.now() - recoveryStartedAt >= TRANSIENT_RECOVERY_MS;
+      const decision = exhausted
+        ? { action: 'stop' as const, reason: `${failure.class}: recovery exceeded five minutes; ending this turn as a transient failure` }
+        : decideRetry(failure, retryState.count);
 
       if (decision.action === 'stop') {
         // Unrecoverable (or escalated after bounded retries): end the turn now.
@@ -1100,7 +1162,9 @@ export async function runWork(
         });
       }
 
-      const delay = decision.delayMs;
+      const delay = Math.min(decision.delayMs, recoveryStartedAt === undefined ? Infinity : Math.max(0, recoveryStartedAt + TRANSIENT_RECOVERY_MS - Date.now()));
+      retryState.nextRetryAt = new Date(Date.now() + delay).toISOString();
+      retryState.recoveryDeadline = recoveryStartedAt === undefined ? undefined : new Date(recoveryStartedAt + TRANSIENT_RECOVERY_MS).toISOString();
       retryState.nextDelayMs = delay;
 
       // Before every retry, re-resolve the live proxy address from the daemon
@@ -1130,14 +1194,17 @@ export async function runWork(
         }
       }
 
+      // Refresh may have consumed part of the recovery window. Schedule from
+      // now, and never sleep beyond its deadline.
+      const effectiveDelay = stoppedForDaemonRestart ? 0 : Math.min(delay,
+        recoveryStartedAt === undefined ? Infinity : Math.max(0, recoveryStartedAt + TRANSIENT_RECOVERY_MS - Date.now()));
+      retryState.nextDelayMs = effectiveDelay;
+      retryState.nextRetryAt = new Date(Date.now() + effectiveDelay).toISOString();
+
       // Notify caller of retry state change
       if (onRetryStateChange) {
         onRetryStateChange(retryState);
       }
-
-      // A daemon-restart stop already cost the human a visible interruption;
-      // skip backoff when we know the new daemon is up and env is fresh.
-      const effectiveDelay = stoppedForDaemonRestart ? 0 : delay;
 
       log(
         effectiveDelay > 0

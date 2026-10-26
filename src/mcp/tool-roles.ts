@@ -111,3 +111,13 @@ export function isToolForRole(name: string, role: McpRole): boolean {
   if (role === 'builder') return !AGENT_ONLY.has(name);
   return !BUILDER_ONLY.has(name);
 }
+
+/**
+ * A paired member has a task context but does not own its supervised turn.
+ * Agent-only tools write that turn's markers, reports, decisions or branch;
+ * builder-only tools still exceed the member connection's task scope.
+ * Shared by advertisement and the daemon's authenticated dispatch gate.
+ */
+export function isToolForMemberPair(name: string): boolean {
+  return !AGENT_ONLY.has(name) && !BUILDER_ONLY.has(name);
+}

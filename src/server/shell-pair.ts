@@ -2,7 +2,7 @@
  * Pair and Chat over the web-shell WebSocket — the same PTY/exec path as a
  * plain container shell, with a different command inside.
  *
- * Pair takes the pairing lock and moves the task to `pairing`, exactly as
+ * Solo Pair takes the pairing lock and moves the task to `pairing`, exactly as
  * `lazy pair` does: unblock/accept refuse until the session ends. Chat does
  * not take that lock and does not change the task's agent/model/effort; it
  * does take the worktree lock so a daemon-driven turn cannot start underneath
@@ -14,7 +14,8 @@
  * new Pair connection for this task arrives, the lock is released and the
  * task is parked. The UI states the timeout in one line.
  *
- * One Pair session per task. A second attempt is refused with who holds it.
+ * Solo Pair has one session per task. Members have independent conversations
+ * and MCP tokens; their sessions never claim the task-wide locks or status.
  */
 
 import type { Storage } from '../storage';
@@ -22,12 +23,13 @@ import type { Task, Session, ActorInput } from '../types';
 import { getActor } from '../constants';
 import { getWorktreePath } from '../task/identity';
 import { pairInContainerCmd } from '../supervisor/pair';
-import { resolveInteractiveLaunch, launchEnvOverlay } from '../credentials/interactive-auth';
+import { resolveInteractiveContainerEnv } from '../credentials/interactive-auth';
 import { profileForAgentName, profileNameForAgent } from '../config/agent-profiles';
 import { loadConfig } from '../config/loader';
 import { pairSessionModel } from '../task/launch-identity-view';
 import { readProjectSettings, resolveProjectModel } from '../daemon/project-settings';
 import { getAgent } from '../agent/registry';
+import { interactiveChatRefusal, MEMBER_SESSION_HARNESSES } from '../agent/interactive-modes';
 import { webInteractiveRefusal } from '../daemon/usage-pause';
 import {
   acquirePairingLock,
@@ -39,7 +41,8 @@ import { parkTaskPaused } from '../utils/paused-status';
 import { logger } from '../utils/logger';
 import { pathExists } from '../utils/fs';
 import { actorEmail } from '../actor-ref';
-import { taskTurnRunning } from '../daemon/member-entry';
+import { prepareMemberPairMcp } from '../daemon/member-pair-mcp';
+import { memberResumableSessionId } from '../daemon/member-container';
 import { recordSessionCommits } from '../task/session-commits';
 import { neutralizeLazyMarkers } from '../task/wrapper-fold';
 
@@ -130,6 +133,8 @@ export async function planPairOrChatExec(opts: {
    * single-person daemon, where the channel role is the whole story.
    */
   member?: { email: string; name?: string } | null;
+  /** From the member container the daemon launched, never the request. */
+  memberMcpDirectory?: string;
 }): Promise<{ ok: true; plan: PairExecPlan } | { ok: false; status: number; message: string }> {
   const { root, storage, task, session, mode } = opts;
   const member = opts.member ?? null;
@@ -149,11 +154,11 @@ export async function planPairOrChatExec(opts: {
   // is the human channel. PEEKED here so a paused credential refuses early;
   // ADMITTED — the one-shot override taken, if that is what lets it through —
   // only after the lock's own refusals (takeModeLock), just before the lock. A
-  // reconnect inside the grace window is the same session and is not judged
-  // again, as a running turn never is.
-  const reconnecting = mode === 'pair'
+  // solo reconnect inside the grace window is the same session and is not
+  // judged again. Each member connection gets its own admission.
+  const reconnecting = !member && (mode === 'pair'
     ? heldPairs.get(task.id)?.graceTimer != null
-    : heldChats.get(task.id)?.graceTimer != null;
+    : heldChats.get(task.id)?.graceTimer != null);
   const spender = member?.email ?? null;
   if (!reconnecting) {
     const peeked = await webInteractiveRefusal(root, task, config, mode, true, spender);
@@ -169,18 +174,33 @@ export async function planPairOrChatExec(opts: {
     config,
     projectModel: resolveProjectModel(await readProjectSettings(storage), config),
   });
-  // A FRESH read where the mode lock is taken: the task the route resolved
-  // is from before the member's entry. For a member on a shared daemon a live
-  // binding counts as a running turn too (a launch binds before it flips to
-  // `working`) — the entry already refused both, so this is belt and braces.
   const fresh = (await storage.getTask(task.id)) ?? task;
-  const locked = member && (fresh.status === 'working' || (await taskTurnRunning(root, storage, task.id)))
-    ? {
-        ok: false as const,
-        status: 409,
-        message: `A turn is running on task ${task.code ?? task.id}. Wait for it to end, then open the terminal again.`,
-      }
-    : await takeModeLock({ task: fresh, worktreePath, storage, actor, mode, agent, agentDesc, harness, admit });
+  // Members coordinate their own work. Their separate conversations never
+  // claim the agent's state machine or exclude another member.
+  if (member) {
+    const refused = await admit();
+    if (refused) return refused;
+    if (!opts.memberMcpDirectory) return { ok: false, status: 409, message: 'Reopen your terminal environment to connect pairing tools.' };
+    const mcp = await prepareMemberPairMcp({
+      root, taskId: task.id, member, readOnly: mode === 'chat', directory: opts.memberMcpDirectory,
+    });
+    return { ok: true, plan: {
+      cmd: pairInContainerCmd({
+        taskId: task.id, worktreePath, harness,
+        runnerType: session.runner_type ?? task.runner_type ?? 'docker',
+        // Resumed only where the member's home carried the conversation in:
+        // a Cursor session has none to resume (../daemon/member-transcripts.ts),
+        // and naming an id its home does not hold would fail or start elsewhere.
+        sessionId: await memberResumableSessionId(worktreePath, harness, session.agent_session_id),
+        modelId, chat: mode === 'chat',
+        memberSession: true, memberMcpConfig: mcp.configPath,
+      }),
+      env: ['TERM=xterm-256color'],
+      onClose: mcp.close,
+      abort: mcp.close,
+    } };
+  }
+  const locked = await takeModeLock({ task: fresh, worktreePath, storage, actor, mode, agent, agentDesc, harness, admit });
   if (!locked.ok) return locked;
 
   const runnerType = session.runner_type ?? task.runner_type ?? 'docker';
@@ -192,11 +212,6 @@ export async function planPairOrChatExec(opts: {
     sessionId: session.agent_session_id ?? null,
     modelId,
     chat: mode === 'chat',
-    // The member's own container: a lazy-built home, no lazy_* tools (there is
-    // no token in it for anything to read — raise 544ca836 tracks giving a
-    // member's Pair tools of their own), and Claude Code told to ignore the
-    // worktree's settings and any MCP server lazy did not write.
-    memberSession: member !== null,
   });
 
   const env = ['TERM=xterm-256color'];
@@ -204,8 +219,8 @@ export async function planPairOrChatExec(opts: {
   // the exec adds nothing. Locally the exec refreshes the task container's.
   if (!member) {
     try {
-      const { envVars } = await resolveInteractiveLaunch(root, mode === 'chat' ? 'lazy chat' : 'lazy pair', {
-        surface: 'container',
+      const sessionEnv = await resolveInteractiveContainerEnv(root, mode === 'chat' ? 'lazy chat' : 'lazy pair', {
+        harness,
         identity: {
           role: 'builder',
           taskId: task.id,
@@ -213,7 +228,7 @@ export async function planPairOrChatExec(opts: {
           profile,
         },
       });
-      for (const [key, value] of Object.entries(launchEnvOverlay(envVars))) {
+      for (const [key, value] of Object.entries(sessionEnv)) {
         env.push(`${key}=${value}`);
       }
     } catch (err) {
@@ -279,11 +294,10 @@ async function resolveModeAgent(root: string, task: Task): Promise<
 }
 
 /**
- * A MEMBER's Pair and Chat run in the member's own container, on the member's
- * own Claude account: so only a task whose agent is Claude Code on Anthropic's
- * own API can be paired or chatted with that way. Any other agent spends a
- * credential the member does not have (a Cursor or OpenAI key, a profile's own
- * named key) or talks to a server their account means nothing to.
+ * Whether a member's own session can run this task's agent. Any harness with
+ * member-session isolation (MEMBER_SESSION_HARNESSES) can, whatever endpoint,
+ * tier chain or credential its profile uses: the member's container gets that
+ * harness's credential for the member, like a turn the member launches.
  */
 function memberAgentRefusal(
   task: Task,
@@ -291,10 +305,10 @@ function memberAgentRefusal(
   config: Awaited<ReturnType<typeof loadConfig>>,
 ): string | null {
   const profile = profileForAgentName(config, profileName, `task ${task.code ?? task.id}`);
-  if (profile.harness === 'claude-code' && profile.credential === 'anthropic' && !profile.endpointPinned) return null;
+  if (MEMBER_SESSION_HARNESSES.includes(profile.harness)) return null;
   return (
-    `Pair and Chat here run Claude Code on your own Claude account, and task ${task.code ?? task.id} runs the ` +
-    `"${profile.name}" agent, which uses a different model service or credential. Open a Shell instead.`
+    `Pair and Chat in your own terminal support Claude Code, Codex, Cursor and Pi, and task ${task.code ?? task.id} runs the ` +
+    `"${profile.name}" agent, which uses the ${profile.harness} interface. Open a Shell instead.`
   );
 }
 
@@ -309,8 +323,9 @@ function agentModeRefusal(
   if (mode === 'pair' && !agent.supportsPairing()) {
     return `Cannot pair on a ${agentDesc} task — that agent does not support pairing.`;
   }
-  if (mode === 'chat' && task.agent_id && task.agent_id !== 'claude-code' && harness !== 'claude-code') {
-    return `Task ${task.code ?? task.id} runs on the "${agentDesc}" agent — chat only supports Claude Code tasks.`;
+  if (mode === 'chat') {
+    const refusal = interactiveChatRefusal(harness);
+    if (refusal) return `Task ${task.code ?? task.id} runs on the "${agentDesc}" agent. ${refusal}`;
   }
   return null;
 }
@@ -350,8 +365,8 @@ async function takeModeLock(opts: {
     const prepared = await preparePairLock(task, worktreePath, storage, actor);
     if (!prepared.ok) return prepared;
   } else {
-    // Chat mirrors the CLI: only a paused task, Claude Code only (checked
-    // above), no pairing lock, no model/effort change. A working task's agent
+    // Chat mirrors the CLI: only a paused task, an agent with a read-only
+    // interactive mode (checked above), no pairing lock, no model/effort change. A working task's agent
     // owns the session.
     if (task.status !== 'blocked' && task.status !== 'conflict') {
       if (task.status === 'working') {
@@ -593,8 +608,9 @@ export async function pairOrChatRefusal(
   memberEmail: string | null,
 ): Promise<string | null> {
   const name = task.code ?? task.id;
-  // The agent rules first: a Cursor task cannot be paired on, a non-Claude
-  // task cannot be chatted with, whatever else holds.
+  // The agent rules first: an agent without an interactive mode cannot be
+  // paired on, one without a read-only mode cannot be chatted with, whatever
+  // else holds.
   const resolved = await resolveModeAgent(root, task);
   if (!resolved.ok) return resolved.message;
   const agentRefusal = agentModeRefusal(task, mode, resolved.agent, resolved.agentDesc, resolved.harness);
@@ -602,6 +618,7 @@ export async function pairOrChatRefusal(
   if (memberEmail) {
     const memberRefusal = memberAgentRefusal(task, resolved.profile, resolved.config);
     if (memberRefusal) return memberRefusal;
+    return null; // Each member owns a separate conversation; no task-wide locks.
   }
   const worktreePath = resolved.worktreePath;
   const pairLock = checkPairingLock(worktreePath);

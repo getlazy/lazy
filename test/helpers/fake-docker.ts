@@ -73,6 +73,7 @@ case "\${1:-}" in
       file="\$(reffile "\${3:-}")"
       [ -f "\$file" ] || exit 1
       case "\${5:-}" in
+        *lazy.built.from*)   sed -n 6p "\$file" ;;
         *lazy.image.inputs*) sed -n 4p "\$file" ;;
         *lazy.base.source*)  sed -n 5p "\$file" ;;
         *Labels*)  sed -n 1p "\$file" ;;
@@ -119,13 +120,48 @@ case "\${1:-}" in
     index_ref "\$3" "\$(sed -n 2p "\$src")"
     exit 0
     ;;
+  start)
+    [ ! -f "\$STATE/fail-start" ] || { echo "fake docker: cannot start container" >&2; exit 1; }
+    name="\$2"
+    awk -F'\\t' -v OFS='\\t' -v n="\$name" '{ if (\$1 == n) \$2 = "running"; print }' "\$STATE/containers.tsv" > "\$STATE/containers.tsv.new"
+    mv "\$STATE/containers.tsv.new" "\$STATE/containers.tsv"
+    exit 0
+    ;;
   inspect)
     # inspect --format '{{... .IPAddress ...}}' <container>: a member terminal
     # container's address on its own network, which lazy pins the member's
     # credential to. A fixed address stands in for Docker's IPAM; a test can
     # override it by writing container-ip.
     case "\$*" in
+      *'json .Config.Env'*)
+        if [ -f "\$STATE/fail-member-env" ]; then
+          echo "fake docker: container environment inspection unavailable" >&2
+          exit 1
+        fi
+        name="\${@: -1}"
+        if [ -f "\$STATE/env-\$name" ]; then cat "\$STATE/env-\$name"; else echo '[]'; fi
+        ;;
+      *lazy.task-data*)
+        # The container-layout label (\$LAZY_TASK_DATA + root-only adopt).
+        # Every container carries it unless the test wrote old-layout-<name>,
+        # standing in for one created by a lazy before the data directory.
+        name="\${@: -1}"
+        [ -f "\$STATE/old-layout-\$name" ] || echo 1
+        ;;
+      *lazy.kept*)
+        name="\${@: -1}"
+        cstate="\$(awk -F'\\t' -v n="\$name" '\$1 == n { print \$2 }' "\$STATE/containers.tsv" 2>/dev/null)"
+        [ -n "\$cstate" ] || exit 1
+        # Only containers explicitly marked by the test carry the kept label.
+        kept=""
+        [ ! -f "\$STATE/kept-\$name" ] || kept=1
+        if [ "\$cstate" = "running" ]; then echo "true \$kept"; else echo "false \$kept"; fi
+        ;;
       *IPAddress*)
+        if [ -f "\$STATE/fail-member-address" ]; then
+          echo "fake docker: container address inspection unavailable" >&2
+          exit 1
+        fi
         if [ -f "\$STATE/container-ip" ]; then cat "\$STATE/container-ip"; else echo "172.30.0.2"; fi
         ;;
       *ExitCode*)
@@ -204,31 +240,50 @@ case "\${1:-}" in
     # queries over the names a test seeds. Without \`-a\` only RUNNING containers
     # are listed, as docker does: that is \`isContainerRunning\`'s probe.
     filter=""
+    project_filter=""
+    member_filter=""
     format=""
     all=""
     shift
     while [ \$# -gt 0 ]; do
       case "\$1" in
         -a|--all) all=1; shift ;;
-        --filter) filter="\$2"; shift 2 ;;
+        --filter)
+          case "\$2" in
+            name=*) filter="\$2" ;;
+            label=lazy.project=*) project_filter="\${2#label=lazy.project=}" ;;
+            label=lazy.member-terminal) member_filter=1 ;;
+          esac
+          shift 2 ;;
         --format) format="\$2"; shift 2 ;;
         *) shift ;;
       esac
     done
     pattern="\$(printf '%s' "\$filter" | sed 's/^name=//' | tr -d '^\$/')"
     [ -f "\$STATE/containers.tsv" ] || exit 0
+    if [ -n "\$member_filter" ] && [ -f "\$STATE/fail-member-ps" ]; then
+      echo "fake docker: member inventory is temporarily unavailable" >&2
+      exit 1
+    fi
     # A tab IS an IFS whitespace character, so bash COLLAPSES a run of them and
     # an empty column would shift every later field left. Hence the \`-\`
     # sentinel for "no label" in the state file, translated back to the empty
     # string docker actually prints.
     while IFS=\$'\\t' read -r cname cstate clabel cid; do
       [ -n "\$cname" ] || continue
+      [ -z "\$project_filter" ] || [ "\$clabel" = "\$project_filter" ] || continue
+      [ -z "\$member_filter" ] || [ -f "\$STATE/member-\$cname" ] || continue
       case "\$cname" in
         "\$pattern"*) ;;
         *) continue ;;
       esac
       [ -n "\$all" ] || [ "\$cstate" = "running" ] || continue
       case "\$format" in
+        *lazy.member-terminal*)
+          printf '%s\\t' "\$cname"
+          tr '\\n' '\\t' < "\$STATE/member-\$cname"
+          printf '%s\\n' "\$cstate"
+          ;;
         *ID*) printf '%s\\n' "\$cid" ;;
         *)
           [ "\$clabel" = "-" ] && clabel=""
@@ -289,6 +344,14 @@ case "\${1:-}" in
     if [ -f "\$STATE/fail-run" ]; then
       exit 1
     fi
+    # The real launch verifies the mounted agent can execute and its output
+    # can be captured. This external-runtime stand-in must answer that probe.
+    case " \$* " in
+      *" --entrypoint /usr/local/bin/lazy-agent "*" selfcheck "*)
+        printf 'lazy-agent ok fake-docker\\n'
+        exit 0
+        ;;
+    esac
     # The projects-dir write probe (\`sh -c 'touch … && rm -f …'\`): a test flips
     # fail-write-probe to get a container user that cannot write the per-builder
     # overlay, so the launch falls back to the member home's projects dir.
@@ -339,12 +402,14 @@ case "\${1:-}" in
       *" -d "*)
         dname=""
         resume_id=""
+        task_data_layout=""
         projects_mount=""
         home_mount=""
         set -- \$*
         while [ \$# -gt 0 ]; do
           case "\$1" in
             --name) dname="\$2"; shift 2 ;;
+            --label) [ "\$2" != "lazy.task-data=1" ] || task_data_layout=1; shift 2 ;;
             --resume) resume_id="\$2"; shift 2 ;;
             -v)
               case "\$2" in
@@ -356,6 +421,7 @@ case "\${1:-}" in
           esac
         done
         if [ -n "\$dname" ]; then
+          if [ "\$task_data_layout" = 1 ]; then rm -f "\$STATE/old-layout-\$dname"; else touch "\$STATE/old-layout-\$dname"; fi
           if [ -f "\$STATE/containers.tsv" ]; then
             awk -F'\\t' -v n="\$dname" '\$1 != n' "\$STATE/containers.tsv" > "\$STATE/containers.tsv.new"
             mv "\$STATE/containers.tsv.new" "\$STATE/containers.tsv"
@@ -412,6 +478,12 @@ case "\${1:-}" in
     fi
     exit 0
     ;;
+  port)
+    # \`docker port <name>\`: the bindings a test seeded (seedPortBindings),
+    # one \`3000/tcp -> 127.0.0.1:49154\` line each; none → nothing printed.
+    [ -f "\$STATE/ports-\$2" ] && cat "\$STATE/ports-\$2"
+    exit 0
+    ;;
   exec)
     # In-container pairing is \`docker exec … lazy-agent pair …\` (and the
     # reach-in stop is \`docker exec … sh -c kill …\`). A test whose subject is
@@ -433,6 +505,7 @@ case "\${1:-}" in
     hash=""
     inputs=""
     source=""
+    builtfrom=""
     while [ \$# -gt 0 ]; do
       case "\$1" in
         -t) tags+=("\$2"); shift 2 ;;
@@ -441,6 +514,7 @@ case "\${1:-}" in
             lazy.dockerfile.hash=*) hash="\${2#lazy.dockerfile.hash=}" ;;
             lazy.image.inputs=*)    inputs="\${2#lazy.image.inputs=}" ;;
             lazy.base.source=*)     source="\${2#lazy.base.source=}" ;;
+            lazy.built.from=*)      builtfrom="\${2#lazy.built.from=}" ;;
           esac
           shift 2
           ;;
@@ -493,7 +567,7 @@ case "\${1:-}" in
       trap - TERM INT HUP
     fi
     for t in "\${tags[@]}"; do
-      printf '%s\\n%s\\n%s\\n%s\\n%s\\n' "\$hash" "\$id" "\$created" "\$inputs" "\$source" > "\$(reffile "\$t")"
+      printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "\$hash" "\$id" "\$created" "\$inputs" "\$source" "\$builtfrom" > "\$(reffile "\$t")"
       index_ref "\$t" "\$id"
     done
     exit 0
@@ -541,6 +615,8 @@ export interface FakeDocker {
     state?: string;
     project?: string;
     id?: string;
+    /** Labels/env of a member container that the previous daemon created. */
+    member?: { taskId: string; email: string; bindingKey: string; env?: Record<string, string> };
   }): Promise<void>;
   /**
    * A running container dies on its own: it moves to `exited` with this exit
@@ -551,6 +627,8 @@ export interface FakeDocker {
    * log at a host path).
    */
   crash(name: string, exitCode: number, output: string, supervisorLog?: string | { symlinkTo: string }): Promise<void>;
+  /** What `docker port <name>` prints for a running container: its published ports. */
+  seedPortBindings(name: string, bindings: Array<{ containerPort: number; hostAddress: string; hostPort: number }>): Promise<void>;
   /** The projects-dir write probe fails, so a builder launch runs without its overlay. */
   failWriteProbe(): Promise<void>;
   /** `docker inspect` and `docker ps` fail — a runtime that does not answer. */
@@ -739,6 +817,16 @@ export async function installFakeDocker(
       await writeFile(
         join(stateDir, 'containers.tsv'),
         [...existing, `${name}\t${state}\t${project}\t${id}`].join('\n') + '\n',
+      );
+      if (opts.member) {
+        await writeFile(join(stateDir, `member-${name}`), [opts.member.taskId, opts.member.email, opts.member.bindingKey].join('\n') + '\n');
+        await writeFile(join(stateDir, `env-${name}`), JSON.stringify(Object.entries(opts.member.env ?? {}).map(([k, v]) => `${k}=${v}`)));
+      }
+    },
+    async seedPortBindings(name, bindings) {
+      await writeFile(
+        join(stateDir, `ports-${name}`),
+        bindings.map((b) => `${b.containerPort}/tcp -> ${b.hostAddress}:${b.hostPort}`).join('\n') + '\n',
       );
     },
     async failWriteProbe() {

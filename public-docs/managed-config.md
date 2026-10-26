@@ -18,6 +18,25 @@ every config key into three buckets:
 | **Overridden** | the fleet's value is used; your ask is recorded | `lazy doctor` |
 | **Refused** | kept in the file but **not used**; the project still starts | `lazy doctor`, the provisioning log, and the Lazy Teams Configuration page |
 
+## Project checkout
+
+Lazy Teams imports the project's committed configuration without rewriting
+`lazy.toml` or `.gitignore`. Configuration saved in Teams lives outside the
+checkout, storage belongs to the project, and runtime ignores use Git's local
+exclude file. If the repository has no `lazy.toml`, setup detects GitHub or
+GitLab and saves that integration in the configuration outside the checkout.
+Existing repository settings and saved Teams settings are preserved.
+
+When a project starts, lazy restores old setup edits to tracked `lazy.toml`
+and `.gitignore` only when their contents exactly match what setup would
+have written to the committed versions. Staged changes and other edits are
+left untouched. The project messages explain what was restored or needs an
+administrator's decision. Recovery keeps copies in Git's local metadata and
+names their locations in the message; concurrent replacements are preserved.
+Project diagnostics also report changes that still
+need attention. Solo `lazy init` continues to create configuration and update
+`.gitignore`.
+
 ## Why override some keys and refuse others
 
 Both are equally safe — neither honours the repository. The choice is about
@@ -250,6 +269,16 @@ apply to every task container and can grant access to other containers or the
 host. Adopt projects only after reviewing their Docker arguments; the
 Configuration page displays a persistent warning when the saved configuration
 sets non-empty arguments.
+
+For example, a project admin can set the project's runner image file under
+**Settings → Configuration**:
+
+```toml
+[docker]
+dockerfile = "docker/agents.Dockerfile"
+```
+
+Lazy builds that file from the project root for later task launches.
 
 - When a project is set up, its repository's `lazy.toml` is copied once, exactly
   as written — nothing in it is refused or dropped. Later changes to the

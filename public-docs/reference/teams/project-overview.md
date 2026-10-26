@@ -18,6 +18,27 @@ The team name above the title links back to the team. A status badge on the righ
 
 Below the header is the project's repository address. A project hosted by Lazy Teams shows it with the commands to clone it.
 
+## Forge identity
+
+For a GitHub or GitLab repository, a line under the address says whose identity the project pushes and opens pull requests with:
+
+- "Acting as @handle (your connection)", or "(a teammate's connection)", when it uses the forge connection of the member who started the project, while they are still on the team;
+- "Using the team's shared GitHub integration", when that member has no connection of their own;
+- "No GitHub credential" when there is nothing to push with. The member whose connection the project uses gets a link to connect their account; anyone else is told who can fix it.
+- "This project never pushes" when the project is set up not to push anywhere: its work stays on the project's machine. A project whose repository is not on GitHub or GitLab still pushes task branches and accepted work to its repository, with the same identity.
+
+The line also names the repository driver, and says whether the project is using the token your connection was saved with. The member whose connection it is, and admins, see a short fingerprint of each token (never the token itself), so a project still holding an old token is visible at a glance, with a **Send the saved token again** button that fixes it.
+
+Connecting, replacing or removing a forge connection in [Account settings](account-settings.md), or changing the team's GitHub integration, takes effect on a running project straight away, and on every restart after it; no restart is needed.
+
+**Check push access** asks the forge, as that identity, whether the repository can be pushed to. Nothing is pushed. The answer is either "Push access OK" or "Push would fail", with what went wrong (the credential was refused, the token cannot write to the repository, the token is not authorized for the organization's single sign-on, the repository was not found, or the remote is an SSH address) and what to do about it, such as reconnecting your account or giving the token write access to the repository's contents. Admins can also open the forge's own message. The same check runs as part of the project's health checks.
+
+If a task's work could not be pushed — after a turn, or after it was accepted — the task page says so with the forge's own error and, when lazy recognises it, the fix: for example that a token needs the `workflow` scope (or "Workflows: Read and write") to push a change to `.github/workflows/`, needs authorizing for an organization's SSO, or cannot push to a protected branch. A push the forge refused is reported at once rather than retried on the spot, and is not described as a network problem. lazy tries again on its own later, so once the token or permission is fixed the work goes through without anyone re-running anything. Repeated failures also appear in the project's Messages.
+
+![Check push access names a token’s missing organization SSO authorization and links to the fix](../../images/teams/teams-project-push-access.png)
+
+[Push-access results at phone width](../../images/teams/teams-project-push-access-phone.png).
+
 ## Quick actions
 
 | Control | What it does |

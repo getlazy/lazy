@@ -34,10 +34,11 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
-import type { Actor, AgentResponse } from '../types';
+import type { ActorInput, AgentResponse } from '../types';
 import type { OneshotRequest } from './types';
 import { tryRpc, isDaemonRpcBypassed, DaemonNotRunningError } from '../daemon/client';
 import { findLazyRoot } from '../project-paths';
+import { actorRole } from '../actor-ref';
 
 export type { OneshotRequest, OneshotRepoAccess } from './types';
 
@@ -80,9 +81,9 @@ export function runAsOneshotPayer<T>(email: string | null | undefined, fn: () =>
  * 429 naming the paused credential).
  *
  * Scoped with AsyncLocalStorage rather than held per process, because the MCP
- * server is long-lived: one tool call is one command there. `actor` is the
- * channel asking — only a person's command may use their override, and a
- * command that names none is judged as nobody's (it never gets it).
+ * server is long-lived: one tool call is one command there. `actor` carries
+ * both the asking channel and the authenticated payer. Only a human-channel
+ * command may use a person's override; attaching a person never widens that.
  *
  * INVARIANT: running INSIDE the daemon is not a way around the gate. The MCP
  * route the daemon serves runs `lazy_conversation_ask` in the daemon's own
@@ -91,7 +92,7 @@ export function runAsOneshotPayer<T>(email: string | null | undefined, fn: () =>
  * own gate in-process instead of skipping it. Only the in-process TEST harness
  * (`LAZY_TEST=1`, no daemon at all) skips it.
  */
-export async function admitOneshotCommand(opts: { actor?: Actor; overrideUsagePause?: boolean } = {}): Promise<OneshotCommand> {
+export async function admitOneshotCommand(opts: { actor?: ActorInput; overrideUsagePause?: boolean } = {}): Promise<OneshotCommand> {
   if (process.env.LAZY_IS_DAEMON === '1' && process.env.LAZY_TEST !== '1') {
     const { getDaemonProjectRoot } = await import('../daemon/rpc-handlers');
     const root = getDaemonProjectRoot() ?? findLazyRoot();
@@ -105,7 +106,9 @@ export async function admitOneshotCommand(opts: { actor?: Actor; overrideUsagePa
   if (isDaemonRpcBypassed()) return { run: (fn) => fn() };
   const state = await tryRpc<{ oneshotAllowance?: string }>('usagePause', {
     action: 'admitOneshot',
-    ...(opts.actor ? { actor: opts.actor } : {}),
+    // Across RPC the token supplies the person; identity is never a request
+    // field. Only the in-daemon branch above accepts its authenticated ref.
+    ...(opts.actor ? { actor: actorRole(opts.actor) } : {}),
     ...(opts.overrideUsagePause ? { overrideUsagePause: true } : {}),
   });
   const allowance = state?.oneshotAllowance ?? null;

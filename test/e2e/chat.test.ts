@@ -351,8 +351,12 @@ describe('lazy chat', () => {
     await writeFile(
       lazyToml,
       await readFile(lazyToml, 'utf-8') +
-        `\n[models.roles.builder]\nbackend = "ollama"\nmodel = "qwen3-coder"\n` +
-        `endpoint = "http://host.docker.internal:${ollama.port}"\n`,
+        // The profile form: a role names the profile it defaults to, and the
+        // profile carries the model and endpoint (the role-level keys were
+        // retired, and the loader refuses them).
+        `\n[agents.builder-ollama]\nharness = "claude-code"\nmodel = "qwen3-coder"\n` +
+        `endpoint = "http://host.docker.internal:${ollama.port}"\ncredential = "none"\n` +
+        `\n[models.roles.builder]\nagent = "builder-ollama"\n`,
       'utf-8',
     );
 
@@ -378,10 +382,11 @@ describe('lazy chat', () => {
       expect(baseUrl).not.toContain('host.docker.internal');
       expect(baseUrl).not.toContain(String(ollama.port));
 
-      // Sanity: the ollama role is genuinely in play (its model was forwarded),
-      // so this is not passing because the backend silently fell back.
-      const claudeArgs = await readClaudeArgs(binDir);
-      expect(claudeArgs[claudeArgs.indexOf('--model') + 1]).toBe('qwen3-coder');
+      // No "the ollama role is in play" check any more: the old one read the
+      // role's model off claude's argv, but a chat now runs the TASK's model
+      // (the one its turns run), and every launch dials the proxy whatever the
+      // role's upstream is — so the base-URL assertions above are the whole
+      // invariant.
     } finally {
       ollama.stop(true);
       await rm(rehydratedDir, { recursive: true, force: true });

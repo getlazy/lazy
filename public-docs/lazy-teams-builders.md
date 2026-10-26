@@ -47,3 +47,13 @@ without the Teams interface. **Download** saves the stored file content.
 
 Files recorded by name only have no stored content to download. Their page
 shows why capture skipped them, rather than offering an empty file.
+
+## Running environment
+
+Every builder receives a generated description of where it runs, alongside its system instructions. It identifies Teams or solo lazy, the runner and deployment backend, the daemon platform, access to files and scratch, and the available browser address. Facts that lazy cannot verify are marked unknown. Custom system instructions do not replace this context. Task agents receive the same deployment context.
+
+The generated context also explains how to inspect another task's committed code
+without copying its tree: read files at the recorded commit with git, or request a
+file-specific task diff. To run checks that write files, use a disposable export
+with the project's required dependencies and setup. Keep other tasks' worktrees
+unchanged, even when they are visible from the builder.

@@ -1,0 +1,1 @@
+Get its branch and recorded commit SHA from `lazy show <task> --json`. Show its complete task diff with `lazy diff <task> --full`; for selected files use the git commands below. Land a child’s work with `lazy accept <task>`.

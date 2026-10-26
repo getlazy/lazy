@@ -21,7 +21,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { initDaemonStorage } from '../../src/daemon/rpc-handlers';
+import { openTestDaemonStorage } from '../helpers/daemon-storage';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { mkdir, writeFile, rm, symlink } from 'fs/promises';
 import { join } from 'path';
@@ -37,6 +37,10 @@ import {
 } from '../../src/builder/scratch-limits';
 import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import type { Task, ScratchFile, ScratchFileInput, Actor } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('builder scratch capture', () => {
   let testDir: string;
@@ -56,7 +60,7 @@ describe('builder scratch capture', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     task = await storage.createTask('Test task', undefined, undefined, 'test-task');
 
     scratchDir = mkdtempSync(join(tmpdir(), 'lazy-scratch-dir-'));
@@ -233,7 +237,7 @@ describe('builder scratch capture', () => {
     await sync();
     const savedTest = process.env.LAZY_TEST;
     process.env.LAZY_TEST = '1';
-    initDaemonStorage(testDir);
+    const closeDaemon = await openTestDaemonStorage(testDir);
     try {
 
       const scratch = createAllHandlers(builderCtx()).get('lazy_scratch')!;
@@ -247,6 +251,7 @@ describe('builder scratch capture', () => {
 
       await expect(scratch({ path: 'nope.md' })).rejects.toThrow(/No captured scratch file/);
     } finally {
+      await closeDaemon();
       if (savedTest === undefined) delete process.env.LAZY_TEST;
       else process.env.LAZY_TEST = savedTest;
     }

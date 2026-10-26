@@ -56,7 +56,7 @@ default = "claude-sonnet-5-5"
 
 **`default` is an Anthropic model name, so it applies only to agents that speak
 Anthropic model names.** An agent may declare its own default instead: a Cursor
-task with no explicit model runs Cursor's `auto` (Cursor picks the model), and a Codex task runs `gpt-6-sol`, not
+task with no explicit model runs Cursor's `auto` (Cursor picks the model), and a Codex task runs `gpt-6.1-sol`, not
 `models.default` — lazy's default is chosen for Claude Code and means nothing to
 another vendor's registry.
 
@@ -84,7 +84,7 @@ and so does a model pinned on the task's [agent profile](#agentsname--named-agen
 
 1. `--model` on the command
 2. The task's model, else the profile's model
-3. The agent's own default (Cursor: `auto`, Cursor picks; Codex: `gpt-6-sol`; Claude Code and Pi declare none)
+3. The agent's own default (Cursor: `auto`, Cursor picks; Codex: `gpt-6.1-sol`; Claude Code and Pi declare none)
    — name `default` as a Codex model to let the Codex CLI pick
 4. A project default set outside the repository (where your deployment offers
    one), else `models.default`
@@ -149,9 +149,17 @@ agent = "claude-code"
 
 [models.roles.agent]
 agent = "local-ollama"
+
+[agents.local-ollama]
+harness = "pi"
+model = "qwen3.8:latest"
+endpoint = "http://localhost:11434"
+credential = "none"
 ```
 
 A role is only a **default**. A task that names its own profile (`lazy create --agent <profile>`) runs on that profile, whatever the role says — which is the whole point of profiles.
+
+The builder role's profile must run **Claude Code or Codex**: `agent = "codex-subscription"` (or `codex-api`, or any profile with `harness = "codex"`) makes every new `lazy builder` session a Codex one. One builder session can also run on another profile without changing the role: `lazy builder --agent codex-subscription`, or the **Runs on** picker in Lazy Teams. A session keeps its profile for its whole life, resumes included. Builder replies in review conversations still need a Claude Code profile in this role; see [Using a builder](how-to/use-a-builder.md#codex-builders).
 
 > **The `backend`, `model` and `endpoint` keys are not accepted in this table.** A lazy.toml that has them is rejected at load, with the exact `[agents.<name>]` block that replaces them printed. See [Migrating from role backends](#rejected-spellings).
 
@@ -189,7 +197,7 @@ model = "claude-opus-5-5"
 
 [agents.work-codex]           # same provider as the built-in codex profile,
 harness = "codex"             # billed to a different key
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 credential = "work-openai"    # any name you choose: `lazy auth set work-openai`
 ```
 
@@ -234,11 +242,11 @@ Because the upstream rides the profile rather than the role, one project can run
 ```toml
 [agents.house-codex]          # the team's OpenAI account
 harness = "codex"
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 
 [agents.work-codex]           # a second OpenAI key, for client work
 harness = "codex"
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 credential = "work-openai"
 
 [agents.local-pi]             # a model server on this machine — no key at all
@@ -262,8 +270,8 @@ Not every task needs the most capable model. A useful split is four tiers, with 
 | Tier | When | Claude Code | Cursor | Codex |
 |------|------|-------------|--------|-------|
 | **Normal** (the default) | Everyday tasks: features, fixes, tests, docs | `claude-sonnet-5-5` | `composer-2.5` | `gpt-5.6-terra` |
-| **Complex** | Tasks that drive their own subtasks, and highly complex work: cross-cutting design, subtle concurrency, large refactors | `claude-opus-5-5` | `grok-4-7` | `gpt-6-sol` |
-| **Security** | Work touching authentication, credentials, permissions, sandboxing or untrusted input, and security reviews | `claude-opus-5-5` | `claude-opus-5-5` | `gpt-6-sol` |
+| **Complex** | Tasks that drive their own subtasks, and highly complex work: cross-cutting design, subtle concurrency, large refactors | `claude-opus-5-5` | `grok-4-7` | `gpt-6.1-sol` |
+| **Security** | Work touching authentication, credentials, permissions, sandboxing or untrusted input, and security reviews | `claude-opus-5-5` | `claude-opus-5-5` | `gpt-6.1-sol` |
 | **On demand** | Only when someone asks for it by name: the hardest problems, or a second opinion after another tier got stuck | `claude-fable-5-1` | — | `gpt-6-astra` |
 
 ```toml
@@ -444,6 +452,15 @@ Controls where the `.lazy` directory lives.
 |--------|----------|-----------|-------------|
 | `path` | `string` | `".lazy"` | Location of the `.lazy` directory. |
 
+```toml
+[data]
+path = ".lazy-local"
+```
+
+On a single-person install, this keeps Lazy's local housekeeping files in a
+separate `.lazy-local` directory. Ignore that directory in git so
+machine-local files are not committed. Lazy Teams assigns its own location.
+
 ---
 
 ## `[storage]`
@@ -453,7 +470,7 @@ Controls where Lazy persists task state (tasks, sessions, turns, commits, commen
 | Key             | Type     | Default      | Description |
 |-----------------|----------|--------------|-------------|
 | `backend`       | `string` | `"external"` | Storage backend. Only `"external"` (file storage outside the repo) is supported. |
-| `external_path` | `string` | `""`         | Path for external storage. Defaults to `~/.lazy/<project-name>` if empty. Leading `~/` is expanded at load time. |
+| `external_path` | `string` | `""`         | Path for external storage. Defaults to `~/.lazy/<project-name>` if empty. Relative paths resolve against the project root; `~/` expands against your home directory. Absolute paths are used unchanged. |
 | `backup_keep`   | `number` | `5`          | How many verified store backups to keep. lazy takes one before a new version first opens the store; see [Store backups](store-backups.md). |
 
 ```toml
@@ -462,11 +479,24 @@ backend = "external"
 external_path = "~/.lazy/my-project"
 ```
 
+Each checkout needs its own store. Lazy records the owning checkout and refuses
+a clone that points at another checkout's store. See
+[Store ownership](store-ownership.md) for moving a checkout or claiming a store
+without an ownership record.
+
 To set this without the interactive prompt — provisioning a project from a script
 or a fleet host — pass `lazy init --external-path <dir>`. It writes
 `backend = "external"` and `external_path = <dir>` into the project's
 `lazy.toml`, inserting the `[storage]` section or replacing an existing
-`external_path`, and creates the directory. Because the flag exists to *repoint*
+`external_path`, and creates the directory. The value is saved as given: use an absolute path
+for a fixed location, or a relative path such as `../stores/my-project` to move
+the project and its neighboring store together. Relative paths always start at
+the project root, even when you run lazy from a subdirectory.
+
+Run `lazy doctor` to see the resolved store path and whether it was configured
+relative to the project root.
+
+Because the flag exists to *repoint*
 the store, it is also the one `init` invocation that skips the startup check
 refusing to run against a configured storage path that does not exist.
 
@@ -489,6 +519,13 @@ Git-related configuration.
 | `default_branch_prefix` | `string` | `"lazy"` | Prefix for task branches (e.g., `lazy/fix-bug`). Set it to `"wip"` and new task branches are named `wip/fix-bug`. A trailing slash is optional — `"wip"` and `"wip/"` mean the same thing. |
 | `lfs_check`             | `string` | `"refuse"` | Start-time git LFS check on repos that use LFS: `"refuse"` blocks the start when the LFS filter would not run, `"warn"` starts anyway and records a warning, `"off"` disables it. Does not affect the accept-time guard, which always runs — see [LFS guard](lfs-guard.md). |
 | `coauthor_trailer`      | `boolean` | `true` | Adds `Co-Authored-By: Lazy <noreply@getlazy.dev>` to the commits lazy writes for a task: `lazy_commit` commits, the accept squash commit, and the squash-merge commit on GitHub/GitLab. Set `false` to leave it off everywhere. Commits an agent makes itself with plain `git` are not touched. |
+
+```toml
+[git]
+default_branch_prefix = "wip"
+```
+
+New task branches use names such as `wip/fix-bug`.
 
 Changing `default_branch_prefix` renames nothing. Branches that already exist keep
 their names and their tasks keep working; the new prefix applies to branches created
@@ -519,6 +556,13 @@ Controls CLI output formatting.
 | Key              | Type     | Default | Description |
 |------------------|----------|---------|-------------|
 | `shortid_length` | `number` | `8`     | Length of shortened IDs displayed in output. |
+
+```toml
+[output]
+shortid_length = 10
+```
+
+CLI output shows ten characters of shortened IDs.
 
 ---
 
@@ -816,6 +860,14 @@ dashboard, not your project's dev servers.
 | `dashboard_url` | `string` | unset         | Exact public origin used to reach the dashboard through a trusted reverse proxy, for example `"https://lazy.example.com"`. A trailing slash is ignored and a port is kept (`"https://lazy.example.com:8443"`). When set, dashboard links use this origin and dashboard authentication accepts only its host and origin — the local `http://lazy.localhost:<port>` address is refused. Paths, queries, fragments, and credentials are rejected. Apply a change with `lazy daemon reload`. |
 | `sync_interval` | `number` | `60`          | Interval in seconds for the daemon's background sync. Set to `0` to disable. Apply a change with `lazy daemon reload`. |
 
+```toml
+[server]
+port = 26024
+bind = "127.0.0.1"
+```
+
+This serves the dashboard on the local machine, starting at port 26024.
+
 To use a tunnel such as ngrok or Tailscale serve, point it at the daemon's
 local dashboard port, set `dashboard_url` to the tunnel's HTTPS origin, and
 run `lazy daemon reload`. Treat the tunnel as a trusted proxy: this setting
@@ -879,6 +931,14 @@ Comment syncing imports each PR/MR comment into the task exactly once, whenever 
 | `git_remote`   | `string` | `"origin"` | Git remote name. Change if your remote is named differently. |
 | `auto_approve` | `bool`   | `false`    | If `true`, `lazy accept` on a protected target branch submits an approving review before merging. See behavior notes below. |
 | `offline`      | `bool`   | `false`    | Permanent offline mode. If `true`, all remote operations (push, fetch, sync, PR creation) are skipped **indefinitely**. See offline modes below. |
+
+```toml
+[remote]
+driver = "github"
+git_remote = "origin"
+```
+
+This uses GitHub for pull requests and the `origin` remote for task branches.
 
 ### Offline modes
 
@@ -987,7 +1047,7 @@ Docker image configuration for agent containers.
 
 | Key            | Type       | Default | Description |
 |----------------|------------|---------|-------------|
-| `dockerfile`   | `string`   | `""`    | Path to a custom Dockerfile, relative to the project root. If empty, lazy uses `Dockerfile.lazy` at the project root when it is committed (and, on Lazy Teams, when the install gives each project its own virtual machine), and otherwise the base image (Debian with Claude Code + passwordless sudo). A named file that is missing fails the launch. |
+| `dockerfile`   | `string`   | `""`    | Path to a custom Dockerfile, relative to the project root. If empty, lazy uses `Dockerfile.lazy` at the project root when it is committed (and, on Lazy Teams, when the install gives each project its own virtual machine), and otherwise the base image (Debian with Claude Code, Codex, Cursor, Pi and passwordless sudo). A named file that is missing fails the launch. |
 | `build_inputs` | `string[]` | `[]`    | Files whose **contents** are part of the image's identity, relative to the project root. Changing one rebuilds the image: the next container start notices it and the daemon rebuilds in the background, while launches keep the current image until the new one is built. |
 | `run_args`     | `string[]` | `[]`    | Extra `docker run` arguments applied verbatim, in order, before the image name when a **task container** is created. They widen the container's privileges and apply to **every** task. |
 
@@ -1173,6 +1233,7 @@ If a profile is removed, its existing launches receive HTTP 410 (route gone), no
 
 `[proxy] enabled` is not a key. A lazy.toml that still carries it is never silently ignored — what happens depends on the value. `enabled = false` is **rejected at load** with an error naming the option. `enabled = true` asks for exactly what lazy already does, so the line is merely dead: you get a **warning** telling you to delete it, and the command carries on.
 
+<!-- toml-example: invalid -->
 ```toml
 [proxy]
 enabled = false   # ERROR: `enabled` is not a key — delete this line
@@ -1197,9 +1258,9 @@ What to do:
 
 The reasoning is the same as for daemon startup: a transient daemon failure must not be able to drop you out of the audit plane — silently, on a single launch, with no trace afterward that the traffic went unaudited. This applies to every profile, local Ollama and explicitly-pinned endpoints included: they need the proxy's address too, because the proxy is what reaches their upstream.
 
-**A resolved address is only good for the daemon that gave it out.** With the port OS-assigned, a restarted daemon serves the proxy somewhere else, so any address held across a restart is dead. This matters for `lazy upgrade`, which restarts the daemon while your builder session keeps running: the in-container supervisor notices the restart, re-resolves the address against the daemon that came back, and relaunches Claude with `--resume` — rather than leaving you on a dead port. If the daemon answers before its proxy is ready, the builder waits briefly for it to bind. If re-resolution still fails, the session is **not** silently degraded — you get the error above and a `lazy builder --resume <id>` to run once the daemon is healthy, instead of a session that comes back alive but unable to reach the API.
+**A resolved address is only good for the daemon that gave it out.** With the port OS-assigned, a restarted daemon serves the proxy somewhere else, so any address held across a restart is dead. This matters for `lazy upgrade`, which restarts the daemon while your builder session keeps running: the in-container supervisor notices the restart, re-resolves the address against the daemon that came back, and resumes the builder on its original harness — rather than leaving you on a dead port. If the daemon answers before its proxy is ready, the builder waits briefly for it to bind. If re-resolution still fails, the session is **not** silently degraded — you get the error above and a `lazy builder --resume <id>` to run once the daemon is healthy, instead of a session that comes back alive but unable to reach the API.
 
-**A reconnect uses your current builder model and effort.** Each time the builder reconnects after a daemon restart, it launches Claude with the model and effort from the current `lazy.toml`, not the ones from when the session started. A `--model` or `--effort` you typed on `lazy builder` stays in force for that session. `lazy doctor` lists running builders whose model or image is behind your config; quit one and run `lazy builder --resume <id>` to refresh it.
+**A reconnect uses your current builder model and effort.** Each time the builder reconnects after a daemon restart, it launches the builder’s agent with the model and effort from the current `lazy.toml`, not the ones from when the session started. A `--model` or `--effort` you typed on `lazy builder` stays in force for that session. `lazy doctor` lists running builders whose model or image is behind your config; quit one and run `lazy builder --resume <id>` to refresh it.
 
 | Key        | Type     | Default                          | Description |
 |------------|----------|----------------------------------|-------------|
@@ -1455,6 +1516,13 @@ Mount additional documents into agent containers.
 | Key    | Type     | Default | Description |
 |--------|----------|---------|-------------|
 | `path` | `string` | `""`    | Path to a directory of documents to mount into the agent container. |
+
+```toml
+[documents]
+path = "reference"
+```
+
+This makes the project's `reference` directory available to agents.
 
 ---
 
@@ -1712,7 +1780,7 @@ Maintained files — the inverse of `[permissions].protected`. Patterns agents a
 
 Opt-in: empty by default. The check runs once, during the wrap-up, over the task's whole change range — the same range `lazy diff` and the reviewer are about to see — not just the final turn. It is skipped entirely when the task changed nothing at all (a no-op turn, or one that only drove subtasks, has nothing to maintain alongside).
 
-When the task's range also has protected-file violations, the maintain nudge runs **after** the push-back exchange and is **independent of its outcome** — it fires whether the agent resolved the violations or kept them. Ordering within the wrap-up is: work → push-back → agent reply → maintain nudge → agent reply (→ react nudge when configured → the uncommitted-work check → the presentation step). The uncommitted-work check is what stops an update made *here* from being written and never committed: it reads the working tree, and if anything is loose it asks the agent once to commit or discard it, before the walkthrough is written over the final file list. See [Work left uncommitted when the turn ends](state-machine.md#work-left-uncommitted-when-the-turn-ends). The push-back never re-runs because of the maintain or react steps (it is single-shot). The maintain response does not carry the violation set; when a react follow-up also runs, that response re-detects and carries the final set. Otherwise the push-back response does — so a still-violating task still becomes a `conflict` even though it also got nudged.
+When the task's range also has protected-file violations, the maintain nudge runs **after** the push-back exchange and is **independent of its outcome** — it fires whether the agent resolved the violations or kept them. Ordering within the wrap-up is: work → push-back → agent reply → maintain nudge → agent reply (→ react nudge when configured → the uncommitted-work check → the presentation step). The uncommitted-work check is what stops an update made *here* from being written and never committed: it reads the working tree, and if anything is loose it asks the agent once to commit or discard it, before the walkthrough is written over the final file list. See [Work left uncommitted when the turn ends](explanation/tasks-and-turns.md#work-left-uncommitted-when-a-turn-ends). The push-back never re-runs because of the maintain or react steps (it is single-shot). The maintain response does not carry the violation set; when a react follow-up also runs, that response re-detects and carries the final set. Otherwise the push-back response does — so a still-violating task still becomes a `conflict` even though it also got nudged.
 
 The follow-up is recorded as its own discrete turn pair — a `supervisor`-authored prompt turn (under a "Maintained Files Review" heading) followed by the agent's reply turn — so the turn history reads cleanly: work turn → supervisor nudge → agent reply. The nudge text is **not** appended to the work turn's response. The reply turn carries its own token usage (including cache tokens) and any commits the follow-up made are attributed to it, not the work turn. The protected-file push-back behaves the same way ("Permission Violation Review"). In `lazy show` and the dashboard these prompt turns are labelled `supervisor` (not `human`), so you can tell "the human said" from "the supervisor pushed back".
 
@@ -1772,7 +1840,7 @@ timeout = 600
 
 Two commands that bracket every agent turn. Both are plain keys on `[automation]`, both are opt-in (empty by default), both run through `sh -c` in the task worktree, and both capture **stdout and stderr** as separately-labelled blocks (never interleaved — the two streams are drained concurrently, so an interleave would be invented rather than observed).
 
-This is where a full test suite or build belongs. Agents are instructed to verify with the tests covering what they changed and *not* to run the whole suite as routine verification — it would cost minutes on every turn. Configure `post_turn` and the sweep happens once, after the turn, without the agent paying for it.
+Use these hooks for checks appropriate to each turn. Agents and clusters run the tests covering their changes during active work and child accepts. Run the full suite once before acceptance into the protected branch; for a cluster, run it before the cluster declares its final result. Put expensive acceptance checks in [`[automation.pre_accept]`](#automationpre_accept), rather than repeating them after every turn.
 
 | Key                 | Type      | Default | Description |
 |---------------------|-----------|---------|-------------|
@@ -1787,7 +1855,7 @@ This is where a full test suite or build belongs. Agents are instructed to verif
 pre_turn = "bin/lazy-services"
 pre_turn_timeout = 120
 pre_turn_required = false
-post_turn = "bun test --bail"
+post_turn = "bun run typecheck"
 post_turn_timeout = 300
 ```
 
@@ -1833,10 +1901,9 @@ The old spelling still **works**: an existing `[checks]` value is applied to the
 - setting the same key in **both** sections to **different** values is a hard config error. lazy refuses to load rather than guess which one you meant. Delete the `[checks]` entry and keep the `[automation]` one.
 
 ```toml
-# Old (deprecated)          # New
-[checks]                    [automation]
-post_turn = "bun test"      post_turn = "bun test"
-post_turn_timeout = 300     post_turn_timeout = 300
+[automation]
+post_turn = "bun run typecheck"
+post_turn_timeout = 300
 ```
 
 ---
@@ -1997,8 +2064,10 @@ minute and are not overage.
   first wait of a pause is announced in `lazy messages`. A review that is
   waiting is recorded on the task as not run yet, so `lazy accept` holds the
   unreviewed work meanwhile.
-- **A turn already running** — never stopped, and neither is anything lazy
-  sends inside it.
+- **A turn already running** — crossing the launch threshold does not kill its
+  process. Further launches it requests still face admission checks. A tiered
+  profile can switch providers or refuse further model requests when all its
+  tiers are full; see [tiered profiles](#tiered-profiles--use-a-tier-until-it-says-no).
 
 A reading is only as fresh as the last request. Once a window's reset time
 has passed, the reading no longer pauses anything. If the provider gave no

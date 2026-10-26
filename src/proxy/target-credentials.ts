@@ -92,7 +92,11 @@ export type CredentialPlacement =
 /** The outcome of asking "what credential does this target need?". */
 export type TargetCredentialOutcome =
   /** Resolved — swap it in. */
-  | { kind: 'credential'; placement: CredentialPlacement; label: string }
+  | {
+      kind: 'credential'; placement: CredentialPlacement; label: string;
+      /** Non-secret scope identity for sessions minted from this credential. */
+      sourceId?: string;
+    }
   /** Mapped, and this target deliberately needs none (e.g. local Ollama). */
   | { kind: 'none'; reason: string }
   /**

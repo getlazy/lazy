@@ -24,6 +24,12 @@ cd lazy
 bun run install:local
 ```
 
+The build checks `.bun-version` before installing dependencies or generating files.
+If your default Bun is older and mise is installed, it installs and uses the
+pinned Bun for this command, leaving your default Bun unchanged. Otherwise it
+stops immediately, names the running Bun version and path, and prints one
+command to upgrade Bun and retry. `bun run build` uses the same check.
+
 This builds lazy and installs it into `~/.lazy/bin`. If `lazy` is not found
 afterwards, add that directory to your `PATH`, as the install prints.
 

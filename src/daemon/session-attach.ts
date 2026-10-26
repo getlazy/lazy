@@ -25,9 +25,8 @@
  *   terminal runs AS the attaching member, in a container of their own built
  *   from the task's image on the task's worktree (./member-container.ts), on
  *   their own credential, and pair's rows name them. A caller naming nobody (a
- *   control token) is refused (403); so — with a 409 — is everyone while a
- *   turn is running, since member terminals and turns take turns with the
- *   worktree (./member-entry.ts).
+ *   control token) is refused (403). A running turn refuses nobody: a member
+ *   and the agent work the worktree at the same time (./member-entry.ts).
  * - A COMMIT RUN (`run:<id>`, ./commit-run.ts). The target is the run's own
  *   container, named from its slug, and a Shell is the only mode. Unlike a
  *   task's, it is entered directly — not through a member container — because
@@ -51,13 +50,11 @@ import { logger } from '../utils/logger';
 import { actorEmail } from '../actor-ref';
 import { resolveGitIdentity } from '../identity/git-identity';
 import { getOrCreateStorage } from './rpc-handlers';
-import { getTaskSessionBinding, type SessionCredentialBinding } from './session-credentials';
-import { SERVICE_CREDENTIAL_USER_ID, getUserCredential } from './user-credentials';
-import { memberCredentialMissingMessage } from '../server/member-exec-credential';
-import { memberTerminalHolder, memberHeldMessage } from '../server/member-terminals';
+import { memberCredentialMissingMessage, memberTerminalCredentialProblem, memberTerminalProfile } from '../server/member-exec-credential';
 import { memberContainerSettingsRefusal, memberRuntimeRefusal, agentTranscriptTooLarge, knownRuntimeSocketPaths, activeRuntimeSockets } from './member-container';
 import { getWorktreePath } from '../task/identity';
 import { loadConfig } from '../config/loader';
+import { profileForAgentNameOrNull } from '../config/agent-profiles';
 import { pairOrChatRefusal } from '../server/shell-pair';
 
 // One definition of "can another member exist", shared with the session
@@ -114,10 +111,15 @@ export interface ResolveSessionAttachOptions {
    * requires a named member for a task session.
    */
   multiMember: boolean;
-  /** The task's credential binding; seam for tests. */
-  bindingFor?: (taskId: string) => Promise<Pick<SessionCredentialBinding, 'ownerUserId' | 'revokedAt'> | null>;
   /** Seam for tests; defaults to the project's configured runner. */
   runnerFor?: (runnerType: RunnerType | undefined) => Promise<RunnerView>;
+  /**
+   * `tmux`: the attach is to one of the task container's named tmux sessions
+   * (src/sessions/tmux.ts), not a terminal of the caller's own, so the
+   * member-terminal entry check below does not apply to it; the route checks
+   * the task's container is running instead. Every other check does.
+   */
+  purpose?: 'terminal' | 'tmux';
 }
 
 function binaryFor(runner: RunnerView): string {
@@ -213,31 +215,10 @@ export async function resolveSessionAttachTarget(
         `member, and this credential names no member.`,
     };
   }
-  // Member terminals and turns take turns with the worktree: while a turn is
-  // RUNNING (the binding is live, or the task is working) nobody opens one —
-  // the route re-checks this under the task's lifecycle lock
-  // (`enterTaskAsMember`, ./member-entry.ts), and a turn launch refuses while a
-  // member is in. This early answer is what `attachSession` reports before a
-  // socket opens.
-  if (multiMember) {
-    const binding = await (opts.bindingFor ?? ((id) => getTaskSessionBinding(projectRoot, id)))(task.id);
-    if ((binding && binding.revokedAt === null) || task.status === 'working') {
-      const owner = binding?.ownerUserId;
-      return {
-        ok: false,
-        status: 409,
-        message:
-          `Task ${task.code ?? task.id} is running a turn` +
-          (owner ? ` on ${owner === SERVICE_CREDENTIAL_USER_ID ? "the project's service" : `${owner}'s`} credential` : '') +
-          // Never "a terminal opens once the turn has ended": nothing opens one
-          // by itself, so that promised something that never happened. Say
-          // why, and what the reader can do.
-          `, and a terminal cannot open while it does — the agent and a terminal share the task's ` +
-          `working copy. When the turn ends, open the terminal again (or stop the task to open it now).`,
-      };
-    }
-    // The entry's other refusal, said early too: a task that has not run a
-    // turn has no environment of its own to open yet.
+  // The entry's refusal, said early: a task that has not run a turn has no
+  // environment of its own to open yet. A running turn is NOT a refusal. A tmux
+  // attach checks its target container is running instead.
+  if (multiMember && opts.purpose !== 'tmux') {
     if (task.status === 'backlog' || (await storage.getSessionTurns(session.id)).length === 0) {
       return {
         ok: false,
@@ -356,14 +337,14 @@ export interface AttachSessionInfo {
    * the authority; this exists because a refused WebSocket reaches a browser
    * with no readable reason, so a client must be able to say it first.
    */
-  refusals?: Partial<Record<'shell' | 'pair' | 'chat', string>>;
+  refusals?: Partial<Record<'shell' | 'pair' | 'chat' | 'ssh', string>>;
   /** True when a refusal is the caller having no Claude credential stored. */
   credentialMissing?: boolean;
 }
 
 /**
  * The per-mode refusals `attachSession` reports for a task session. Mirrors
- * what the upgrade enforces: another member working in the task, a container
+ * what the upgrade enforces: a container
  * runtime member containers cannot run on, container settings that would let a
  * turn see the member's container, the caller having
  * no credential to bill, and pair/chat's own locks and states.
@@ -376,7 +357,6 @@ export async function taskModeRefusals(opts: {
   /** The task's container runtime binary (the attach target's). */
   binary: string;
   deps?: {
-    holder?: (taskId: string) => string | null;
     runArgsRefusal?: () => Promise<string | null>;
     credentialMissing?: (email: string) => Promise<boolean>;
     pairOrChat?: typeof pairOrChatRefusal;
@@ -388,8 +368,6 @@ export async function taskModeRefusals(opts: {
   const deps = opts.deps ?? {};
   const all = (message: string) => ({ shell: message, pair: message, chat: message });
   if (multiMember && callerEmail) {
-    const holder = (deps.holder ?? memberTerminalHolder)(task.id);
-    if (holder && holder !== callerEmail) return { refusals: all(memberHeldMessage(holder)), credentialMissing: false };
     const runtime = memberRuntimeRefusal(opts.binary);
     if (runtime) return { refusals: all(runtime), credentialMissing: false };
     const runArgs = await (deps.runArgsRefusal ?? (async () => {
@@ -403,11 +381,10 @@ export async function taskModeRefusals(opts: {
     // Whatever team mode says: outside it the only credential is the
     // daemon's own, and a member's terminal never falls back to it
     // (../server/member-exec-credential.ts refuses at the upgrade too).
-    const missing = await (deps.credentialMissing ?? (async (email: string) =>
-      !(await getUserCredential(projectRoot, email))))(callerEmail);
-    if (missing) {
-      return { refusals: all(memberCredentialMissingMessage(callerEmail)), credentialMissing: true };
-    }
+    const problem = deps.credentialMissing
+      ? (await deps.credentialMissing(callerEmail) ? memberCredentialMissingMessage(callerEmail) : null)
+      : await memberTerminalCredentialProblem(projectRoot, callerEmail, await memberTerminalProfile(projectRoot, task.agent_id));
+    if (problem) return { refusals: all(problem), credentialMissing: true };
   }
   const refusals: Partial<Record<'shell' | 'pair' | 'chat', string>> = {};
   const pairOrChat = deps.pairOrChat ?? pairOrChatRefusal;
@@ -422,7 +399,8 @@ export async function taskModeRefusals(opts: {
   if (member && (!refusals.pair || !refusals.chat)) {
     const tooLarge = await (deps.transcriptTooLarge ?? (async (t: Task) => {
       const session = await (await getOrCreateStorage()).getSessionByTaskId(t.id);
-      return agentTranscriptTooLarge(getWorktreePath(projectRoot, t), session?.agent_session_id);
+      const harness = profileForAgentNameOrNull(await loadConfig(projectRoot), t.agent_id)?.harness ?? 'claude-code';
+      return agentTranscriptTooLarge(getWorktreePath(projectRoot, t), session?.agent_session_id, harness);
     }))(task);
     if (tooLarge) {
       const why = "The agent's conversation on this task is too large to open in a terminal of your own. Open a Shell instead.";
@@ -504,10 +482,43 @@ export async function handleAttachSession(
     sessionId: target.sessionId,
     kind: target.kind,
     attachPath: sessionAttachPath(target.sessionId),
-    modes: target.kind === 'builder' ? ['attach'] : target.kind === 'run' ? ['shell'] : ['shell', 'pair', 'chat'],
+    modes: target.kind === 'builder' ? ['attach'] : target.kind === 'run' ? ['shell'] : ['shell', 'pair', 'chat', 'ssh'],
     container: target.container,
     ...(target.kind === 'task' ? { taskId: target.task.id } : {}),
     ...(target.kind === 'run' ? { runId: target.run.id } : {}),
-    ...(preflight ? { refusals: preflight.refusals, credentialMissing: preflight.credentialMissing } : {}),
+    // SSH lands where the Shell lands, under the same rules.
+    ...(preflight ? {
+      refusals: { ...preflight.refusals, ...(preflight.refusals.shell ? { ssh: preflight.refusals.shell } : {}) },
+      credentialMissing: preflight.credentialMissing,
+    } : {}),
   };
+}
+
+export interface SshHostKeyInfo {
+  /** `ssh-ed25519 AAAA…` — the key the caller's SSH connections to this task present. */
+  hostKey: string;
+  /** The login name every lazy SSH config uses. */
+  user: string;
+  taskId: string;
+}
+
+/**
+ * `sshHostKey` — the public half of the stable host key an SSH connection to
+ * this task presents to THE CALLER (one per member on a shared daemon, one per
+ * task solo; ../ssh/host-keys.ts), made on first ask. Resolved exactly as an
+ * attach is, so a caller who could not connect is not handed a key either.
+ */
+export async function handleSshHostKey(projectRoot: string, params: Record<string, unknown>): Promise<SshHostKeyInfo> {
+  const sessionId = typeof params.id === 'string' && params.id ? params.id : null;
+  if (!sessionId) throw new RpcError(400, 'sshHostKey: id (a task session id) is required.');
+  const storage = await getOrCreateStorage();
+  const multiMember = await multiMemberDaemon(projectRoot);
+  const callerEmail = actorEmail(params.actor as ActorInput | undefined) ?? null;
+  const resolved = await resolveSessionAttachTarget({ projectRoot, storage, sessionId, callerEmail, multiMember });
+  if (!resolved.ok) throw new RpcError(resolved.status, resolved.message);
+  if (resolved.target.kind !== 'task') throw new RpcError(400, 'sshHostKey: SSH opens into a task session only.');
+  const { ensureSshHostKey } = await import('../ssh/host-keys');
+  const { SSH_LOGIN_USER } = await import('../ssh/keys');
+  const pair = await ensureSshHostKey(projectRoot, resolved.target.task.id, multiMember ? callerEmail : null);
+  return { hostKey: pair.publicKey, user: SSH_LOGIN_USER, taskId: resolved.target.task.id };
 }

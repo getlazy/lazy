@@ -41,6 +41,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { builderTargetForProfile, resolveBuilderProfileName } from '../builder/builder-profile';
 import { join } from 'path';
 import { readAuditRecords } from '../proxy/audit-log';
 import { currentCredentialFailures } from './current-credential-failures';
@@ -98,6 +99,7 @@ import { seedUsageReadings, usageReadingsStoreError, type UsageReadingsStoreErro
 import { RpcError } from './rpc-error';
 import { getTaskSessionBinding } from './session-credentials';
 import {
+  memberPairUsageLimitsView,
   memberUsageLimitsView,
   projectUsageLimits,
   scopeUsageLimitsView,
@@ -902,12 +904,20 @@ export async function assertBesideUsagePauseOverrideAllowed(
 export async function admitInteractiveSession(
   projectRoot: string,
   storage: Storage,
-  input: { surface: 'pair' | 'chat' | 'builder'; taskId?: string; actor: ActorInput | undefined; peek?: boolean; overrideUsagePause?: boolean },
+  input: {
+    surface: 'pair' | 'chat' | 'builder'; taskId?: string; actor: ActorInput | undefined; peek?: boolean; overrideUsagePause?: boolean;
+    /**
+     * A builder session's own agent profile (`lazy builder --agent <profile>`),
+     * when it is not the builder role's: the session spends THAT profile's
+     * credential, so that is the one judged.
+     */
+    builderProfile?: string;
+  },
 ): Promise<void> {
   if (input.overrideUsagePause && !mayUseUsagePauseOverride(input.actor)) {
     throw new RpcError(403, 'Only a person may override the usage pause for an interactive session.');
   }
-  const config = await loadConfig(projectRoot);
+  const config = withBuilderProfile(await loadConfig(projectRoot), input.surface === 'builder' ? input.builderProfile : undefined);
   if (!usagePauseConfigured(config) && !(await tieredBesideProfile(projectRoot, config))) return;
   const task = input.taskId ? (await storage.resolveTask(input.taskId)).task : null;
   if (input.taskId && !task) throw new RpcError(404, `Task not found: ${input.taskId}`);
@@ -939,6 +949,22 @@ export async function admitInteractiveSession(
         ? 'lazy builder --override-usage-pause'
         : 'lazy pair --host --no-task --override-usage-pause',
   });
+}
+
+/**
+ * The config as a builder session on `profile` sees it: the builder ROLE's
+ * target replaced by that profile's, so every "beside a task" judgement below
+ * (which credential, which tiers) is about the profile the session runs on.
+ */
+function withBuilderProfile(config: ResolvedConfig, profile: string | undefined): ResolvedConfig {
+  if (!profile || profile === config.models.roles.builder.profile) return config;
+  let builder;
+  try {
+    builder = builderTargetForProfile(config, resolveBuilderProfileName(config, profile));
+  } catch (err) {
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
+  return { ...config, models: { ...config.models, roles: { ...config.models.roles, builder } } };
 }
 
 /** Does `id` name an admitted one-shot command that has not expired? */
@@ -1796,11 +1822,14 @@ export async function webInteractiveRefusal(
 ): Promise<{ ok: false; status: 429; message: string } | null> {
   try {
     if (spenderEmail) {
+      const profile = profileForAgentNameOrNull(config, task.agent_id);
       const spend = await spendCredentialFor(projectRoot, config, task.agent_id, spenderEmail, displayId(task));
       await assertSpendAllowed({
         actor: 'human',
         peek,
-        judge: (threshold) => usagePauseForSpend(projectRoot, config, spend, threshold),
+        judge: (threshold) => profile?.tiers
+          ? tieredUsagePause(projectRoot, config, profile.name, profile.harness, threshold, Date.now(), spenderEmail)
+          : usagePauseForSpend(projectRoot, config, spend, threshold),
         task: { id: task.id, retry: usagePauseRetryCommand(mode, displayId(task), 'human') },
         what: `the ${mode} of ${displayId(task)}`,
         refused: `Task ${displayId(task)} was not ${NOT_DONE[mode]}`,
@@ -1846,6 +1875,8 @@ export async function taskViewCredential(
 /** Who is asking for the usage-limit view over MCP — from the authenticated token, never an argument. */
 export type UsageLimitsCaller =
   | { kind: 'task'; taskId: string }
+  /** Pair/Chat's authenticated member, independent of the task's spender. */
+  | { kind: 'member-pair'; email: string; taskId?: string | null }
   /** `label` is the builder's MCP token label (`builder-<id>` for a daemon-owned session). */
   | { kind: 'builder'; label: string | null };
 
@@ -1885,6 +1916,7 @@ async function builderViewCredential(projectRoot: string, config: ResolvedConfig
  * The usage-limit view for an MCP caller, narrowed HERE, in the daemon, so no
  * reading the caller may not see ever leaves it:
  *   - a task agent: only the credential its own live turn spends;
+ *   - member Pair/Chat: that member's endpoint accounts, never the task's payer;
  *   - the builder on a Lazy Teams host: no other member's credential (the
  *     service credential and its session's own, like a member's own CLI);
  *   - the builder on a single-person install: everything.
@@ -1902,6 +1934,14 @@ export async function describeUsageLimitsView(
   // Failing credentials, scoped below exactly like the readings.
   const records = await readAuditRecords(join(projectRoot, config.data.path), { limit: 200 });
   const view = projectUsageLimits(daemonUsageLimits.readings(), state, Date.now(), await currentCredentialFailures(projectRoot, records));
+  if (caller.kind === 'member-pair') {
+    const task = caller.taskId ? await storage.getTask(caller.taskId) : null;
+    const profile = task ? profileForAgentNameOrNull(config, task.agent_id) : null;
+    const endpoints = profile?.harness === 'claude-code'
+      ? endpointRequirementsForProfile(profile, config).filter(r => r.credential !== 'none').map(r => r.endpointId)
+      : undefined;
+    return memberPairUsageLimitsView(view, caller.email, endpoints);
+  }
   if (caller.kind === 'builder') {
     if (!(await teamModeEnabled(projectRoot))) return view;
     return memberUsageLimitsView(

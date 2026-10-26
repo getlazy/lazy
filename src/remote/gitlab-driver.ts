@@ -171,7 +171,7 @@ export class GitLabDriver implements RepositoryDriver {
     // When deps are injected (test mode), default to no-retry to avoid test
     // timeouts from backoff delays. Tests that want to verify retry behavior
     // can explicitly set retryOptions with appropriate timeouts.
-    this.retryOpts = deps?.retryOptions ?? (deps ? { maxAttempts: 1 } : undefined);
+    this.retryOpts = { forge: 'gitlab', ...(deps?.retryOptions ?? (deps ? { maxAttempts: 1 } : {})) };
     this.driverContext = context;
   }
 

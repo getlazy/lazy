@@ -535,6 +535,25 @@ describe('lazy-guest-init bounds the build cache', () => {
     expect(JSON.parse(await readFile(join(runDir, 'lazy-dockerd.json'), 'utf8')).builder.gc.defaultMaxUsedSpace).toBe(r.out.build_cache_max);
   });
 
+  // INVARIANT: live disk growth recomputes DESIRED limits without restarting
+  // Docker. Its embedded BuildKit policy cannot reload and stays at its old cap.
+  test('live resize reports new limits pending restart and a later start applies them', async () => {
+    await fake('df', `echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho "fake $(cat '${state}/disk-kb') 0 1 1% /storage"`);
+    await writeFile(join(state, 'disk-kb'), String(32 * 1048576));
+    expect(ensure().out.build_cache_max).toBe('12GB');
+    await writeFile(join(state, 'disk-kb'), String(64 * 1048576));
+    const plan = ensure({}, '--print-plan');
+    expect(plan.out.build_cache_max).toBe('25GB');
+    expect(plan.out.build_cache_min_free).toBe('12GB');
+    expect(plan.out.dockerd_config_state).toBe('pending-restart');
+    expect(JSON.parse(await readFile(join(runDir, 'lazy-dockerd.json'), 'utf8')).builder.gc.defaultMaxUsedSpace).toBe('12GB');
+    expect((await readFile(join(state, 'starts'), 'utf8')).trim().split('\n')).toHaveLength(1);
+    expect(ensure().out.dockerd_config_state).toBe('pending-restart');
+    await stopFakeDockerd();
+    expect(ensure().code).toBe(0);
+    expect(JSON.parse(await readFile(join(runDir, 'lazy-dockerd.json'), 'utf8')).builder.gc.defaultMaxUsedSpace).toBe('25GB');
+  });
+
   test('a cap that is not a size is ignored instead of breaking dockerd', async () => {
     await mkdir(join(dir, 'overlay-params'));
     const r = ensure({ LAZY_GUEST_BUILD_CACHE_MAX: '1"; rm' });

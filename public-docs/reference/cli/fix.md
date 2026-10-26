@@ -27,8 +27,10 @@ The debugging methodology:
   2. Instrument code with assertions/logs to prove hypotheses
   3. Run and observe actual behavior (don't assume from reading)
   4. Fix with evidence, not theory
-  5. Verify fix passes reproduction and full test suite
+  5. Verify fix passes reproduction and targeted tests
   6. Leave regression test to prevent reintroduction
+
+Run the full test suite only before acceptance into the protected branch.
 
 Examples:
   lazy fix --goal "Token refresh hangs on expired tokens" --code fix-token-hang

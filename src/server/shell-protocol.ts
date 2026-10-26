@@ -52,7 +52,16 @@ export type ShellServerMessage =
   | { type: 'ready'; container: string; resume?: string; resumed?: boolean }
   | { type: 'exit'; code: number | null }
   /** `detail` is what failed underneath — the Teams relay passes it to god mode only. */
-  | { type: 'error'; message: string; detail?: string };
+  | { type: 'error'; message: string; detail?: string }
+  /**
+   * An SSH connection's audit facts, read off sshd's log (`?mode=ssh` only):
+   * the key it accepted, and each `-L` forward it opened — as REPORTED from
+   * inside the person's environment, which they control, so a record and
+   * never a decision. The Teams relay records them on the connection's audit
+   * row; a client ignores them.
+   */
+  | { type: 'ssh-audit'; event: 'key'; keyType: string; fingerprint: string }
+  | { type: 'ssh-audit'; event: 'forward'; host: string; port: number };
 
 export type ParseResult =
   | { ok: true; message: ShellClientMessage }
@@ -147,6 +156,14 @@ export function parseShellServerMessage(raw: string): ServerParseResult {
       if (typeof msg.message !== 'string') return { ok: false, error: 'error message has no text' };
       if (msg.detail !== undefined && typeof msg.detail !== 'string') return { ok: false, error: 'error detail must be text' };
       return { ok: true, message: { type: 'error', message: msg.message, ...(typeof msg.detail === 'string' ? { detail: msg.detail } : {}) } };
+    case 'ssh-audit':
+      if (msg.event === 'key' && typeof msg.keyType === 'string' && typeof msg.fingerprint === 'string') {
+        return { ok: true, message: { type: 'ssh-audit', event: 'key', keyType: msg.keyType, fingerprint: msg.fingerprint } };
+      }
+      if (msg.event === 'forward' && typeof msg.host === 'string' && typeof msg.port === 'number' && Number.isInteger(msg.port)) {
+        return { ok: true, message: { type: 'ssh-audit', event: 'forward', host: msg.host, port: msg.port } };
+      }
+      return { ok: false, error: 'malformed ssh-audit message' };
     default:
       return { ok: false, error: `unknown control message type: ${String(msg.type)}` };
   }

@@ -32,6 +32,8 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
   // What the browser typed into the shell session, and its socket.
   let typed = '';
   let shellSocket: { send(data: string | Uint8Array): void } | null = null;
+  // The query of every shell socket the page opened, in order.
+  const shellQueries: string[] = [];
 
   beforeAll(async () => {
     server = Bun.serve({
@@ -39,6 +41,7 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
       fetch(req, srv) {
         const url = new URL(req.url);
         if (url.pathname.endsWith('/ws')) {
+          if (url.pathname.endsWith('/shell/ws')) shellQueries.push(url.search);
           return srv.upgrade(req, { data: { shell: url.pathname.endsWith('/shell/ws') } }) ? undefined : new Response('upgrade failed', { status: 400 });
         }
         const text = (body: string, type: string) => new Response(body, { headers: { 'content-type': type } });
@@ -244,4 +247,24 @@ describe.skipIf(skipped)('dashboard terminal controls', () => {
     await until(() => browser.evaluate<boolean>(`!!document.querySelector('#mnt .xterm-rows')`), (b) => b, 'the mounted terminal');
     await exercise({ panel: '#mnt .lz-shell-session', fill: '#mnt [data-lz-term-fill]', term: '#mnt [data-lz-shell-term]', size: screenSize('#mnt') });
   }, 60_000);
+
+  // INVARIANT: each plain shell the dashboard opens is a tmux session of its
+  // own in the container — the first is the default `shell` (no `session=`),
+  // later ones `shell-<n>`, a Run `run-<n>` — so a reconnect or `lazy shell`
+  // lands back in the same one, and two terminals are never one session
+  // mirrored twice.
+  test('each shell opened here asks for its own named session', async () => {
+    const before = shellQueries.length;
+    const newButton = `document.querySelector('[data-lz-shell-newtab]').click()`;
+    await browser.evaluate(newButton);
+    await browser.evaluate(newButton);
+    await browser.evaluate(`window.lzShellRun('echo hi\\n', 't1', 'Run')`);
+    const opened = await until(async () => shellQueries.slice(before), (q) => q.length >= 3, 'three shell sockets');
+    const sessions = shellQueries.map((q) => new URLSearchParams(q).get('session'));
+    // The very first plain shell of the page is the default session.
+    expect(sessions.filter((s) => s === null).length).toBe(1);
+    expect(opened.map((q) => new URLSearchParams(q).get('session')).filter((s) => s !== null && /^shell-\d+$/.test(s)).length).toBeGreaterThanOrEqual(1);
+    expect(opened.some((q) => /^run-\d+$/.test(new URLSearchParams(q).get('session') ?? ''))).toBe(true);
+    expect(new Set(sessions).size).toBe(sessions.length);
+  });
 });

@@ -76,7 +76,7 @@ tr.rv-expand td {
   color: var(--color-text); margin-right: 4px;
 }
 .rv-expand-btn:hover { border-color: var(--color-accent); color: var(--color-accent); }
-.rv-expand-btn[disabled] { opacity: 0.5; cursor: default; }
+.rv-expand-btn[aria-busy="true"] { cursor: progress; }
 .rv-expand-count { margin-left: var(--space-2); font-size: 11.5px; }
 tr.rv-add { background: var(--color-success-100); }
 tr.rv-del { background: var(--color-danger-100); }
@@ -175,8 +175,8 @@ td.rv-code:target { outline: 2px solid var(--color-accent); outline-offset: -2px
   border-color: var(--color-accent); color: var(--color-accent-800);
   background: var(--color-accent-100);
 }
-.rv-viewopts button[disabled] { opacity: 0.45; cursor: not-allowed; }
-.rv-viewopts button[disabled]:hover { border-color: var(--color-divider); }
+.rv-viewopts button[aria-busy="true"] { cursor: progress; }
+.rv-viewopts button[aria-busy="true"]:hover { border-color: var(--color-divider); }
 .rv-viewopt-group { display: flex; align-items: center; gap: 6px; margin-right: 10px; }
 
 /*

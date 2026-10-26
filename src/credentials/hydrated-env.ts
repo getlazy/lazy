@@ -55,6 +55,7 @@ export interface HydratedFrom {
   hint: string;
   kind: CredentialKind;
   backend: BackendId;
+  setName?: string;
 }
 
 interface Mark {
@@ -127,12 +128,13 @@ export function hydratedCopyFrom(
 /** Is this index entry the one a value was hydrated from? */
 export function matchesHydratedEntry(
   from: HydratedFrom,
-  entry: { updatedAt: string; hint: string; kind: CredentialKind; backend: BackendId },
+  entry: { updatedAt: string; hint: string; kind: CredentialKind; backend: BackendId; setName?: string },
 ): boolean {
   return entry.updatedAt === from.updatedAt
     && entry.hint === from.hint
     && entry.kind === from.kind
-    && entry.backend === from.backend;
+    && entry.backend === from.backend
+    && entry.setName === from.setName;
 }
 
 /**
@@ -160,7 +162,7 @@ export function markStoreUnreadable(provider: CredentialName, failedOn: Hydrated
  */
 export function storeUnreadableFor(
   provider: CredentialName,
-  entry: { updatedAt: string; hint: string; kind: CredentialKind; backend: BackendId },
+  entry: { updatedAt: string; hint: string; kind: CredentialKind; backend: BackendId; setName?: string },
 ): boolean {
   const known = unreadable.get(provider);
   return !!known && matchesHydratedEntry(known, entry);

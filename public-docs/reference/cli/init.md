@@ -12,7 +12,7 @@ Requires an interactive terminal to display warnings and instructions.
 If a supported remote (GitHub, etc.) is detected, offers to configure it.
 
 Options:
-  --external-path PATH      Put the external store here instead of ~/.lazy/<project-name>.
+  --external-path PATH      Store path: absolute, ~/..., or relative to the project root.
                             Answers the storage prompt, so it also works without a TTY,
                             and rewrites storage.external_path in an existing lazy.toml.
   --skip-auth-check         Skip authentication check during init

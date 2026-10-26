@@ -35,6 +35,10 @@ import {
   agentTranscriptTooLarge,
   removeLeftoverMemberHomes,
   removeLeftoverMemberContainers,
+  readoptMemberContainer,
+  MEMBER_EMAIL_LABEL,
+  MEMBER_BINDING_LABEL,
+  type LeftoverMemberContainer,
   ensureMemberNetwork,
   memberNetworkCreateArgs,
   MEMBER_NETWORK,
@@ -122,6 +126,16 @@ describe('the member container argv', () => {
     expect(name.startsWith('lazy-')).toBe(false);
     expect(memberContainerName('task-1234-uuid')).not.toBe(memberContainerName('task-1234-uuid'));
     expect(flagValues(argv, '--label')).toEqual([`lazy.project=${ROOT}`, `${MEMBER_CONTAINER_LABEL}=task-1234-uuid`]);
+  });
+
+  test('records whose it is and which credential binding it uses, for a later daemon to re-adopt it', () => {
+    const labelled = buildMemberContainerDockerArgs({ ...PARAMS, memberEmail: 'alice@example.com', bindingKey: 'member-exec:task-1234-uuid:01' });
+    expect(flagValues(labelled, '--label')).toEqual([
+      `lazy.project=${ROOT}`, `${MEMBER_CONTAINER_LABEL}=task-1234-uuid`,
+      `${MEMBER_EMAIL_LABEL}=alice@example.com`, `${MEMBER_BINDING_LABEL}=member-exec:task-1234-uuid:01`,
+    ]);
+    // The key names the binding; the placeholder itself is never a label.
+    expect(flagValues(labelled, '--label').join(' ')).not.toContain('lazy-sess-');
   });
 
   test('mounts only files: the repo read-only, the worktree, its git dirs and the agent binary', () => {
@@ -233,6 +247,50 @@ describe("the member container's home", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  // INVARIANT (engineer, 2026-10-24): a member's Pair on a Codex or Pi task
+  // resumes the agent's conversation. The home carries that ONE session file in
+  // at the path the harness keeps it (Codex rollouts under sessions/YYYY/MM/DD,
+  // Pi under its per-worktree directory), hands the member's turns back over
+  // the agent's copy, and saves a session the member started for recovery —
+  // never into the task. Never any of the harness's config.
+  for (const harness of ['codex', 'pi'] as const) {
+    test(`a ${harness} task's conversation is carried in and handed back`, async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), `member-home-${harness}-`)));
+      try {
+        const worktree = join(root, 'wt');
+        const sandbox = join(worktree, '.lazy-task-sandbox');
+        const id = '01a16c74-0b56-7920-b442-9031f1fb5821';
+        const dir = harness === 'codex'
+          ? join('.codex', 'sessions', '2026', '10', '24')
+          : join('.pi', 'agent', 'sessions', `--${worktree.replace(/^\//, '').replace(/\//g, '-')}--`);
+        const name = harness === 'codex' ? `rollout-2026-10-24T05-48-26-${id}.jsonl` : `2026-10-24T05-48-26-000Z_${id}.jsonl`;
+        const otherName = harness === 'codex' ? 'rollout-2026-10-23T00-00-00-0000.jsonl' : '2026-10-23T00-00-00-000Z_other.jsonl';
+        await mkdir(join(sandbox, dir), { recursive: true });
+        await writeFile(join(sandbox, dir, name), '{"agent":1}\n');
+        await writeFile(join(sandbox, dir, otherName), '{"agent":"other"}\n');
+        const configFile = harness === 'codex' ? join(sandbox, '.codex', 'config.toml') : join(sandbox, '.pi', 'agent', 'settings.json');
+        await writeFile(configFile, 'planted');
+
+        const home = await prepareMemberHome({ projectRoot: root, container: `lazymember-${harness}-1`, worktreePath: worktree, agentSessionId: id, harness, safeDirectories: [worktree] });
+        try {
+          expect(await readdir(join(home.dir, dir))).toEqual([name]);
+          expect(await pathExists(join(home.dir, configFile.slice(sandbox.length + 1)))).toBe(false);
+
+          await writeFile(join(home.dir, dir, name), '{"agent":1}\n{"member":2}\n');
+          await writeFile(join(home.dir, dir, harness === 'codex' ? 'rollout-2026-10-24T09-00-00-new.jsonl' : '2026-10-24T09-00-00-000Z_new.jsonl'), '{"member":"own"}\n');
+          await home.close();
+          expect(await readFile(join(sandbox, dir, name), 'utf-8')).toContain('member');
+          expect((await readdir(join(sandbox, dir))).sort()).toEqual([otherName, name].sort());
+          expect(await pathExists(home.dir)).toBe(false);
+        } finally {
+          await rm(home.dir, { recursive: true, force: true });
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe('container settings that would let turns see a member container', () => {
@@ -725,6 +783,25 @@ describe("pinning the member's credential to its container", () => {
     }
   }
 
+  // INVARIANT: a fresh member container records whose it is and which binding
+  // its credential is — without them no later daemon can re-adopt it — and
+  // never the placeholder itself.
+  test('labels the container with its member and credential binding key', async () => {
+    let argv: string[] = [];
+    const { r } = await launchWith({
+      platform: 'darwin',
+      planCredential: async () => ({ ok: true as const, credential: {
+        env: [{ key: 'ANTHROPIC_API_KEY', value: 'lazy-sess-secret' }], release: async () => {}, pinOrigin: async () => {}, key: 'member-exec:task-1234-uuid:ab',
+      } }),
+      run: async (a: string[]) => { if (a[1] === 'run') argv = a; return { exitCode: 0, stderr: '' }; },
+    });
+    expect(r.ok).toBe(true);
+    const labels = flagValues(argv, '--label');
+    expect(labels).toContain(`${MEMBER_EMAIL_LABEL}=alice@example.com`);
+    expect(labels).toContain(`${MEMBER_BINDING_LABEL}=member-exec:task-1234-uuid:ab`);
+    expect(labels.join(' ')).not.toContain('lazy-sess-');
+  });
+
   test('pins to the address the container has on the member network', async () => {
     const { r, log } = await launchWith({ platform: 'linux', containerAddress: async () => '172.30.0.9' });
     expect(r.ok).toBe(true);
@@ -746,6 +823,250 @@ describe('leftover member containers at daemon startup', () => {
     });
     expect(r.removed).toBe(1);
     expect(r.failed).toEqual([{ taskId: 'task-b', name: 'lazymember-bbbb-2', error: 'device busy' }]);
+  });
+
+  test('one re-adopted is left running; the listing carries whose it is and whether it runs', async () => {
+    const seen: LeftoverMemberContainer[] = [];
+    const removed: string[] = [];
+    const r = await removeLeftoverMemberContainers('/p', 'docker', {
+      list: async () => 'lazymember-aaaa-1\ttask-a\talice@example.com\tmember-exec:task-a:01\trunning\nlazymember-bbbb-2\ttask-b\t\t\texited\n',
+      remove: async (_b, name) => { removed.push(name); },
+      readopt: async (l) => { seen.push(l); return l.running; },
+    });
+    expect(seen[0]).toEqual({ name: 'lazymember-aaaa-1', taskId: 'task-a', email: 'alice@example.com', bindingKey: 'member-exec:task-a:01', running: true });
+    expect(seen[1]).toMatchObject({ email: null, bindingKey: null, running: false });
+    expect(r.readopted).toEqual(['lazymember-aaaa-1']);
+    expect(removed).toEqual(['lazymember-bbbb-2']);
+  });
+});
+
+// INVARIANT: a container is re-adopted after a restart only with the SAME
+// credential it was made with, still live — its placeholder is baked into its
+// environment, so nothing is re-minted and a revoked one is never revived —
+// and on Linux only once that credential is pinned again to the container's
+// current address. Anything less, and the container is removed as before.
+describe('re-adopting a member container after a restart', () => {
+  const TASK = 'abcd1234-0000-0000-0000-000000000000';
+  const NAME = `lazymember-${TASK.substring(0, 8)}-aa11`;
+  const KEY = `member-exec:${TASK}:0102`;
+  async function withHome() {
+    const projectRoot = join(baseDir, 'project');
+    const worktree = join(projectRoot, '.lazy', 'worktrees', 'w');
+    await mkdir(join(worktree, '.lazy-task-sandbox'), { recursive: true });
+    const home = await prepareMemberHome({ projectRoot, container: NAME, worktreePath: worktree, agentSessionId: null, safeDirectories: [] });
+    return { projectRoot, home };
+  }
+  const leftover = (over: Partial<LeftoverMemberContainer> = {}): LeftoverMemberContainer =>
+    ({ name: NAME, taskId: TASK, email: 'alice@example.com', bindingKey: KEY, running: true, ...over });
+  const live = async () => ({ token: 'lazy-sess-x', taskId: KEY, sessionId: 's', ownerUserId: 'alice@example.com', kind: 'oauth' as const, boundAt: 1, revokedAt: null as number | null });
+
+  test('re-pins the live credential, and its removal revokes it and hands the home back', async () => {
+    const { projectRoot, home } = await withHome();
+    const log: string[] = [];
+    const r = await readoptMemberContainer({
+      projectRoot, binary: 'docker', leftover: leftover(),
+      deps: {
+        binding: live, credentialProblem: async () => null,
+        platform: 'linux',
+        containerAddress: async () => '172.30.0.7',
+        pinOrigin: async (_r, key, addr) => { log.push(`pin:${key}:${addr}`); },
+        remove: async (_b, n) => { log.push(`rm:${n}`); },
+        releaseCredential: async (_r, key, label) => { log.push(`release:${key}:${label}`); },
+        containerEnv: async () => ({}),
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.grantLabel).toBe(`member-terminal:alice@example.com:${NAME}`);
+    expect(r.container.mcpDirectory).toBe(join(home.dir, 'member-mcp'));
+    expect(log).toEqual([`pin:${KEY}:172.30.0.7`]);
+    expect(await pathExists(home.dir)).toBe(true);
+    await r.container.remove();
+    expect(log.slice(1)).toEqual([`rm:${NAME}`, `release:${KEY}:${r.grantLabel}`]);
+    expect(await pathExists(home.dir)).toBe(false);
+  });
+
+  // INVARIANT: runtime stops lose processes, never the member's environment.
+  // Restart only after ownership and credential validation; pin the new IP
+  // before returning anything a terminal could use.
+  test('restarts a stopped environment, re-pins it, and remembers it across a second restart', async () => {
+    const { projectRoot, home } = await withHome();
+    const log: string[] = [];
+    const deps = {
+      binding: live,
+      credentialProblem: async () => { log.push('credential'); return null; },
+      platform: 'linux' as const,
+      run: async (argv: string[]) => { log.push(argv[1]!); return { exitCode: 0, stderr: '' }; },
+      containerAddress: async () => { log.push('address'); return '172.30.0.19'; },
+      pinOrigin: async (_r: string, _k: string, address: string) => { log.push(`pin:${address}`); },
+      containerEnv: async () => ({}),
+      gitPaths: async () => ({ commonDir: '/git', objectsDir: '/git/objects', worktreeGitDir: '/git/worktrees/w', pointerFiles: [] }),
+    };
+    const r = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover({ running: false }), deps });
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error(r.reason);
+    expect(log).toEqual(['credential', 'start', 'address', 'pin:172.30.0.19']);
+    expect(r.waitForAttach).toBe(true);
+    expect(await pathExists(home.dir)).toBe(true);
+    const again = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover(), deps });
+    expect(again.ok && again.waitForAttach).toBe(true);
+    expect(log.filter(s => s === 'start')).toHaveLength(1);
+    await r.container.adopt!();
+    const prepared = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover(), deps });
+    expect(prepared.ok && prepared.waitForAttach).toBe(true);
+    await r.container.attached!();
+    const attached = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover(), deps });
+    expect(attached.ok && attached.waitForAttach).toBe(false);
+  });
+
+  // INVARIANT: a runtime restart failure preserves the member's environment;
+  // a later retry must revalidate credentials and pin its new address first.
+  test('keeps a failed restart and revalidates the binding before retrying', async () => {
+    const { projectRoot } = await withHome();
+    let revoked = false;
+    let failing = true;
+    const log: string[] = [];
+    const r = await readoptMemberContainer({
+      projectRoot, binary: 'docker', leftover: leftover({ running: false }),
+      deps: {
+        binding: async () => ({ ...(await live()), revokedAt: revoked ? 1 : null }),
+        credentialProblem: async () => null, platform: 'linux',
+        run: async () => { log.push('start'); return { exitCode: failing ? 1 : 0, stderr: 'runtime unavailable' }; },
+        containerEnv: async () => ({}),
+        containerAddress: async () => '172.30.0.20',
+        pinOrigin: async () => { log.push('pin'); },
+      },
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error(r.reason);
+    expect(r.waitForAttach).toBe(true);
+    expect(log).toEqual(['start']);
+    await expect(r.container.prepare!()).rejects.toThrow('could not be restarted');
+    revoked = true;
+    await expect(r.container.prepare!()).rejects.toThrow('no longer live');
+    expect(log).toEqual(['start', 'start']);
+    revoked = false;
+    failing = false;
+    await r.container.prepare!();
+    expect(log).toEqual(['start', 'start', 'start', 'pin']);
+  });
+
+  test('does not restart stopped containers with invalid bindings or refused credentials', async () => {
+    const { projectRoot } = await withHome();
+    const runs: string[][] = [];
+    for (const override of [
+      { binding: async () => null },
+      { binding: async () => ({ ...(await live()), revokedAt: 1 }) },
+      { binding: async () => ({ ...(await live()), ownerUserId: 'bob@example.com' }) },
+      { credentialProblem: async () => 'connection refused' },
+    ]) {
+      const result = await readoptMemberContainer({
+        projectRoot, binary: 'docker', leftover: leftover({ running: false }),
+        deps: { binding: live, credentialProblem: async () => null, run: async argv => { runs.push(argv); return { exitCode: 0, stderr: '' }; }, ...override },
+      });
+      expect(result.ok).toBe(false);
+    }
+    expect(runs).toEqual([]);
+  });
+
+  test('is refused for an unlabelled, homeless or revoked container', async () => {
+    const { projectRoot } = await withHome();
+    const deps = { binding: live, credentialProblem: async () => null, platform: 'darwin' as const, containerEnv: async () => ({}) };
+    const reason = async (l: LeftoverMemberContainer, d: object = deps) => {
+      const r = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: l, deps: d });
+      return r.ok ? null : r.reason;
+    };
+    expect(await reason(leftover({ email: null, bindingKey: null }))).toContain('older lazy');
+    expect(await reason(leftover({ bindingKey: 'member-exec:other:01' }))).toContain('does not match');
+    expect(await reason(leftover({ name: `lazymember-${TASK.substring(0, 8)}-nohome` }))).toBe('its home is gone');
+    expect(await reason(leftover(), { ...deps, binding: async () => ({ ...(await live()), revokedAt: 5 }) })).toBe('its credential was revoked');
+    expect(await reason(leftover(), { ...deps, binding: async () => null })).toBe('its credential was revoked');
+    expect(await reason(leftover(), { ...deps, binding: async () => ({ ...(await live()), ownerUserId: 'bob@example.com' }) })).toContain('does not match');
+    expect(await reason(leftover(), { ...deps, binding: async () => ({ ...(await live()), taskId: 'wrong' }) })).toContain('does not match');
+    expect(await reason(leftover(), { ...deps, credentialProblem: async () => 'connection refused' })).toBe('connection refused');
+    await expect(reason(leftover(), { ...deps, platform: 'linux', containerAddress: async () => null })).rejects.toThrow('no address');
+    await expect(reason(leftover(), { ...deps, containerEnv: async () => { throw new Error('unavailable'); } })).rejects.toThrow('environment cannot be read');
+  });
+
+  // INVARIANT: operational failures never authorize deleting an environment.
+  // A fresh recovery re-reads the live binding before allowing a retry to spend.
+  for (const running of [true, false]) {
+    for (const failure of ['address', 'pin', 'environment', 'binding', 'connection', 'metadata-read', 'metadata-write']) {
+      if (running && failure === 'metadata-write') continue;
+      test(`${running ? 'running' : 'stopped'} recovery stays pending after ${failure} failure`, async () => {
+        const { projectRoot, home } = await withHome();
+        const path = join(home.dir, 'lazy-member-home.json');
+        const original = await readFile(path, 'utf-8');
+        let fail = true;
+        const log: string[] = [];
+        if (failure === 'metadata-read') await writeFile(path, '{');
+        const deps = {
+          binding: async () => {
+            if (fail && failure === 'binding') throw new Error('binding store unavailable');
+            if (fail && failure === 'metadata-write' && !running) {
+              await rm(path);
+              await mkdir(path);
+            }
+            return live();
+          },
+          credentialProblem: async () => {
+            if (fail && failure === 'connection') throw new Error('connection store unavailable');
+            return null;
+          },
+          platform: 'linux' as const,
+          run: async () => { log.push('start'); return { exitCode: 0, stderr: '' }; },
+          containerAddress: async () => {
+            if (fail && failure === 'address') throw new Error('address inspection unavailable');
+            return '172.30.0.24';
+          },
+          pinOrigin: async () => {
+            if (fail && failure === 'pin') throw new Error('binding write unavailable');
+            log.push('pin');
+          },
+          containerEnv: async () => {
+            if (fail && failure === 'environment') throw new Error('environment inspection unavailable');
+            return {};
+          },
+        };
+        await expect(readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover({ running }), deps })).rejects.toThrow();
+        expect(await pathExists(home.dir)).toBe(true);
+        fail = false;
+        if (failure === 'metadata-write') await rm(path, { recursive: true });
+        if (failure === 'metadata-read' || failure === 'metadata-write') await writeFile(path, original);
+        const recovered = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover({ running }), deps });
+        expect(recovered.ok).toBe(true);
+        expect(log).toContain('pin');
+        const revoked = await readoptMemberContainer({ projectRoot, binary: 'docker', leftover: leftover({ running }), deps: { ...deps, binding: async () => ({ ...(await live()), revokedAt: 1 }) } });
+        expect(revoked).toEqual({ ok: false, reason: 'its credential was revoked' });
+      });
+    }
+  }
+
+  // INVARIANT: a re-adopted container's env still names the PREVIOUS daemon's
+  // proxy port (OS-assigned, it moves at every restart), so every terminal
+  // exec carries the address moved to the live port — and never a credential.
+  test("every exec carries the live proxy address in place of the previous daemon's", async () => {
+    const { projectRoot } = await withHome();
+    const runs: string[][] = [];
+    const r = await readoptMemberContainer({
+      projectRoot, binary: 'docker', leftover: leftover(),
+      deps: {
+        binding: live, credentialProblem: async () => null, platform: 'darwin',
+        containerEnv: async () => ({
+          ANTHROPIC_BASE_URL: 'http://host.docker.internal:41000',
+          LAZY_PROXY_BASE_URL: 'http://host.docker.internal:41000',
+          GIT_SSH_COMMAND: 'ssh',
+          ANTHROPIC_API_KEY: 'lazy-sess-secret',
+        }),
+        proxyPort: () => 42000,
+        run: async (argv) => { runs.push(argv); return { exitCode: 0, stderr: '' }; },
+      },
+    });
+    if (!r.ok) throw new Error(r.reason);
+    const env = await r.container.execEnv!();
+    expect(env.sort()).toEqual(['ANTHROPIC_BASE_URL=http://host.docker.internal:42000', 'LAZY_PROXY_BASE_URL=http://host.docker.internal:42000']);
+    expect(runs[0]!.join(' ')).toContain('tmux set-environment -g ANTHROPIC_BASE_URL');
+    expect(runs.flat().join(' ')).not.toContain('lazy-sess-');
   });
 });
 
@@ -784,7 +1105,9 @@ describe("the task's own environment variables", () => {
       if (!r.ok) throw new Error(r.message);
       await r.container.remove();
       const keys = flagValues(runs[0]!, '-e').map((e) => e.split('=')[0]);
-      expect(keys).toEqual(['GIT_SSH_COMMAND', 'ANTHROPIC_API_KEY']);
+      // Lazy's own fixed values only (LAZY_TASK_DATA is always /lazy/data), then the credential.
+      expect(keys).toEqual(['GIT_SSH_COMMAND', 'LAZY_TASK_DATA', 'ANTHROPIC_API_KEY']);
+      expect(flagValues(runs[0]!, '-e')).toContain('LAZY_TASK_DATA=/lazy/data');
       const argvText = runs[0]!.join(' ');
       for (const value of Object.values(vars)) expect(argvText).not.toContain(value);
     } finally {
@@ -1120,8 +1443,8 @@ test('the daemon hands back leftover member homes at startup, before the reconci
 });
 
 // INVARIANT: the member container's startup command EXECUTES correctly: it asks
-// sudo to chown a worktree it cannot write (skipping read-only pointer copies)
-// and leaves a writable one alone. access(2) always succeeds for root, so the
+// sudo to chown the ROOT-owned entries of a worktree it cannot write (skipping
+// read-only pointer copies), never another user's, and leaves a writable one alone. access(2) always succeeds for root, so the
 // probe cannot be exercised there.
 describe('memberContainerCommand executed', () => {
   const asRoot = process.getuid?.() === 0;
@@ -1144,16 +1467,33 @@ describe('memberContainerCommand executed', () => {
     return (await pathExists(log)) ? await readFile(log, 'utf8') : '';
   }
 
-  test.skipIf(asRoot)('chowns a worktree with unwritable entries, skipping read-only paths', async () => {
+  // Needs a real root-owned entry, as a root daemon leaves one.
+  const canSudo = !asRoot && Bun.spawnSync(['sudo', '-n', 'true']).exitCode === 0;
+  test.skipIf(!canSudo)('chowns a worktree with root-owned unwritable entries, skipping read-only paths', async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'lzd-adopt-')));
+    try {
+      const wt = join(dir, 'wt');
+      await mkdir(wt, { recursive: true });
+      expect(Bun.spawnSync(['sudo', '-n', 'mkdir', join(wt, 'log')]).exitCode).toBe(0);
+      const out = await run([wt], [join(wt, '.git')], dir);
+      expect(out).toContain(`find ${wt}`);
+      expect(out).toContain(`! -path ${join(wt, '.git')}`);
+      expect(out).toContain('chown -h');
+    } finally {
+      Bun.spawnSync(['sudo', '-n', 'rm', '-rf', join(dir, 'wt', 'log')]);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // INVARIANT: a directory the container user cannot write but that is NOT
+  // root-owned (its own, or a service user's data dir) is never adopted.
+  test.skipIf(asRoot)('leaves a non-root-owned unwritable directory alone', async () => {
     const dir = await realpath(await mkdtemp(join(tmpdir(), 'lzd-adopt-')));
     try {
       const wt = join(dir, 'wt');
       await mkdir(join(wt, 'log'), { recursive: true });
       await chmod(join(wt, 'log'), 0o555);
-      const out = await run([wt], [join(wt, '.git')], dir);
-      expect(out).toContain(`find ${wt}`);
-      expect(out).toContain(`! -path ${join(wt, '.git')}`);
-      expect(out).toContain('chown -h');
+      expect(await run([wt], [], dir)).toBe('');
     } finally {
       await chmod(join(dir, 'wt', 'log'), 0o755).catch(() => {});
       await rm(dir, { recursive: true, force: true });

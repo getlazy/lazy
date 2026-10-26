@@ -56,7 +56,7 @@ type WorkingSubstateKind =
        * `list`/`active`/MCP say WHAT is being retried (attempt count, failure
        * class, latest error) rather than a bare `harness:retrying`.
        */
-      retry?: RetrySummaryInput;
+      retry?: RetrySummaryInput & { summary?: string };
     }
   | {
       /**
@@ -247,9 +247,12 @@ export function deriveWorkingSubstate(
       currentCommandStartedAt: status.current_command_started_at,
       retry: status.phase === 'retrying'
         ? {
+            summary: formatRetrySummary(status) ?? undefined,
             retryCount: status.retryCount,
             errors: status.errors,
             retry_failure_class: status.retry_failure_class,
+            retry_next_at: status.retry_next_at,
+            retry_recovery_deadline: status.retry_recovery_deadline,
           }
         : undefined,
     };

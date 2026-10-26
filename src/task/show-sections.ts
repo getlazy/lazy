@@ -31,12 +31,13 @@
  */
 
 import { formatTurnLatency } from './turn-latency';
-import type { Comment, Session, Turn } from '../types';
+import type { Comment, ReviewComment, Session, Turn } from '../types';
 import { resolveNotesCutoff } from './turn-context';
 import { foldTurn, type TurnFold } from './wrapper-fold';
 import { resolveFinalState, finalHeadMovedLabel, type FinalState } from './final-state';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 import { buildConversation, type ConversationExchange } from './conversation';
+import { buildChat, type ChatMessage } from './chat';
 import {
   successfulReviewTurnsOf,
   raisedItemIdsOf,
@@ -61,6 +62,7 @@ export const SHOW_SECTION_NAMES = [
   'turns',
   'chunks',
   'conversation',
+  'chat',
   'commits',
   'comments',
   'journal',
@@ -191,6 +193,13 @@ export function buildShowChunks(turns: Turn[]): ShowChunk[] {
 /** The chunks as person -> reply exchanges; the rule lives in conversation.ts. */
 export function buildShowConversation(turns: Turn[]): ConversationExchange[] {
   return buildConversation(turns);
+}
+
+// --- Chat ------------------------------------------------------------------
+
+/** The person's words and the agent's answers to its asks; the rule lives in chat.ts. */
+export function buildShowChat(turns: Turn[], reviewComments: ReviewComment[]): ChatMessage[] {
+  return buildChat(turns, reviewComments);
 }
 
 // --- Reviews --------------------------------------------------------------

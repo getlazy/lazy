@@ -16,6 +16,7 @@ import { tmpdir } from 'os';
 import {
   initDaemonStorage,
   getOrCreateStorage,
+  openProjectStorage,
   closeAllStorage,
   daemonStoreLockHold,
 } from '../../src/daemon/rpc-handlers';
@@ -192,6 +193,16 @@ describe('the daemon reports a store it could not open', () => {
     if (prevLazyConfig === undefined) delete process.env.LAZY_CONFIG;
     else process.env.LAZY_CONFIG = prevLazyConfig;
     await rm(root, { recursive: true, force: true });
+  });
+
+  // INVARIANT: daemon storage errors retain both the configured and resolved
+  // paths. Explicit options must not erase the spelling a person can fix.
+  test.each(['singleton', 'fresh'] as const)('%s storage open reports the relative configured path', async (mode) => {
+    await writeFile(join(root, 'lazy.toml'), '[storage]\nbackend = "external"\nexternal_path = "./store"\n');
+    await writeFile(storeDir, 'not a directory');
+    initDaemonStorage(root);
+    const open = mode === 'singleton' ? getOrCreateStorage() : openProjectStorage(root);
+    await expect(open).rejects.toThrow(`Cannot open storage "./store" (resolved to "${storeDir}")`);
   });
 
   // INVARIANT: a failed open is reported as such (with its error), never as

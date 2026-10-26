@@ -15,6 +15,10 @@ import { tmpdir } from 'os';
 import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('lazy_stop input validation', () => {
   let testDir: string;
@@ -31,7 +35,7 @@ describe('lazy_stop input validation', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     ctx = { taskId: '', worktreePath: testDir, storage };
   });
 

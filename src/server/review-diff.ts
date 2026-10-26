@@ -1282,7 +1282,7 @@ export function diffViewScript(rootSelector: string, expandUrl?: string): string
 
     root.addEventListener('click', function (ev) {
       var btn = ev.target.closest ? ev.target.closest('.rv-expand-btn') : null;
-      if (!btn || btn.disabled) return;
+      if (!btn || btn.getAttribute('aria-busy') === 'true') return;
       var visibleRow = btn.closest('tr.rv-expand');
       var table = btn.closest('table.rv-diff');
       if (!visibleRow || !table) return;
@@ -1451,7 +1451,7 @@ export function diffViewScript(rootSelector: string, expandUrl?: string): string
 
   function setBusy(visibleRow, busy) {
     var btns = visibleRow.querySelectorAll('.rv-expand-btn');
-    for (var i = 0; i < btns.length; i++) btns[i].disabled = busy;
+    for (var i = 0; i < btns.length; i++) btns[i].setAttribute('aria-busy', String(busy));
   }
 
   function fail(visibleRow, message) {
@@ -1473,7 +1473,7 @@ export function diffViewScript(rootSelector: string, expandUrl?: string): string
 
   // Two panes of code do not fit on a phone, and a diff you can only reach by
   // scrolling sideways is worse than one column. Below the breakpoint the
-  // layout is forced back to unified and the Split button is disabled — the
+  // layout is forced back to unified and Split explains how to use it — the
   // stored preference is left alone, so widening the window restores it.
   var narrow = window.matchMedia('(max-width: 900px)');
 
@@ -1635,7 +1635,8 @@ ${presentedViewScript()}
   function syncNarrow() {
     var splitBtn = bar.querySelector('[data-rv-mode="layout"][data-rv-value="split"]');
     if (splitBtn) {
-      splitBtn.disabled = narrow.matches;
+      if (narrow.matches) splitBtn.setAttribute('data-control-refusal', 'Side by side needs a wider window. Widen the window to use Split.');
+      else splitBtn.removeAttribute('data-control-refusal');
       splitBtn.title = narrow.matches ? 'Side by side needs a wider window' : '';
     }
     if (current.layout) set('layout', current.layout, false);
@@ -1682,7 +1683,7 @@ ${presentedViewScript()}
 
   bar.addEventListener('click', function (ev) {
     var btn = ev.target.closest ? ev.target.closest('[data-rv-mode]') : null;
-    if (!btn || btn.disabled) return;
+    if (!btn || btn.getAttribute('aria-busy') === 'true') return;
     set(btn.dataset.rvMode, btn.dataset.rvValue, true);
   });
 })();

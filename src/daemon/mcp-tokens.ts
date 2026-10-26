@@ -30,6 +30,8 @@
  * documented in ./actor-tokens.ts.
  */
 
+import { lookupMemberPairIdentity, type MemberPairIdentity } from './member-pair-mcp';
+
 import {
   mintDaemonToken,
   lookupDaemonIdentity,
@@ -51,7 +53,8 @@ export { MAX_BUILDER_TOKENS };
 /** Who a presented MCP token proves the caller to be. */
 export type McpIdentity =
   | { kind: 'task'; taskId: string }
-  | { kind: 'builder' };
+  | { kind: 'builder' }
+  | MemberPairIdentity;
 
 /**
  * Extra facts about the session a token is being minted for.
@@ -65,7 +68,7 @@ export type MintMcpTokenOptions = Omit<MintDaemonTokenOptions, 'rotate'>;
 /** Mint (or reuse) the token bound to one MCP identity. */
 export function mintMcpToken(
   projectRoot: string,
-  identity: McpIdentity,
+  identity: Exclude<McpIdentity, MemberPairIdentity>,
   label: string,
   options: MintMcpTokenOptions = {},
 ): Promise<string> {
@@ -81,6 +84,8 @@ export async function lookupMcpIdentity(
   projectRoot: string,
   token: string | null | undefined,
 ): Promise<McpIdentity | null> {
+  const member = lookupMemberPairIdentity(projectRoot, token);
+  if (member) return member;
   const identity: DaemonIdentity | null = await lookupDaemonIdentity(projectRoot, token);
   if (!identity) return null;
   if (identity.kind === 'task') return { kind: 'task', taskId: identity.taskId };
@@ -123,7 +128,7 @@ export function clearMcpTokenCache(): void {
 /** The token currently bound to an identity, or null. Diagnostics/tests. */
 export function peekMcpToken(
   projectRoot: string,
-  identity: McpIdentity,
+  identity: Exclude<McpIdentity, MemberPairIdentity>,
   label: string,
 ): Promise<string | null> {
   return peekDaemonToken(projectRoot, identity, label);

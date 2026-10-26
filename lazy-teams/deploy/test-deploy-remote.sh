@@ -249,7 +249,7 @@ assert_contains "${out}" "--source rsync" "a failed fetch suggests the credentia
 
 out="$(LAZY_FAKE_SSH_FAIL_ON='waiting for /up' run_deploy "${WORK}/fail4.log" root@box.example --repo git@x:y.git)"; RC=$?
 assert_rc 1 "a failing health wait exits non-zero"
-assert_contains "${out}" "do not restart the stack" "a health-wait failure warns against restarting mid-build"
+assert_contains "${out}" "not a restart" "a health-wait failure warns against restarting mid-build"
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "6. teardown is guarded"

@@ -79,6 +79,7 @@ export function beginContainerStart(
   taskId: string,
   actions: Pick<TaskActions, 'ensureContainer'>,
   subjectId: string = taskId,
+  restart = false,
 ): ContainerStartState {
   const existing = getContainerStart(taskId);
   if (existing && existing.phase === 'starting') return existing;
@@ -95,7 +96,7 @@ export function beginContainerStart(
       // Narration from the launch itself: which image, why a rebuild, the
       // build's own output. Latest line wins — this is a status, not a log.
       if (detail.trim()) state.detail = detail.trim();
-    })
+    }, restart)
     .then((result) => {
       state.phase = 'done';
       state.detail = result.alreadyRunning

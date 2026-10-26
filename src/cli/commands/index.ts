@@ -17,6 +17,7 @@ export { commandCustomize, customizeUsage, customizeSubcommandUsage } from './cu
 export { commandTokens, tokensUsage } from './tokens';
 export { commandDiff, diffUsage } from './diff';
 export { commandRegions, regionsUsage } from './regions';
+export { commandSessions, sessionsUsage } from './sessions';
 export { commandShell, shellUsage } from './shell';
 export { commandDashboard, dashboardUsage } from './dashboard';
 export { commandPlayground, playgroundUsage } from './demo';

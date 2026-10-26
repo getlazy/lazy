@@ -63,12 +63,32 @@ describe('a bound clone reaches its project through the Teams proxy', () => {
         if (url.pathname === '/api/projects/acme/lazy-toy/rpc/list') {
           return Response.json({ tree: [] });
         }
+        if (url.pathname === '/api/projects/acme/lazy-toy/rpc/show') {
+          return Response.json({ task: { id: 'abcdef1234', code: 'demo' }, session: { id: 'session-ssh' } });
+        }
         return Response.json({ error: `unexpected path ${url.pathname}` }, { status: 404 });
       },
     });
   }
 
   const env = () => ({ HOME: tmpHome, LAZY_DAEMON_BASE_DIR: daemonBase, LAZY_TEST: '', LAZY_IS_DAEMON: '' });
+
+  // INVARIANT: an HTTP Teams binding is described as HTTP, never as HTTPS.
+  // The SSH name also carries the install port, matching the Teams panel.
+  test('SSH config describes the actual HTTP transport and install address', async () => {
+    stub = startStubProxy();
+    await writeTeamsLogin(ctx.root, {
+      teamsUrl: `http://127.0.0.1:${stub.port}`,
+      token: 'lz_cli_token_abc',
+      project: 'acme/lazy-toy',
+      projectId: '42',
+    });
+    const result = await ctx.lazy(['shell', 'demo', '--ssh-config'], { env: env() });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`Host demo.lazy-toy.acme.127.0.0.1--http-${stub.port}\n`);
+    expect(result.stderr).toContain('through Lazy Teams over HTTP (no DNS, no open SSH port)');
+    expect(result.stderr).not.toContain('over HTTPS');
+  });
 
   test('`lazy list` reaches the stub proxy carrying the ApiToken', async () => {
     stub = startStubProxy();

@@ -29,8 +29,12 @@ export interface BuilderLaunchDirective {
  * Resolved through `resolveBuilderModel`, exactly as `lazy builder` does, so a relaunch with
  * no profile model lands on the builder default and never omits `--model`.
  */
-export function resolveBuilderLaunchDirective(config: ResolvedConfig): BuilderLaunchDirective {
-  const target = resolveRoleTarget('builder', config);
+export function resolveBuilderLaunchDirective(
+  config: ResolvedConfig,
+  // The session's own target when it runs on a profile other than the role's
+  // (`lazy builder --agent …`): its model must be valid on THAT harness.
+  target: { harness: string; model: string } = resolveRoleTarget('builder', config),
+): BuilderLaunchDirective {
   return {
     model: resolveBuilderModel(config, { harness: target.harness, model: target.model }),
     effort: config.builder.effort,

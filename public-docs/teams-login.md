@@ -156,42 +156,51 @@ The usage-pause check that `lazy start` and `lazy unblock` run before they
 open an editor asks the install the same way.
 
 `lazy chat`, `lazy report` and `lazy ask` on a stored conversation work from a
-bound clone and spend **your own** Claude credential, exactly as the browser
-does — never the project's or a colleague's. `lazy chat <task>` opens the
-task's Chat on the install, like `lazy pair` opens its Pair: it runs there, in
-an environment of your own, and **ctrl-]** leaves it. As in the browser, you
-can chat with a paused task whose agent is Claude Code; `--effort` and
-`--override-usage-pause` do not apply, because the install decides how the
-session runs. `lazy report` and `lazy ask <conversation>` run their model
-calls on the install and print the answer here. `lazy report` reads the project's tasks from the install but its main-branch commits from your checkout, so pull first for an up-to-date report. If you have not connected a
-Claude account to the install yet, each of them says so and runs nothing.
+bound clone and use **your own** model connection, exactly as the browser
+does — never a colleague’s. `lazy chat <task>` opens interactive terminal Chat
+on the install, like `lazy pair` opens Pair: it runs there, in an environment
+of your own, and **ctrl-]** leaves it. Chat uses the task’s profile and supports
+Claude Code, Cursor and Pi; for a Codex task, use `lazy ask <task>` or the
+browser’s **Chat tab** for a read-only question. Member terminals can run
+beside the task’s agent. `--effort` and `--override-usage-pause` do not apply
+to bound-clone Chat, because the install decides how the session runs.
+
+`lazy report` and `lazy ask <conversation>` run their model calls on the
+install and print the answer here. `lazy report` reads the project’s tasks
+from the install but its main-branch commits from your checkout, so pull first
+for an up-to-date report. If a required connection is missing, the command
+explains which one to connect and runs nothing.
 
 ## Your builder, from a bound clone
 
 `lazy builder` in a bound clone does not start anything on your machine. Your
 builder runs on the Teams install, next to the project, and `lazy builder`
-opens a terminal on it. Running `lazy builder` again — from this clone, another
-machine, or the **Builders** page in your browser — reaches the same session, so
-you can start something on your laptop and pick it up from your phone. Its
-conversation is kept with the project, like any other builder conversation.
+opens a terminal on it. Each `lazy builder` starts another builder with a fresh
+conversation; existing builders keep running. Use `lazy builder attach <id>`
+to rejoin a running builder or resume a stopped one. The same builder is
+reachable from the **Builders** page in your browser, so you can start on your
+laptop and pick it up from your phone. Its conversation is kept with the project.
 
 - **ctrl-]** leaves the terminal. The builder keeps running.
-- `lazy builder stop` stops it and keeps its conversation; the next
-  `lazy builder` resumes it.
-- `lazy builder end` ends it for good.
+- `lazy builder stop [<id>]` stops a builder and keeps its conversation;
+  `lazy builder attach <id>` resumes it.
+- `lazy builder end [<id>]` ends the run. Its transcript remains available and
+  can still be resumed from the browser’s builders list.
+- With several builders, name the id to attach, stop or end; leaving it out
+  lists the choices rather than picking one for you.
 
 In the browser, a stopped builder stays on the **Builders** page, marked
-"Stopped — resumable". Its page has a **Resume** button, and the Builders page
-button reads **Resume your builder**. If a builder stopped on its own (it
-crashed, or the machine restarted), its page says so, with the exit code, and
-Resume starts it again. If a stopped builder's conversation cannot be picked
-up again, starting it opens a fresh conversation instead; the old one stays
-readable under **Builders**. If Teams could not check whether your builder is
-running, the terminal says so; nothing is stopped, and you can try again in a
-moment.
+"Stopped — resumable". **Resume** starts that builder again on the profile it
+used before, leaving your other builders running. If it stopped unexpectedly,
+its page says why, with the exit code. If its session file is missing, Resume
+explains that and starts nothing; its transcript stays readable. **Continue**
+starts an additional builder from a summary instead. See
+[Resuming a builder](reference/teams/builders.md#resuming-a-builder).
 
 A builder runs until you stop or end it — there is no idle timeout. It runs on
-your own Claude account, so connect one in Teams first. Options that choose how
+your own connection for its Claude Code or Codex profile. Choose a profile
+with **Runs on** in the browser; a missing connection is explained before
+anything starts. Options that choose how
 a local builder runs (`--model`, `--effort`, `--resume`, `--no-autonomous`)
 are refused from a bound clone: the server decides how its sessions run.
 
@@ -200,9 +209,10 @@ To use a Claude Code you run yourself against the project instead, see
 works, with fewer capabilities than the server-side builder.
 
 Without `--local` (below), `lazy pair` and `lazy shell` likewise go through Teams
-rather than opening anything locally. On a Teams install they are refused: a task's
-container runs on the account of whoever started the task, so entering it in
-your name is not offered.
+rather than opening anything locally. They enter your own environment on the
+task’s files, alongside the agent and other members. Pair supports Claude Code,
+Codex, Cursor and Pi, using your connections for the task’s profile. See
+[Pairing](pairing.md#pairing-in-lazy-teams) for conversation capture and tool limits.
 
 ### Working on a task's branch on your own machine
 
@@ -276,6 +286,14 @@ by; log in again whenever you like to see the new one.
 If another project has taken the old name since a clone logged in, the clone is
 refused rather than connected to that other project; log in again with
 `lazy login --project <team/new-name>`.
+
+### When the project is deleted
+
+A clone bound to a deleted project never reaches its successor. If the project
+is deleted and a new one is created under the same `team/project` name, a clone
+logged in before that delete is refused rather than reaching the new project.
+Logins made since, and addresses that were never reused, are not affected. Run
+`lazy login` again to bind it to the new one.
 
 ## Seeing where a machine and a clone point
 

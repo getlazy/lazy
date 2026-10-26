@@ -20,7 +20,7 @@ import type { Session } from '../types';
 import { loadConfig } from '../config/loader';
 import { bridgeSessionForRunnerSwitch } from '../cli/commands/pair-bridge';
 import { logger } from '../utils/logger';
-import { recordRecreationIfRunning, RECORDED_ENVIRONMENT_EXIT_KEY } from '../task/environment-replaced';
+import { recordRecreationIfRunning, RECORDED_ENVIRONMENT_EXIT_KEY, OBSERVED_ENVIRONMENT_EXIT_KEY } from '../task/environment-replaced';
 import type { Runner } from './types';
 
 /**
@@ -121,9 +121,11 @@ export async function removeTaskRun(
     task_id?: string;
   } | null | undefined,
   containerName: string,
+  // Services can create an environment before the task has its first session.
+  taskId = session?.task_id,
 ): Promise<void> {
-  if (session?.task_id && runner.usesSandbox && runner.isRunning) {
-    await recordRecreationIfRunning(storage, session.task_id, null, {
+  if (taskId && runner.usesSandbox && runner.isRunning) {
+    await recordRecreationIfRunning(storage, taskId, null, {
       usesSandbox: () => runner.usesSandbox!(),
       isRunning: name => runner.isRunning!(name),
       getRunInfo: runner.getRunInfo?.bind(runner),
@@ -138,11 +140,12 @@ export async function removeTaskRun(
     session.container_agent_id = null;
   }
   await runner.removeRun(containerName);
-  if (session?.task_id && runner.usesSandbox?.()) {
+  if (taskId && runner.usesSandbox?.()) {
     // All replacement launches tear down here first. The removed environment's
     // fingerprint must not suppress loss of its successor with the same name,
     // even when that successor disappears before the first live probe.
     // Keep the pending notice and durable history; only retire deduplication.
-    await storage.updateTaskMetadata(session.task_id, RECORDED_ENVIRONMENT_EXIT_KEY, '');
+    await storage.updateTaskMetadata(taskId, RECORDED_ENVIRONMENT_EXIT_KEY, '');
+    await storage.updateTaskMetadata(taskId, OBSERVED_ENVIRONMENT_EXIT_KEY, '');
   }
 }

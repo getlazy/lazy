@@ -61,6 +61,8 @@ import { describeProgress } from './progress';
 import { resolveTargetAddresses, describeTargetResolution } from '../utils/target-resolution';
 
 export interface DaemonMcpConfig {
+  /** Member connection: narrow discovery; authority still comes from the token. */
+  memberPair?: boolean;
   /**
    * This caller's OWN MCP bearer token, minted for exactly one identity — this
    * task, or the builder (see src/daemon/mcp-tokens.ts). It is not the shared
@@ -760,6 +762,8 @@ export async function signalDaemonShutdown(config: DaemonMcpConfig): Promise<voi
  * launching the container).
  */
 export interface DaemonMcpConfigFile {
+  /** Member connection: advertisement only, never an identity claim. */
+  memberPair?: unknown;
   /** Capabilities granted to this identity; absent means none. */
   capabilities?: unknown;
   /** Bearer token */
@@ -792,6 +796,7 @@ export function readDaemonMcpConfig(configPath: string): DaemonMcpConfig {
     target: raw.target,
     sourcePath: configPath,
     capabilities: knownCapabilities(raw.capabilities),
+    memberPair: raw.memberPair === true,
   };
 }
 
@@ -825,6 +830,7 @@ export async function readDaemonMcpConfigWithRetry(configPath: string): Promise<
         target: raw.target,
         sourcePath: configPath,
         capabilities: knownCapabilities(raw.capabilities),
+        memberPair: raw.memberPair === true,
       };
     } catch (err) {
       lastErr = err;

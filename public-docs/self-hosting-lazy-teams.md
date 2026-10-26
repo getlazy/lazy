@@ -416,6 +416,61 @@ mount follows the *path*, not the directory that was there at startup, so
 replacing it swaps what the running containers see. Stop the stack, move the
 directory, point `LAZY_FLEET_HOST_PATH` at the new location, and start again.
 
+## Deleting projects, teams and users
+
+Projects and teams are deleted from their **Danger zone**: the last tab of a
+project's **Settings**, and **Danger zone** on a team's page. It is set apart in
+red, and asks you to type the name before anything happens. Every member can
+open it. If you may not delete the project or team, the **Delete** button is
+still there, and pressing it tells you who can.
+
+![A project's Settings → Danger zone: the red panel with what deleting it does, and the field for typing its name](images/teams-topics/danger-zone-project.png)
+
+- **A project** is deleted by a team admin or owner (or god mode). It stops,
+  and nobody can open it, run its tasks, or reach it from a logged-in clone or
+  Slack any more. Credentials and tokens members connected for it are revoked;
+  its Slack rooms are archived. A project being set up, started or upgraded
+  says so instead, and can be deleted once that has finished.
+- **A team** is deleted by one of its owners (or god mode), and only once it has
+  no projects left — its Danger zone says so, and links to them, until then.
+  Its memberships, integrations and team-level credentials go; its members
+  keep their accounts.
+
+![A team's Danger zone while it still has a project: the reason, in place of the form](images/teams-topics/danger-zone-team-refused.png)
+
+- **A user** is deleted from god mode, by typing their address. They are signed
+  out and removed from every team, and their Claude and agent credentials, API
+  tokens and forge connections are revoked on every project. The work they did
+  still names them. The installation's last site admin, your own account, and
+  the only owner of a team cannot be deleted.
+
+A deleted project's **data is kept, not destroyed**. Its task store, its working
+copy, its members' builder history and (for a repository this install hosts) its repository are moved to
+`<fleet root>/deleted/<project>-<timestamp>/`, with a `README.txt` saying what it
+was and how to bring it back — adopting a copy of the store, as described below
+(the README's command includes `COPY=1`, and `AS=` names who deleted it — replace it with a current team member if they are not one), creates it again as a new project. For a hosted repository, the README first has you push the kept repository to a new remote with `git push --mirror` and adopt against that, because the old hosted address no longer answers. **God mode → Deletions** lists every delete with who
+made it, and **Wipe for good** there removes a project's kept data permanently —
+refused while any project runs on a store inside it.
+
+A project's working copy lives on its machine, so a delete carries it out of
+the machine first, and refuses when it cannot — a machine that will not start,
+say — leaving the project as it was. In god mode, the Danger zone also offers
+**Delete without saving the working copy** for exactly that case: the machine
+is deleted anyway, the task store is still kept aside, and **Deletions** records
+that the working copy was discarded and why. Work in it that was never pushed
+is lost. Team admins and owners never see this option.
+
+A delete that fails partway says so on the project page, including where any
+data was already moved; such a project cannot be started again, only deleted
+again to finish. A user delete also ends that person's builder sessions, so a
+new account with the same address starts with a session of its own.
+
+A new project, team or account can take a deleted one's name or address right
+away. It is a new record and starts empty: nothing of the deleted one carries
+over. A clone that was logged in to the deleted project is refused by the new
+one and asked to log in again — including one logged in under an address the
+project or its team had before a rename.
+
 ## Adopting an existing store
 
 If you have been running lazy locally on a project — a daemon on your own
@@ -637,7 +692,7 @@ it was created. You confirm by typing the new slug.
 
 ## Hosting repositories on the install
 
-When you add a project, choose **Host on this install** instead of pasting a GitHub or GitLab URL. The install keeps a bare repository for that project and serves `git clone`, `fetch`, and `push` over HTTPS (smart HTTP) at a URL under your `APP_HOST`.
+When you add a project, choose **Host on this install** instead of pasting a GitHub or GitLab URL. The install keeps a bare repository for that project and serves `git clone`, `fetch`, and `push` over HTTPS (smart HTTP) at a URL under your `APP_HOST` — copy it from the project page. A repository's address belongs to its project for good: if the project is ever deleted and a new one is created with the same name, the new one gets the next free address (`…/git/acme/api-2.git`), and clones of the old one are refused rather than pushing into the new one.
 
 From your own machine, run `lazy login <install>` once: it sets git up for that
 install, so `git clone`, `fetch` and `push` need no password (see below). Where
@@ -1021,6 +1076,8 @@ Saving a different size stops the machine and starts it again. The machine is no
 
 The Installation page in god mode sets the size for machines created from then on. A blank field there keeps the built-in size (4 CPUs, 8192 MiB, 32 GiB), or the `LAZY_SMOLVM_*` value when one is set. Projects that already have a machine keep their size until you change that project.
 
+Full project disks recover automatically. Lazy first reclaims unused Docker space and retries the failed build, pull or launch once. If space is still exhausted, the next machine check grows the disk live in 16 GiB steps, up to 128 GiB by default. This keeps running containers and their work in place. God mode sets the **Automatic disk growth ceiling** on the Installation page or overrides it on a project's Machine page. **Grow disk now** runs that recovery immediately for an exhausted disk or unfinished resize. Lowering the ceiling never shrinks a disk. When growth reaches that ceiling or fails, the Machine page records why; members are told that the project ran out of space and an admin has been notified.
+
 ## Checking the host is not overcommitted
 
 The landing page of god mode has a **Host capacity** section for microVM installs. It adds up the CPUs and memory of the machines that are running, compares them with the host's RAM and CPU count, and shows the host's own view of memory: how much is available, how much is compressed or swapped, and the pressure level (macOS) or memory stall time (Linux). A machine that is stopped holds no host memory, so it is listed but not counted.
@@ -1035,15 +1092,28 @@ A project's admins can see what its machine is doing, even where they cannot cha
 
 - each step and how long it took;
 - the failing step and its output, when a step fails;
-- the end of the log.
+- the complete saved log.
 
 **Cancel** stops a running build; steps that already finished stay cached. **Rebuild** builds the image again. Confirming **Use Dockerfile.lazy from…** takes you straight to that build's log, and the page never waits for the build to finish.
 
-**The machine.** **Machine**, in the project page's header, shows the machine's four services: the container runtime, the forwarder, the project's daemon and the task proxy. For each, it gives the service's state and its recent log. It also shows CPU, memory and disk use against the machine's size. On a host shared by several projects (the local Docker backend), the host's name, CPU, memory and disk are not shown, because they would describe every project on that host; the page says so instead. Logs are shown with credentials and secrets removed before they leave the machine. The page is read-only for project admins.
+**Image and build history.** Open **Image** from the project header or **Settings → Image**. Project admins can always choose **Rebuild image** or **Rebuild without cache** there. While a build runs, its log and **Cancel build** stay available. Clicking either rebuild button during a build explains that it is running and links to its log. When a rebuild is held for disk capacity, clicking shows the measured space requirement, links to **Free space**, and explains when to ask the site admin to raise the disk.
+
+The page shows the current image tag, Dockerfile source, recorded commit and build time. Checks that reuse an existing image are labelled separately and do not change its recorded build time. Build history records automatic builds and admin rebuilds, including who requested them, when they ran, their source commit, result and duration. Each build has a permanent page. Teams saves the full logs of the newest **20 builds**; older builds remain as summaries. Saved pages keep working after builds finish and after the project's daemon restarts.
+
+**The machine.** **Machine**, in the project page's header, shows the machine's four services: the container runtime, the forwarder, the project's daemon and the task proxy. For each, it gives the service's state and its recent log. It also shows CPU, memory and disk use against the machine's size. On a host shared by several projects (the local Docker backend), the host's name, CPU, memory and disk are not shown, because they would describe every project on that host; the page says so instead. Logs are shown with credentials and secrets removed before they leave the machine. Project admins can read diagnostics and free unused Docker space; machine growth stays in god mode.
 
 On a microVM, the container runtime also has a **Restart history**: each time it stopped, how it ended (its exit status, the end of its log, and whether the machine ran out of memory), and each time it was started again. When it stops, lazy restarts it on its own; if it stops again after three restarts within 15 minutes, lazy stops restarting it, and the page shows **Keeps stopping** for your installation's administrator. A restart from god mode is shown as requested and never counts toward that limit. If an image build loses its connection to the container runtime because the runtime stopped or was cut off, lazy runs the build once more after the runtime answers again. If that fails too, the failure says what the machine recorded (for example, that the runtime ran out of memory) and marks it as the installation administrator's to fix.
 
 On a microVM, the container runtime stores images and builds them in a way that keeps its memory use low, even while a large image is being built and saved, so big project images build without the runtime running out of memory. It also keeps its build cache to at most 40% of the machine's disk, removing the least recently used entries beyond that, so builds stay fast without the cache filling the disk.
+
+**Disk space.** On a microVM, the Machine page shows capacity and free space, build cache, images and container space, plus the last cleanup and disk growth. Project admins can open **Free space…** to preview the unused containers, superseded images and old build cache that can be removed, with estimated space savings. Confirm to run the same safe cleanup used by automatic recovery. Running containers, current task and member containers, volumes, active worktrees, current and previous images, and the current image's warm build cache are kept. During builds, cleanup waits to protect their cache. The action remains available when nothing can safely be freed and explains why. If cleanup cannot make enough room, ask the site admin to raise the disk size.
+
+**Finished-task cleanup.** The Machine and **Free space…** pages list finished tasks' remaining worktrees with their measured sizes, plus task and member environments still awaiting cleanup. They show the last automatic check, what it removed or kept, and each unresolved failure's error, attempt count and first-failure time. Checks run every 15 minutes. Eligible worktrees are included in the Free space preview; live locks and open member sessions keep files in place. Failed environment removal also keeps the worktree for retry. Manual cleanup preserves the automatic check's history. This worktree cleanup is available on shared-engine projects too; it does not enable shared image pruning.
+
+
+If an image build exhausts the disk, or loses cached build steps while free space is low, the Machine page shows its estimated disk requirement beside the machine's capacity. The estimate covers room to build and keep cache, rather than the final image size. Another build of the same Dockerfile is held while capacity is insufficient, so a failed build cannot repeatedly start cold against the same full disk. Project admins are told to ask a site admin to raise the disk; god mode also offers **Grow disk now**.
+
+Live disk growth leaves running containers in place and checks the cache limits for the larger disk. Docker applies those limits only when it next starts; it cannot reload them live. If the active cache limit is still too small, the build stays held and the growth report explains that a site admin must explicitly restart Docker to apply the larger limits. Restarting Docker stops the project's containers; automatic recovery never does that.
 
 **Memory.** The machine page charts the machine's memory in use and the container runtime's own over the last day (sampled every five minutes, the last 288 readings kept), and shows the machine's size, the container runtime's current memory, and how many times the kernel's out-of-memory killer has killed the container runtime. Project admins read all of it. The history appears once the machine has been sampled a couple of times, and a machine that did not answer leaves a gap rather than a made-up reading.
 
@@ -1056,6 +1126,7 @@ On a microVM, the container runtime stores images and builds them in a way that 
 - restart the container runtime or the forwarder from the machine page. Restarting the container runtime stops every task and builder running on that machine. It also restarts a container runtime that lazy stopped restarting because it kept stopping.
 - restart the project from its god-mode page, which the machine page links to. **Restart** stops a running project (on the microVM backend, its machine) and starts it again with its secrets resolved afresh as the person who clicked; running tasks and builders are interrupted and resume;
 - open the machine's **Shell** from the machine page;
+- set the automatic disk growth ceiling from the machine page;
 - change the machine's size (CPUs, memory, disk) from the machine page, with the same form as on the project's god-mode page. Saving a different size stops the machine and starts it again; the machine is not replaced, so its files stay, and disk can only grow.
 
 Site operators see the same pages and restart nothing.
@@ -1151,6 +1222,12 @@ Stopped projects stay stopped: the automatic restart and version rolls only touc
 
 ## Building from source (development)
 
+Local builds (`bun run build`, `bun run install:local`) and
+`lazy-teams/bin/native-install` check the checkout’s `.bun-version` before
+installing dependencies. An older default Bun automatically hands off to the
+pinned Bun through mise when available. If that cannot run, installation stops
+with the running version and executable path and one command to fix it and retry.
+
 When you are developing lazy or Lazy Teams itself, build the application image from the repository checkout instead of pulling:
 
 ```bash
@@ -1241,6 +1318,8 @@ An install that predates the image-layout change also needs the **deploy bundle 
 
 ## Kamal and cloud deployment
 
+For a **server with KVM**, deployed with Kamal behind ngrok — including moving a native install onto it — see [Deploying Lazy Teams on a KVM server with Kamal](./deploying-lazy-teams-kamal-kvm.md).
+
 For a **cloud VPS** (DigitalOcean droplet or similar) with Kamal — private by default (SSH tunnel / Tailscale), optional public HTTPS — see [Deploying Lazy Teams on DigitalOcean with Kamal](./deploying-lazy-teams-digitalocean.md).
 
 The lazy-teams repository ships `config/deploy.yml` and `.kamal/secrets` for that path. For **local or single-box** self-hosting without SSH keys or a registry account, the docker-compose bundle above remains the supported path.
@@ -1253,9 +1332,9 @@ On the microVM backend, a project's god-mode page also has **Shell**: a terminal
 
 Lazy Teams also runs `lazy doctor` against every running project once an hour. What it finds is handled one of three ways:
 
-- **Safe housekeeping is fixed automatically**: finished-task worktrees, orphaned containers, leftover upstream tracking on task branches, and conversations missing from the store. Every fix is logged. Removing stale runner images is left to an administrator, because projects on one machine share its images.
+- **Safe housekeeping is fixed automatically**: finished-task worktrees, containers of finished or deleted tasks, leftover upstream tracking on task branches, and conversations missing from the store. Every fix is logged. Removing stale runner images is left to an administrator, because projects on one machine share its images.
 - **Problems that affect people's work** (for example a model credential that is refused, an unreachable repository host, or low disk) are shown to the project's members as a short notice on the project page and under the project's **Settings → Doctor**, which also says when the checks last ran (or that a recent result is not available). The notice says what is affected, not how to fix it, and when it was last checked. A project's admins also see which check failed and can press **Report this to support**, which sends the full finding to the installation's administrator. The notice then tells the admin who received it, whether support has seen it yet, and that it clears itself once the problem is fixed. In god mode, waiting reports are announced on the landing page and listed under **Support reports**, each linking to the project's doctor; **Mark as seen** lets the reporting admin know somebody looked. Reports also appear on the project's god-mode pages and in the app log. Viewed in god mode, the same notice shows the full finding, what can be done about it from Lazy Teams as a button — **Restart this project's daemon**, **Apply** for a remedy doctor can perform, or **Download support bundle** when Lazy Teams cannot fix it — plus **Check again** and an **Open doctor** link.
-- **Everything else is shown only in god mode.** Open the project and choose **Doctor** to see the full report: every check with its detail, its remedy and since when it has been reported, what Lazy Teams has already fixed and who started it, a **Run doctor** button, and an **Apply** button for each remedy that doctor can perform itself. Apply first lists exactly what the remedy would touch, and acts only when you confirm. Doctor findings are not written to the app log; the project's **Logs** page links to Doctor. Starting, restarting or retrying setup of a project runs doctor again as soon as its daemon answers, so a fixed problem disappears from the project page within a minute. The support bundle is one JSON file — the doctor report, the installed lazy version, what admins reported and the project's recent log lines — with every credential the installation holds removed; send it to the lazy team.
+- **Everything else is shown only in god mode.** Open the project and choose **Doctor** to see the full report: every check with its detail, its remedy and since when it has been reported, what Lazy Teams has already fixed and who started it, a **Run doctor** button, and an **Apply** button for each remedy that doctor can perform itself. Apply first lists exactly what the remedy would touch, and acts only when you confirm. Doctor findings are not written to the app log; the project's **Logs** page links to Doctor. Starting, restarting or retrying setup of a project runs doctor again as soon as its daemon answers, so a fixed problem disappears from the project page within a minute. The support bundle is one JSON file — the doctor report, every live daemon health check with its reason and remedy, the installed lazy version, what admins reported and the project's recent log lines — with every credential the installation holds removed; send it to the lazy team.
 
 ## Agents and credentials
 

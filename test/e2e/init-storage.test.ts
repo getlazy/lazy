@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join, basename } from 'path';
-import { mkdtemp, rm, writeFile, readFile, mkdir } from 'fs/promises';
+import { mkdtemp, rm, writeFile, readFile, mkdir, rename } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { existsSync } from 'fs';
 
@@ -22,7 +22,7 @@ function spawnGit(cwd: string, ...args: string[]) {
 }
 
 async function runLazy(cwd: string, args: string[], input?: string, extraEnv?: Record<string, string>): Promise<WorkResult> {
-  const proc = Bun.spawn(['bun', 'run', ENTRY_PATH, ...args], {
+  const proc = Bun.spawn(['bun', 'run', ...(extraEnv?.LAZY_MOCK_CLAUDE_RESPONSE ? ['--preload', join(__dirname, '../mocks/preload-mocks.ts')] : []), ENTRY_PATH, ...args], {
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -146,6 +146,51 @@ describe('lazy init storage location', () => {
   // config shape — a flag that silently no-ops on a repo shipping its own
   // lazy.toml would be worse than no flag at all.
   describe('--external-path', () => {
+    // INVARIANT: moving a project and neighboring store together retains its tasks. Cwd must never select a different store.
+    test('preserves a relative store and runs a task after moving the parent', async () => {
+      const original = join(testRoot, 'original');
+      const project = join(original, 'project');
+      await mkdir(project, { recursive: true });
+      for (const args of [['init', '-b', 'main'], ['config', 'user.email', 'test@lazy.test'], ['config', 'user.name', 'Lazy Test'], ['commit', '--allow-empty', '-m', 'Initial']]) {
+        expect(spawnGit(project, ...args).exitCode).toBe(0);
+      }
+      const init = await runLazy(project, ['init', '--skip-auth-check', '--non-interactive', '--external-path', '../stores/portable']);
+      expect(init.exitCode).toBe(0);
+      expect(await readFile(join(project, 'lazy.toml'), 'utf8')).toContain('external_path = "../stores/portable"');
+      const created = await runLazy(project, ['create', '--goal', 'Portable task', '--prompt', 'Verify the moved project works', '--code', 'portable-task']);
+      expect(created.exitCode).toBe(0);
+      const moved = join(testRoot, 'moved');
+      await rename(original, moved);
+      const movedProject = join(moved, 'project');
+      const subdir = join(movedProject, 'nested');
+      await mkdir(subdir);
+      const listed = await runLazy(subdir, ['list']);
+      expect(listed.exitCode).toBe(0);
+      expect(listed.stdout).toContain('Portable task');
+      const started = await runLazy(subdir, ['start', 'portable-task'], undefined, {
+        ANTHROPIC_API_KEY: 'sk-test-fake-key-for-testing',
+        LAZY_PROTOCOL_BASE: join(testRoot, 'protocol'),
+        LAZY_MOCK_CLAUDE_RESPONSE: JSON.stringify({ result: 'Moved project task ran successfully', session_id: 'portable-session', usage: { input_tokens: 1, output_tokens: 1 } }),
+      });
+      expect(started).toMatchObject({ exitCode: 0 });
+      const shown = await runLazy(subdir, ['show', 'portable-task']);
+      expect(shown.exitCode).toBe(0);
+      expect(shown.stdout).toContain('Portable task');
+      const doctor = await runLazy(subdir, ['doctor']);
+      expect(doctor.stdout).toContain('relative to project root');
+      expect(doctor.stdout).toContain('../stores/portable');
+    });
+
+    test('reports both configured and resolved paths when the store is missing', async () => {
+      const init = await runLazy(testRoot, ['init', '--skip-auth-check', '--non-interactive', '--external-path', 'missing-store']);
+      expect(init.exitCode).toBe(0);
+      await rm(join(testRoot, 'missing-store'), { recursive: true });
+      const listed = await runLazy(testRoot, ['list'], undefined, { LAZY_TEST: '' });
+      expect(listed.exitCode).not.toBe(0);
+      expect(listed.stderr).toContain('value:        missing-store');
+      expect(listed.stderr).toContain(`resolved to:  ${join(testRoot, 'missing-store')}`);
+    });
+
     test('places the store on a fresh repo', async () => {
       const store = join(testRoot, 'fleet-store');
       const result = await runLazy(testRoot, [

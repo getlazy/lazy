@@ -14,6 +14,7 @@
 import { describe, test, expect } from 'bun:test';
 import type { Storage } from '../../src/storage';
 import type { Task, TaskStatus, TaskType } from '../../src/types';
+import { MEMBER_PAIR_CREATION_KEY } from '../../src/task/created-by-own-agent';
 import {
   freshClusterChildren,
   restartClusterForAddedChildren,
@@ -139,6 +140,22 @@ function stubStorage(opts: StubOptions): Storage {
 const cluster = { ...task('the-cluster', 0, { type: 'cluster', status: 'blocked' }) };
 
 describe('freshClusterChildren', () => {
+  // INVARIANT: a member's Pair assistant adds outside work even though its
+  // creation row keeps the agent channel. It must survive the restart watermark.
+  test('member Pair children stay fresh while supervised-agent children are marked seen', async () => {
+    const pairChild = { ...task('pair-child', 1_500), metadata: { [MEMBER_PAIR_CREATION_KEY]: 'true' } };
+    const storage = stubStorage({
+      children: [task('own-child', 1_400)],
+      creators: { 'own-child': 'agent', 'pair-child': 'agent' },
+      lastPromptAt: 1_000,
+    });
+    expect(await freshClusterChildren(storage, cluster, 1_450)).toEqual([]);
+    expect(await storage.getTaskMetadata(cluster.id, CLUSTER_CHILDREN_SEEN_KEY)).toBe('1450');
+    storage.getChildTasks = async () => [task('own-child', 1_400), pairChild];
+    expect((await freshClusterChildren(storage, cluster, 1_600)).map(t => t.id)).toEqual(['pair-child']);
+    expect(await storage.getTaskMetadata(cluster.id, CLUSTER_CHILDREN_SEEN_KEY)).toBe('1450');
+  });
+
   test('children the cluster was created with are not news', async () => {
     const storage = stubStorage({
       children: [task('a', 500), task('b', 900)],

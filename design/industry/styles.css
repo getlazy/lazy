@@ -148,7 +148,7 @@ figcaption {
   border-radius: var(--radius-md);
 }
 .btn svg { display: block; }
-.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn[aria-busy="true"] { cursor: progress; }
 .btn-primary { background: var(--color-accent); color: var(--color-bg); }
 .btn-primary:hover { background: var(--color-accent-600); }
 .btn-primary:active { background: var(--color-accent-700); }
@@ -177,7 +177,7 @@ figcaption {
 textarea.input { min-height: 90px; resize: vertical; }
 .radio { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; }
 .radio input, .seg-opt input {
-  position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none;
+  position: absolute; opacity: 0; width: 0; height: 0;
 }
 .radio .dot {
   width: 16px; height: 16px; flex: none; border-radius: 50%;

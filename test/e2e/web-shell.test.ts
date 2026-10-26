@@ -8,11 +8,12 @@
  *
  * These run on a `fakeClaude` context, which uses the HOST-PROCESS runner. That
  * makes the availability path DETERMINISTIC and Docker-free: a host-process task
- * has no container, so the Shell button renders disabled with a clear reason.
+ * has no container, so no terminal can be opened on that runner.
  * The container-resolution and protocol logic that a real Docker shell would use
  * is covered at the unit layer (test/unit/shell-*.test.ts).
  */
 
+import { Window } from 'happy-dom';
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { createTask } from '../helpers/fixtures';
@@ -48,6 +49,29 @@ describe('lazy web shell', () => {
     expectSuccess(await ctx.lazy(['wait', taskId]));
     return taskId;
   }
+
+  // INVARIANT: an unavailable action stays clickable and gives the daemon's
+  // own refusal on click; a tooltip alone is inaccessible on touch screens.
+  test('unavailable dashboard actions explain their refusal on click', async () => {
+    const taskId = await createTask(ctx, 'Not started yet', 'Do the work');
+    const html = await (await fetch(`${base}/tasks/${taskId}`)).text();
+    const win = new Window({ settings: { enableJavaScriptEvaluation: true, suppressInsecureJavaScriptEnvironmentWarning: true,
+      disableCSSFileLoading: true, disableJavaScriptFileLoading: true } });
+    try {
+      win.document.write(html);
+      const button = [...win.document.querySelectorAll('button')].find(el => el.hasAttribute('data-control-refusal'));
+      expect(button).not.toBeNull();
+      expect(button!.disabled).toBe(false);
+      const script = [...win.document.querySelectorAll('script')].find(el => el.textContent.includes('function explain(event)'));
+      expect(script).toBeDefined();
+      win.eval(script!.textContent);
+      button!.click();
+      expect(button!.parentElement!.querySelector('[role=alert]')?.textContent).toBe(button!.getAttribute('data-control-refusal') ?? undefined);
+      expect(win.document.querySelector('button[disabled], input[disabled], select[disabled]')).toBeNull();
+    } finally {
+      await win.happyDOM.close();
+    }
+  }, 90_000);
 
   test('serves the vendored xterm.js and its stylesheet locally (no CDN)', async () => {
     const js = await fetch(`${base}${XTERM_JS_PATH}`);

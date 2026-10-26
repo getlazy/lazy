@@ -25,6 +25,7 @@ differences from the `lazy` CLI are listed in
 | `lazy_messages` | [System messages](system-messages.md) |
 | `lazy_raised_items` | [Raised items](raised-items.md) across tasks |
 | `lazy_artifact_list`, `lazy_artifact_get` | A task's [artifacts](artifacts.md) |
+| `lazy_sessions` | A task's long-running terminal sessions — its [services](agent-container.md#services-and-other-long-running-commands) — and each one's live screen and log |
 | `lazy_usage_limits`, `lazy_token_stats` | Usage-window readings and token spend, narrowed to what the caller may see ([token budgets](token-budgets.md)) |
 | `lazy_scratch` | The builder's [scratch directory](builder-scratch-dir.md) — **builder only** |
 | `lazy_review_comments`, `lazy_review_status` | A task's pull/merge request on the forge — an agent's own task only; see below |

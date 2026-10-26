@@ -23,6 +23,10 @@ import { resolveStorage } from '../../preconditions';
 import { requireLazyRoot, requireStorage, parseFlags, type FlagDefinition } from '../helpers';
 import { loadConfig } from '../../config/loader';
 import { resolveRoleTarget, isKnownAnthropicModel, KNOWN_ANTHROPIC_SHORT_NAMES } from '../../utils/role-target';
+import { profileForAgentNameOrNull } from '../../config/agent-profiles';
+import { builderTargetForProfile, resolveBuilderProfileName } from '../../builder/builder-profile';
+import { detectCodexBuilderSessionId, findBuilderCodexHome, resolveBuilderCodexHome } from '../../builder/codex-home';
+import { resolveBuilderSessionHomeDir } from '../../builder/claude-home';
 import { resolveBuilderModel } from '../../agent/agent-model';
 import { assertNoModelOnTiered } from '../../agent/tiered-model';
 import { builderProfileAdvice } from '../../config/agent-profile-advice';
@@ -160,6 +164,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     { name: 'import', takesValue: false },
     { name: 'effort', takesValue: true },
     { name: 'model', takesValue: true },
+    { name: 'agent', takesValue: true },
     { name: 'override-usage-pause', takesValue: false },
   ];
   const parsed = parseFlags(args, BUILDER_FLAGS, 'builder');
@@ -213,14 +218,34 @@ export async function commandBuilder(args: string[]): Promise<void> {
     effortOverride = effortValue as EffortLevel;
   }
 
-  // Create the runner — determines Docker vs host-process mode
-  const runner = await createRunner(root);
+  // --agent: the agent profile THIS session runs on, in place of the builder
+  // role's configured one — `codex-subscription` runs a Codex builder. It is
+  // fixed for the session's whole life (recorded on its MCP token), and only
+  // Claude Code and Codex profiles can run the builder.
+  const agentValue = parsed.flags.get('agent') as string | undefined;
+  if (agentValue !== undefined && agentValue.trim() === '') {
+    console.error('Invalid --agent: a profile name is required, e.g. --agent codex-subscription');
+    process.exit(1);
+  }
   const config = await loadConfig(root);
+  let builderProfile: string;
+  try {
+    builderProfile = resolveBuilderProfileName(config, agentValue);
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  const runnerOptions = { builderProfile: agentValue !== undefined ? builderProfile : null };
+
+  // Create the runner — determines Docker vs host-process mode
+  const runner = await createRunner(root, undefined, runnerOptions);
+  const builderHarness = builderTargetForProfile(config, builderProfile).harness;
+  const isCodexBuilder = builderHarness === 'codex';
 
   // A TIERED builder takes its model from the tier serving each request, so a
   // --model would be silently ignored: refused, exactly as for a tiered task.
   try {
-    assertNoModelOnTiered(config, config.models.roles.builder.profile, modelOverride);
+    assertNoModelOnTiered(config, builderProfile, modelOverride);
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
@@ -352,6 +377,19 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   const isResuming = resumeId !== null;
 
+  // A conversation continues only on the harness that recorded it. A Codex
+  // conversation lives in one of this project's Codex builder homes; resuming
+  // it on a Claude Code profile (or the reverse) would start Claude Code on an
+  // id it has never seen, so say which agent to pass instead.
+  if (resumeId) {
+    const codexHeld = await findBuilderCodexHome(resolveBuilderSessionHomeDir(root, null), resumeId);
+    if (codexHeld && !isCodexBuilder) {
+      console.error(`Session ${resumeId} is a Codex builder conversation, and this builder would run ${agentDisplayName(builderHarness)}.`);
+      console.error(`Resume it on Codex:  lazy builder --resume ${resumeId} --agent <codex profile, e.g. codex-subscription>`);
+      process.exit(1);
+    }
+  }
+
   // Per-builder Claude projects-dir isolation lives under the data dir. Like the
   // runner and the debug flag, this is process-level: changing [data] path or
   // [runner] type needs a fresh `lazy builder`, not a relaunch. The model,
@@ -364,7 +402,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
   // deliberate: error with the remedy, and let `--import` opt in. Sandbox runners
   // only (host-process has no overlay to adopt into), and only for the id the USER
   // asked for — the relaunch loop resolves its own ids and must never hit this.
-  if (resumeId && runner.usesSandbox() && !importSession) {
+  if (resumeId && runner.usesSandbox() && !importSession && !isCodexBuilder) {
     const provenance = await classifyResumeSession({ dataDirAbs, lazyRoot: root, resumeId });
     if (provenance === 'needs-import') {
       console.error(`Session ${resumeId} exists, but has never run under lazy's builder isolation.`);
@@ -378,7 +416,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   // Session disclosure — skip on resume (user already saw it in the original session)
   if (!isResuming) {
-    const agentName = agentDisplayName(config.agent.agent_id);
+    const agentName = agentDisplayName(builderHarness);
     const firstRun = await isFirstBuilderRun(root);
 
     console.log(`Launching ${agentName} in a new session with lazy's system prompt.`);
@@ -451,7 +489,10 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
   // Ensure runner infrastructure is ready (builds Docker image if needed)
   await runner.ensureReady();
-  await admitInteractiveOrExit('builder', undefined, { overrideUsagePause });
+  await admitInteractiveOrExit('builder', undefined, {
+    overrideUsagePause,
+    ...(runnerOptions.builderProfile ? { builderProfile } : {}),
+  });
 
   // Resolve builder effort: --effort flag > config.builder.effort (default "high").
 
@@ -534,7 +575,17 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // never a host-seeded copy.
     // `adopt` applies ONLY to the id the user passed --import for; ids the relaunch
     // loop resolves on its own already have a container-written copy.
-    const hostDir = runner.usesSandbox()
+    // This launch's harness, re-read like the profile: a role-default session
+    // relaunched after lazy.toml changed runs what the config says NOW.
+    // A profile lazy.toml no longer defines is reported (with the resume
+    // command) by the check below, so it reads as "not Codex" here.
+    const launchProfile = runnerOptions.builderProfile
+      ? profileForAgentNameOrNull(launchConfig, builderProfile)
+      : profileForAgentNameOrNull(launchConfig, launchConfig.models.roles.builder.profile);
+    const launchIsCodex = launchProfile?.harness === 'codex';
+    // A Codex builder writes no Claude session files: its conversation lives in
+    // its own CODEX_HOME (src/builder/codex-home.ts), so there is no projects dir.
+    const hostDir = runner.usesSandbox() && !launchIsCodex
       ? await resolveBuilderProjectsDirForLaunch({
           dataDirAbs,
           lazyRoot: root,
@@ -556,14 +607,23 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // forcing it. With neither, the builder default (resolveBuilderModel) — never
     // Claude Code's own pick and never the task default. We resolve to a single value here so we never
     // append two --model args to the Claude Code child (which would be ambiguous).
-    const builderTarget = resolveRoleTarget('builder', launchConfig, { overrideModel: modelOverride });
+    // The session's own profile when `--agent` named one (re-read from THIS
+    // launch's config, like everything else here); the role's otherwise.
+    const sessionProfile = runnerOptions.builderProfile
+      ? profileForAgentNameOrNull(launchConfig, builderProfile)
+      : null;
+    if (runnerOptions.builderProfile && !sessionProfile) {
+      console.error(`Could not relaunch the builder: lazy.toml no longer defines the "${builderProfile}" agent profile.`);
+      return { exitCode: 1, sessionId: null, builderId: null };
+    }
+    const builderTarget = resolveRoleTarget('builder', launchConfig, { overrideModel: modelOverride, profile: sessionProfile });
     // An explicit --model on a profile that pins no endpoint of its own goes to
     // the Anthropic API, so it must be a model that API can actually serve.
     // Reject an unrecognized name up front instead of handing it to Claude Code
     // and failing opaquely at runtime. `claude-*` is the escape hatch for models
     // newer than our known list; to run anything else (e.g. a local model), point
     // the builder at a profile whose endpoint serves it.
-    if (modelOverride && !builderTarget.pinned && !isKnownAnthropicModel(modelOverride)) {
+    if (modelOverride && !launchIsCodex && !builderTarget.pinned && !isKnownAnthropicModel(modelOverride)) {
       console.error(
         `Unknown --model "${modelOverride}". lazy recognizes Anthropic models ` +
         `(claude-*, or ${KNOWN_ANTHROPIC_SHORT_NAMES.join('/')}). ` +
@@ -668,6 +728,9 @@ export async function commandBuilder(args: string[]): Promise<void> {
         // went first, which preferentially disarmed the longest-running live
         // builder (every lazy_* tool gone, silently, mid-session).
         ownerPid: process.pid,
+        // What this session runs on, for its whole life: every relaunch's
+        // environment is resolved for this profile, never the role default.
+        profile: builderTarget.profile,
       });
 
       // Stamp the launch instant BEFORE the container starts: it is the cut that
@@ -685,6 +748,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
       const mcpReissue = startBuilderMcpReissueWatcher({
         name: daemonMcpName,
         projectRoot: root,
+        profile: builderTarget.profile,
       });
 
       try {
@@ -697,12 +761,18 @@ export async function commandBuilder(args: string[]): Promise<void> {
         // the container wrote into the mounted projects dir, so the id survives
         // ANY death (upgrade stop, docker kill, crash, OOM) and the relaunch loop
         // has something concrete to resume. See src/builder/session-detect.ts.
-        const sessionId = result.sessionId ?? await detectBuilderLaunchSessionId({
-          lazyRoot: root,
-          projectsHostDir: hostDir,
-          launchedAtMs,
-          resumeId: rid,
-        });
+        const sessionId = result.sessionId ?? (launchIsCodex
+          ? await detectCodexBuilderSessionId({
+              codexHome: (await resolveBuilderCodexHome(resolveBuilderSessionHomeDir(root, null), id, rid)).codexHome,
+              launchedAtMs,
+              resumeId: rid,
+            })
+          : await detectBuilderLaunchSessionId({
+              lazyRoot: root,
+              projectsHostDir: hostDir,
+              launchedAtMs,
+              resumeId: rid,
+            }));
         return { exitCode: result.exitCode, sessionId, builderId: id };
       } finally {
         // The builder supervisor has exited (normally, by upgrade-stop, or by
@@ -759,7 +829,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
     // The daemon restarted during the upgrade and its proxy port is OS-assigned,
     // so the address `createRunner` stamped on this runner at startup is dead.
     // Re-resolve it against the daemon now serving, or fail loud.
-    refreshProxyTarget: () => refreshRunnerProxyTargets(runner, root),
+    refreshProxyTarget: () => refreshRunnerProxyTargets(runner, root, runnerOptions),
     log: (m) => console.log(m),
     errorOut: (m) => console.error(m),
   });
@@ -769,7 +839,7 @@ export async function commandBuilder(args: string[]): Promise<void> {
   if (loopResult.sessionId) {
     console.log('');
     console.log(`Session: ${loopResult.sessionId}`);
-    console.log(`Resume:  lazy builder --resume ${loopResult.sessionId}`);
+    console.log(`Resume:  lazy builder --resume ${loopResult.sessionId}${runnerOptions.builderProfile ? ` --agent ${builderProfile}` : ''}`);
   }
 
   process.exit(loopResult.exitCode);
@@ -777,9 +847,9 @@ export async function commandBuilder(args: string[]): Promise<void> {
 
 export function builderUsage(): void {
   console.log(`Usage: lazy builder [list | attach [<id>] | stop [<id>] | end [<id>]] [--resume <id> [--import]] [--no-autonomous] [--yes]
-                    [--effort <level>] [--model <id>] [--override-usage-pause]
+                    [--effort <level>] [--model <id>] [--agent <profile>] [--override-usage-pause]
 
-Launch an interactive Claude Code session with Lazy builder instructions.
+Launch an interactive Claude Code session (or a Codex one, with --agent) with Lazy builder instructions.
 
 --override-usage-pause starts this builder session even when its credential is paused.
 
@@ -843,6 +913,11 @@ Flags:
                        pass --no-autonomous instead to run with prompts)
   --effort <level>     Claude Code reasoning effort (low, medium, high, xhigh, max)
                        Defaults to lazy.toml [builder].effort (default "high")
+  --agent <profile>    Run this builder session on an agent profile other than
+                       the builder role's ([models.roles.builder] agent) —
+                       e.g. codex-subscription for a Codex builder. Claude Code
+                       and Codex profiles only; needs the docker/podman runner
+                       for Codex. Pass it again with --resume <id>.
   --model <id>         Override the model the builder itself runs as (passed
                        straight through to Claude Code's --model; no allow-list,
                        so brand-new models work). Takes precedence over the
@@ -854,5 +929,6 @@ Examples:
   lazy builder --resume <uuid>    # Resume a specific session
   lazy builder list               # List captured conversations
   lazy builder --no-autonomous    # Run with permission prompts instead
-  lazy builder --model mythos     # Run the builder on a specific model`);
+  lazy builder --model mythos     # Run the builder on a specific model
+  lazy builder --agent codex-subscription   # Run the builder on Codex`);
 }

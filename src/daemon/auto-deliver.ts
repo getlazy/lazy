@@ -1,3 +1,4 @@
+import { refreshEnvironmentReplacedCommand } from './environment-replaced-command';
 /**
  * Auto-delivery — daemon detects state changes and delivers signals to tasks.
  *
@@ -14,6 +15,7 @@
  *   task.accepted    → blocked siblings: syncTask() (merge only)
  */
 
+import { keptRunNote, reuseOrStartTaskRun } from '../runner/start-or-recreate';
 import { shouldLogImageHold, runnerImageHold, mustRecreateForRunnerImage } from './runner-image-choice';
 import { join } from 'path';
 import { pathExists } from '../utils/fs';
@@ -35,7 +37,6 @@ import { protocolDir as getProtocolDir, writeCommand, ensureProtocolDir, commonC
 import type { UnblockCommand } from '../protocol';
 import { acquireLock, removeLock, checkLock } from '../utils/lock';
 import { isTurnInFlight } from './in-flight-turn';
-import { memberInsideTask } from '../server/member-terminals';
 import { withTaskLifecycleLock } from './task-lifecycle-lock';
 import { supervisorStillOwnsTurn } from './supervisor-handback';
 import { logger } from '../utils/logger';
@@ -57,7 +58,7 @@ import { hasDaemonContext } from './context';
 import { restartClusterForAddedChildren } from './cluster-restart';
 import { isClusterTask } from '../types';
 import { typeConstraintsSection } from '../task/type-constraints';
-import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
+import { recordContainerBeforeLaunch, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { isUserStopped } from '../task/user-stop';
 
 import lazyToolInstructions from '../prompts/tool-instructions.md' with { type: 'text' };
@@ -170,17 +171,6 @@ export async function autoUnblockTask(
   // second actor moving the task underneath a turn already in flight.
   if (await isTurnInFlight(storage, task.id)) {
     logger.debug(`Auto-unblock ${taskShortId}: a synchronous daemon turn is in flight for this task, skipping`);
-    return false;
-  }
-
-  // A member has a terminal open on the task (a Teams Shell, Pair or Chat): no
-  // turn starts underneath them. Checked here, before anything is written, so
-  // a pass that finds them still there leaves no trace; the launch below
-  // re-checks under the lifecycle lock (refuseLaunchWhileMemberInside), which
-  // is the authority.
-  const memberInside = memberInsideTask(task.id);
-  if (memberInside) {
-    logger.debug(`Auto-unblock ${taskShortId}: ${memberInside} has a terminal open on this task, skipping`);
     return false;
   }
 
@@ -340,15 +330,10 @@ export async function autoUnblockTask(
       storage,
     });
     // UNDER THE TASK'S LIFECYCLE LOCK, like every launch path, and the
-    // delivered turn with it: a member's entry into this task
-    // (src/daemon/member-entry.ts) takes the same lock, so either this launch
-    // sees the member inside and refuses BEFORE writing anything
-    // (refuseLaunchWhileMemberInside, inside mustRecreateForCredentialPlan), or the entry sees
-    // this task `working` and is refused — never a member working in the
-    // worktree while a turn runs on it.
+    // delivered turn with it.
     const mustRecreateForCredential = await withTaskLifecycleLock(task.id, async () => {
       const recreate = await mustRecreateForCredentialPlan(lazyRoot, task.id, credentialPlan);
-      // The delivered turn is written only once the member check above has
+      // The delivered turn is written only once the credential plan above has
       // passed, in the same lock: written before it, a refused launch left a
       // feedback-carrying turn nobody dispatched, which redelivery would later
       // hand the agent a second time.
@@ -385,13 +370,13 @@ export async function autoUnblockTask(
     if (mustRecreateForEnv) logger.info('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
     // See src/task/environment-replaced.ts: a replaced container is told to the
     // turn that runs in its successor.
-    await recordRecreationIfRunning(
+    await recordContainerBeforeLaunch(
       storage,
       task.id,
       recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)),
       runner, containerName,
     );
-    const envNotice = await environmentReplacedPrefix(storage, task.id);
+    let envNotice = await environmentReplacedPrefix(storage, task.id);
     if (mustRecreateForAgent) {
       logger.info(
         `Auto-unblock ${taskShortId}: recreating container — agent changed ` +
@@ -433,7 +418,7 @@ export async function autoUnblockTask(
         config,
       })),
       ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
-      ...commonCommandFields(config),
+      ...commonCommandFields(config, { runner: runner.type }),
     };
     // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
     await deliverTaskFilesForLaunch(lazyRoot, task.id, worktreePath);
@@ -446,10 +431,12 @@ export async function autoUnblockTask(
     }
 
     // Check if supervisor is already running
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
-      logger.debug(`Auto-unblock ${taskShortId}: supervisor already running, command written`);
+    const kept = await reuseOrStartTaskRun(runner, storage, session, containerName, mustRecreateForCredential || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForRunnerImage(task), task.agent_id);
+    if (kept) {
+      logger.debug(`Auto-unblock ${taskShortId}: ${keptRunNote(kept, containerName)}, command written`);
     } else {
       await removeTaskRun(runner, storage, session, containerName);
+      envNotice = await refreshEnvironmentReplacedCommand(storage, protoDir, unblockCommand, envNotice);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, task.id, launchImagePin(task));
@@ -559,7 +546,7 @@ export async function deliverUpstreamUpdated(
   try {
     logger.debug(`Auto-sync ${taskShortId}: calling syncTask (${reason})`);
     const { syncTask } = await import('./task-lifecycle');
-    const result = await syncTask(lazyRoot, { taskId: task.id, queueIfMemberInside: true, daemonLaunch: true });
+    const result = await syncTask(lazyRoot, { taskId: task.id, daemonLaunch: true });
     logger.debug(`Auto-sync ${taskShortId}: syncTask returned status=${result.status}`);
 
     if (result.status === 'sync_launched') {

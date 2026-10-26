@@ -22,6 +22,7 @@ Subcommands:
   export-dockerfile  Write the embedded default Dockerfile to disk for customization
   repair-commits     Fix recorded commit lists that name commits a task never made
   store-check <path> Report what a store directory holds, without opening it
+  store-rehome       Transfer a stopped project's store to this checkout
   store-backup       Copy and verify the store into <store>.backups/ (taken before every upgrade)
   store-backups      List the store's backups
   store-restore <b>  Put a backup back (daemon stopped; the current store is moved aside)

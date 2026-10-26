@@ -265,7 +265,9 @@ describe('runWork — retry state carries the classification', () => {
       onRetryStateChange: (s) => { if (s) states.push({ ...s }); },
     });
 
-    expect(states.length).toBe(1);
+    expect(states.length).toBe(2);
+    expect(states[1]!.nextDelayMs).toBeUndefined();
+    expect(states[1]!.nextRetryAt).toBeUndefined();
     expect(states[0]!.failureClass).toBe('transient_overload');
     expect(states[0]!.failureReason).toBeTruthy();
     expect(states[0]!.nextDelayMs).toBe(5_000);
@@ -365,4 +367,25 @@ describe('describeAgentExitError', () => {
     const long = 'x'.repeat(900) + ' insufficient_quota';
     expect(describeAgentExitError('', '', long).message).toContain('insufficient_quota');
   });
+});
+
+// INVARIANT: time spent in launches counts against recovery, not only backoff.
+test('recovery ends at five minutes even before the attempt cap', async () => {
+  const realNow = Date.now;
+  let now = realNow();
+  const clock = spyOn(Date, 'now').mockImplementation(() => now);
+  let calls = 0;
+  try {
+    const { error } = await run({ execute: async () => {
+      calls++;
+      if (calls > 1) now += 300_000;
+      throw crash('API Error: 529 Overloaded');
+    } });
+    expect(calls).toBe(2);
+    expect(error).toBeInstanceOf(FatalAgentError);
+    expect((error as FatalAgentError).failureClass).toBe('transient_overload');
+    expect((error as Error).message).toContain('exceeded five minutes');
+  } finally {
+    clock.mockRestore();
+  }
 });

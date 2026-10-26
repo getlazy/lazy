@@ -12,6 +12,7 @@ export type { Runner, RunInfo, FollowHandle, RunnerType, HealthCheck, DiagnoseOp
 export { PROJECT_LABEL_KEY } from './docker-runner';
 
 import type { Runner } from './types';
+import { builderTargetForProfile } from '../builder/builder-profile';
 import { isContainerRunnerType, type RunnerType, type ResolvedConfig, type RoleTarget } from '../config/types';
 import { DockerRunner } from './docker-runner';
 import { PodmanRunner } from './podman-runner';
@@ -85,9 +86,28 @@ async function withProxyTargets(
  * Call it only after the new daemon is known to be serving; calling it earlier
  * would resolve the dying daemon's address or fail spuriously.
  */
-export async function refreshRunnerProxyTargets(runner: Runner, lazyRoot: string): Promise<void> {
+export async function refreshRunnerProxyTargets(
+  runner: Runner,
+  lazyRoot: string,
+  opts: CreateRunnerOptions = {},
+): Promise<void> {
   const config = await loadConfig(lazyRoot);
-  runner.setRoleTargets(await withProxyTargets(config.models.roles, config));
+  runner.setRoleTargets(await withProxyTargets(configuredRoles(config, opts), config));
+}
+
+export interface CreateRunnerOptions {
+  /**
+   * The agent profile THIS builder session runs on, when it is not the
+   * builder role's configured one (`lazy builder --agent <profile>`, a Teams
+   * member's choice). Only the builder role's target changes.
+   */
+  builderProfile?: string | null;
+}
+
+/** The role targets a runner is stamped with, honouring a session's builder profile. */
+function configuredRoles(config: ResolvedConfig, opts: CreateRunnerOptions): { builder: RoleTarget; agent: RoleTarget } {
+  if (!opts.builderProfile) return config.models.roles;
+  return { ...config.models.roles, builder: builderTargetForProfile(config, opts.builderProfile) };
 }
 
 /**
@@ -99,7 +119,11 @@ export async function refreshRunnerProxyTargets(runner: Runner, lazyRoot: string
  *   (`session.runner_type`). When omitted, the global config default applies —
  *   so existing zero-override callers keep working unchanged.
  */
-export async function createRunner(lazyRoot: string, overrideType?: RunnerType): Promise<Runner> {
+export async function createRunner(
+  lazyRoot: string,
+  overrideType?: RunnerType,
+  opts: CreateRunnerOptions = {},
+): Promise<Runner> {
   const config = await loadConfig(lazyRoot);
   const runnerType = overrideType ?? config.runner.type;
 
@@ -135,7 +159,7 @@ export async function createRunner(lazyRoot: string, overrideType?: RunnerType):
   // Wire the per-role model targets into runners so they can inject the right
   // backend env vars and preflight reachability per role (builder vs agent).
   // Route proxyable roles through the (default-on) local audit/policy proxy.
-  const roleTargets = await withProxyTargets(config.models.roles, config);
+  const roleTargets = await withProxyTargets(configuredRoles(config, opts), config);
 
   switch (runnerType) {
     case 'docker': {

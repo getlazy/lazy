@@ -2021,8 +2021,11 @@ export type ReviewCommentRole = 'human' | 'agent';
  * - 'answered' — the agent replied; the reply is a sibling comment in the thread
  * - 'failed'   — the ask could not be delivered. The comment is STILL persisted
  *                and visible; `ask_error` says why. Never a silent loss.
+ * - 'queued'   — asked while the agent was mid-turn: saved, and dispatched as
+ *                the same read-only ask, as the person who typed it
+ *                (`ask_owner_*`), once the task parks (src/daemon/queued-asks.ts).
  */
-export type ReviewCommentAskState = 'pending' | 'answered' | 'failed';
+export type ReviewCommentAskState = 'pending' | 'answered' | 'failed' | 'queued';
 
 /**
  * What the reviewer meant by a message, chosen per message.
@@ -2100,6 +2103,16 @@ export interface ReviewComment {
   ask_state?: ReviewCommentAskState;
   /** Why the ask failed. Present only when ask_state === 'failed'. */
   ask_error?: string;
+  /**
+   * Who asked a QUEUED question, captured from the request that asked it, so
+   * the ask dispatched when the task parks runs — and bills — as that person,
+   * not as nobody. Absent when nobody was resolved (it then asks as nobody,
+   * exactly as an immediate ask from the same caller would have).
+   */
+  ask_owner_email?: string;
+  ask_owner_name?: string;
+  /** Whether that identity may be SPENT (a provisioned member) — see PendingTurnOwner. */
+  ask_owner_spendable?: boolean;
   /** Set on human 'comment'-intent comments. */
   delivery_state?: ReviewCommentDeliveryState;
   /** Session turn number of the unblock turn that carried this comment. */
@@ -2180,6 +2193,8 @@ export interface ReviewCommentInput {
 export interface ReviewCommentUpdate {
   askState?: ReviewCommentAskState;
   askError?: string | null;
+  /** Who asked a queued question; null clears it. */
+  askOwner?: { email: string; name?: string; spendable: boolean } | null;
   deliveryState?: ReviewCommentDeliveryState;
   deliveredTurn?: number;
   deliveredAt?: number;

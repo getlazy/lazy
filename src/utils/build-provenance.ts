@@ -72,7 +72,9 @@ export function captureGitBuildMetadata(projectRoot: string): Pick<BuildInfoValu
   // .git either). The caller then takes the identity from the source stamp. A
   // spawn of a missing binary throws rather than returning a non-zero exit, so
   // it is asked for up front instead of being caught.
-  if (!Bun.which('git')) return { buildSha, buildDirty };
+  // The LIVE PATH: children get the live environment (src/utils/spawn.ts),
+  // while Bun.which on its own reads the PATH the process started with.
+  if (!Bun.which('git', { PATH: process.env.PATH ?? '' })) return { buildSha, buildDirty };
 
   const shaProc = spawnSyncUnsupervised(['git', 'rev-parse', '--short', 'HEAD'], {
     cwd: projectRoot,

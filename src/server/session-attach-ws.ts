@@ -43,20 +43,61 @@ import {
   attachNeedsRunningContainer,
   taskModeRefusals,
   type ResolveSessionAttachOptions,
+  type SessionAttachTarget,
 } from '../daemon/session-attach';
+import { attachSessionArgv, isValidSessionName } from '../sessions/tmux';
 import {
   claimMemberTerminal,
   releaseMemberTerminal,
   memberTerminalContainer,
-  memberHeldMessage,
+  markMemberTerminalAttached,
   MEMBER_VACATING_MESSAGE,
   ABANDONED_LAUNCH,
   type HeldContainer,
 } from './member-terminals';
 import { enterTaskAsMember } from '../daemon/member-entry';
 import { launchMemberContainer, memberContainerRunning } from '../daemon/member-container';
+import { memberTerminalProfile } from './member-exec-credential';
 import { logger } from '../utils/logger';
-import { MEMBER_TERMINAL_IDLE_MS, MEMBER_TERMINAL_MAX_MS, type TerminalLimits } from './terminal-idle';
+import { parseShellSessionName, shellSessionCommand } from '../terminal/shell-session';
+import { listTaskSessions, withTimeout, type TaskSessionsDeps } from '../daemon/task-sessions';
+
+/** The most a shell's entry notice may add to opening it. */
+export const ENTRY_NOTICE_TIMEOUT_MS = 3_000;
+import { presenceNotice } from '../sessions/presence';
+
+/**
+ * The one-line "who else is here" a shell shows on entry, or null. A notice
+ * that cannot be read is logged and left out: it never stops the terminal.
+ */
+export async function presenceEntryNotice(
+  root: string,
+  storage: Storage,
+  taskId: string,
+  viewer: string | null,
+  opts: { deps?: TaskSessionsDeps; timeoutMs?: number } = {},
+): Promise<string | null> {
+  try {
+    // Bounded: it runs before the terminal's upgrade is answered, and Lazy
+    // Teams' relay waits only seconds for that answer.
+    const list = await withTimeout(
+      listTaskSessions(root, { taskId }, { getStorage: async () => storage, ...opts.deps }),
+      opts.timeoutMs ?? ENTRY_NOTICE_TIMEOUT_MS,
+      'who else is in the task',
+    );
+    return presenceNotice({ task: list.task, members: list.members, sessions: list.running ? list.sessions : null, agent: list.agent }, { viewer });
+  } catch (err) {
+    logger.warn(`shell entry notice for task ${taskId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+import { getWorktreePath } from '../task/identity';
+import { sshdExecCommand, sshdExecEnv } from '../ssh/sshd-command';
+import { ensureSshHostKey } from '../ssh/host-keys';
+import { soloAuthorizedKeys } from '../ssh/local-files';
+import { parseAuthorizedKeysHeader, SSH_AUTHORIZED_KEYS_HEADER } from '../ssh/connection';
+import { declaredServices, mintForwardGrant, revokeForwardGrant, serviceHostNames } from '../ssh/service-forward';
+import { daemonMcpTarget } from '../daemon/task-launcher';
 
 import { DEFAULT_TERM_COLS, DEFAULT_TERM_ROWS, MAX_TERM_COLS, MAX_TERM_ROWS } from './shell-protocol';
 
@@ -80,7 +121,7 @@ export const MEMBER_PREPARE_STALLED_MESSAGE =
   'Preparing your terminal environment stopped making progress. Try again, and if it keeps happening ask your administrator.';
 
 type MemberPrepared =
-  | { ok: true; container: string; plan: PairExecPlan | null }
+  | { ok: true; container: string; plan: PairExecPlan | null; env: string[]; onStarted: () => Promise<void> }
   | { ok: false; message: string; detail?: string };
 
 export const SESSION_ATTACH_WS_PATH_RE = /^\/rpc\/sessions\/([^/]+)\/attach\/ws$/;
@@ -96,11 +137,11 @@ export interface SessionAttachUpgraderDeps {
   confirmRunning?: typeof confirmAttachTargetRunning;
   /** Runner seam for tests; see ResolveSessionAttachOptions.runnerFor. */
   runnerFor?: ResolveSessionAttachOptions['runnerFor'];
-  /** Binding seam for tests; see ResolveSessionAttachOptions.bindingFor. */
-  bindingFor?: ResolveSessionAttachOptions['bindingFor'];
   /** Member-entry seam for tests; defaults to `enterTaskAsMember`. */
   enterAsMember?: typeof enterTaskAsMember;
   /** Member preflight seam for tests; defaults to `taskModeRefusals`. */
+  /** The one-line "who else is here" a shell shows on entry; defaults to {@link presenceEntryNotice}. */
+  entryNotice?: (root: string, storage: Storage, taskId: string, viewer: string | null) => Promise<string | null>;
   memberPreflight?: typeof taskModeRefusals;
   /** The member's own container; defaults to `launchMemberContainer`. */
   launchMemberContainer?: (opts: Parameters<typeof launchMemberContainer>[0]) => Promise<
@@ -116,8 +157,14 @@ export interface SessionAttachUpgraderDeps {
   memberGraceMs?: number;
   /** Stall seam for tests; defaults to MEMBER_PREPARE_STALL_MS. */
   memberPrepareStallMs?: number;
-  /** Idle/max seam for tests; defaults to MEMBER_TERMINAL_IDLE_MS / _MAX_MS. */
-  memberTerminalLimits?: TerminalLimits;
+  /**
+   * The web port this daemon bound, which a member's SSH service forwards dial
+   * back on (`host.docker.internal:<port>`). Read from the daemon's memory;
+   * null (or unset, as in tests) before the bind: forwards are then not offered.
+   */
+  webPort?: () => number | null;
+  /** Solo SSH keys seam for tests; defaults to the daemon user's `~/.lazy/ssh` files. */
+  soloAuthorizedKeys?: typeof soloAuthorizedKeys;
 }
 
 export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): WebSocketUpgrader {
@@ -154,14 +201,19 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       // The PERSON comes from the token, never from the request.
       const caller = auth.actor.kind === 'user' ? auth.actor : null;
       const multiMember = await deps.multiMember();
+      // `?tmux=<name>`: attach to one of the task container's named tmux
+      // sessions (src/sessions/tmux.ts) — its services, a long-running command
+      // — instead of opening a terminal of one's own. `&readonly=1` watches
+      // without typing (`attach -r`).
+      const tmuxName = url.searchParams.get('tmux');
       const resolved = await resolveSessionAttachTarget({
+        purpose: tmuxName !== null ? 'tmux' : 'terminal',
         projectRoot: deps.root,
         storage,
         sessionId,
         callerEmail: caller?.email ?? null,
         multiMember,
         runnerFor: deps.runnerFor,
-        bindingFor: deps.bindingFor,
       });
       if (!resolved.ok) return refusal(resolved.status, resolved.message);
       const { target } = resolved;
@@ -174,6 +226,13 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       // there is no agent in it to pair or chat with.
       if (target.kind === 'run' && requestedMode !== null && requestedMode !== 'shell') {
         return refusal(400, `A run is entered with a shell, not in "${requestedMode}" mode.`);
+      }
+      // SSH lands in a TASK's environment only, exactly where its Shell lands.
+      const ssh = requestedMode === 'ssh';
+      if (ssh && target.kind !== 'task') return refusal(400, 'SSH opens into a task session only.');
+
+      if (tmuxName !== null) {
+        return attachTmuxSession({ req, server, url, deps, target, tmuxName, requestedMode, multiMember, caller });
       }
 
       // A reattach after a dropped connection goes back to the terminal it
@@ -206,23 +265,97 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       let memberLaunch: ((status: (message: string) => void, abandoned: () => boolean) => Promise<MemberPrepared>) | null = null;
       // Releases this terminal's claim on the task (members only; once).
       let releaseClaim: (() => void) | null = null;
+      // `?mode=ssh`: the bounds and audit this connection carries (below).
+      let sshConnection: ShellSocketData['ssh'] = undefined;
+      // The service-forward grant this connection holds, revoked when it ends.
+      let sshForwardToken: string | null = null;
       if (target.kind === 'task') {
-        const mode = parseShellSessionMode(requestedMode);
+        // SSH is a Shell in every respect but its command: same container,
+        // same claim and preflight, same credential (docs/design/task-sessions-and-ssh.md §5).
+        const mode = ssh ? 'shell' : parseShellSessionMode(requestedMode);
+        // A person's shell is the `shell` tmux session of the container it
+        // lands in, so a reconnect finds what they left running
+        // (../terminal/shell-session.ts).
         // On a shared daemon the terminal runs AS the attaching member —
         // billed to them, and pair's rows name them. Locally the single person
         // is the daemon's own, exactly as the dashboard shell.
         const member = multiMember && caller
           ? { email: caller.email, ...(caller.name ? { name: caller.name } : {}) }
           : null;
+        if (mode === 'shell' && !ssh) {
+          const name = parseShellSessionName(url.searchParams.get('session'));
+          if (!name) return refusal(400, 'session must be lowercase letters, digits and dashes (at most 32).');
+          // Who else is in the task, shown once tmux has the screen — every
+          // terminal that opens a shell comes through here (Teams, the
+          // dashboard, a Teams-linked `lazy shell`), so the person entering is
+          // left out by who the daemon authenticated, not by what a client says.
+          cmd = shellSessionCommand(name, await (deps.entryNotice ?? presenceEntryNotice)(deps.root, storage, target.task.id, member?.email ?? null));
+        }
         // The resolver already refused a nameless caller on a shared daemon;
         // restated here because the fallback below is the TASK's container,
         // which a shared daemon must never hand a terminal.
         if (multiMember && !member) return refusal(403, 'A task terminal on a shared daemon is opened as a member.');
+        if (ssh) {
+          // Which keys may log in: on a shared daemon the ones Lazy Teams
+          // holds for THIS member, sent by its relay; solo, the daemon's own
+          // user's lazy key files — never anything the SSH client sends.
+          const keys = multiMember
+            ? parseAuthorizedKeysHeader(req.headers.get(SSH_AUTHORIZED_KEYS_HEADER))
+            : await (deps.soloAuthorizedKeys ?? soloAuthorizedKeys)();
+          if (!keys.ok) return refusal(400, keys.error);
+          if (keys.keys.length === 0) {
+            return refusal(400, multiMember
+              ? 'You have no SSH keys registered. Run `lazy shell <task> --ssh-config --install`, or add one under Account settings → SSH keys.'
+              : 'No SSH key to accept. Run `lazy shell <task> --ssh-config --install` first.');
+          }
+          let hostKey;
+          try {
+            hostKey = await ensureSshHostKey(deps.root, target.task.id, member?.email ?? null);
+          } catch (err) {
+            return refusal(500, `Could not read this task's SSH host key: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          // A member's container cannot reach the task's published ports
+          // itself: while this connection lives it gets a forwarder and a
+          // grant for them (../ssh/service-forward.ts). Solo, the services are
+          // on the task container's own loopback already.
+          let forward: Parameters<typeof sshdExecEnv>[0]['forward'];
+          if (member) {
+            const services = await declaredServices(deps.root);
+            const webPort = deps.webPort?.() ?? null;
+            if (services.length > 0 && webPort !== null) {
+              const token = mintForwardGrant({ taskId: target.task.id, memberEmail: member.email });
+              sshForwardToken = token;
+              forward = {
+                url: daemonMcpTarget(webPort),
+                token,
+                ports: services.map((s) => s.port),
+                hosts: serviceHostNames(services),
+              };
+            }
+          }
+          cmd = sshdExecCommand();
+          env = sshdExecEnv({
+            hostKey: hostKey.privateKey,
+            authorizedKeys: keys.keys.map((k) => k.line),
+            workdir: getWorktreePath(deps.root, target.task),
+            forward,
+            // Built here, from the member the daemon authenticated, and left out.
+            notice: await (deps.entryNotice ?? presenceEntryNotice)(deps.root, storage, target.task.id, member?.email ?? null),
+          });
+          sshConnection = {
+            who: member?.email ?? 'local user',
+            task: target.task.code ?? target.task.id.slice(0, 8),
+          };
+        }
         // Everything acquired from here on is undone if ANY later step refuses
-        // or throws: the claim, pair/chat's locks. A leaked claim would lock
-        // every other member (and every turn) out of the task until the daemon
-        // restarted.
+        // or throws: the claim, pair/chat's locks. A leaked claim would keep
+        // this member counted as inside — holding off the task's teardown —
+        // until the daemon restarted.
         const undo: Array<() => void> = [];
+        if (sshForwardToken) {
+          const t = sshForwardToken;
+          undo.push(() => revokeForwardGrant(t));
+        }
         // The member's container is removed once their last terminal has gone
         // (after the grace): every process they left running in it dies with
         // it, and its credential is revoked. A removal that fails THROWS, so
@@ -247,10 +380,10 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
         };
         try {
           if (member) {
-            // One member in a task at a time (./member-terminals.ts).
-            const claimed = claimMemberTerminal(target.task.id, member.email);
+            // Each member has their own hold; any number may be inside (./member-terminals.ts).
+            const claimed = claimMemberTerminal(target.task.id, member.email, vacate);
             if (!claimed.ok) {
-              return refusal(409, claimed.vacating ? MEMBER_VACATING_MESSAGE : memberHeldMessage(claimed.holder));
+              return refusal(409, MEMBER_VACATING_MESSAGE);
             }
             // Released exactly once per terminal, whichever path gets there first:
             // a refusal, a failed or stalled launch, the client closing while its
@@ -263,8 +396,8 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
               releaseMemberTerminal(target.task.id, member.email, vacate, deps.memberGraceMs);
             };
             undo.push(releaseClaim);
-            // EVERY CHECK THAT CAN REFUSE runs before the entry, which keeps
-            // turns off the task from the moment it succeeds: a Pair on an
+            // EVERY CHECK THAT CAN REFUSE runs before the entry, which marks
+            // her inside the task from the moment it succeeds: a Pair on an
             // agent that cannot pair, a Chat on a working task, or a member
             // with no credential must not hold anything. Same rules the page
             // preflight shows (`taskModeRefusals`), against a fresh read.
@@ -278,8 +411,8 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
             });
             const preRefusal = pre.refusals[mode];
             if (preRefusal) return fail(pre.credentialMissing ? 400 : 409, preRefusal);
-            // Under the task's lifecycle lock: no turn running, and from here
-            // on no turn starts until this member's session ends.
+            // Under the task's lifecycle lock, so a teardown starting now sees
+            // the member inside. Turns are neither checked nor held off.
             const entered = await (deps.enterAsMember ?? enterTaskAsMember)({
               projectRoot: deps.root,
               storage,
@@ -378,12 +511,20 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
                 } catch (err) {
                   logger.warn(`member terminal for task ${target.task.id.substring(0, 8)} could not take ownership of the worktree: ${err instanceof Error ? err.message : String(err)}`);
                 }
-                // Pair/Chat take their lock only once the container exists: a
-                // launch that fails must not flip the task to `pairing`, spend
-                // a usage-pause override, or record a pairing session that
-                // never started. The member preflight already applied the
-                // planner's rules, so a refusal here is a race. Nor is one taken
-                // for a terminal nobody is waiting on any more.
+                // A container a previous daemon made still names that daemon's
+                // proxy port; every exec carries the live one (Shell, Pair, Chat).
+                let execEnv: string[] = [];
+                if (container.execEnv) {
+                  try {
+                    execEnv = await container.execEnv(mode === 'shell' ? undefined : await memberTerminalProfile(deps.root, freshTask.agent_id));
+                  } catch (err) {
+                    undoAll();
+                    return { ok: false, message: `Could not prepare your terminal credentials: ${err instanceof Error ? err.message : String(err)}` };
+                  }
+                }
+                // Prepare the member's tools only once their container exists.
+                // A failed or abandoned launch must not mint MCP authority or
+                // spend a usage-pause override. Members take no task-wide lock.
                 if (mode !== 'shell' && !abandoned()) {
                   const planned = await (deps.planPairOrChat ?? planPairOrChatExec)({
                     root: deps.root,
@@ -392,14 +533,19 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
                     session: target.session,
                     mode,
                     member,
+                    memberMcpDirectory: container.mcpDirectory,
                   });
+                  if (abandoned()) {
+                    if (planned.ok) planned.plan.abort();
+                    return { ok: false, message: 'The terminal connection ended while its tools were being prepared.' };
+                  }
                   if (!planned.ok) {
                     undoAll();
                     return { ok: false, message: planned.message };
                   }
-                  return { ok: true, container: container.name, plan: planned.plan };
+                  return { ok: true, container: container.name, plan: planned.plan, env: execEnv, onStarted: () => markMemberTerminalAttached(target.task.id, member.email, container) };
                 }
-                return { ok: true, container: container.name, plan: null };
+                return { ok: true, container: container.name, plan: null, env: execEnv, onStarted: () => markMemberTerminalAttached(target.task.id, member.email, container) };
               } catch (err) {
                 undoAll();
                 const r = launchRefusal as { status: number; message: string } | null;
@@ -440,6 +586,12 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
           onClose = () => { release(); close0?.(); };
           abort = () => { release(); abort0?.(); };
         }
+        if (sshForwardToken) {
+          const t = sshForwardToken;
+          const [close1, abort1] = [onClose, abort];
+          onClose = () => { revokeForwardGrant(t); close1?.(); };
+          abort = () => { revokeForwardGrant(t); abort1?.(); };
+        }
       }
 
       const data: ShellSocketData = {
@@ -453,11 +605,12 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
         cmd,
         env,
         attach: target.kind === 'builder',
+        ...(sshConnection ? { ssh: sshConnection } : {}),
         onClose,
         resumeOwner: owner,
-        // A member's open terminal keeps every turn off the task, so a
-        // forgotten one is closed (./terminal-idle.ts).
-        ...(target.kind === 'task' && multiMember ? { limits: deps.memberTerminalLimits ?? { idleMs: MEMBER_TERMINAL_IDLE_MS, maxMs: MEMBER_TERMINAL_MAX_MS } } : {}),
+        // No idle or lifetime close on a member's terminal: it holds no turn
+        // off the task. Its environment ends with its sessions, membership,
+        // or task (./member-terminals.ts).
       };
       if (memberLaunch) {
         const launchIt = memberLaunch;
@@ -470,6 +623,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
           const launched = await launchIt(status, () => data.closedWhilePreparing === true);
           if (!launched.ok) return launched;
           data.container = launched.container;
+          data.onStarted = launched.onStarted;
           const plan = launched.plan;
           if (plan) {
             data.cmd = plan.cmd;
@@ -477,6 +631,7 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
             const release = data.onClose;
             data.onClose = () => { release?.(); plan.onClose(); };
           }
+          if (launched.env.length > 0) data.env = [...data.env, ...launched.env];
           return { ok: true };
         };
       }
@@ -492,4 +647,50 @@ export function createSessionAttachUpgrader(deps: SessionAttachUpgraderDeps): We
       return 'upgraded';
     },
   };
+}
+
+/**
+ * Attach to a named tmux session in the TASK's own container — on a shared
+ * daemon too, where a terminal of one's own never lands there. What the
+ * socket runs is `tmux attach` and nothing else: the session's command is
+ * whatever lazy (Start services) or a person started in it, and nothing is
+ * started here. It takes no member claim and no turn exclusion: a tmux
+ * session runs whether anybody watches it, so watching or typing into it
+ * never blocks a turn and a turn never blocks it
+ * (docs/design/task-sessions-and-ssh.md §1, §4).
+ */
+async function attachTmuxSession(opts: {
+  req: Request;
+  server: Server<unknown>;
+  url: URL;
+  deps: SessionAttachUpgraderDeps;
+  target: SessionAttachTarget;
+  tmuxName: string;
+  requestedMode: string | null;
+  multiMember: boolean;
+  caller: { email: string } | null;
+}): Promise<UpgradeOutcome> {
+  const { req, server, url, deps, target, tmuxName } = opts;
+  if (target.kind !== 'task') return refusal(400, 'Only a task has tmux sessions to attach to.');
+  if (opts.requestedMode !== null) return refusal(400, 'Attach to a tmux session (?tmux=) or open a terminal (?mode=), not both.');
+  if (!isValidSessionName(tmuxName)) return refusal(400, `Not a session name: ${JSON.stringify(tmuxName)}.`);
+  // Restated from the resolver: the target below is the TASK's container,
+  // which a shared daemon hands only to a named member.
+  if (opts.multiMember && !opts.caller) return refusal(403, 'A task session on a shared daemon is attached to as a member.');
+  const running = await (deps.confirmRunning ?? confirmAttachTargetRunning)(deps.root, target);
+  if (!running.ok) return refusal(running.status, running.message);
+  const data: ShellSocketData = {
+    socketPath: '',
+    container: target.container,
+    binary: target.binary,
+    cols: clampDim(url.searchParams.get('cols'), DEFAULT_TERM_COLS, MAX_TERM_COLS),
+    rows: clampDim(url.searchParams.get('rows'), DEFAULT_TERM_ROWS, MAX_TERM_ROWS),
+    exec: null,
+    cmd: attachSessionArgv(tmuxName, { readOnly: url.searchParams.get('readonly') === '1' }),
+    env: ['TERM=xterm-256color'],
+    attach: false,
+    onClose: null,
+  };
+  if (!server.upgrade(req, { data })) return refusal(426, 'Expected a WebSocket upgrade request.');
+  return 'upgraded';
 }

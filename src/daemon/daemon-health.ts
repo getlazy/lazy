@@ -48,7 +48,6 @@ import { STORAGE_LOCK_FILENAME, storageLockActivity } from '../utils/storage-loc
 import { PROXY_HEALTH_PATH } from '../proxy';
 import { getSlowLaneState } from './auto-resume-queue';
 import { syncRetryBackoffSnapshot, syncRetryFailureSnapshot, type BackoffEntry, type SyncFailureEntry } from './sync-retry';
-import { memberInsideTask } from '../server/member-terminals';
 import {
   daemonHealthRecorder,
   RECONCILE_LOOP,
@@ -262,9 +261,6 @@ export function describeHeldSync(
   const code = displayId(task);
   if (!isSyncDispatchable(task.status)) {
     return { code, pending: task.pending_sync, state: `waits for the ${task.status} task to park`, attempt: null };
-  }
-  if (memberInsideTask(task.id)) {
-    return { code, pending: task.pending_sync, state: 'held while a member works in its terminal', attempt: null };
   }
   // A sync that threw is retried every tick with no backoff, so the backoff
   // record alone would call it "due" forever; the throw record says otherwise.

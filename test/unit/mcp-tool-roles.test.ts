@@ -340,9 +340,15 @@ describe('MCP tool roles', () => {
  * cheap alternative to prompt text. TRIMMED: a one-sentence description and no
  * argument help. Raised to 60,250; after merging agent-profile descriptions from
  * the hub the agent role measures 60,232 (under the ratchet by 18 bytes).
+ *
+ * `lazy_sessions` then arrived: a WHOLE NEW TOOL — the read the task-sessions
+ * design asks for, so an agent reads its services' output (the tmux sessions
+ * that now survive turns and daemon restarts) without attaching. ARGUED: a
+ * capability that did not exist. TRIMMED: a three-clause description and no
+ * argument help text. Raised to 60,680, ~40 bytes over the agent role (60,637).
  */
 describe('MCP tool surface byte budget', () => {
-  const BUDGET_BYTES = 60_250;
+  const BUDGET_BYTES = 60_680;
 
   for (const role of ['builder', 'agent'] as const) {
     test(`the ${role} surface stays under budget`, () => {

@@ -28,6 +28,8 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
   lazy_active: 'read',
   lazy_diff: 'read',
   lazy_regions: 'read',
+  // A task's tmux sessions and their output; never starts anything.
+  lazy_sessions: 'read',
   lazy_status: 'read',
   lazy_wait: 'read',
   lazy_conversations: 'read',

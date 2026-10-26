@@ -52,8 +52,9 @@ lazy auth rm <name>            # remove one
 ```
 
 `lazy auth list` shows, per credential: whether this project requires it, what is
-in effect right now (environment, store, or nothing), which backend the stored
+in effect right now (environment, project, a named set, or nothing), which backend the stored
 credential lives in, and a last-four hint. It never prints a credential.
+It also shows the project's set binding and when that binding last changed.
 
 `<name>` can be a credential name — `anthropic`, `openai`, `chatgpt`, or one you
 picked yourself — **or the name of an agent**. Naming an agent stores the
@@ -76,9 +77,67 @@ the same place.
 
 ```
 anthropic  ● required by this project
-  In effect:  store (keychain)
+  In effect:  project store (keychain)
   Stored:     oauth …7f3a in keychain, updated 2026-08-29T09:14:02.118Z
 ```
+
+### Share a credential across projects
+
+A **credential set** stores credentials under a name you choose. Store a key
+once, then bind each project that should use it:
+
+```bash
+lazy auth set openai --set personal
+lazy auth use personal
+```
+
+Run the second command from each project. A project's own stored credential
+wins over the set's credential for that name; a missing name can come from the
+set. Environment overrides still apply as described under **Precedence** below.
+Existing projects have no set binding until you choose one.
+
+The same set can hold several credentials, including names your agent profiles
+reference. Import a subscription session or inspect and remove a set's entries
+with the same commands:
+
+```bash
+lazy auth import chatgpt --set personal
+lazy auth list --set personal
+lazy auth remove openai --set personal
+```
+
+Removing an entry warns that projects bound to the set may lose access to it.
+Unbind one project without removing any shared credentials:
+
+```bash
+lazy auth use --none
+```
+
+Its project credentials and environment fallbacks remain available. The binding's
+last-change time remains visible after unbinding. An unknown set name is refused,
+with the existing names listed; storing the first credential creates a set.
+
+Set secrets use the same selected storage backend as project credentials. The
+binding contains only the set name and a timestamp, in the project root's ignored
+`.lazy/credential-set.json`. It is never a `lazy.toml` setting and never travels
+with a branch. Moving the project retains this local binding and access to the
+set on the same machine; per-project credentials remain tied to their original
+path. Bindings and shared credentials are changed by a person through the CLI;
+agents cannot change them.
+
+Anthropic credentials already loaded by a running daemon keep their existing
+restart behavior: restart the daemon to switch the loaded credential after
+changing a binding. Other credentials are read on the next use.
+Doctor continues to name the set and credential type actually loaded by the
+daemon until it restarts, even if the project's binding has changed or been removed.
+
+### Share credentials in Lazy Teams
+
+In Teams, save a connection at **account** scope to use it across your projects,
+or at **team** scope for projects in one team. A project connection takes
+precedence over a team connection, which takes precedence over the account
+connection. Each member uses their own connections. These choices live in Teams,
+not in repository files; local credential sets do not replace them.
 
 ### Storing a credential
 
@@ -129,7 +188,7 @@ and `-`, up to 64 characters), and an
 ```toml
 [agents.work-codex]
 harness = "codex"
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 credential = "work-openai"    # lazy auth set work-openai
 ```
 
@@ -228,15 +287,17 @@ clone points without reading a secret to do it.
 ## Precedence: the environment always wins
 
 ```
-environment variable  →  credential store  →  (nothing: refuse)
+environment variable  →  project credential  →  bound set  →  (nothing: refuse)
 ```
 
 If `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is set and non-blank, it is
 used and the store is ignored. This is deliberate: an exported token keeps working
 without any `lazy auth` setup, and exporting one
 stays the way to try a different account for one session. `lazy auth list` tells
-you when the environment is shadowing something you stored, so you never have to
-discover it by debugging a 401.
+you which exported variable overrides a project or bound-set credential. `lazy
+doctor` reports the same override from the daemon’s environment. Unset the
+variable to use the project credential, or the bound set when the project has
+none.
 
 A **blank** export (`export CLAUDE_CODE_OAUTH_TOKEN=` — the shape a failed
 `$(claude setup-token)` leaves behind) counts as *absent*, not as a credential.
@@ -319,7 +380,10 @@ only ever holds a placeholder; the proxy swaps in the stored key on each request
 
 Cursor: `lazy system agent set-key cursor` (or any profile whose harness is
 `cursor`) is the same as `lazy auth set cursor`. `CURSOR_API_KEY`, exported in the
-daemon's environment, overrides the stored value.
+daemon's environment, overrides the stored value. Cursor's exchanged sessions
+remain tied to the credential source and key that created them. After a set or
+Teams member changes, or a key rotates, sessions from the previous source are
+refused rather than continuing to spend that account.
 
 Codex: `lazy system agent set-key codex` is the same as `lazy auth set openai`;
 `OPENAI_API_KEY` overrides it. A codex profile that names its own credential
@@ -422,6 +486,12 @@ first subscription turn, running `codex` on this machine may send you through
 disturb lazy: it has its own copy in the credential store and keeps renewing
 that. You do not need to re-import after a `codex login`, and re-importing every
 time would just swap which copy goes stale first.
+
+If a renewal succeeds but its replacement cannot be saved, lazy refuses the
+request and adds an alert to the project's system messages. The previous refresh
+token may already be retired. Resolve the storage problem before retrying; lazy
+keeps the replacement in memory and retries saving it. If lazy has restarted,
+connect the credential again from a fresh `codex login`.
 
 **Keeping it alive.** A ChatGPT access token expires within hours. lazy renews
 it for you from the refresh token and stores the renewed session, so you should

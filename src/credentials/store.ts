@@ -59,7 +59,8 @@
 import { readFile, unlink } from 'fs/promises';
 import { replaceCredentialFile, withCredentialFileLock } from './file-updates';
 import { logger } from '../utils/logger';
-import { getCredentialIndexPath } from '../daemon/paths';
+import { type CredentialScope, credentialIndexPath } from './scope';
+import { readCredentialSetBinding } from './set-binding';
 import { loadConfig } from '../config/loader';
 import {
   type BackendId,
@@ -80,7 +81,6 @@ import {
   type HydratedFrom,
   clearStoreUnreadable,
   hydratedCopyFrom,
-  isStoreUnreadable,
   markHydratedEnvValue,
   markStoreUnreadable,
   matchesHydratedEntry,
@@ -129,6 +129,8 @@ export interface CredentialIndexEntry {
   updatedAt: string;
   /** Present only for a credential that binds this clone to something. */
   binding?: CredentialBinding;
+  /** Read-time provenance only; never persisted in a project index. */
+  setName?: string;
 }
 
 interface CredentialIndexFile {
@@ -142,6 +144,7 @@ export interface ResolvedCredential {
   kind: CredentialKind;
   value: string;
   source: 'env' | 'store';
+  setName?: string;
   /** Set only when `source` is 'store'. */
   backend?: BackendId;
   /** The env var this credential is carried in. */
@@ -190,8 +193,8 @@ export class CredentialIndexParseError extends Error {
  * have none, and send them re-entering tokens instead of fixing one line of
  * JSON.
  */
-export async function readCredentialIndex(projectRoot: string): Promise<CredentialIndexEntry[]> {
-  const path = getCredentialIndexPath(projectRoot);
+export async function readCredentialIndex(projectRoot: CredentialScope): Promise<CredentialIndexEntry[]> {
+  const path = credentialIndexPath(projectRoot);
   let raw: string;
   try {
     raw = await readFile(path, 'utf-8');
@@ -233,15 +236,22 @@ export async function readCredentialIndex(projectRoot: string): Promise<Credenti
 
 /** The index entry for one credential, or null. Never reads a secret. */
 export async function credentialPresence(
-  projectRoot: string,
+  projectRoot: CredentialScope,
   provider: CredentialName,
+  options: { inheritSet?: boolean } = {},
 ): Promise<CredentialIndexEntry | null> {
   const entries = await readCredentialIndex(projectRoot);
-  return entries.find((entry) => entry.provider === provider) ?? null;
+  const own = entries.find((entry) => entry.provider === provider);
+  if (own) return own;
+  if (options.inheritSet === false || typeof projectRoot !== 'string' || provider.startsWith('teams:')) return null;
+  const binding = await readCredentialSetBinding(projectRoot);
+  if (!binding?.set) return null;
+  const shared = (await readCredentialIndex({ set: binding.set })).find(entry => entry.provider === provider);
+  return shared ? { ...shared, setName: binding.set } : null;
 }
 
-async function writeIndex(projectRoot: string, entries: CredentialIndexEntry[]): Promise<void> {
-  const path = getCredentialIndexPath(projectRoot);
+async function writeIndex(projectRoot: CredentialScope, entries: CredentialIndexEntry[]): Promise<void> {
+  const path = credentialIndexPath(projectRoot);
   const file: CredentialIndexFile = { version: 1, credentials: entries };
   // No secret in here, but it still describes the shape of a user's setup —
   // same 0600 posture as everything else in the daemon dir.
@@ -250,11 +260,11 @@ async function writeIndex(projectRoot: string, entries: CredentialIndexEntry[]):
 
 /** Serialize a read-modify-write against the index. */
 async function mutateIndex<T>(
-  projectRoot: string,
+  projectRoot: CredentialScope,
   fn: (entries: CredentialIndexEntry[]) => Promise<T> | T,
 ): Promise<T> {
   const run = writeChain.then(() => withCredentialFileLock(
-    getCredentialIndexPath(projectRoot),
+    credentialIndexPath(projectRoot),
     async () => fn(await readCredentialIndex(projectRoot)),
   ));
   writeChain = run.catch(() => {});
@@ -269,12 +279,12 @@ async function mutateIndex<T>(
  * failure modes it cannot act on.
  */
 async function backendFor(
-  projectRoot: string,
+  projectRoot: CredentialScope,
   selection?: BackendSelection,
 ): Promise<CredentialBackend> {
   if (selection) return resolveBackend(selection);
-  const config = await loadConfig(projectRoot);
-  return resolveBackend(config.credentials.backend);
+  const config = typeof projectRoot === 'string' ? await loadConfig(projectRoot) : null;
+  return resolveBackend(config?.credentials.backend ?? 'auto');
 }
 
 /**
@@ -287,8 +297,8 @@ async function backendFor(
  * is one extra subprocess on a command a human runs by hand.
  */
 export async function setCredential(
-  projectRoot: string,
-  input: { provider: CredentialName; kind: CredentialKind; secret: string; binding?: CredentialBinding },
+  projectRoot: CredentialScope,
+  input: { provider: CredentialName; kind: CredentialKind; secret: string; binding?: CredentialBinding; expectedValue?: string },
   selection?: BackendSelection,
 ): Promise<CredentialIndexEntry> {
   const secret = input.secret.trim();
@@ -319,6 +329,9 @@ export async function setCredential(
 
   const backend = await backendFor(projectRoot, selection);
   return mutateIndex(projectRoot, async (entries) => {
+    if (input.expectedValue !== undefined && await backend.get(projectRoot, input.provider) !== input.expectedValue) {
+      throw new Error(`The ${input.provider} credential changed while renewing it. The newer credential was preserved.`);
+    }
     await backend.set(projectRoot, input.provider, secret);
 
     const readBack = await backend.get(projectRoot, input.provider);
@@ -382,14 +395,26 @@ function nextUpdatedAt(previous: string | undefined): string {
  * make a credential that is sitting in the keychain invisible.
  */
 export async function getStoredCredential(
-  projectRoot: string,
+  projectRoot: CredentialScope,
   provider: CredentialName,
-): Promise<{ value: string; kind: CredentialKind; backend: BackendId } | null> {
-  const entry = await credentialPresence(projectRoot, provider);
+  options: { inheritSet?: boolean } = {},
+): Promise<{ value: string; kind: CredentialKind; backend: BackendId; setName?: string } | null> {
+  const entry = await credentialPresence(projectRoot, provider, options);
   if (!entry) return null;
 
+  return getStoredCredentialForEntry(projectRoot, provider, entry);
+}
+
+/** Read the exact selected snapshot, without resolving a possibly newer binding. */
+export async function getStoredCredentialForEntry(
+  projectRoot: CredentialScope,
+  provider: CredentialName,
+  entry: CredentialIndexEntry,
+): Promise<{ value: string; kind: CredentialKind; backend: BackendId; setName?: string }> {
   const backend = backendById(entry.backend);
-  const value = await backend.get(projectRoot, provider);
+  const value = await backend.get(entry.setName ? { set: entry.setName } : projectRoot, provider);
+  const setName = entry.setName ?? (typeof projectRoot === 'string' ? undefined : projectRoot.set);
+  const scopeFlag = setName ? ` --set ${setName}` : '';
   if (value === null) {
     throw new Error(
       `The credential index says a ${credentialLabel(provider)} credential is stored in the ` +
@@ -400,11 +425,11 @@ export async function getStoredCredential(
       `directory restored without its keyring).\n` +
       `  If it is locked, unlock it and retry: \`security unlock-keychain\` on macOS, or start ` +
       `a keyring for the session on Linux.\n` +
-      `  If it is gone, re-store it with \`lazy auth set ${provider}\`, or drop the stale record ` +
-      `with \`lazy auth rm ${provider}\`.`,
+      `  If it is gone, re-store it with \`lazy auth set ${provider}${scopeFlag}\`, or drop the stale record ` +
+      `with \`lazy auth rm ${provider}${scopeFlag}\`.`,
     );
   }
-  return { value, kind: entry.kind, backend: entry.backend };
+  return { value, kind: entry.kind, backend: entry.backend, ...(entry.setName ? { setName: entry.setName } : {}) };
 }
 
 /**
@@ -425,7 +450,7 @@ export async function getStoredCredential(
  * @returns true when an orphan was actually removed
  */
 export async function purgeOrphanCredential(
-  projectRoot: string,
+  projectRoot: CredentialScope,
   name: CredentialName,
 ): Promise<boolean> {
   return mutateIndex(projectRoot, async (entries) => {
@@ -442,7 +467,7 @@ export async function purgeOrphanCredential(
 }
 
 /** Remove a provider's credential from both the backend and the index. */
-export async function deleteCredential(projectRoot: string, provider: CredentialName): Promise<boolean> {
+export async function deleteCredential(projectRoot: CredentialScope, provider: CredentialName): Promise<boolean> {
   return mutateIndex(projectRoot, async (entries) => {
     const entry = entries.find((candidate) => candidate.provider === provider);
     if (!entry) return false;
@@ -457,7 +482,7 @@ export async function deleteCredential(projectRoot: string, provider: Credential
     if (remaining.length === 0) {
       // Leave no empty index behind — `lazy auth list` should describe a fresh
       // project and a fully-cleared one identically.
-      await unlink(getCredentialIndexPath(projectRoot)).catch((err: NodeJS.ErrnoException) => {
+      await unlink(credentialIndexPath(projectRoot)).catch((err: NodeJS.ErrnoException) => {
         if (err.code !== 'ENOENT') throw err;
       });
     } else {
@@ -529,7 +554,7 @@ function envCredentialFor(
 function servedFromHydrated(
   provider: CredentialName,
   hydrated: EnvCredential,
-  describedBy: { kind: CredentialKind; backend: BackendId },
+  describedBy: { kind: CredentialKind; backend: BackendId; setName?: string },
   stale = false,
 ): ResolvedCredential {
   return {
@@ -538,6 +563,7 @@ function servedFromHydrated(
     value: hydrated.value,
     source: 'store',
     backend: describedBy.backend,
+    ...(describedBy.setName ? { setName: describedBy.setName } : {}),
     envVar: hydrated.envVar,
     ...(stale ? { stale: true } : {}),
   };
@@ -574,7 +600,9 @@ function adoptRotated(
     hint: entry.hint,
     kind: entry.kind,
     backend: entry.backend,
+    setName: entry.setName,
   });
+  clearStoreUnreadable(provider);
 }
 
 /**
@@ -655,6 +683,16 @@ export async function resolveCredential(
   if (fromEnv?.hydratedFrom) {
     const entry = await credentialPresence(projectRoot, provider);
     if (!entry) return null;
+    // A different source is a different spending decision. A failed read of
+    // the newly selected set must never spend the old set's hydrated secret.
+    if (fromEnv.hydratedFrom.setName !== entry.setName) {
+      const changed = await getStoredCredentialForEntry(projectRoot, provider, entry);
+      if (!changed) return null;
+      const resolved = resolvedFromStore(provider, changed);
+      adoptRotated(provider, fromEnv, entry, resolved, env);
+      return resolved;
+    }
+
     if (matchesHydratedEntry(fromEnv.hydratedFrom, entry)) {
       clearStoreUnreadable(provider);
       return servedFromHydrated(provider, fromEnv, entry);
@@ -676,7 +714,7 @@ export async function resolveCredential(
     // backend read worth its cost — and if it fails, the startup copy stands in
     // rather than every request for this provider throwing.
     try {
-      const rotated = await getStoredCredential(projectRoot, provider);
+      const rotated = await getStoredCredentialForEntry(projectRoot, provider, entry);
       clearStoreUnreadable(provider);
       if (!rotated) return null;
       const resolved = resolvedFromStore(provider, rotated);
@@ -699,7 +737,7 @@ export async function resolveCredential(
 /** A secret read straight out of the backend, as a resolved credential. */
 function resolvedFromStore(
   provider: CredentialName,
-  stored: { value: string; kind: CredentialKind; backend: BackendId },
+  stored: { value: string; kind: CredentialKind; backend: BackendId; setName?: string },
 ): ResolvedCredential {
 
   const envVar = envVarFor(provider, stored.kind);
@@ -715,6 +753,7 @@ function resolvedFromStore(
     value: stored.value,
     source: 'store',
     backend: stored.backend,
+    ...(stored.setName ? { setName: stored.setName } : {}),
     envVar,
   };
 }
@@ -747,6 +786,7 @@ export function credentialInEnv(
 /** Where a credential is available, and the non-secret handle that says so. */
 export interface CredentialSource {
   source: 'env' | 'store';
+  setName?: string;
   /** The env var NAME or the store backend id — never the secret. */
   via: string;
   /**
@@ -757,8 +797,8 @@ export interface CredentialSource {
    */
   stale?: boolean;
   /**
-   * Set only on the stale path: the FORM of the value actually being served,
-   * taken from the record it was hydrated from. The current index entry may
+   * Set for a stale copy or a set credential served from the daemon's startup
+   * environment: the FORM taken from its hydration record. The current index may
    * describe a different kind, and reporting that one beside a served secret of
    * the other is the same reporting-vs-serving divergence `stale` exists to
    * close. Null elsewhere — a caller reads the kind from the index as before.
@@ -794,14 +834,23 @@ export async function locateCredential(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<CredentialSource | null> {
   const fromEnv = envCredentialFor(provider, env);
-  if (fromEnv && !fromEnv.hydratedFrom) return { source: 'env', via: fromEnv.envVar };
+  if (fromEnv && !fromEnv.hydratedFrom) {
+    // Native Anthropic keeps spending its startup environment until restart.
+    // Preserve the loaded set's provenance, not the current binding or index:
+    // either can now describe a different account or credential form.
+    const loaded = hydratedCopyFrom(provider, fromEnv.envVar, fromEnv.value);
+    return { source: 'env', via: fromEnv.envVar,
+      ...(loaded?.setName ? { setName: loaded.setName, kind: loaded.kind } : {}) };
+  }
   const stored = await credentialPresence(projectRoot, provider);
   if (!stored) return null;
-  const degraded = fromEnv?.hydratedFrom && isStoreUnreadable(provider) ? fromEnv.hydratedFrom : null;
+  const degraded = fromEnv?.hydratedFrom
+    && fromEnv.hydratedFrom.setName === stored.setName
+    && storeUnreadableFor(provider, stored) ? fromEnv.hydratedFrom : null;
   // Degraded: describe the record being SERVED — its backend and its kind —
   // not the newer entry the backend will not hand over.
-  if (degraded) return { source: 'store', via: degraded.backend, stale: true, kind: degraded.kind };
-  return { source: 'store', via: stored.backend };
+  if (degraded) return { source: 'store', via: degraded.backend, stale: true, kind: degraded.kind, ...(degraded.setName ? { setName: degraded.setName } : {}) };
+  return { source: 'store', via: stored.backend, ...(stored.setName ? { setName: stored.setName } : {}) };
 }
 
 /**
@@ -819,4 +868,33 @@ export async function credentialAvailable(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<'env' | 'store' | null> {
   return (await locateCredential(projectRoot, provider, env))?.source ?? null;
+}
+
+/** Stored source hidden by a genuine export, never by our own startup copy. */
+export async function credentialOverrideReport(
+  root: string,
+  provider: CredentialName,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ shadowed?: string; shadowCheckError?: string }> {
+  const exported = envCredentialFor(provider, env);
+  if (!exported || hydratedCopyFrom(provider, exported.envVar, exported.value)) return {};
+  try {
+    const stored = await credentialPresence(root, provider);
+    return stored ? { shadowed: stored.setName ? `set ${stored.setName}` : 'project credential store' } : {};
+  } catch (err) {
+    // A broken store cannot invalidate a usable export. Report the failed
+    // inspection separately, keeping environment-first presence intact.
+    return { shadowCheckError: `Could not inspect credentials overridden by ${exported.envVar}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/** Effective stored names, with the project's own entry winning per name. */
+export async function effectiveCredentialIndex(root: string): Promise<CredentialIndexEntry[]> {
+  const own = await readCredentialIndex(root);
+  const binding = await readCredentialSetBinding(root);
+  if (!binding?.set) return own;
+  const shared = await readCredentialIndex({ set: binding.set });
+  const owned = new Set(own.map(entry => entry.provider));
+  return [...own, ...shared.filter(entry => !owned.has(entry.provider) && !entry.provider.startsWith('teams:'))
+    .map(entry => ({ ...entry, setName: binding.set! }))];
 }

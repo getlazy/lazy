@@ -9,7 +9,9 @@
  * it keys on the park, as every automatic daemon action does.
  *
  * WHAT: only when the project has a Start services command. Stop runs once
- * (the project's Stop services command, then the process group is ended);
+ * (the project's Stop services command, then the process group is ended —
+ * the `services` tmux session itself stays open, so anyone attached to it
+ * stays attached and sees "restarted after turn N");
  * a failed stop is logged and the start runs anyway. Start runs once, through
  * the same `runStartServices` Run services uses — with the same short settle
  * check and no waiting on ports. A failed start is a WARNING recorded on the
@@ -119,7 +121,7 @@ export async function servicesRestartGate(
     logger.warn(`Task ${displayId(task)}: services not restarted after the turn (parking without it): ${err instanceof Error ? err.message : String(err)}`);
     return 'proceed';
   }
-  const run = restartServicesAfterWorkTurn(storage, projectRoot, task, session, deps)
+  const run = restartServicesAfterWorkTurn(storage, projectRoot, task, session, deps, turnKey.split(':').pop())
     .then(() => undefined)
     .finally(() => { inFlight.delete(task.id); });
   inFlight.set(task.id, run);
@@ -146,6 +148,8 @@ export async function restartServicesAfterWorkTurn(
   task: Task,
   session: Session | null,
   deps: ServicesRestartDeps = servicesRestartDefaults,
+  /** The agent turn this restart follows, for the line the session prints. */
+  afterTurn?: string,
 ): Promise<ServicesRestartRecord | null> {
   try {
     const command = await (deps.resolveCmd ?? resolveProjectStartServicesCmd)(storage, projectRoot);
@@ -163,7 +167,9 @@ export async function restartServicesAfterWorkTurn(
     };
     const stop: ServicesRestartStep = { ok: true };
     try {
-      await stopStartServices(projectRoot, { taskId: task.id }, runDeps);
+      // The session stays open: the start below restarts the command IN it,
+      // so a terminal attached to the services is not thrown out by a turn.
+      await stopStartServices(projectRoot, { taskId: task.id }, { ...runDeps, keepSession: true });
     } catch (err) {
       stop.ok = false;
       stop.error = readableFailure(err);
@@ -171,7 +177,10 @@ export async function restartServicesAfterWorkTurn(
     }
     const start: ServicesRestartStep = { ok: true };
     try {
-      await runStartServices(projectRoot, { taskId: task.id }, runDeps);
+      await runStartServices(projectRoot, { taskId: task.id }, {
+        ...runDeps,
+        startBanner: `restarted after ${afterTurn && /^\d+$/.test(afterTurn) ? `turn ${afterTurn}` : 'the agent\'s turn'}`,
+      });
     } catch (err) {
       start.ok = false;
       // Not readableFailure: it joins lines, and the output tail is the point.

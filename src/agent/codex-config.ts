@@ -38,7 +38,7 @@
  * shapes against codex-cli 0.152.1; see docs/codex-chatgpt-subscription.md.
  */
 
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { getHome } from '../utils/home';
 import { readFileSafe, writeFile, ensureDir } from '../utils/fs';
 
@@ -83,6 +83,33 @@ export interface CodexTurnConfig {
   proxyBaseUrl: string;
   /** The lazy MCP server entry, provided by the Runner. */
   mcpServer: { command: string; args: string[] };
+  /**
+   * Directories codex must treat as UNTRUSTED (`[projects."<path>"]
+   * trust_level = "untrusted"`) — a member's session on Lazy Teams passes the
+   * task worktree. An untrusted project's own `.codex/` config layer and its
+   * hooks are not loaded, and with an entry present codex never asks the
+   * "trust this directory?" question, so a member cannot be talked into
+   * loading configuration a turn wrote next to their credential. Accepted by
+   * codex-cli 0.164.0 (an unknown value fails with "failed to load bootstrap
+   * configuration"; "untrusted" loads).
+   */
+  untrustedProjects?: string[];
+  /**
+   * Instructions codex adds as a DEVELOPER message ahead of the conversation —
+   * the builder's system prompt. Top-level `developer_instructions`, verified
+   * against codex-cli 0.164.0 with `codex debug prompt-input` (the text appears
+   * as its own developer message, after codex's base instructions). In the file
+   * rather than `-c` on argv so a large prompt has no argv limit. Task turns
+   * leave it unset: their prompt rides the `codex exec` input.
+   */
+  developerInstructions?: string;
+  /**
+   * How codex treats the lazy MCP server's tools. `approve` (the default, and
+   * what every supervised turn uses — nobody is there to answer a prompt);
+   * `prompt` only for an interactive builder the human started with
+   * `--no-autonomous`, where asking first is the point.
+   */
+  toolsApproval?: 'approve' | 'prompt';
 }
 
 /**
@@ -113,7 +140,7 @@ export function renderCodexConfig(config: CodexTurnConfig): string {
 
 model_provider = "lazy"
 project_doc_max_bytes = ${CODEX_PROJECT_DOC_MAX_BYTES}
-
+${config.developerInstructions !== undefined ? `developer_instructions = ${tomlString(config.developerInstructions)}\n` : ''}
 [model_providers.lazy]
 name = "lazy audit proxy (OpenAI-compatible)"
 base_url = ${tomlString(base)}
@@ -123,11 +150,14 @@ wire_api = "responses"
 [mcp_servers.lazy]
 command = ${tomlString(config.mcpServer.command)}
 args = [${config.mcpServer.args.map(tomlString).join(', ')}]
-default_tools_approval_mode = "approve"
+default_tools_approval_mode = "${config.toolsApproval ?? 'approve'}"
 
 [features]
 plugins = false
-`;
+${(config.untrustedProjects ?? []).map((dir) => `
+[projects.${tomlString(dir)}]
+trust_level = "untrusted"
+`).join('')}`;
 }
 
 /**
@@ -137,9 +167,8 @@ plugins = false
  * when an unmanaged config.toml is in the way — the caller fails the turn,
  * which is the same posture as prepareTurnMcp's other config writes.
  */
-export async function writeCodexConfig(config: CodexTurnConfig): Promise<boolean> {
-  const path = codexConfigPath();
-  await ensureDir(join(getHome(), '.codex'));
+export async function writeCodexConfig(config: CodexTurnConfig, path: string = codexConfigPath()): Promise<boolean> {
+  await ensureDir(dirname(path));
 
   const next = renderCodexConfig(config);
   const existing = await readFileSafe(path);

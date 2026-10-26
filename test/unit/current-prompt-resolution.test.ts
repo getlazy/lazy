@@ -32,6 +32,10 @@ import { createStorage, type Storage } from '../../src/storage';
 import { currentPromptOf } from '../../src/task-prompt';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { closeAllStorage } from '../../src/daemon/rpc-handlers';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 const V1 = 'ORIGINAL PROMPT\n\n## Note on your own worktree\nYou are a child of release-v022.';
 const V2 = 'EDITED PROMPT\n\nYou are targeting `main`, deliberately.\n\n## One hazard to watch\n...';
@@ -52,7 +56,7 @@ describe('current prompt resolution', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     ctx = { taskId: '', worktreePath: testDir, storage };
   });
 

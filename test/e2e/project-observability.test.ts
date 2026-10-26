@@ -115,6 +115,62 @@ describe('project observability over the daemon\'s wire', () => {
     return (await rpc('runnerImage')).imageState;
   }
 
+// INVARIANT: concurrent rebuild clicks start one job and the losing click
+// names its log, rather than cancelling the first request's work.
+test('overlapping cached and uncached rebuild clicks share one running build', async () => {
+  await docker.slowBuilds(2);
+  const before = (await docker.builds()).length;
+  const outcomes = await Promise.allSettled([
+    rpc('rebuildRunnerImage', { noCache: false }),
+    rpc('rebuildRunnerImage', { noCache: true }),
+  ]);
+  const successes = outcomes.filter(r => r.status === 'fulfilled');
+  const refusals = outcomes.filter(r => r.status === 'rejected');
+  expect(successes).toHaveLength(1);
+  expect(refusals).toHaveLength(1);
+  const reply = successes[0]!.value;
+  const buildId = reply.defaultBuild?.id ?? reply.imageState.build.id;
+  expect(refusals[0]!.reason).toMatchObject({ status: 409, details: { buildId } });
+  const finished = await until(
+    () => rpc('imageBuildLog', { buildId }),
+    page => page.build.outcome !== 'running', 30_000, 'the winning rebuild to finish',
+  );
+  expect(finished.build.outcome).not.toBe('cancelled');
+  expect((await docker.builds()).length - before).toBe(1);
+});
+
+  // INVARIANT: completed image logs and summaries survive daemon restarts;
+  // a build URL is a durable record rather than a process-local handle.
+  test('completed image build history and full logs survive a daemon restart', async () => {
+    await docker.buildOutput(Array.from({ length: 6000 }, (_, i) => '#5 0.1 archive-line-' + i).join('\n'));
+    const rebuilding = await rpc('rebuildRunnerImage');
+    const newId = rebuilding.imageState.build.id;
+    const state = await until(imageState, s => s.build?.id === newId && s.state === 'failed', 60_000, 'the long build to fail');
+    const id = state.build.id;
+    const before = await rpc('imageBuildLog', { buildId: id });
+    expect(before.build.outcome).toBe('failed');
+    const allLines = [];
+    let cursor = 0;
+    while (true) {
+      const page = await rpc('imageBuildLog', { buildId: id, after: cursor, limit: 2000 });
+      allLines.push(...page.lines);
+      if (!page.lines.length || page.next >= page.lastSeq) break;
+      cursor = page.next;
+    }
+    expect(allLines.length).toBeGreaterThan(6000);
+    expect(allLines.some(l => l.text.includes('archive-line-0'))).toBe(true);
+    expect(allLines.some(l => l.text.includes('archive-line-5999'))).toBe(true);
+    expect(JSON.stringify(before)).not.toContain(SEEDED_SECRET);
+    await ctx.restartDaemon({ PATH: `${docker.binDir}:${process.env.PATH ?? ''}` });
+    client = (await DaemonClient.create(ctx.root))!;
+    const after = await rpc('imageBuildLog', { buildId: id });
+    expect(after.build.outcome).toBe('failed');
+    expect(after.lines).toEqual(before.lines);
+    const listing = await rpc('imageBuildLog', { list: true });
+    expect(listing.builds.some((b: any) => b.id === id)).toBe(true);
+    expect(listing.logsKept).toBe(20);
+  }, 120_000);
+
   // INVARIANT: adoption never blocks the request on the export (engineer,
   // 2026-10-03). The RPC answers while `git archive` is still held inside
   // git, and the export is a running step of the adoption's build log.
@@ -134,6 +190,11 @@ describe('project observability over the daemon\'s wire', () => {
     expect(adopted.adoptionBuild.phase).toBe('exporting');
     // ONE state: the adoption, not the failed project image beside it.
     expect(adopted.imageState.state).toBe('adoption_in_progress');
+    for (const noCache of [false, true]) {
+      await expect(rpc('rebuildRunnerImage', { noCache })).rejects.toMatchObject({
+        status: 409, details: { buildId: adopted.adoptionBuild.buildId },
+      });
+    }
 
     // The export really is still running: give it time, it does not finish.
     await new Promise((r) => setTimeout(r, 1_500));

@@ -66,6 +66,17 @@ For repositories you manage yourself, configure the mode with `[git] lfs_check` 
 
 `lfs_check` does **not** affect the accept-time guard below, which is always on.
 
+In Lazy Teams, a project admin can set the same start-time mode under
+**Settings → Configuration**:
+
+```toml
+[git]
+lfs_check = "refuse"
+```
+
+This refuses a task start if the LFS filter would leave raw file content in
+commits.
+
 ## Layer 2: the accept-time guard
 
 Before `lazy accept` merges anything, lazy scans `merge-base..<task branch>` for

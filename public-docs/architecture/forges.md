@@ -1,6 +1,29 @@
 # Forges
 
+```mermaid
+%% caption: Protected targets merge through a PR or MR; unprotected targets merge locally
+flowchart LR
+  Task[Task branch] --> Decision{Target protected?}
+  Decision -->|yes| PR[PR or MR on forge]
+  PR --> Protected[Protected target]
+  Decision -->|no| Local[Local squash merge]
+  Local --> Parent[Target branch]
+  Person[Person explicitly submits] --> PR
+```
+
+
 Lazy works with GitHub and GitLab through their command-line tools, `gh` and `glab`, which run on the host under your login (`[remote] driver = "github"` or `"gitlab"`). With the default `local` driver there is no forge and lazy never touches a remote. Task containers never hold forge credentials, so agents cannot reach the forge themselves.
+
+In Lazy Teams, a project admin sets the forge under **Settings → Configuration**:
+
+```toml
+[remote]
+driver = "github"
+git_remote = "origin"
+```
+
+Lazy then uses the `origin` remote for task branches and GitHub for pull
+requests.
 
 ## When a pull request exists
 

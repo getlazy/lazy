@@ -183,14 +183,20 @@ own sign-in still guards them.
 ## When nothing is listening
 
 Opening a task service in a browser when the dev server is not up does not
-give you the browser's own "connection refused" page. The daemon knows why it
-could not forward, so it sends you to that task's page in the web UI with a
-banner saying which service you opened and what is wrong — the container is not
-running, or it is running and nothing is listening on that port — followed by
-the same **Start container** and **Start services** buttons the page already
-has, and a *Try again* link back to the URL you tried.
+give you the browser’s own "connection refused" page. In Teams and the daemon
+dashboard, when a Start services command is configured, a **Services are
+starting** page shows the start command’s live
+progress while it waits for the specific port you opened. Each port is
+checked independently: a ready web service opens even if another service is
+still starting. Once that port answers, you reach the exact URL you requested,
+including its path and query, without a detour through the task page.
 
-Only browser *navigations* are redirected. An asset, an XHR or a `fetch` gets a
+If nothing is starting the service, the page explains what is missing and
+offers **Run services**. That starts the environment first if needed, then
+runs the configured start command. Without a Start services command, the
+dashboard opens the task’s Services page so you can configure one.
+
+Only browser *navigations* get this waiting page. An asset, an XHR or a `fetch` gets a
 `502` with a one-line explanation instead, because answering those with an HTML
 page produces a confusing failure rather than a clear one.
 
@@ -277,6 +283,10 @@ arrival. Bring the task up with `lazy shell my-task` first, start
 whatever should be listening, then forward in another terminal. And it does not
 show up in `lazy url`, which reports what the *container* publishes — a forward
 lives only in the terminal you started it in.
+
+For a long-lived forward from an editor or another machine's terminal, `ssh -L`
+works too, once the task is set up for SSH: see
+[How to SSH into a task](how-to/ssh-into-a-task.md#preview-a-service-with-ssh--l).
 
 If the task's image is old enough to predate lazy shipping `socat` (which is how
 a forwarded connection reaches a port inside the container), the command says so

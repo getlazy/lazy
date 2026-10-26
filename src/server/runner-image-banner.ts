@@ -15,7 +15,14 @@ import { launchNeedsImageConfirmation, taskRunnerImageView } from '../daemon/run
 /** The dashboard line: building (with the newest build line) or failed (with the reason and a retry). */
 export function dashboardRunnerImageHtml(): string {
   const s = runnerImageStatus();
-  if (s.state === 'none' || s.state === 'ready') return '';
+  if (s.state === 'none') return '';
+  // A ready image says nothing — unless the daemon rebuilt it after the branch
+  // advanced, when the commit it was built from is the useful fact.
+  if (s.state === 'ready') {
+    return s.builtFrom
+      ? `<div class="rv-note" id="runner-image-status"><span class="tag">runner image</span> ${escapeHtml(describeRunnerImage(s))}</div>`
+      : '';
+  }
   // A Rebuild that is replacing a ready image (or failed to) leaves that image
   // in use: nothing falls back to the default image, so do not say it does.
   const fallback = s.state !== 'checking' && s.replacing

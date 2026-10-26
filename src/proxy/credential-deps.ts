@@ -14,7 +14,6 @@
 
 import type { ResolvedConfig } from '../config/types';
 import { getAuthEnvVars } from '../capture/claude';
-import { resolveAgentApiKey } from '../agent/credentials';
 import { resolveCredential } from '../credentials/store';
 import { resolveChatGptSession, resolveChatGptSessionFrom } from '../credentials/chatgpt-session';
 import { ChatGptRefreshTransientError } from '../credentials/chatgpt-tokens';
@@ -45,6 +44,7 @@ import { loadConfig } from '../config/loader';
 import { providerCredentialHostAdvice } from '../config/agent-profile-advice';
 import { isManagedMode } from '../config/managed-mode';
 import { getTaskSessionBinding } from '../daemon/session-credentials';
+import { memberBindingMaySpend } from '../daemon/member-recovery';
 import {
   storeRenewedEndpointCredential,
   teamModeEnabled,
@@ -107,7 +107,7 @@ async function resolveAnthropic(): Promise<TargetCredentialOutcome> {
  */
 function resolveCursor(projectRoot: string): () => Promise<TargetCredentialOutcome> {
   return async () => {
-    const key = await resolveAgentApiKey(projectRoot, 'cursor');
+    const key = await resolveCredential(projectRoot, 'cursor');
     if (!key) {
       return {
         kind: 'missing',
@@ -116,7 +116,8 @@ function resolveCursor(projectRoot: string): () => Promise<TargetCredentialOutco
           'or export CURSOR_API_KEY in the environment the daemon starts from.',
       };
     }
-    return { kind: 'credential', placement: { kind: 'in-place', value: key.value }, label: 'CURSOR_API_KEY' };
+    return { kind: 'credential', placement: { kind: 'in-place', value: key.value }, label: 'CURSOR_API_KEY',
+      sourceId: JSON.stringify([projectRoot, key.source, key.setName ?? null]) };
   };
 }
 
@@ -393,7 +394,7 @@ async function resolveMemberSpender(projectRoot: string, grant: CredentialGrant)
   if (!(await teamModeEnabled(projectRoot))) return null;
   const bindingKey = grant.role === 'agent' ? grant.taskUuid : grant.bindingKey;
   const found = bindingKey ? await getTaskSessionBinding(projectRoot, bindingKey) : null;
-  if (!found || found.revokedAt !== null) return { member: null, bound: false, reason: 'this launch has no active member credential binding; resume it before spending' };
+  if (!found || found.revokedAt !== null || !memberBindingMaySpend(projectRoot, found.taskId)) return { member: null, bound: false, reason: 'this launch has no active member credential binding; resume it before spending' };
   const member = await spendingMember(projectRoot, found.ownerUserId);
   return { member, bound: true, ...(member ? {} : { reason: 'no service credential holder is configured' }) };
 }
@@ -458,6 +459,7 @@ async function memberPlacement(
     let session: Awaited<ReturnType<typeof resolveChatGptSessionFrom>>;
     try {
       session = await resolveChatGptSessionFrom({
+        projectRoot,
         key: JSON.stringify([projectRoot, 'member', owner, record.endpointId]),
         read: async () => {
           // A queued renewal reads live. Re-check that live record against this
@@ -470,10 +472,7 @@ async function memberPlacement(
         persist: async (secret, renewedFrom) => {
           const stored = await storeRenewedEndpointCredential(projectRoot, owner, record.endpointId, secret, renewedFrom);
           if (!stored) {
-            logger.warn(
-              `[credentials] a renewed ChatGPT session for ${owner} (profile ${record.endpointId}) was not ` +
-              `written back: the credential was replaced or removed while it renewed, and the newer one stands`,
-            );
+            throw new Error('The connected ChatGPT credential was replaced or removed while renewing. The newer connection was preserved.');
           }
         },
         label: `${owner}, profile ${record.endpointId}`,
@@ -496,7 +495,8 @@ async function memberPlacement(
   }
   switch (profile.credential) {
     case 'cursor':
-      return { kind: 'credential', placement: { kind: 'in-place', value: record.token }, label };
+      return { kind: 'credential', placement: { kind: 'in-place', value: record.token }, label,
+        sourceId: JSON.stringify([projectRoot, 'member', owner, record.endpointId]) };
     case 'ollama':
       return { kind: 'credential', placement: ollamaPlacement(record.token), label };
     case 'openai':

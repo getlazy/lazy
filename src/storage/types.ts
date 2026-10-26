@@ -1321,6 +1321,14 @@ export interface BuilderSession {
    * link and its seed when it is listed or resumed later.
    */
   pastContinuations?: BuilderPastContinuation[] | null;
+  /**
+   * The agent profile this run's builder runs on, when the member picked one
+   * other than the builder role's (`codex-subscription` for a Codex builder).
+   * Null or absent: the role's configured profile. Fixed for the run's life —
+   * a stop and restart, and a resume, come back on the same profile, because a
+   * conversation can only be continued by the harness that recorded it.
+   */
+  agentProfile?: string | null;
 }
 
 /** A continuation a run carried for one conversation (BuilderSession.pastContinuations). */

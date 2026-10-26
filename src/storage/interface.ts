@@ -1,3 +1,6 @@
+import type { StoredImageBuild, StoredImageBuildLogPage } from './image-build';
+import type { DiskSpaceState } from './disk-space-state';
+import type { TerminalCleanupState } from './terminal-cleanup-state';
 /**
  * Storage interface
  *
@@ -278,6 +281,15 @@ export interface Storage {
    */
   initialize(): Promise<void>;
 
+  /** Inspect ownership without initializing, locking, or mutating the store. */
+  checkOwnership(): Promise<void>;
+
+  /** Record this checkout as owner, refusing any existing different owner. */
+  claimOwnership(): Promise<void>;
+
+  /** Explicit local operator transfer; requires the previous owner and a free lock. */
+  rehomeOwnership(previousProject: string): Promise<void>;
+
   /**
    * Close storage and release resources
    */
@@ -339,6 +351,12 @@ export interface Storage {
    * List all tasks
    */
   listTasks(): Promise<Task[]>;
+
+  /**
+   * List every task, refusing unreadable records or an unreadable directory.
+   * Destructive ownership checks must never mistake a partial list for absence.
+   */
+  listTasksStrict(): Promise<Task[]>;
 
   /**
    * List tasks with filtering options
@@ -1468,6 +1486,18 @@ export interface Storage {
    * set. Null means "no overrides" — every effective value comes from
    * lazy.toml. Callers must not treat null as an error.
    */
+  /** Daemon-owned disk recovery; never writable through the generic storage RPC. */
+  listImageBuilds(): Promise<StoredImageBuild[]>;
+  saveImageBuild(build: StoredImageBuild): Promise<void>;
+  appendImageBuildLog(id: string, lines: string): Promise<void>;
+  readImageBuildLog(id: string, after: number, limit: number): Promise<StoredImageBuildLogPage>;
+  pruneImageBuildLogs(keep: number): Promise<void>;
+
+  getDiskSpaceState(): Promise<DiskSpaceState | null>;
+  saveDiskSpaceState(state: DiskSpaceState): Promise<void>;
+  getTerminalCleanupState(): Promise<TerminalCleanupState | null>;
+  saveTerminalCleanupState(state: TerminalCleanupState): Promise<void>;
+
   getProjectSettings(): Promise<ProjectSettings | null>;
 
   /**

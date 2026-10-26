@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.94.1212] - 2026-10-23 - Pair on other agents, Codex Builders, SSH into a task
+
+### Added
+
+- **Pair and Chat on Codex, Cursor and Pi** — Teams members pair on their own connections, resuming the agent's conversation; `lazy chat` covers Cursor and Pi; Codex pairing can run commands
+- **Builders on Codex** — `lazy builder --agent codex-subscription` and Teams' **Runs on** picker start a Codex builder with lazy's tools, instructions, transcripts and usage, billed to that profile's credential
+- **SSH into a task** — `lazy shell <task> --ssh-config --install` sets up `ssh`, `scp`, `ssh -L` to its services and VS Code/JetBrains remote, with keys under Teams' Account settings
+- **`$LAZY_TASK_DATA`** — every task gets a persistent data directory for its services' data that survives restarts and is removed when the task finishes; an existing environment gets it when you restart it
+- **Credential sets** — store a credential once, bind several projects outside git, and see each credential’s source and binding change time
+- **Services in a tmux session** — a task's services run in an attachable `services` session that survives turns and daemon restarts; agents read its output with `lazy_sessions` (images without tmux keep the plain detached run)
+- **Sessions on the Services tab** — Teams and the dashboard list a task's sessions with their screens and logs, and attach read-only or take control; `lazy sessions` reads them
+- **Who else is in a task** — shells (including SSH logins), `lazy sessions` and the Sessions section name the other members inside a task, its running sessions, and whether the agent is mid-turn
+- **Project image follows the branch** — when the project's branch advances, including a PR/MR merged on GitHub or GitLab, the runner image rebuilds in the background from that commit and is used once built
+- **Chat tab on every task** — a read-only conversation with the task's agent in Teams and the dashboard; messages sent mid-turn wait for the turn to end
+- **Danger zone in Teams** — delete a project or an empty team by typing its name; data is kept aside, and the name is reusable at once
+- **Teams image history** — rebuild from project settings and revisit completed build logs; the newest 20 logs survive daemon restarts
+- **Builder context** — builders and task agents know their deployment, file access and browser addresses, keeping Teams guidance separate from laptop instructions
+- **Teams: forge identity and Check push access** — a project shows whose GitHub/GitLab identity and which token it pushes with, and checks push access with the forge's real answer and fix; new tokens apply without a restart and survive every restart
+- **Project network diagnostics** — admins can check DNS and egress, see host resolver changes, and review running work before restarting
+
+### Changed
+
+- **Agent verification** — active work and child accepts use targeted tests; the full suite runs once before protected-branch acceptance
+- **Codex default model** — tasks without an explicit model now run `gpt-6.1-sol`; documentation and configuration examples use the new default
+- **Task shells keep running** — terminal and SSH connections have no idle or lifetime limit; member environments survive inactivity and project restarts
+- **Leaving a team removes your environments** — a departed member's task containers and terminals on the team's projects are removed at once instead of after 12 idle hours
+
+### Fixed
+
+- **Daemon start after an upgrade** — the store backup shows progress, where it was saved and how to restore it everywhere; survives Ctrl+C; reused across versions; fixed start failures read as fixed
+- **Service data ownership** — lazy no longer takes over files a task's own services own, so a Postgres or Redis data directory keeps working across turns
+- **Source builds** — select the pinned Bun through mise before installing dependencies, or stop immediately with one command to fix an older Bun
+- **Agent retries** — transient model errors recover on a bounded schedule, show retry times, and end clearly when recovery fails
+- **Task containers** — cleanup preserves open tasks’ stopped containers and member environments across restarts; support bundles include full daemon health details
+- **Teams disk recovery** — reclaim unused space, grow disks live, prevent repeated cold builds, and show finished-task cleanup failures with sizes and retry history
+- **Clickable controls** — Teams and dashboard controls explain unavailable actions when clicked, including why and what to do next
+- **Portable stores** — relative storage paths follow the project root, so a project and its neighboring store can move together
+- **`lazy init`** — interactive setup offers only Docker while the microVM runner remains available through explicit configuration
+- **Store ownership** — existing stores upgrade with saved checkout proof; otherwise, a default-no terminal prompt offers an explicit claim; clones remain refused
+- **Lazy Teams setup** — leaves project files clean and recovers exact setup-only edits that blocked updates, preserving staged and concurrent changes
+- **Pairing in Lazy Teams** — Pair and Chat support every Claude Code profile, including tiered endpoints, using your connections and member-scoped lazy tools
+- **Services in Teams and the dashboard** — each port waits on one live progress page, then opens the exact address requested without bouncing to the task
+- **Refused pushes are reported, not retried** — a forge refusal (missing `workflow` scope, organization SSO, protected branch, 401/403) fails at once with its fix instead of three retries and a network hint
+
 ## [0.93.1210] - 2026-10-23 - More fixes
 
 ### Added

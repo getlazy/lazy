@@ -14,6 +14,7 @@
  * remote is GitHub, GitLab, or any other forge.
  */
 
+import { recordPushOutcome } from './push-failure';
 import { assertNoDeliveredSecretsToPush } from './task-files';
 import { shortId, displayId, getWorktreePath, taskRef } from '../task/identity';
 import { loadConfig } from '../config/loader';
@@ -464,8 +465,11 @@ async function exportTasks(storage: Storage, root: string, driver: RepositoryDri
         await assertNoDeliveredSecretsToPush(root, session.git_branch, `Pushing ${session.git_branch}`);
         await driver.pushBranch(session.git_branch);
         result.pushed++;
+        await recordPushOutcome(storage, task.id, session.git_branch, null);
       } catch (err) {
-        result.errors.push(`Failed to push ${session.git_branch}: ${err instanceof Error ? err.message : err}`);
+        const message = err instanceof Error ? err.message : String(err);
+        result.errors.push(`Failed to push ${session.git_branch}: ${message}`);
+        await recordPushOutcome(storage, task.id, session.git_branch, message);
         continue;
       }
 
@@ -1397,6 +1401,13 @@ export async function runSync(root: string, storage: Storage, log: SyncLogger): 
   // Let the driver fetch upstream state (git fetch, ff-merge, etc.)
   // Throws for LocalDriver — caller decides how to handle.
   await driver.fetchRemoteState(root, targetBranches);
+
+  // The fetch is where the daemon learns that the project's branch advanced
+  // on the forge (a PR/MR merged into a protected main): the project image
+  // follows origin's tip from here (src/daemon/runner-image.ts). Never throws,
+  // never waits for the build.
+  const { noteActingBranchAdvance } = await import('./runner-image');
+  await noteActingBranchAdvance(root);
 
   // Linked branch-only tasks: attach a PR/MR that appeared since last pass.
   // PULL only — no webhooks. Uses the adopted git branch, never lazy/<ref>.

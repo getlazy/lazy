@@ -3,7 +3,8 @@
  * the narrowing a task agent's call gets.
  */
 import { describe, test, expect } from 'bun:test';
-import { memberUsageLimitsView, projectUsageLimits, scopeUsageLimitsView } from '../../src/usage-pause/limits-view';
+import { memberPairUsageLimitsView, memberUsageLimitsView, projectUsageLimits, scopeUsageLimitsView } from '../../src/usage-pause/limits-view';
+import { memberEndpointUsageKey } from '../../src/proxy/usage-limits';
 import type { UsageLimitReading } from '../../src/proxy/usage-limits';
 import type { UsagePauseVerdict } from '../../src/usage-pause/policy';
 import { describeUsageLimitsView } from '../../src/daemon/usage-pause';
@@ -36,6 +37,45 @@ const pause = {
 };
 
 describe('usage-limits view', () => {
+  // INVARIANT: member Pair/Chat sees only its own account, never the paired
+  // task's spender or comment/launch state. Two members on one task differ.
+  test('Pair and Chat scope every credential field to the authenticated member', () => {
+    const endpointAlice = memberEndpointUsageKey('alice@example.com', 'builtin:anthropic');
+    const endpointBob = memberEndpointUsageKey('bob@example.com', 'builtin:anthropic');
+    const service = 'user:__service__';
+    const credentials = [alice.credential, bob.credential, endpointAlice, endpointBob, service, 'credential:ANTHROPIC_API_KEY'];
+    const full = projectUsageLimits(credentials.map(c => reading(c, {})), {
+      ...pause,
+      configured: { threshold_percent: 80, credentials: Object.fromEntries(credentials.map(c => [c, 70])) },
+      paused: credentials.map(c => ({ ...bobPaused, credential: c })),
+      coverage: credentials.map(c => ({ credential: c, coverage: 'none' as const, readingAt: null, lastSpentAt: null })),
+    }, Date.now(), credentials.map(c => ({
+      credential: c, userId: null, profile: null, upstream: 'https://api.anthropic.com',
+      failedAt: 1000, status: 401, error: 'Expired', unusable: false,
+    })));
+    for (const [email, own] of [[' ALICE@example.com ', [alice.credential, endpointAlice]], ['bob@example.com', [bob.credential, endpointBob]]] as const) {
+      const scoped = memberPairUsageLimitsView(full, email);
+      expect(scoped.scope).toBe('member');
+      expect(scoped.readings.map(r => r.credential)).toEqual([...own]);
+      expect(Object.keys(scoped.pause.configured.credentials)).toEqual([...own]);
+      expect(scoped.pause.paused.map(p => p.credential)).toEqual([...own]);
+      expect(scoped.pause.coverage.map(c => c.credential)).toEqual([...own]);
+      expect(scoped.credentialHealth.map(c => c.credential)).toEqual([...own]);
+      expect(scoped.pause.held).toEqual([]);
+    }
+    expect(() => memberPairUsageLimitsView(full, '')).toThrow('authenticated member');
+  });
+
+  // INVARIANT: a member on an endpoint/tiered profile sees their own endpoint
+  // readings, never the task owner's or another member's connection.
+  test('member Pair scopes named tier endpoints to the attaching member', () => {
+    const own = memberEndpointUsageKey('alice@example.com', 'gateway');
+    const other = memberEndpointUsageKey('bob@example.com', 'gateway');
+    const primary = memberEndpointUsageKey('alice@example.com', 'builtin:anthropic');
+    const full = projectUsageLimits([own, other, primary].map(key => reading(key, {})), pause);
+    expect(memberPairUsageLimitsView(full, 'alice@example.com', ['gateway']).readings.map(r => r.credential)).toEqual([own]);
+  });
+
   test('project view carries every reading with its overage and pause verdict', () => {
     const view = projectUsageLimits([alice, bob], pause);
     expect(view.scope).toBe('project');

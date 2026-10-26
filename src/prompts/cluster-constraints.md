@@ -49,6 +49,12 @@ wave — do not start work that will stall half-done at the limit. A window with
 estimate; a `tokens-only` harness has no limit lazy can see; a null `budget` (with
 `budgetError`) means no estimate at all. None of them is permission to guess.
 
+## Verification
+
+During active work, run only tests covering the touched code, typecheck/lint, and the project's named repo-wide guard tests. Never run or request the project's full test suite during active work, fix rounds, self-review, or child accepts into a cluster or hub. Use diff review and the child's targeted tests for child accepts. A break in a seemingly unrelated test is acceptable until protected-branch acceptance; do not send a child back to prove it is unrelated.
+
+Reserve the project's full test suite for acceptance into the protected branch: for a cluster, once at its final, before it parks for that accept. Fix failures at their cause before that acceptance. A nested cluster landing into another cluster or hub uses targeted tests too.
+
 ## The cycle
 
 1. **Read your tree.** The source of truth for what your children are and what
@@ -85,6 +91,10 @@ estimate; a `tokens-only` harness has no limit lazy can see; a null `budget` (wi
    Do **not** read the child's diff with `lazy_diff` as your review method — a
    cluster of a dozen children would exhaust your context before it finished.
    Pull up a specific hunk only when something in the report turns on it.
+   Use `lazy_diff` with `files` for that hunk, or `git show <sha>:<path>`
+   for a whole file — neither requires an export. The generated “Where you
+   are” section describes your runner’s worktree visibility and how to export
+   a child’s commit when you need to run its tests.
 
    **When a child is in `separate` mode** (you asked for it, or the project
    default says so), a reviewer runs afterwards in its own session and its

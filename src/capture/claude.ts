@@ -1,3 +1,4 @@
+import { withDiskSpaceRecovery, currentDiskSpaceManager, isEngineDiskFull, launchWithDiskSpaceRecovery } from '../docker/disk-space';
 import { requireLaunchModel } from '../agent/launch-model';
 import { agentBinaryMountSources } from '../vm/smolvm-engines';
 import type { AgentExecArgs } from '../agent/interface';
@@ -9,6 +10,7 @@ import { access, mkdir, mkdtemp, writeFile, readFile, realpath, lstat } from 'fs
 import { join, isAbsolute, dirname, basename, relative } from 'path';
 import { networkInterfaces, tmpdir } from 'os';
 import { AsyncLocalStorage } from 'async_hooks';
+import { BUILT_FROM_LABEL, formatBuiltFromLabel, type BuiltFromCommit } from './built-from-label';
 import type { AgentResponse, TokenUsage } from '../types';
 import { ClaudeCodeAgent } from '../agent/claude-code';
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
@@ -34,6 +36,8 @@ import { getTaskEnv, planTaskEnvLaunchFile, recordTaskEnvLaunched } from '../dae
 import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
 import { recordContainerCredentialLaunch } from '../daemon/container-credential-launch';
 import { isSessionPlaceholderToken, lookupSessionBinding, setSessionBindingOrigin } from '../daemon/session-credentials';
+import { AGENT_RESTART_MARKER, KEPT_CONTAINER_LABEL, SUPERVISOR_PID_FILE } from '../runner/agent-stop';
+import { PROXY_BASE_ENV } from '../supervisor/proxy-address-env';
 import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
 import { buildTaskGitMounts } from './git-mounts';
 import {
@@ -43,6 +47,7 @@ import {
   teamModeLaunchCreds,
   resolveProfileLaunchCreds,
   usesSyntheticCreds,
+  proxyBaseUrlForRunner,
   type ProxyAuditHints,
   type LaunchSurface,
 } from '../utils/role-target';
@@ -94,6 +99,8 @@ import { pathExists } from '../utils/fs';
 import { TaskMutex } from '../utils/task-mutex';
 import { analyzeLazyBaseUsage, type LazyBaseUsage } from './dockerfile-base';
 import { adoptedBuildContextRoot } from '../daemon/adopted-image';
+import { adoptChownShell, adoptProbeShell } from '../utils/adopt-rule';
+import { TASK_DATA_LABEL, claimTaskDataDirShell, taskDataMountArgs, taskDataVolumeName } from '../runner/task-data';
 import { customImageGate, RunnerImageNotReadyError, DEFAULT_RUNNER_IMAGE_PIN, READONLY_DEFAULT_RUNNER_IMAGE_PIN, recordLaunchImage } from './custom-image-gate';
 import { DamagedImageError, isDamagedLayerError, withDamagedImageRepair, type DamagedImageRepairDeps } from '../docker/damaged-image';
 
@@ -531,6 +538,20 @@ export function describeDockerfileSource(path: string): string {
  */
 const dockerfilePin = new AsyncLocalStorage<{ resolved: { root: string; path: string | null } | null }>();
 
+/**
+ * A directory that stands in for the project root's WORKING TREE as the build
+ * context (and as the place `[docker] build_inputs` are read) while a build runs
+ * inside {@link runWithBuildContext}. The daemon's background rebuild after the
+ * project's branch advances exports that commit's tree and builds from it, so
+ * what the image holds is the commit, never whatever the checkout looks like.
+ */
+const buildContextOverride = new AsyncLocalStorage<{ dir: string; builtFrom?: BuiltFromCommit }>();
+
+/** `builtFrom` is the commit `dir` was exported from; it is written onto the image as a label. */
+export function runWithBuildContext<T>(dir: string, fn: () => Promise<T>, builtFrom?: BuiltFromCommit): Promise<T> {
+  return buildContextOverride.run({ dir, builtFrom }, fn);
+}
+
 export async function resolveCustomDockerfile(lazyRoot: string): Promise<string | null> {
   const pin = dockerfilePin.getStore();
   if (pin?.resolved && pin.resolved.root === lazyRoot) return pin.resolved.path;
@@ -570,7 +591,11 @@ async function resolveCustomDockerfileFresh(lazyRoot: string): Promise<string | 
     return state.kind === 'used' ? state.path : null;
   }
 
-  const absPath = join(lazyRoot, configPath);
+  // During a rebuild for an advanced branch the Dockerfile is read from the exported commit, like the context.
+  let base = buildContextOverride.getStore()?.dir ?? lazyRoot;
+  // A Dockerfile the owner never committed (the key may name any file) is not in the export: the checkout's copy is used, as before.
+  if (base !== lazyRoot && !(await pathExists(join(base, configPath)))) base = lazyRoot;
+  const absPath = join(base, configPath);
   try {
     await access(absPath);
   } catch (err) {
@@ -586,7 +611,7 @@ async function resolveCustomDockerfileFresh(lazyRoot: string): Promise<string | 
       { cause: err },
     );
   }
-  await assertInsideProject(lazyRoot, absPath, configPath);
+  await assertInsideProject(base, absPath, configPath);
   return absPath;
 }
 
@@ -710,9 +735,10 @@ async function resolveBuildInputs(lazyRoot: string): Promise<{ relative: string;
   const declared = config.docker.build_inputs;
   if (declared.length === 0) return [];
 
+  const inputsRoot = buildContextOverride.getStore()?.dir ?? lazyRoot;
   const resolved = [...declared]
     .sort()
-    .map(relative => ({ relative, absolute: join(lazyRoot, relative) }));
+    .map(relative => ({ relative, absolute: join(inputsRoot, relative) }));
 
   const missing: string[] = [];
   for (const input of resolved) {
@@ -721,7 +747,7 @@ async function resolveBuildInputs(lazyRoot: string): Promise<{ relative: string;
   if (missing.length > 0) {
     throw new Error(
       `[docker] build_inputs file(s) not found: ${missing.join(', ')} ` +
-      `(resolved against ${lazyRoot}). ` +
+      `(resolved against ${inputsRoot}). ` +
       `Remove them from the build_inputs setting in lazy.toml, or create the files.`
     );
   }
@@ -933,11 +959,12 @@ function withPullReason(err: unknown, outcome: RunnerPullOutcome): Error {
 }
 
 /**
- * Pull the release's runner image and tag it onto `targets`. Returns false
- * (never throws) when the caller should build locally instead, after saying why
+ * Pull the release's runner image and tag it onto `targets`. Returns an outcome
+ * with pulled=false when the caller should build locally, after saying why
  * once: offline, an identity no published image can have, a version that was
  * never published, a failed pull, or a published image whose identity label does
- * not match what this binary composes (a publishing bug, never used).
+ * not match what this binary composes (a publishing bug, never used). Engine
+ * ENOSPC uses safe recovery and one retry; exhausted space fails the operation.
  *
  * See docs/design/published-runner-image.md §4.
  */
@@ -965,8 +992,19 @@ async function pullPublishedRunner(
 
   notify?.(`pulling ${PUBLISHED_RUNNER_REF}`);
   logger.info(`Pulling ${PUBLISHED_RUNNER_REF} (the published runner image lazy ${VERSION} composes)...`);
+  const disk = binary === 'docker' ? currentDiskSpaceManager() : null;
+  const attempt = () => pullPublishedRunnerOnce(expected.hash, targets, binary, notify);
+  // Release the reservation before ENOSPC reclaim, then reserve again for its
+  // one retry. Keep the new image protected through verification and tagging.
+  return withDiskSpaceRecovery(binary, () => disk ? disk.pull(targets[0], attempt) : attempt(), notify);
+}
+
+async function pullPublishedRunnerOnce(
+  expectedHash: string, targets: string[], binary: string, notify?: PhaseNotify,
+): Promise<RunnerPullOutcome> {
   const proc = spawn([binary, 'pull', PUBLISHED_RUNNER_REF], { stdout: 'ignore', stderr: 'pipe', timeout: RUNNER_PULL_TIMEOUT_MS });
   const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (exitCode !== 0 && isEngineDiskFull(stderr)) throw new Error(stderr);
   if (exitCode !== 0) {
     const { quiet, why } = classifyRunnerPullFailure(stderr.trim(), exitCode);
     if (quiet) logger.info(`Building ${targets[0]} locally — ${why}.`);
@@ -976,9 +1014,9 @@ async function pullPublishedRunner(
   }
 
   const pulledHash = await getImageDockerfileHash(PUBLISHED_RUNNER_REF, binary);
-  if (pulledHash !== expected.hash) {
+  if (pulledHash !== expectedHash) {
     logger.warn(
-      `${PUBLISHED_RUNNER_REF} carries identity ${pulledHash ?? '(none)'}, but lazy ${VERSION} composes ${expected.hash}. ` +
+      `${PUBLISHED_RUNNER_REF} carries identity ${pulledHash ?? '(none)'}, but lazy ${VERSION} composes ${expectedHash}. ` +
       `The release published a different Dockerfile than this binary builds — not using it; building locally.`,
     );
     return { pulled: false, why: `the published ${PUBLISHED_RUNNER_REF} was built from a different Dockerfile than lazy ${VERSION} composes` };
@@ -1403,7 +1441,11 @@ class ContainerBuildFailed extends Error {
  * ONCE when dockerd answers again; a final failure leads with the likely cause
  * instead of only BuildKit's EOF (src/daemon/build-connection-lost.ts).
  */
-async function runDockerBuild(request: DockerBuildRequest): Promise<{ output: string }> {
+function runDockerBuild(request: DockerBuildRequest): Promise<{ output: string }> {
+  return withDiskSpaceRecovery(request.binary, () => runDockerBuildWithConnectionRecovery(request), request.notify);
+}
+
+async function runDockerBuildWithConnectionRecovery(request: DockerBuildRequest): Promise<{ output: string }> {
   const lostConnection = (err: unknown): err is ContainerBuildFailed =>
     err instanceof ContainerBuildFailed && isBuildConnectionLost(err.output);
   const diagnose = async (err: ContainerBuildFailed, since: Date) => {
@@ -1442,8 +1484,12 @@ async function runDockerBuild(request: DockerBuildRequest): Promise<{ output: st
 }
 
 /** Every container build lazy runs passes here: counted while it runs, reported when it succeeds (src/capture/build-observer.ts). */
-function runDockerBuildOnce(request: DockerBuildRequest): Promise<{ output: string }> {
-  return trackContainerBuild(request.tags[0], () => runDockerBuildUntracked(request));
+async function runDockerBuildOnce(request: DockerBuildRequest): Promise<{ output: string }> {
+  const disk = request.binary === 'docker' ? currentDiskSpaceManager() : null;
+  const build = () => trackContainerBuild(request.tags[0], () => runDockerBuildUntracked(request));
+  // Remember the old image before Docker moves its tag, inside the same
+  // reservation that keeps reclaim away from this build's cache.
+  return disk ? disk.build(request.tags[0], build, request.identity.hash) : build();
 }
 
 async function runDockerBuildUntracked(request: DockerBuildRequest): Promise<{ output: string }> {
@@ -1561,7 +1607,7 @@ async function runDockerBuildUntracked(request: DockerBuildRequest): Promise<{ o
     const bare = buildFailureMessage(exitCode, stdout, stderr, source);
     // Only a PROJECT Dockerfile gets "fix it" — never lazy's own default, and
     // never a build that lost its connection to Docker, which no Dockerfile edit fixes.
-    const pointer = request.projectDockerfile && !isBuildConnectionLost(output) ? '\n\nFix that Dockerfile and relaunch.' : '';
+    const pointer = request.projectDockerfile && !isBuildConnectionLost(output) && !isEngineDiskFull(output) ? '\n\nFix that Dockerfile and relaunch.' : '';
     const message = bare + pointer;
     logger.error(message);
     throw new ContainerBuildFailed(message, bare, output);
@@ -1832,7 +1878,7 @@ async function buildImageWithTags(
     // the project root as its context: it lives at the root and describes the
     // root's tree.
     const adoptedContext = await adoptedBuildContextRoot(lazyRoot, customPath);
-    buildCwd = adoptedContext ?? lazyRoot;
+    buildCwd = adoptedContext ?? buildContextOverride.getStore()?.dir ?? lazyRoot;
     // The single build announcement runDockerBuild makes names `source`, so the
     // context rides along there rather than in a second log line of our own.
     source = adoptedContext
@@ -1863,6 +1909,8 @@ async function buildImageWithTags(
     dockerfileName = temp.dockerfilePath;
     labels = LOCAL_BASE_LABELS;
   }
+  const builtFrom = customPath ? buildContextOverride.getStore()?.builtFrom : undefined;
+  if (builtFrom) labels = { ...labels, [BUILT_FROM_LABEL]: formatBuiltFromLabel(builtFrom) };
 
   try {
     await runDockerBuild({
@@ -3333,10 +3381,10 @@ export async function getContainerLogs(containerName: string, tailLines: number 
 }
 
 /**
- * Remove a Docker container. Logs a warning on failure but does not throw.
- * No-op if Docker is not available.
+ * Remove a Docker container. Legacy best-effort callers log failures;
+ * strict task teardown throws the runtime's error and keeps mounted files.
  */
-export async function removeContainer(containerName: string, binary: string = 'docker'): Promise<void> {
+export async function removeContainer(containerName: string, binary: string = 'docker', options?: { strict?: boolean }): Promise<void> {
   try {
     const proc = spawn(
       [binary, 'rm', '-f', containerName],
@@ -3344,9 +3392,14 @@ export async function removeContainer(containerName: string, binary: string = 'd
     );
     const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     if (exitCode !== 0) {
+      if (options?.strict) {
+        if (/no such (?:object|container)/i.test(stderr)) return;
+        throw new Error(`${binary} could not remove ${containerName}: ${stderr.trim() || `exit ${exitCode}`}`);
+      }
       logger.warn(`Failed to remove container ${containerName} (exit ${exitCode}): ${stderr.trim()}`);
     }
-  } catch {
+  } catch (error) {
+    if (options?.strict) throw new Error(`Task environment teardown failed: ${error instanceof Error ? error.message : String(error)}`);
     // Docker not available — nothing to remove
   }
 }
@@ -3526,7 +3579,12 @@ export function acceptGateContainerNameForTask(taskShortId: string): string {
  * Exit code protocol:
  *   0  — turn completed successfully → restart supervisor
  *   42 — stop command received → restart supervisor, keep the environment
- *   other — failed turn or supervisor crash → report, back off and restart
+ *   other — failed turn or supervisor crash → report, back off and restart,
+ *           UNLESS the daemon stopped the supervisor on purpose (it writes
+ *           AGENT_RESTART_MARKER first, holding the supervisor's pid, which the
+ *           wrapper must match — src/runner/agent-stop.ts): that restarts at
+ *           once, with no crash receipt and no backoff. A daemon restart stops
+ *           the agent, never the container.
  */
 /**
  * Where the task's protocol dir is mounted INSIDE the supervisor container.
@@ -3554,9 +3612,11 @@ export function containerProtocolDir(protocolDir: string): string {
  * `user` cannot write it: the sandbox's `.claude.json` (fleet demo run 8,
  * "Could not register the lazy MCP tools … EACCES"), the worktree, the
  * worktree's gitdir, the shared objects dir. Docker Desktop maps ownership,
- * which is why no Mac ever saw it. The wrapper takes ownership of what is not
- * writable before each turn (see the `adopt` step); `find -writable` asks the
- * kernel, so on a Mac nothing matches and nothing is changed.
+ * which is why no Mac ever saw it. The wrapper takes back ROOT-owned entries the
+ * container user cannot write before each turn (see the `adopt` step and
+ * src/utils/adopt-rule.ts) and never touches another user's files — a service's
+ * data dir keeps its owner; `find -writable` asks the kernel, so on a Mac
+ * nothing matches and nothing is changed.
  */
 export function supervisorWritablePaths(opts: {
   protocolDir: string;
@@ -3592,20 +3652,17 @@ export function buildSupervisorWrapperScript(
   // The paths are injected directly — they come from our own code, not user input.
   const adoptArgs = writablePaths.map((p) => `"${p}"`).join(' ');
   const excl = readOnlyPaths.map((p) => `! -path "${p}"`).join(' ');
-  const probe = excl
-    ? `    find "$p" ! -writable ${excl} -print -quit 2>/dev/null | grep -q . || continue`
-    : '    find "$p" ! -writable -print -quit 2>/dev/null | grep -q . || continue';
-  const chown = excl
-    ? `sudo -n find "$p" ${excl} -exec chown -h "$(id -u):$(id -g)" {} +`
-    : 'sudo -n chown -R "$(id -u):$(id -g)" "$p"';
+  const probe = `    ${adoptProbeShell('"$p"', excl)} || continue`;
+  const chown = adoptChownShell('"$p"', excl);
   return [
     '#!/bin/sh',
     '# PID 1 wrapper — restarts supervisor between turns to release memory.',
     '# Processes the agent leaves running (dev servers, databases) survive turn',
     '# boundaries on purpose; the container is the cleanup boundary.',
-    '# adopt: take ownership of a mounted path the container user cannot write.',
-    '# A daemon running as root on native Linux leaves every mount root-owned;',
+    '# adopt: take back ROOT-owned entries the container user cannot write.',
+    '# A daemon running as root on native Linux leaves what it writes root-owned;',
     '# the runner image gives its user sudo for exactly this kind of thing.',
+    '# Files of any other user (a postgres or redis data dir) are never touched.',
     'adopt() {',
     '  for p in "$@"; do',
     '    [ -e "$p" ] || continue',
@@ -3617,6 +3674,9 @@ export function buildSupervisorWrapperScript(
     '    fi',
     '  done',
     '}',
+    '# The task data dir ($LAZY_TASK_DATA): claim a freshly created volume\'s top',
+    '# directory once; its contents are never touched (src/runner/task-data.ts).',
+    claimTaskDataDirShell(),
     'child_pid=""',
     'trap \'[ -n "$child_pid" ] && kill $child_pid 2>/dev/null; wait; exit 0\' TERM INT',
     'backoff=1',
@@ -3634,11 +3694,19 @@ export function buildSupervisorWrapperScript(
     ...(adoptArgs ? [`  adopt ${adoptArgs}`] : []),
     `  lazy-agent --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" &`,
     '  child_pid=$!',
+    `  echo $child_pid > ${SUPERVISOR_PID_FILE}`,
     `  echo "$child_pid" > "${protocolDir}/supervisor.pid"`,
     '  wait $child_pid',
     '  rc=$?',
-    `  lazy-agent supervisor-exit --protocol-dir "${protocolDir}" --pid "$child_pid" --exit-code "$rc"`,
+    '  sup_pid=$child_pid',
     '  child_pid=""',
+    '  # The daemon stopped this supervisor on purpose (a daemon restart stops',
+    '  # the agent, never the container — src/runner/agent-stop.ts): start a',
+    '  # fresh one at once — no crash receipt, no backoff. Read and cleared on',
+    '  # EVERY exit, so a later crash is a crash.',
+    `  restart=0; [ "$(cat ${AGENT_RESTART_MARKER} 2>/dev/null)" = "$sup_pid" ] && restart=1; rm -f ${AGENT_RESTART_MARKER} ${SUPERVISOR_PID_FILE}`,
+    '  if [ $restart = 1 ]; then backoff=1; continue; fi',
+    `  lazy-agent supervisor-exit --protocol-dir "${protocolDir}" --pid "$sup_pid" --exit-code "$rc"`,
     '  # A turn owns the agent, never the environment (including stop / 42).',
     '  # A broken binary must not spin hot or take services down with it.',
     '  if [ $rc -ne 0 ] && [ $rc -ne 42 ]; then',
@@ -3694,6 +3762,12 @@ export interface SupervisorDockerArgsParams {
    */
   runArgs: string[];
   wrapperScript: string;
+  /**
+   * The task's persistent data volume, mounted at $LAZY_TASK_DATA
+   * (src/runner/task-data.ts). `readOnly` for a side run (a review) that must
+   * not write the task's services' data.
+   */
+  taskData?: { volume: string; readOnly: boolean };
   /** Path to this container's daemon MCP config, when the daemon minted one. */
   daemonConfigPath?: string;
 }
@@ -3709,8 +3783,9 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
   const {
     binary, containerName, imageName, repoRoot, sandbox, protocolDir,
     agentBinaryPath, authEnvVars, taskEnvArgs, customMountArgs, gitMountArgs,
-    publishArgs, runArgs, wrapperScript, daemonConfigPath,
+    publishArgs, runArgs, wrapperScript, daemonConfigPath, taskData,
   } = params;
+  const dataArgs = taskData ? taskDataMountArgs(taskData.volume, taskData.readOnly) : [];
 
   return [
     binary, 'run', '-d', '--init',
@@ -3719,6 +3794,14 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     // (e.g. `lazy upgrade`) can filter on the label. Kept in sync with
     // PROJECT_LABEL in src/runner/docker-runner.ts.
     '--label', `lazy.project=${repoRoot}`,
+    // This container's wrapper restarts a supervisor the daemon stopped on
+    // purpose, so a daemon restart keeps it and a stopped one may be started
+    // again in place (src/runner/agent-stop.ts, src/runner/start-or-recreate.ts).
+    // A container without the label predates both and is recreated instead.
+    '--label', `${KEPT_CONTAINER_LABEL}=1`,
+    // Created with $LAZY_TASK_DATA and the root-only adopt rule. A kept
+    // container without it is kept until a person requests a restart.
+    ...(taskData ? ['--label', `${TASK_DATA_LABEL}=1`] : []),
     // Allow container to reach host services (daemon MCP, Ollama, etc.)
     '--add-host=host.docker.internal:host-gateway',
     // Mount repo read-only; worktree and protocol dir are mounted read-write on top.
@@ -3760,6 +3843,10 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     ...taskEnvArgs,
     ...authEnvVars.flatMap(v => ['-e', `${v.key}=${v.value}`]),
     '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
+    // The task's persistent data dir — outside git and the worktree, survives
+    // container recreation; removed only at the task's terminal teardown.
+    // After the task's env so LAZY_TASK_DATA cannot be redirected.
+    ...dataArgs,
     // Pass daemon config to container for MCP proxy mode. The config file is the
     // ONLY thing from the daemon state dir a container may ever see: a single
     // file, read-only, holding just this container's own token.
@@ -4279,6 +4366,16 @@ async function launchSupervisorOnce(
     endpoint: profile.endpoint,
   }));
 
+  // The proxy base this container's env was built against, so a later
+  // daemon (whose proxy is on another port) can move it: the container is
+  // kept across daemon restarts (src/supervisor/proxy-address-env.ts).
+  if (hasDaemonContext() && getDaemonContext().proxyPort) {
+    authEnvVars.push({
+      key: PROXY_BASE_ENV,
+      value: proxyBaseUrlForRunner(binary === 'podman' ? 'podman' : 'docker', getDaemonContext().proxyPort!, config.proxy.bind),
+    });
+  }
+
   // Resolve user-configured custom mounts ([[mounts]]). Validated at load time;
   // here we just expand placeholders and build the `-v` args. Empty by default,
   // so default behavior is completely unchanged when no mounts are configured.
@@ -4349,6 +4446,12 @@ async function launchSupervisorOnce(
     runArgs,
     wrapperScript,
     daemonConfigPath,
+    // Keyed by the task's UUID, so a side run (review) sees the same data and
+    // no other project's task of the same code ever does.
+    ...(taskUuid ? { taskData: {
+      volume: taskDataVolumeName(taskUuid),
+      readOnly: !!taskId && containerName !== containerNameForTask(taskId),
+    } } : {}),
   });
 
   if (debug) {
@@ -4374,46 +4477,11 @@ async function launchSupervisorOnce(
   // The task env file exists only for the life of `docker run`: written here,
   // removed in the finally below (docker has read it by the time run exits).
   await taskEnvLaunch.write();
-  const proc = await (async () => {
-    try {
-      return spawn(args, { stdout: 'pipe', stderr: 'pipe', timeout: 0 });
-    } catch (err) {
-      await taskEnvLaunch.cleanup();
-      throw err;
-    }
-  })();
-
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill();
-    } catch {
-      // Process may have already exited — nothing to kill.
-    }
-  }, CONTAINER_LAUNCH_TIMEOUT_MS);
-
-  let stdout: string;
-  let stderr: string;
-  let exitCode: number;
+  let stdout: string, stderr: string, exitCode: number;
   try {
-    [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+    ({ stdout, stderr, exitCode } = await launchWithDiskSpaceRecovery(args, CONTAINER_LAUNCH_TIMEOUT_MS, notify));
   } finally {
-    clearTimeout(timer);
     await taskEnvLaunch.cleanup();
-  }
-
-  if (timedOut) {
-    const msg =
-      `Timed out after ${CONTAINER_LAUNCH_TIMEOUT_MS / 60_000}m launching supervisor container ${containerName}. ` +
-      `The container runtime (${binary}) may be unresponsive or stuck pulling an image — ` +
-      `check \`${binary} info\` and \`${binary} ps\`, then retry.`;
-    logger.error(msg);
-    throw new Error(msg);
   }
 
   if (exitCode !== 0) {
@@ -4467,6 +4535,15 @@ async function containerGatewayIsLocal(binary: string, containerName: string): P
   if (gateways.length === 0) return false;
   const local = new Set(Object.values(networkInterfaces()).flatMap(list => (list ?? []).map(i => i.address)));
   return gateways.every(g => local.has(g));
+}
+
+/**
+ * Re-pin a task container's proxy grants to the address it has NOW — after a
+ * `docker start` of a kept container, whose bridge address may differ from
+ * the one its grants were pinned to at create. Never throws.
+ */
+export async function repinLaunchGrantsToContainer(binary: string, containerName: string): Promise<void> {
+  await pinLaunchGrantsToContainer(binary, containerName);
 }
 
 async function pinLaunchGrantsToContainer(

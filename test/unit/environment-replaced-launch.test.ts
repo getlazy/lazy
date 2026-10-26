@@ -34,6 +34,9 @@ let recreateForEnv = false;
 let running = true;
 let sandboxed = true;
 let launchFails = false;
+let stoppedInfo = false;
+let startable = false;
+const journal: string[] = [];
 
 function makeTask(): any {
   return {
@@ -99,6 +102,7 @@ function createMockStorage(): any {
     updateSessionInteraction: async () => {},
     updateTaskTarget: async () => {},
     createComment: async () => {},
+    appendJournalEntry: async (_id: string, content: string) => { journal.push(content); },
     close: async () => {},
   } as any;
 }
@@ -175,7 +179,10 @@ await mockModule(resolve(import.meta.dir, '../../src/runner/index.ts'), () => ({
     checkAvailability: async () => {},
     usesSandbox: () => sandboxed,
     isRunning: async () => running,
-    launchSupervisor: async () => { if (launchFails) throw new Error('docker run failed'); },
+    getRunInfo: async () => stoppedInfo ? { running: false, exitCode: 137, oomKilled: false, finishedAt: '2026-10-23T10:00:00Z' } : null,
+    startStoppedRun: async () => { if (startable) { running = true; return true; } return false; },
+    removeRun: async () => { running = false; stoppedInfo = false; },
+    launchSupervisor: async () => { if (launchFails) throw new Error('docker run failed'); running = true; },
   }),
 }));
 
@@ -185,9 +192,10 @@ await mockModule(resolve(import.meta.dir, '../../src/daemon/task-env.ts'), () =>
   mustRecreateForTaskEnv: async () => recreateForEnv,
 }));
 
+const realSessionLaunch = { ...(await import('../../src/runner/session-launch')) };
 await mockModule(resolve(import.meta.dir, '../../src/runner/session-launch.ts'), () => ({
   stampSessionRunner: async () => {},
-  removeTaskRun: async () => {},
+  removeTaskRun: realSessionLaunch.removeTaskRun,
   mustRecreateForContainerAgent: () => recreateForAgent,
 }));
 
@@ -330,6 +338,9 @@ async function unblock(): Promise<string> {
 
 describe('environment-replaced notice on the unblock launch', () => {
   beforeEach(() => {
+    stoppedInfo = false;
+    startable = false;
+    journal.length = 0;
     metadata.clear();
     createdTurns.length = 0;
     statusWrites.length = 0;
@@ -386,4 +397,55 @@ describe('environment-replaced notice on the unblock launch', () => {
     sandboxed = false;
     expect(count(await unblock(), 'Your environment was replaced')).toBe(0);
   });
+  // INVARIANT: a normal work turn that starts the SAME stopped container
+  // retains its exit evidence without telling the agent its tools were lost.
+  test('an external stop followed by an in-place start produces no replacement prompt', async () => {
+    running = false;
+    stoppedInfo = true;
+    startable = true;
+    const prompt = await unblock();
+    expect(prompt).not.toContain('Your environment was replaced');
+    expect(metadata.get('task-1:environment_replaced')).toBeFalsy();
+    expect(metadata.get('task-1:last_environment_replaced')).toBeFalsy();
+    expect(journal).toHaveLength(1);
+    expect(journal[0]).toContain('Container stopped');
+    expect(journal[0]).toContain('code 137');
+    expect(journal[0]).toContain('files and installed tools are kept');
+    expect(running).toBe(true);
+  });
+
+  // INVARIANT: a failed in-place start records a replacement for THIS work
+  // turn, even though the initial command was published before the start.
+  test('an unstartable stopped container tells the first replacement turn once', async () => {
+    running = false;
+    stoppedInfo = true;
+    const prompt = await unblock();
+    expect(count(prompt, 'Your environment was replaced')).toBe(1);
+    expect(prompt).toContain('code 137');
+    expect(metadata.get('task-1:environment_replaced')).toBeFalsy();
+    expect(await unblock()).not.toContain('Your environment was replaced');
+  });
+
+  test('a failed replacement launch preserves the refreshed notice for retry', async () => {
+    running = false;
+    stoppedInfo = true;
+    launchFails = true;
+    await expect(unblock()).rejects.toThrow('Failed to launch supervisor');
+    expect(prompts[prompts.length - 1]).toContain('code 137');
+    expect(metadata.get('task-1:environment_replaced')).toContain('code 137');
+    launchFails = false;
+    expect(await unblock()).toContain('code 137');
+    expect(metadata.get('task-1:environment_replaced')).toBeFalsy();
+  });
+
+  test('refreshing a pending notice includes the newly lost environment without duplicate prefixes', async () => {
+    metadata.set('task-1:environment_replaced', 'an earlier environment was replaced');
+    running = false;
+    stoppedInfo = true;
+    const prompt = await unblock();
+    expect(count(prompt, 'Your environment was replaced')).toBe(1);
+    expect(count(prompt, 'an earlier environment was replaced')).toBe(1);
+    expect(count(prompt, 'code 137')).toBe(1);
+  });
+
 });

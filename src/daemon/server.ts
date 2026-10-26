@@ -1,3 +1,4 @@
+import { DiskSpaceManager, diskSpaceSupported, setDiskSpaceManager } from '../docker/disk-space';
 /**
  * Daemon HTTP server — a single TCP listener is the daemon's ONLY transport.
  *
@@ -18,6 +19,9 @@
  *   everything else              — web dashboard (no auth, read-only rendering;
  *                                  mutations go through /rpc//mcp handlers)
  */
+import { recoverManagedSetup, reportSetupRecovery } from '../git/managed-setup';
+
+import { daemonRuntimeFacts } from '../runtime-context';
 
 import { deleteLegacyAgentCredentials } from '../agent/credentials';
 import { daemonStatusBuild, runningBuildIdentity } from '../utils/build-provenance';
@@ -42,15 +46,15 @@ import { startGuestDockerdWatchdog, setGuestDockerdReporter, fileGuestDockerdEve
 import { setDamagedImageReporter } from '../docker/damaged-image';
 import { recordDamagedImageRepair } from './damaged-image-record';
 import { setMachineIntegrityReporter, fileIntegrityAlert, onImageBuildSucceeded } from './machine-integrity';
-import { onContainerBuildSucceeded } from '../capture/build-observer';
+import { onContainerBuildSucceeded, runningContainerBuilds } from '../capture/build-observer';
 import { handleRpc, handleBuilderStorageCall, handleGetBuilderLaunchEnv, handleGetAgentLaunchEnv, handleClaimAgentPendingNotes, openProjectStorage, initDaemonStorage, getOrCreateStorage, closeAllStorage, storeAvailability, storeOpeningStage, daemonStoreLockPath } from './rpc-handlers';
 import { boundedStep, STATUS_STEP_DEADLINE_MS, collectWedgeReport, describeLockHolderBounded, logWedgeIfStuck, loopWedgeViews, trackRequest } from './wedge-report';
-import { lookupMcpIdentity } from './mcp-tokens';
 import { primeTaskEnvRedaction } from './task-env';
 import { primeTaskFilesRedaction } from './task-files';
 import { primeTaskEnvSeedRedaction } from './task-env-seed';
 import { initTracing, shutdownTracing } from '../tracing';
 import { daemonRouteTemplate, withRequestSpan } from './request-span';
+import { lookupMcpIdentity } from './mcp-tokens';
 import { authorizeMcpCall, handleMcpToolCall, httpStatusForError, parseMcpToolCallBody } from './mcp-routes';
 import { RpcError } from './rpc-error';
 import { resolveRpcActor, rpcAuthErrorMessage, describeActor } from './rpc-auth';
@@ -103,6 +107,7 @@ import { recordTaskLaunchImage } from './runner-image-choice';
 import { registerLaunchImageRecorder } from '../capture/custom-image-gate';
 import { settleDeadBuilderSessions } from './builder-sessions';
 import { indexRunsByName, type OwnedRuns } from '../runner/run-ownership';
+import { stopTaskAgent } from '../runner/agent-stop';
 import type { Storage } from '../storage/interface';
 import { logger, LogLevel } from '../utils/logger';
 import { markLoggedToFile } from '../utils/logged-error';
@@ -110,9 +115,11 @@ import { createWebRequestHandler, tryBindTcpPort } from '../server';
 import { createShellUpgrader } from '../server/shell-ws';
 import { createWatchUpgrader, createRpcWatchUpgrader } from '../server/watch-ws';
 import { revokeLeftoverMemberTerminalCredentials } from '../server/member-exec-credential';
-import { sweepLeftoverMemberEnvironments } from './member-leftovers';
+import { sweepLeftoverMemberEnvironments, type ReadoptedCredentials } from './member-leftovers';
+import { beginMemberRecovery, memberInventoryRead } from './member-recovery';
 import { createActionRunUpgrader } from '../server/action-ws';
 import { createSessionAttachUpgrader } from '../server/session-attach-ws';
+import { createServiceForwardUpgrader } from '../ssh/service-forward';
 import { createRunActions } from './run-actions-service';
 import { multiMemberDaemon } from './session-attach';
 import { composeUpgraders } from '../server/ws';
@@ -186,9 +193,7 @@ import { resumeHeldReviewFix, processRunnerImageHeldRestores } from './task-life
 import { closeSignalDb, initSignalDb } from './signals';
 import { startSyncRetryLoop } from './sync-retry';
 import { sweepConversations, createSweepCursor } from '../import/capture-sweep';
-import { findTerminalTaskWorktrees } from '../doctor/findings';
-import { cleanupWorktree } from '../task/cleanup';
-import { checkLock } from '../utils/lock';
+import { terminalCleanupFor } from './terminal-cleanup';
 import { createDriver } from '../remote';
 import { runSync, debugSyncLogger } from './remote-sync';
 import { isOfflineMode } from '../utils/offline';
@@ -387,13 +392,19 @@ async function loadDaemonConfigOrFail(projectRoot: string) {
 const SOURCE_ID_STEP_DEADLINE_MS = 10_000;
 
 export async function startDaemonServer(options: DaemonServerOptions): Promise<RunningDaemon> {
+  // The same refusal every start makes (src/daemon/managed-marker.ts), here
+  // for a foreground start and any path that reaches the server directly.
+  const { assertManagedStartAllowed } = await import('./managed-marker');
+  await assertManagedStartAllowed(options.projectRoot);
+
   // Mark this process as the daemon to prevent recursive RPC calls
   process.env.LAZY_IS_DAEMON = '1';
 
   // No git the daemon runs may ever open a terminal prompt.
   //
-  // The daemon is a BACKGROUND process, and it is detached but not setsid — it
-  // keeps the controlling terminal of whoever started it. Its sync loop runs
+  // A background start runs in its own session (setsid), but a `--foreground`
+  // start, or a daemon started by another tool, keeps the controlling terminal
+  // of whoever started it. Its sync loop runs
   // `git fetch` every 60 seconds, and git asks for credentials by opening
   // /dev/tty directly, not by reading stdin (which is 'ignore' here). So a
   // project whose remote needs credentials the machine does not have turns into
@@ -406,6 +417,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   process.env.GIT_TERMINAL_PROMPT ??= '0';
 
   const projectRoot = options.projectRoot;
+  // Before the proxy listener: retain old binding records, but deny spending
+  // until their environments have been validated and their addresses pinned.
+  beginMemberRecovery(projectRoot);
 
   // Configure logger: write to daemon.log via appendFileSync (supports rotation).
   //
@@ -430,6 +444,24 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   }
 
   logger.info(`Daemon starting for project: ${projectRoot} (PID ${process.pid})`);
+
+  // A daemon Lazy Teams manages: mark it, so a shell `lazy daemon start/restart`
+  // without the fleet's environment is refused instead of starting one that has
+  // lost its credentials (src/cli/commands/daemon.ts), and re-apply the forge
+  // token Teams last pushed — newer than whatever environment this process was
+  // started with, which for a shell restart is the shell's
+  // (src/daemon/forge-credential.ts). Neither may stop the daemon from starting.
+  if (isManagedMode()) {
+    try {
+      const { writeManagedDaemonMarker } = await import('./managed-marker');
+      await writeManagedDaemonMarker(projectRoot);
+      const { restoreForgeCredential } = await import('./forge-credential');
+      const restored = await restoreForgeCredential(projectRoot);
+      if (restored) logger.info(`Forge credential restored: ${restored.kind} ${restored.source === 'user' ? `@${restored.handle ?? '?'}` : 'integration'} (token ${restored.fingerprint})`);
+    } catch (err) {
+      logger.error(`Could not restore the managed daemon's forge credential: ${err instanceof Error ? err.message : err}. Pushes use the start environment until Teams sends it again.`);
+    }
+  }
 
   // The identity of the code this daemon runs, STARTED now rather than on the
   // first `/daemon/status`. Cold, it reads every source file; under load that
@@ -524,6 +556,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       throw abandonEarlyStart(new Error(message));
     });
   }
+  // Ownership precedes the upgrade backup too: it also takes .storage-lock.
+  // A foreign checkout must never get as far as acquiring that lock.
+  {
+    const { checkProjectStoreOwnership } = await import('../storage');
+    await checkProjectStoreOwnership(projectRoot).catch(async (err) => {
+      const failure = await recordStartupFailure(projectRoot, err instanceof Error ? err.message : String(err));
+      throw abandonEarlyStart(failure);
+    });
+  }
   await deleteLegacyAgentCredentials(projectRoot).catch((err) => { throw abandonEarlyStart(err); });
   // A start on a different lazy version backs the store up BEFORE anything
   // opens it, and refuses if it cannot (src/daemon/upgrade-store-backup.ts).
@@ -531,9 +572,11 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   // initialization and the upgrade notice that rewrites the version marker.
   {
     const { backupStoreIfVersionChanged } = await import('./upgrade-store-backup');
-    await backupStoreIfVersionChanged(projectRoot).catch((err) => {
-      logger.error(err instanceof Error ? err.message : String(err));
-      throw abandonEarlyStart(err);
+    // The refusal goes to the startup-error marker too, so the CLI that
+    // started this daemon shows it rather than a generic timeout.
+    await backupStoreIfVersionChanged(projectRoot).catch(async (err) => {
+      const failure = await recordStartupFailure(projectRoot, err instanceof Error ? err.message : String(err));
+      throw abandonEarlyStart(failure);
     });
   }
   // What this daemon holds from its start, for `lazy daemon status` and
@@ -552,6 +595,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
   // An existing project picks up lazy's runtime-file excludes without re-init.
   await ensureLazyExcludeBestEffort(projectRoot);
+  const setupRecovery = await recoverManagedSetup(projectRoot, true);
 
   // Every commit the daemon makes outside a member's request or an agent's
   // tool call — a reconciler-driven sync, a stranded accept's resume — is
@@ -664,6 +708,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     await storage.appendTraceSpans(spans);
   });
 
+  if (setupRecovery.restored.length || setupRecovery.untouched.length) {
+    await reportSetupRecovery(await getOrCreateStorage(), setupRecovery);
+  }
+
   // Initialize signal DB with the project root so signals are stored
   // per-project in .lazy/signals.db instead of globally.
   initSignalDb(projectRoot);
@@ -751,24 +799,27 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   }
 
   // Member terminals (Teams Shell/Pair/Chat) run in containers of their own,
-  // each holding a credential minted for it; both are removed by the daemon
-  // when the member's session ends, which a restart cuts short. No terminal
-  // survives a restart, so every one left is removed here — the containers
-  // (and whatever the member left running in them) first, then their
-  // credentials — before the reconcile loop can launch a turn
-  // (src/daemon/member-container.ts, src/server/member-exec-credential.ts).
-  // A runtime that is not up yet does not lose anything: the sweep holds every
-  // task a leftover home names and retries until it succeeds
-  // (./member-leftovers.ts).
+  // each holding a credential minted for it. A restart ends the terminals'
+  // sockets but not the member's environment: every running or stopped container
+  // whose credential can be kept is RE-ADOPTED here (its hold rebuilt, its
+  // tmux sessions kept), and every other one is removed — the containers (and
+  // whatever the member left running in them) first, then, below, every
+  // credential except the re-adopted ones' — before the reconcile loop can
+  // launch a turn (./member-leftovers.ts, src/daemon/member-container.ts,
+  // src/server/member-exec-credential.ts). A runtime that is not up yet does
+  // not lose anything: the sweep holds every task a leftover home names and
+  // retries until it succeeds.
+  let readoptedMemberCredentials: ReadoptedCredentials | undefined;
   try {
     const runnerType = (await loadConfig(projectRoot)).runner.type;
     if (runnerType === 'docker' || runnerType === 'podman') {
-      await sweepLeftoverMemberEnvironments(projectRoot, runnerType, await getOrCreateStorage());
+      readoptedMemberCredentials = await sweepLeftoverMemberEnvironments(projectRoot, runnerType, await getOrCreateStorage());
     }
   } catch (err) {
+    readoptedMemberCredentials = { bindingKeys: new Set(), grantLabels: new Set(), pending: true };
     logger.error(
       `Could not remove member terminal environments left by the previous daemon: ${err instanceof Error ? err.message : String(err)}. ` +
-      `Their credentials are still revoked below; run \`lazy doctor\` and restart the daemon.`,
+      `Their credentials stay blocked pending recovery; run \`lazy doctor\` and restart the daemon.`,
     );
   }
   // Commit runs' containers (./commit-run-container.ts) left by the previous
@@ -783,10 +834,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     logger.warn(`Could not look for run containers left by the previous daemon: ${err instanceof Error ? err.message : String(err)}`);
   }
   try {
-    const leftover = await revokeLeftoverMemberTerminalCredentials(projectRoot);
+    // Container recovery owns its revoke and retries registry failures. Other
+    // runners have no retained member containers and retire all old bindings.
+    const leftover = readoptedMemberCredentials
+      ? { bindings: 0, grants: 0 }
+      : await revokeLeftoverMemberTerminalCredentials(projectRoot, readoptedMemberCredentials);
     if (leftover.bindings + leftover.grants > 0) {
       logger.info(`Revoked ${leftover.bindings} member-terminal binding(s) and ${leftover.grants} grant(s) left by the previous daemon.`);
     }
+    if (!readoptedMemberCredentials?.pending) memberInventoryRead(projectRoot);
   } catch (err) {
     logger.error(
       `Could not revoke member-terminal credentials left by the previous daemon: ${err instanceof Error ? err.message : String(err)}. ` +
@@ -866,6 +922,19 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
   });
   const stopIntegrityBuildAudit = onContainerBuildSucceeded(onImageBuildSucceeded);
   const stopGuestDockerdWatchdog = startGuestDockerdWatchdog();
+  const diskSpace = diskSpaceSupported() ? new DiskSpaceManager(await getOrCreateStorage(), projectRoot) : null;
+  setDiskSpaceManager(diskSpace);
+  const stopDiskBuildListener = onContainerBuildSucceeded((image, startedAt) => {
+    if (diskSpace) void diskSpace.built(image, startedAt).catch(err => logger.error('Could not retain the current image for disk reclaim: ' + err.message));
+  });
+  let diskMaintenanceRunning = false;
+  const diskTimer = diskSpace ? setInterval(() => {
+    if (diskMaintenanceRunning || runningContainerBuilds() > 0) return;
+    diskMaintenanceRunning = true;
+    void diskSpace.reclaim('periodic maintenance').catch(err => logger.warn('Disk maintenance failed: ' + err.message))
+      .finally(() => { diskMaintenanceRunning = false; });
+  }, 30 * 60_000) : null;
+  diskTimer?.unref();
 
   // Periodic `daemon.health` tick for SSE subscribers. The timer no-ops while
   // nobody is subscribed, so it costs nothing on a daemon with no listener.
@@ -887,6 +956,13 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     root: projectRoot,
     authenticate: (req) => resolveRpcActor(projectRoot, token, req.headers.get('authorization')),
     multiMember: () => multiMemberDaemon(projectRoot),
+    // The port this daemon bound, read from memory — never a per-connection
+    // file read (an SSH connection's service forwards dial it).
+    webPort: () => boundWebPort ?? null,
+  });
+  const serviceForwardUpgrader = () => createServiceForwardUpgrader({
+    getStorage: () => getOrCreateStorage(),
+    root: projectRoot,
   });
   // Watch on the same /rpc gate, for the Teams relay (managed mode 404s the
   // dashboard's own watch route).
@@ -1181,6 +1257,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         // Callers must not invent a URL from bindHost+webPort when this is null.
         // Explicit, so a client never has to guess why dashboardUrl is null.
         managed: isManagedMode(),
+        runtimeFacts: daemonRuntimeFacts(),
         dashboardUrl: isManagedMode()
           ? null
           : (boundWebPort
@@ -1287,9 +1364,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
           const builderTokenLabel = !authorizedTaskId && token
             ? await lookupDaemonTokenLabel(projectRoot, token)
             : null;
+          const identity = await lookupMcpIdentity(projectRoot, token);
+          if (!identity) throw new RpcError(401, 'This MCP session has ended. Reopen Pairing.');
           const result = await handleMcpToolCall(
             projectRoot, authorizedTaskId, toolName, args, emit, builderTokenLabel,
             clientAcceptsHeartbeat(req) ? (effect) => { afterDelivery.push(effect); } : undefined,
+            identity.kind === 'member-pair' ? identity : null,
           );
           const durationMs = Date.now() - mcpStart;
           logger.info(`MCP ${toolName} for task ${taskIdParam.substring(0, 8)} completed in ${durationMs}ms`);
@@ -1920,6 +2000,10 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
       // upgrader below answers 404.
       sessionAttachUpgrader(),
       rpcWatchUpgrader(),
+      // An SSH connection's forwards to the task's services: authenticated by
+      // a grant that lives exactly as long as that connection, never the
+      // dashboard session (src/ssh/service-forward.ts).
+      serviceForwardUpgrader(),
       createShellUpgrader({
         getStorage: () => getOrCreateStorage(),
         root: projectRoot,
@@ -2165,6 +2249,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
             createServeProxyUpgrader(serveProxyDeps),
             sessionAttachUpgrader(),
             rpcWatchUpgrader(),
+            serviceForwardUpgrader(),
             createShellUpgrader({ getStorage: () => getOrCreateStorage(), root: projectRoot, guard }),
             createWatchUpgrader({ getStorage: () => getOrCreateStorage(), root: projectRoot, guard }),
             createActionRunUpgrader({ getStorage: () => getOrCreateStorage(), guard }),
@@ -2671,11 +2756,12 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
          * Docker is deliberately left alone. There `gracefulTimeoutSeconds` is
          * not "a shorter grace" at all — it is the switch from `docker kill`
          * (immediate, the default) to `docker stop --time <n>` (SIGTERM, wait,
-         * SIGKILL), and it raises the CLI spawn timeout to match. Passing it
-         * would make production's runner spend real wall clock per container
-         * inside this budget, to buy a politeness its own default has already
-         * decided is worthless. Docker's default IS the fast path; only the host
-         * runner needs telling.
+         * SIGKILL), and it raises the CLI spawn timeout to match. Docker's
+         * default IS the fast path; only the host runner needs telling.
+         *
+         * A container's AGENT stop (below) is its own bounded window inside the
+         * container — SHUTDOWN_STOP_GRACE_SECONDS, run in parallel like the rest
+         * — and only when that fails does Docker fall back to its `docker kill`.
          */
         const shutdownStopOpts = runner.type === 'dangerously-host-process-without-any-isolation'
           ? { gracefulTimeoutSeconds: SHUTDOWN_STOP_GRACE_SECONDS }
@@ -2705,9 +2791,14 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
 
           try {
             logger.info(`Stopping supervisor ${runner.runDisplayName(runName)}...`);
-            const ok = await runner.stopRun(runName, shutdownStopOpts);
+            // The AGENT, never the container: its tmux sessions (the task's
+            // services) and everything else in it keep running across the
+            // restart (src/runner/agent-stop.ts). A short grace inside the
+            // container, for the same budget reason as the host runner's.
+            // Falls back to stopping the run when only the agent cannot be.
+            const { ok, keptRun } = await stopTaskAgent(runner, runName, { gracefulTimeoutSeconds: SHUTDOWN_STOP_GRACE_SECONDS, fallback: shutdownStopOpts ?? null });
             if (ok) {
-              logger.info(`Stopped supervisor ${runner.runDisplayName(runName)}`);
+              logger.info(`Stopped supervisor ${runner.runDisplayName(runName)}${keptRun ? ' (its container keeps running)' : ''}`);
               const task = owned?.get(runName);
               if (task) stoppedTaskIds.push(task.id);
             } else {
@@ -2762,6 +2853,9 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     stopSyncLoop();
     stopCaptureLoop();
     stopGuestDockerdWatchdog();
+    if (diskTimer) clearInterval(diskTimer);
+    stopDiskBuildListener();
+    setDiskSpaceManager(null);
     setGuestDockerdReporter(null);
     setMachineIntegrityReporter(null);
     stopIntegrityBuildAudit();
@@ -3171,7 +3265,7 @@ function startDaemonReconcileLoop(
 
             if (!offline && branch && (task.status === 'blocked' || task.status === 'conflict' || task.status === 'submitted')) {
               // Task completed a turn — push the branch (skip when offline)
-              pushBranchAfterStateChange(projectRoot, branch).catch(err => {
+              pushBranchAfterStateChange(projectRoot, branch, { taskId, storage }).catch(err => {
                 const msg = err instanceof Error ? err.message : String(err);
                 logger.debug(`Background push failed for ${branch}: ${msg}`);
               });
@@ -3293,6 +3387,13 @@ function startDaemonReconcileLoop(
               return autoUnblockTask(storage, parent, session, projectRoot, message, 'child_added');
             },
           );
+        });
+        // Questions asked in Chat while the agent was mid-turn: send them now
+        // that their task parked — as ASKS, each as the person who typed it
+        // (src/daemon/queued-asks.ts). Never a work turn.
+        await runPhase('dispatchQueuedAsks', async () => {
+          const sent = await (await import('./review-service')).dispatchQueuedAsks(projectRoot);
+          if (sent > 0) logger.info(`Sent ${sent} question(s) that waited for their task's turn to end`);
         });
         // Restore unblocks after another task's accept that waited for the
         // project's runner image (src/daemon/task-lifecycle.ts).
@@ -3437,10 +3538,10 @@ const WORKTREE_CLEANUP_TEST_INTERVAL_MS = 1_000;
  * run automatically so the drift stays rare instead of accumulating until a
  * human happens to run `lazy doctor`.
  *
- * Local disk + git work only — no network, no agent involvement — so it runs
- * on its own slow timer rather than inside the reconcile tick. Sizes are not
- * measured (unlike the doctor check): the loop only needs to decide what to
- * remove, not report how much space it reclaimed.
+ * Shares the admin preview's measured inventory and durable cleanup record.
+ * Finished-task environments are removed before their files; locks and open
+ * member holds protect worktrees. Runtime failures keep files and are reported
+ * with retry history rather than disappearing into a warning.
  */
 function startTerminalWorktreeCleanupLoop(projectRoot: string): () => void {
   const forcedInTest = process.env.LAZY_FORCE_CAPTURE_SWEEP === '1';
@@ -3458,23 +3559,10 @@ function startTerminalWorktreeCleanupLoop(projectRoot: string): () => void {
     sweeping = true;
     try {
       const storage = await getOrCreateStorage();
-      const worktrees = await findTerminalTaskWorktrees(projectRoot, storage);
-      for (const w of worktrees) {
-        if (stopped) break;
-        // A live lock means some other process (an accept/close/reject still
-        // mid-flight, or a human in `lazy shell`) is using this worktree right
-        // now — skip it this tick rather than race its own cleanup step.
-        if (await checkLock(w.path)) continue;
-        try {
-          await cleanupWorktree(w.path, projectRoot, storage, w.taskId, w.sessionId);
-          logger.info(`Worktree cleanup: removed leftover worktree for finished task ${w.taskCode} (${w.path})`);
-        } catch (err) {
-          logger.warn(`Worktree cleanup failed for ${w.taskCode} (${w.path}): ${err instanceof Error ? err.message : err}`);
-        }
-      }
+      await terminalCleanupFor(projectRoot, storage).run();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logger.debug(`Worktree cleanup sweep failed: ${msg}`);
+      logger.warn(`Finished-task cleanup sweep failed: ${msg}`);
     } finally {
       sweeping = false;
     }

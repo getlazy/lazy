@@ -26,6 +26,17 @@ async function fake(name: string, body: string): Promise<void> {
   await chmod(join(bin, name), 0o755);
 }
 
+async function fakeDockerd(beforeReady = ''): Promise<void> {
+  // Keep the fake alive until a readiness probe succeeds. Exiting immediately
+  // raced a probe that saw "not ready": guest-init then saw the exit record
+  // and correctly stopped waiting. Directory removal also releases it if a
+  // test fails before probing readiness, so teardown cannot leave it running.
+  await fake('dockerd', `echo start >>"${state}/starts"
+${beforeReady}
+touch "${state}/up"
+while [ -d "${state}" ] && [ ! -f "${state}/ready-observed" ]; do sleep 0.01; done`);
+}
+
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'guest-init-reset-'));
   bin = join(dir, 'bin'); runDir = join(dir, 'run'); logDir = join(dir, 'log'); state = join(dir, 'state');
@@ -50,8 +61,8 @@ lazy=""; [ "$1" = "-l" ] && { lazy=1; shift; }
 grep -vF " $1 " "${mounts}" >"${mounts}.new"; mv "${mounts}.new" "${mounts}"`);
   await fake('pkill', `echo "$*" >>"${state}/pkills"; exit 0`);
   await fake('pgrep', 'exit 1');
-  await fake('docker', `case "$1" in ps) [ -f "${state}/containers" ] && echo abc123; exit 0;; kill) echo "$*" >>"${state}/kills"; exit 0;; info) [ -f "${state}/up" ] || exit 1; [ "$2" = "--format" ] && echo overlay2; exit 0;; esac; exit 0`);
-  await fake('dockerd', `echo start >>"${state}/starts"; touch "${state}/up"; exit 0`);
+  await fake('docker', `case "$1" in ps) [ -f "${state}/containers" ] && echo abc123; exit 0;; kill) echo "$*" >>"${state}/kills"; exit 0;; info) [ -f "${state}/up" ] || exit 1; touch "${state}/ready-observed"; [ "$2" = "--format" ] && echo overlay2; exit 0;; esac; exit 0`);
+  await fakeDockerd();
   await fake('id', 'echo 0');
   await fake('ip', 'exit 0');
   await fake('dmesg', 'exit 0');
@@ -152,6 +163,31 @@ describe('lazy-guest-init --reset-storage', () => {
     const r = run('--ensure');
     expect(r.code).toBe(0);
     expect(r.out.source).toBe('started-dockerd');
+  });
+
+  // INVARIANT: a failed readiness probe is not a daemon exit. A live daemon
+  // becoming ready during that probe must still get its next readiness check.
+  test('a dead reset marker is ignored when dockerd becomes ready during a failed probe', async () => {
+    await writeFile(join(runDir, 'lazy-dockerd.reset-in-progress'), `2147483000 ${Math.floor(Date.now() / 1000)}\n`);
+    // Force the first post-launch probe to see "not ready", then let dockerd
+    // become ready before that probe returns. No scheduler timing is assumed.
+    await fakeDockerd(`while [ -d "${state}" ] && [ ! -f "${state}/probe" ]; do sleep 0.01; done`);
+    await fake('docker', `
+[ "$1" = info ] || exit 0
+if [ -f "${state}/up" ]; then
+  touch "${state}/ready-observed"
+  [ "$2" = --format ] && echo overlay2
+  exit 0
+fi
+if [ -f "${runDir}/lazy-dockerd.pid" ]; then
+  touch "${state}/probe"
+  while [ -d "${state}" ] && [ ! -f "${state}/up" ]; do sleep 0.01; done
+fi
+exit 1`);
+    const r = run('--ensure');
+    expect(r.code).toBe(0);
+    expect(r.out.source).toBe('started-dockerd');
+    expect(existsSync(join(state, 'probe'))).toBe(true);
   });
 
   // INVARIANT: the removal cannot cross a mount point even if one were missed.

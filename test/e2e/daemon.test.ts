@@ -39,6 +39,7 @@ import { makeDaemonBaseDir, removeDaemonBaseDir } from '../helpers/daemon-base-d
 import { pinConfig } from '../helpers/pin-config';
 import { isolateInProcessDaemonEnv } from '../helpers/in-process-daemon';
 import { DEAD_PID } from '../helpers/dead-pid';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
 
 /**
  * The address a port squatter must bind to actually block the daemon.
@@ -126,6 +127,7 @@ async function pinFreeServerPort(projectRoot: string): Promise<number> {
 // This suite runs a daemon IN-PROCESS; keep the LAZY_IS_DAEMON flag that
 // startDaemonServer() sets process-wide from leaking into later test files.
 isolateInProcessDaemonEnv();
+isolateLazyEnv();
 
 describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
   describe('server module (unit-level)', () => {
@@ -1842,6 +1844,21 @@ describe.skipIf(slowSuiteSkipped('lazy daemon'))('lazy daemon', () => {
       // The in-process sibling above asserts the same thing on the startup
       // path; this one covers the whole real process, exit handler included.
       expectLastLogEntry(logContent, 'Daemon failed to bind web dashboard');
+    }, 20_000);
+
+    // INVARIANT: an interactive ownership preflight preserves the already-logged
+    // marker on unrelated startup failures, so the terminal sees one error.
+    test('terminal foreground startup reports an already-logged bind failure once', async () => {
+      await forceBindFailure(ctx.root);
+      const result = await ctx.lazy(['daemon', 'start', '--foreground'], {
+        env: {
+          HOME: tmpHome, LAZY_DAEMON_BASE_DIR: daemonBaseDir, LAZY_TEST: '',
+          LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: 'accept',
+        },
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect((result.stdout + result.stderr).match(/Daemon failed to bind web dashboard/g)).toHaveLength(1);
+      expect(result.stdout + result.stderr).not.toContain('Claim it for');
     }, 20_000);
 
     // INVARIANT: startDaemonBackground throws the daemon's actionable error

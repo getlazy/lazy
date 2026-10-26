@@ -46,6 +46,7 @@ A strip of tabs sits under the header. Counts appear on a tab when there is some
 | **Comments** | Notes to the agent, saved now and delivered with the next feedback. |
 | **Journal** | The rationale, decisions and deferred items the agent recorded. |
 | **Reviews** | Formal reviews an agent ran on the task's own work. |
+| **Chat** | Questions people asked the task's agent and its answers, and a box to ask the next one. See [Chat](#chat). |
 | **Artifacts** | Files attached for the agent to read, and files it published back. |
 | **Subtasks** | Tasks stacked on this one, grouped by where they stand. |
 | **Stats** | Where the time and the tokens went, per turn and per tool. |
@@ -55,6 +56,16 @@ A strip of tabs sits under the header. Counts appear on a tab when there is some
 | **More** | The prompt, details, diagnostics and the less common things to do with the task. |
 
 The **?** button at the right end of the strip opens the keyboard shortcut legend.
+
+## Chat
+
+**Chat** is a conversation with the task's agent. Type a message and **Send**: the agent answers from the same session that did the work, so it remembers the task and everything asked before. Only your words and its answers are shown, with each message's time and turn number; a question still waiting for its answer says so, and the answer appears without reloading the page.
+
+![The Chat tab: questions on the right, the agent's answers on the left, one still waiting, and the box to send the next message](../../images/teams/teams-task-chat.png)
+
+A chat message is read-only. The agent answers in text, changes no code and starts no work, and the turn runs on your own connection for the task’s agent profile — Claude Code, Codex, Cursor or Pi. A message sent while the agent is in the middle of a turn waits, marked **Waiting for the agent to finish its turn**, and is sent as soon as that turn ends — still read-only, still on your account. To have the agent act on something, send feedback from **Current review**.
+
+**Ask** stays where it was — on Current review, on a line of the diff and on the agent's report. A question asked from Current review opens Chat; one asked on a line or the report stays there and also appears in Chat, and each of those conversations has an **Asked in Chat →** link. A task that has ended is answered from what lazy recorded about it, and the answer says so.
 
 ## The conversation view
 

@@ -11,6 +11,10 @@ import { executeSearch } from '../../src/search';
 import { idQueryOf } from '../../src/search/id-search';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('search by id', () => {
   let testDir: string;
@@ -25,7 +29,7 @@ describe('search by id', () => {
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {

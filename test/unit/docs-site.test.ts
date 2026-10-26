@@ -475,3 +475,17 @@ test('long pages get an On this page outline; short pages do not', () => {
   expect(long.indexOf('class="toc"')).toBeGreaterThan(long.indexOf('</h1>'));
   expect(withOutline(`<h1 id="t">T</h1>\n${h(OUTLINE_MIN_H2 - 1)}`)).not.toContain('class="toc"');
 });
+
+describe('Mermaid diagrams', () => {
+  // INVARIANT: diagram syntax is checked at build time, so a broken public diagram cannot ship silently.
+  test('renders an accessible offline diagram and names a broken page in strict mode', async () => {
+    await writeDoc('diagram.md', '# Diagram\n\n```mermaid\n%% caption: A to B\nflowchart LR\n A[One] --> B[Two]\n```\n');
+    await buildDocsSite({ docsDir, outDir, strict: true, local: true });
+    const html = await readFile(join(outDir, 'diagram', 'index.html'), 'utf8');
+    expect(html).toContain('<figcaption>A to B</figcaption>');
+    expect(html).toContain('diagrams.js');
+    expect((await readFile(join(outDir, 'diagrams.js'), 'utf8')).length).toBeGreaterThan(1000);
+    await writeDoc('diagram.md', '# Diagram\n\n```mermaid\n%% caption: Broken\nflowchart LR\n A-->\n```\n');
+    await expect(buildDocsSite({ docsDir, outDir, strict: true })).rejects.toThrow('diagram.md: invalid Mermaid diagram');
+  });
+});

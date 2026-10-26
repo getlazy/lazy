@@ -13,8 +13,24 @@
  */
 
 import { tryRemoteStorage } from '../preconditions';
-import { createStorage } from '../storage';
+import { createStorage, checkProjectStoreOwnership } from '../storage';
+import { UnownedStoreError } from '../storage/store-owner';
 import type { Storage } from '../storage/interface';
+import type { CheckResult } from './types';
+
+export async function checkStoreOwnership(root: string): Promise<CheckResult> {
+  const label = 'Store belongs to this checkout';
+  try {
+    await checkProjectStoreOwnership(root);
+    return { ok: true, label };
+  } catch (err) {
+    return {
+      ok: false, label, problem: 'The store cannot be opened by this checkout',
+      detail: err instanceof Error ? err.message : String(err),
+      ...(err instanceof UnownedStoreError ? { remedy: err.remedy } : {}),
+    };
+  }
+}
 
 /**
  * How long a doctor storage call may wait for the storage lock before failing.

@@ -53,6 +53,7 @@ import {
 import { resolveBuilderSessionHomeDir } from '../../src/builder/claude-home';
 import { builderRunName } from '../../src/builder/relaunch';
 import { fetchBuilderLaunchEnv } from '../../src/builder/launch-env';
+import { lookupCredentialGrant } from '../../src/proxy/credential-broker';
 import { daemonMcpConfigDir, DAEMON_MCP_CONFIG_PREFIX } from '../../src/daemon/task-launcher';
 import { agentBinaryContentIdOfFile, versionedAgentBinaryName } from '../../src/agent/binary-install';
 import type { BuilderSession } from '../../src/storage/types';
@@ -62,6 +63,7 @@ const ALICE_OAUTH = 'sk-ant-oat01-alice-real-secret-for-start-proof';
 const BOB_EMAIL = 'bob@example.com';
 const BOB_OAUTH = 'sk-ant-oat01-bob-real-secret-for-start-proof';
 const SERVICE_OAUTH = 'sk-ant-oat01-service-real-secret-for-start-proof';
+const ALICE_OPENAI = 'sk-alice-real-openai-key-for-start-proof';
 
 /**
  * Mirror of the private `calculateSourceHash` (src/capture/claude.ts): the
@@ -382,6 +384,62 @@ describe('daemon-owned builder session start proof', () => {
     expect(JSON.stringify(env)).not.toContain(ALICE_OAUTH);
     expect(JSON.stringify(env)).not.toContain(SERVICE_OAUTH);
   }, 120_000);
+
+  // INVARIANT: a member's Codex builder runs on the profile they picked, billed
+  // to THEIR credential for that profile: the run records the profile, the
+  // container is the Codex builder (its own CODEX_HOME under the member's
+  // home, the codex supervisor), and the launch-env refresh hands it an
+  // OPENAI_API_KEY placeholder bound to the member's session — never a real
+  // key, never the project's own credential.
+  test('a member starts a Codex builder on their own OpenAI credential', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    await rpc(sharedToken, 'putUserCredential', {
+      userId: ALICE_EMAIL, profile: 'codex-api', kind: 'api-key', token: ALICE_OPENAI, endpoint: 'https://api.openai.com',
+    });
+    const userToken = await mintUserToken(ALICE_EMAIL, 'Alice');
+
+    const row = await rpc(userToken, 'startBuilderSession', { agent: 'codex-api' }) as BuilderSession;
+    expect(row.state).toBe('running');
+    expect(row.agentProfile).toBe('codex-api');
+
+    const memberHome = resolveBuilderSessionHomeDir(ctx.root, ALICE_EMAIL);
+    const launchLine = (await docker.invocations()).find(l => l.includes('--name lazy-builder-') && l.includes(' -d '))!;
+    expect(launchLine).toContain(`-v ${join(memberHome, 'codex-homes', row.builderId)}:/home/user/.codex`);
+    expect(launchLine).toContain('-e CODEX_HOME=/home/user/.codex');
+    expect(launchLine).toContain('lazy-agent builder --harness codex');
+
+    const mounted = join(daemonMcpConfigDir(ctx.root), `${DAEMON_MCP_CONFIG_PREFIX}builder-${row.builderId}.json`);
+    const cfg = JSON.parse(await readFile(mounted, 'utf-8')) as { target: string };
+    const copy = join(proofDir, 'codex-builder-mcp.json');
+    await writeFile(copy, JSON.stringify({ ...cfg, target: cfg.target.replace('host.docker.internal', '127.0.0.1') }));
+    const env = await fetchBuilderLaunchEnv(copy);
+    const byKey = new Map(env.authEnvVars.map(v => [v.key, v.value]));
+    const placeholder = byKey.get('OPENAI_API_KEY');
+    expect(placeholder).toBeDefined();
+    const grant = await lookupCredentialGrant(ctx.root, placeholder!);
+    expect(grant?.profile).toBe('codex-api');
+    expect(grant?.bindingKey).toBe(row.builderId);
+    expect(byKey.get('LAZY_CODEX_API_BASE')).toMatch(/^http:\/\/host\.docker\.internal:\d+\/v1$/);
+    expect(JSON.stringify(env)).not.toContain(ALICE_OPENAI);
+    expect(JSON.stringify(await docker.invocations())).not.toContain(ALICE_OPENAI);
+  }, 120_000);
+
+  test('a member with no credential for the Codex profile is refused, naming it', async () => {
+    await putCredential(ALICE_EMAIL, 'oauth', ALICE_OAUTH);
+    await putCredential(SERVICE_CREDENTIAL_USER_ID, 'oauth', SERVICE_OAUTH);
+    const userToken = await mintUserToken(ALICE_EMAIL, 'Alice');
+
+    const status = await rpcStatus(userToken, 'startBuilderSession', { agent: 'codex-api' });
+    expect(status.status).toBe(400);
+    expect(status.message).toContain('codex-api');
+    expect(await rpc(userToken, 'storage', { method: 'listBuilderSessions' })).toEqual([]);
+
+    // A profile that cannot run a builder at all is refused at the boundary.
+    const cursor = await rpcStatus(userToken, 'startBuilderSession', { agent: 'cursor' });
+    expect(cursor.status).toBe(400);
+    expect(cursor.message).toContain('cannot run the builder');
+  }, 60_000);
 
   test('a member with no stored credential is refused before any row exists', async () => {
     // Team mode ON via a DIFFERENT member's credential (the service credential

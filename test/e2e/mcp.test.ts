@@ -173,6 +173,8 @@ describe('lazy-agent mcp', () => {
     // concurrency cap), and the pre-unification aliases lazy_add_followup /
     // lazy_followups / lazy_followup_promote — raised items are one entity now,
     // and lazy_raise / lazy_raised_items / lazy_raised_promote are the surface.
+    // 53 since lazy_sessions — an agent-facing READ by design: an agent reads
+    // its task's long-running tmux sessions (its services) without attaching.
     // 52 since lazy_recipe — an agent-facing READ by design: agents load
     // step-by-step recipes (e.g. task-image) for recurring kinds of work.
     // 51 since lazy_token_stats, lazy_review_comments and lazy_review_status —
@@ -184,7 +186,7 @@ describe('lazy-agent mcp', () => {
     // (public-docs/surface-asymmetries.md §25) — an agent reviewing a large
     // branch a region at a time is what the tool exists for. Only the human
     // OVERLAY (naming, sign-off) is CLI-only, and that is a separate tool.
-    expect(result.tools.length).toBe(52);
+    expect(result.tools.length).toBe(53);
 
     const toolNames = result.tools.map(t => t.name).sort();
     expect(toolNames).not.toContain('lazy_propose');
@@ -232,6 +234,7 @@ describe('lazy-agent mcp', () => {
       'lazy_review_comments',
       'lazy_review_status',
       'lazy_search',
+      'lazy_sessions',
       'lazy_show',
       'lazy_start',
       'lazy_status',

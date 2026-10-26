@@ -46,8 +46,8 @@ describe('lazy.toml.example model tiers', () => {
       'cursor-complex': 'grok-4-7',
       'cursor-security': 'claude-opus-5-5',
       'codex-normal': 'gpt-5.6-terra',
-      'codex-complex': 'gpt-6-sol',
-      'codex-security': 'gpt-6-sol',
+      'codex-complex': 'gpt-6.1-sol',
+      'codex-security': 'gpt-6.1-sol',
       'codex-on-demand': 'gpt-6-astra',
     });
   });

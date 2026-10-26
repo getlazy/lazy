@@ -1,3 +1,4 @@
+import { shellSessionCommand } from '../../src/terminal/shell-session';
 import { describe, test, expect } from 'bun:test';
 import { resolveSessionAttachTarget, taskModeRefusals } from '../../src/daemon/session-attach';
 import { createSessionAttachUpgrader } from '../../src/server/session-attach-ws';
@@ -90,7 +91,6 @@ async function resolve(sessionId: string, callerEmail: string | null, multiMembe
     sessionId,
     callerEmail,
     multiMember,
-    bindingFor: async () => null,
     runnerFor: dockerRunner,
   });
 }
@@ -179,7 +179,7 @@ describe('resolveSessionAttachTarget (attach exec target)', () => {
       projectRoot: ROOT,
       storage: { ...fakeStorage(), getSessionTurns: async () => [] } as never,
       sessionId: TASK_SESSION.id, callerEmail: 'alice@example.com', multiMember: true,
-      bindingFor: async () => null, runnerFor: dockerRunner,
+      runnerFor: dockerRunner,
     });
     expect(r).toMatchObject({ ok: false, status: 409 });
     if (!r.ok) expect(r.message).toContain('has not run a turn yet');
@@ -190,60 +190,24 @@ describe('resolveSessionAttachTarget (attach exec target)', () => {
     expect(r).toMatchObject({ ok: false, status: 403 });
   });
 
-  // INVARIANT: while a turn is RUNNING nobody opens a terminal on the task on
-  // a shared daemon — not even that turn's own member. Member terminals and
-  // turns take turns with the worktree (src/daemon/member-entry.ts); this is
-  // the early answer, the entry re-checks under the lifecycle lock. Running =
-  // the binding is live, or the task is working.
-  describe('a running turn keeps every member out', () => {
-    const as = (
-      callerEmail: string,
-      binding: { ownerUserId: string; revokedAt: number | null } | null,
-      opts: { multiMember?: boolean; status?: string } = {},
-    ) => resolveSessionAttachTarget({
+  // INVARIANT: a running turn never keeps a member's terminal out (engineer,
+  // 2026-10-21, replacing "a running turn keeps every member out"): a member
+  // and the agent work the worktree at the same time, exactly like solo
+  // `lazy shell <task>`, which is never refused while the agent works.
+  describe('a running turn keeps nobody out', () => {
+    const as = (callerEmail: string, status: string) => resolveSessionAttachTarget({
       projectRoot: ROOT,
-      storage: { ...fakeStorage(), getTask: async () => ({ ...TASK, status: opts.status ?? 'blocked' }) } as never,
-      sessionId: TASK_SESSION.id, callerEmail, multiMember: opts.multiMember ?? true,
-      runnerFor: dockerRunner, bindingFor: async () => binding,
+      storage: { ...fakeStorage(), getTask: async () => ({ ...TASK, status }) } as never,
+      sessionId: TASK_SESSION.id, callerEmail, multiMember: true,
+      runnerFor: dockerRunner,
     });
 
-    test("a live placeholder naming another member is a 409", async () => {
-      expect(await as('alice@example.com', { ownerUserId: 'bob@example.com', revokedAt: null }))
-        .toMatchObject({ ok: false, status: 409 });
+    test('a working task lets a member through to the entry step', async () => {
+      expect((await as('alice@example.com', 'working')).ok).toBe(true);
     });
 
-    test("a live placeholder of the service credential is a 409", async () => {
-      expect(await as('alice@example.com', { ownerUserId: '__service__', revokedAt: null }))
-        .toMatchObject({ ok: false, status: 409 });
-    });
-
-    test("the live placeholder's own member is refused too", async () => {
-      expect(await as('bob@example.com', { ownerUserId: 'bob@example.com', revokedAt: null }))
-        .toMatchObject({ ok: false, status: 409 });
-    });
-
-    test('a working task with no binding (the daemon-env mode) is refused', async () => {
-      expect(await as('alice@example.com', null, { status: 'working' })).toMatchObject({ ok: false, status: 409 });
-    });
-
-    // INVARIANT: the refusal says what the reader can do, never that a
-    // terminal "opens once the turn has ended" — nothing opens one by itself,
-    // so that promised something that never happened.
-    test('the refusal says why and what to do, and promises nothing', async () => {
-      const r = await as('alice@example.com', null, { status: 'working' });
-      expect(r.ok).toBe(false);
-      const message = (r as { message: string }).message;
-      expect(message).toContain('a terminal cannot open while it does');
-      expect(message).toContain('When the turn ends, open the terminal again');
-      expect(message).not.toMatch(/opens once the turn/);
-    });
-
-    test('between turns a member is let through to the entry step', async () => {
-      expect((await as('alice@example.com', { ownerUserId: 'bob@example.com', revokedAt: 1 })).ok).toBe(true);
-    });
-
-    test('a single-person daemon has no other member to protect', async () => {
-      expect((await as('alice@example.com', { ownerUserId: 'bob@example.com', revokedAt: null }, { multiMember: false })).ok).toBe(true);
+    test('so does a parked one', async () => {
+      expect((await as('alice@example.com', 'blocked')).ok).toBe(true);
     });
   });
 
@@ -404,6 +368,46 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
     });
   });
 
+  // INVARIANT: a shell may name its tmux session (`?session=`, e.g. a page's
+  // second Shell is `shell-2`), and only a plain name is accepted — it is
+  // interpolated into the exec's script, so anything else is refused 400.
+  describe('a named shell session', () => {
+    const upgrader = () => createSessionAttachUpgrader({
+      getStorage: async () => fakeStorage() as Storage,
+      root: ROOT,
+      authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
+      multiMember: async () => true,
+      confirmRunning: async () => ({ ok: true }),
+      runnerFor: dockerRunner,
+      enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
+      memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
+      onMemberVacate: async () => {},
+      launchMemberContainer: async (o) => ({ ok: true, container: { name: 'lazymember-task-1-bbbb', binary: o.binary, remove: async () => {} } }),
+      memberContainerRunning: async () => true,
+    });
+    const req = (q: string) => new Request(
+      `http://daemon/rpc/sessions/${TASK_SESSION.id}/attach/ws?mode=shell${q}`,
+      { headers: { Authorization: 'Bearer t', 'X-Lazy-Project': ROOT } },
+    );
+
+    test('reaches the session it names', async () => {
+      resetMemberTerminalsForTests();
+      const { server, upgrades } = capturingServer();
+      expect(await upgrader().tryUpgrade(req('&session=shell-2'), server)).toBe('upgraded');
+      expect(upgrades[0]!.cmd).toEqual(shellSessionCommand('shell-2'));
+      resetMemberTerminalsForTests();
+    });
+
+    test('a name that is not plain is refused before anything is claimed', async () => {
+      resetMemberTerminalsForTests();
+      const { server } = capturingServer();
+      const outcome = await upgrader().tryUpgrade(req('&session=x%3Bkill'), server);
+      expect(outcome).toBeInstanceOf(Response);
+      expect((outcome as Response).status).toBe(400);
+      expect((await import('../../src/server/member-terminals')).memberTerminalHolders('task-1')[0] ?? null).toBeNull();
+    });
+  });
+
   // INVARIANT: on a shared daemon a member's terminal NEVER runs in the task's
   // container. It execs into a container of the member's own
   // (src/daemon/member-container.ts) — whose environment carries their
@@ -420,7 +424,6 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       multiMember: async () => true,
       confirmRunning: async () => { throw new Error('a member terminal must not need the task container running'); },
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async () => {},
@@ -448,8 +451,12 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
     // The exec carries no credential: the member's is in their container's
     // own environment, and nothing else's is anywhere near it.
     expect(upgrades[0]!.env).toEqual(['TERM=xterm-256color']);
-    // A member's terminal is closed when forgotten (./terminal-idle.ts).
-    expect(upgrades[0]!.limits).toEqual({ idleMs: 3_600_000, maxMs: 43_200_000 });
+    // INVARIANT: a member's shell is their container's `shell` tmux session,
+    // so a reconnect lands back in what they left running; and it is never
+    // closed for idleness — it holds no turn off the task (engineer,
+    // 2026-10-21), and the idle limit on its sessions bounds the container.
+    expect(upgrades[0]!.cmd).toEqual(shellSessionCommand());
+    expect(upgrades[0]!.limits).toBeUndefined();
     resetMemberTerminalsForTests();
   });
 
@@ -461,7 +468,6 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
       multiMember: async () => true,
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async () => {},
@@ -478,18 +484,18 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
     expect(prepared).toEqual({ ok: false, message: expect.stringContaining('No Anthropic credential') });
     await new Promise((r) => setTimeout(r, 60));
     // Nothing came up, so nothing is held: the task is free at once.
-    const { memberInsideTask } = await import('../../src/server/member-terminals');
-    expect(memberInsideTask(TASK.id)).toBeNull();
+    const { membersInsideTask } = await import('../../src/server/member-terminals');
+    expect((membersInsideTask(TASK.id)[0] ?? null)).toBeNull();
     resetMemberTerminalsForTests();
   });
 
-  // INVARIANT: one member in a task at a time — their terminals share one
-  // container of their own, and two people editing one checkout at once is
-  // not something either asked for — and the hold outlives their last
-  // terminal until that container has been removed, so nothing they left
-  // running survives into anyone else's session. The same member may open as
-  // many terminals as they like; all of them land in the same container.
-  describe('one member inside at a time', () => {
+  // INVARIANT: several members may be inside one task at once, each in their
+  // own container; humans coordinate (engineer, 2026-10-21 — replacing "one
+  // member inside at a time"). A member's hold outlives their last terminal
+  // until their container has been removed, so nothing they left running
+  // survives unowned. The same member may open as many terminals as they
+  // like; all of them land in the same container.
+  describe('several members inside at once', () => {
     function memberUpgrader(email: string, opts: {
       entered?: string[];
       vacated?: string[];
@@ -507,7 +513,6 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
         multiMember: async () => true,
         confirmRunning: async () => ({ ok: true }),
         runnerFor: dockerRunner,
-        bindingFor: async () => null,
         enterAsMember: async (o) => {
           opts.entered?.push(o.email);
           if (opts.enter) return opts.enter();
@@ -542,7 +547,7 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       headers: { Authorization: 'Bearer t', 'X-Lazy-Project': ROOT },
     });
 
-    test('a second member is refused until the first has closed every terminal and been vacated', async () => {
+    test('a second member gets their own container while the first is inside', async () => {
       resetMemberTerminalsForTests();
       const vacated: string[] = [];
       const launched: string[] = [];
@@ -556,17 +561,17 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       expect(alice.upgrades.map((u) => u.container)).toEqual(['lazymember-alice-1', 'lazymember-alice-1']);
 
       const bob = capturingServer();
-      expect(((await memberUpgrader('bob@example.com').tryUpgrade(req(), bob.server)) as Response).status).toBe(409);
+      expect(await memberUpgrader('bob@example.com', { vacated, launched }).tryUpgrade(req(), bob.server)).toBe('upgraded');
+      await prepareSocket(bob.upgrades[0]!);
+      expect(launched).toEqual(['lazymember-alice-1', 'lazymember-bob-2']);
+      expect(bob.upgrades[0]!.container).toBe('lazymember-bob-2');
 
       for (const u of alice.upgrades) (u.onClose as () => void)();
-      // Still held through the grace: Alice's container has not been removed yet.
-      expect(((await memberUpgrader('bob@example.com').tryUpgrade(req(), bob.server)) as Response).status).toBe(409);
-      expect(bob.upgrades).toHaveLength(0);
-
       await new Promise((r) => setTimeout(r, 60));
-      // Her container is what the vacate removed.
+      // Only her container is what the vacate removed; Bob is still inside.
       expect(vacated).toEqual(['alice@example.com:lazymember-alice-1']);
-      expect(await memberUpgrader('bob@example.com').tryUpgrade(req(), bob.server)).toBe('upgraded');
+      const { membersInsideTask } = await import('../../src/server/member-terminals');
+      expect(membersInsideTask(TASK.id)).toEqual(['bob@example.com']);
       resetMemberTerminalsForTests();
     });
 
@@ -678,10 +683,10 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
       const outcome = await memberUpgrader('alice@example.com', { launchThrows: true }).tryUpgrade(req(), server);
       expect(outcome).toBe('upgraded');
       expect((await prepareSocket(upgrades[0]!)).ok).toBe(false);
-      const { memberTerminalHolder } = await import('../../src/server/member-terminals');
+      const { memberTerminalHolders } = await import('../../src/server/member-terminals');
       // Released: after the grace the task is free for anyone.
       await new Promise((r) => setTimeout(r, 60));
-      expect(memberTerminalHolder(TASK.id)).toBeNull();
+      expect((memberTerminalHolders(TASK.id)[0] ?? null)).toBeNull();
       resetMemberTerminalsForTests();
     });
   });
@@ -693,18 +698,26 @@ describe('session attach upgrader: the client cannot steer the exec', () => {
 describe('attachSession preflight refusals', () => {
   const task = { ...TASK, status: 'blocked' } as unknown as Task;
 
-  test('another member holding the container refuses every mode, naming them', async () => {
+  // INVARIANT: several members may be inside one task at once, each in their
+  // own container; humans coordinate (engineer, 2026-10-21). Another member
+  // being inside never refuses anyone's terminal.
+  test('another member inside the task refuses nothing', async () => {
+    resetMemberTerminalsForTests();
+    const { claimMemberTerminal, markMemberTerminalEntered } = await import('../../src/server/member-terminals');
+    expect(claimMemberTerminal(task.id, 'bob@example.com')).toEqual({ ok: true });
+    markMemberTerminalEntered(task.id, 'bob@example.com');
     const r = await taskModeRefusals({
       projectRoot: ROOT, task, callerEmail: 'alice@example.com', multiMember: true, binary: 'docker',
-      deps: { holder: () => 'bob@example.com', credentialMissing: async () => false, pairOrChat: async () => null },
+      deps: { runArgsRefusal: async () => null, credentialMissing: async () => false, pairOrChat: async () => null, transcriptTooLarge: async () => false },
     });
-    for (const m of ['shell', 'pair', 'chat'] as const) expect(r.refusals[m]).toContain('bob@example.com');
+    expect(r.refusals.shell).toBeUndefined();
+    resetMemberTerminalsForTests();
   });
 
   test('no stored credential refuses every mode with the marker Teams recognises', async () => {
     const r = await taskModeRefusals({
       projectRoot: ROOT, task, callerEmail: 'alice@example.com', multiMember: true, binary: 'docker',
-      deps: { holder: () => null, credentialMissing: async () => true, pairOrChat: async () => null },
+      deps: { credentialMissing: async () => true, pairOrChat: async () => null },
     });
     expect(r.credentialMissing).toBe(true);
     expect(r.refusals.shell).toContain('No Anthropic credential for this user');
@@ -717,7 +730,6 @@ describe('attachSession preflight refusals', () => {
     const r = await taskModeRefusals({
       projectRoot: ROOT, task, callerEmail: 'alice@example.com', multiMember: true, binary: 'docker',
       deps: {
-        holder: () => null,
         runArgsRefusal: async () => (await import('../../src/daemon/member-container')).memberContainerSettingsRefusal(['--pid=host']),
         credentialMissing: async () => false,
         pairOrChat: async () => null,
@@ -733,7 +745,7 @@ describe('attachSession preflight refusals', () => {
   test('a runtime member containers cannot run on refuses every mode, naming it', async () => {
     const r = await taskModeRefusals({
       projectRoot: ROOT, task, callerEmail: 'alice@example.com', multiMember: true, binary: 'podman',
-      deps: { holder: () => null, runArgsRefusal: async () => null, credentialMissing: async () => false, pairOrChat: async () => null },
+      deps: { runArgsRefusal: async () => null, credentialMissing: async () => false, pairOrChat: async () => null },
     });
     for (const m of ['shell', 'pair', 'chat'] as const) {
       expect(r.refusals[m]).toContain('need the docker runtime');
@@ -745,7 +757,7 @@ describe('attachSession preflight refusals', () => {
   test('the docker runtime is not refused for its own sake', async () => {
     const r = await taskModeRefusals({
       projectRoot: ROOT, task, callerEmail: 'alice@example.com', multiMember: true, binary: 'docker',
-      deps: { holder: () => null, runArgsRefusal: async () => null, credentialMissing: async () => false, pairOrChat: async () => null, transcriptTooLarge: async () => false },
+      deps: { runArgsRefusal: async () => null, credentialMissing: async () => false, pairOrChat: async () => null, transcriptTooLarge: async () => false },
     });
     expect(r.refusals).toEqual({});
   });
@@ -773,9 +785,12 @@ describe('attachSession preflight refusals', () => {
   });
 
   // INVARIANT: the page's preflight carries the AGENT rules too, so a task on
-  // an agent that cannot pair shows Pair disabled with why, and a non-Claude
-  // task shows Chat disabled — instead of a socket that is refused unread.
-  test('pair on an agent that cannot pair, and chat on a non-Claude agent, are refused', async () => {
+  // an agent that cannot pair says why on Pair, and one with no read-only
+  // interactive mode (Codex, whose read-only sandbox cannot run in a
+  // container) says why on Chat — instead of a socket that is refused unread.
+  // Cursor and Pi chat read-only (engineer, 2026-10-24: Pair/Chat on every
+  // harness that can do it).
+  test('pair on an agent that cannot pair, and chat on Codex, are refused with why', async () => {
     const noPair = { ...TASK, status: 'blocked', agent_id: 'qa-agent' } as unknown as Task;
     const r1 = await withWorktree(noPair, (root) => taskModeRefusals({ projectRoot: root, task: noPair, callerEmail: null, multiMember: false, binary: 'docker' }));
     expect(r1.refusals.pair).toContain('does not support pairing');
@@ -783,7 +798,13 @@ describe('attachSession preflight refusals', () => {
     const cursor = { ...TASK, status: 'blocked', agent_id: 'cursor' } as unknown as Task;
     const r2 = await withWorktree(cursor, (root) => taskModeRefusals({ projectRoot: root, task: cursor, callerEmail: null, multiMember: false, binary: 'docker' }));
     expect(r2.refusals.pair).toBeUndefined();
-    expect(r2.refusals.chat).toContain('chat only supports Claude Code');
+    expect(r2.refusals.chat).toBeUndefined();
+
+    const codex = { ...TASK, status: 'blocked', agent_id: 'codex' } as unknown as Task;
+    const r3 = await withWorktree(codex, (root) => taskModeRefusals({ projectRoot: root, task: codex, callerEmail: null, multiMember: false, binary: 'docker' }));
+    expect(r3.refusals.pair).toBeUndefined();
+    expect(r3.refusals.chat).toContain('Chat is not available for Codex');
+    expect(r3.refusals.chat).toContain('Use Ask');
   });
 });
 
@@ -805,7 +826,6 @@ describe('a member terminal is answered first and prepared after', () => {
       authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
       multiMember: async () => true,
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async () => {},
@@ -872,8 +892,8 @@ describe('a member terminal is answered first and prepared after', () => {
     expect(frames.at(-1)).toEqual({ type: 'error', message: expect.stringContaining('could not be started'), detail: expect.stringContaining('no space left on device') });
     expect(closes).toEqual([1011]);
     await new Promise((r) => setTimeout(r, 60));
-    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
-    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    const { memberTerminalHolders } = await import('../../src/server/member-terminals');
+    expect((memberTerminalHolders(TASK.id)[0] ?? null)).toBeNull();
     resetMemberTerminalsForTests();
   });
 
@@ -887,8 +907,8 @@ describe('a member terminal is answered first and prepared after', () => {
     expect(JSON.parse(sent.at(-1)!)).toEqual({ type: 'error', message: expect.stringContaining('could not be started'), detail: 'the registry is unreadable' });
     expect(closes).toEqual([1011]);
     await new Promise((r) => setTimeout(r, 60));
-    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
-    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    const { memberTerminalHolders } = await import('../../src/server/member-terminals');
+    expect((memberTerminalHolders(TASK.id)[0] ?? null)).toBeNull();
     resetMemberTerminalsForTests();
   });
 
@@ -907,7 +927,6 @@ describe('a member terminal is answered first and prepared after', () => {
       authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
       multiMember: async () => true,
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async (c) => { vacated.push(c?.name ?? 'none'); },
@@ -926,8 +945,8 @@ describe('a member terminal is answered first and prepared after', () => {
     // Let the launch get under way (it waits on the gate: a build in progress).
     await new Promise((r) => setTimeout(r, 10));
     handler.close(ws);
-    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
-    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    const { memberTerminalHolders } = await import('../../src/server/member-terminals');
+    expect((memberTerminalHolders(TASK.id)[0] ?? null)).toBeNull();
     expect(vacated).toEqual([]);
     finishLaunch();
     await opened;
@@ -946,7 +965,6 @@ describe('a member terminal is answered first and prepared after', () => {
       authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
       multiMember: async () => true,
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async () => {},
@@ -1025,8 +1043,8 @@ describe('a member terminal is answered first and prepared after', () => {
     handler.close(ws);
     await opened;
     expect(launches).toBe(0);
-    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
-    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    const { memberTerminalHolders } = await import('../../src/server/member-terminals');
+    expect((memberTerminalHolders(TASK.id)[0] ?? null)).toBeNull();
     resetMemberTerminalsForTests();
   });
 
@@ -1045,7 +1063,6 @@ describe('a member terminal is answered first and prepared after', () => {
       authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
       multiMember: async () => true,
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async () => {},
@@ -1079,7 +1096,6 @@ describe('a member terminal is answered first and prepared after', () => {
       authenticate: async () => ({ ok: true, actor: { kind: 'user', email: 'alice@example.com' } as never, legacyShared: false }),
       multiMember: async () => true,
       runnerFor: dockerRunner,
-      bindingFor: async () => null,
       enterAsMember: async (o) => { markMemberTerminalEntered(o.taskId, o.email); return { ok: true }; },
       memberPreflight: async () => ({ refusals: {}, credentialMissing: false }),
       onMemberVacate: async () => {},
@@ -1092,8 +1108,8 @@ describe('a member terminal is answered first and prepared after', () => {
     expect(await silentUp.tryUpgrade(req(), silent.server)).toBe('upgraded');
     const outcome = await prepareSocket(silent.upgrades[0]!);
     expect(outcome).toEqual({ ok: false, message: expect.stringContaining('stopped making progress'), detail: expect.stringContaining('no progress') });
-    const { memberTerminalHolder } = await import('../../src/server/member-terminals');
-    expect(memberTerminalHolder(TASK.id)).toBeNull();
+    const { memberTerminalHolders } = await import('../../src/server/member-terminals');
+    expect((memberTerminalHolders(TASK.id)[0] ?? null)).toBeNull();
     resetMemberTerminalsForTests();
   });
 });

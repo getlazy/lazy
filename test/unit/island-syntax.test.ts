@@ -42,6 +42,7 @@ import { reviewDraftScript } from '../../src/server/review-draft-script';
 import { raisedDialogScript } from '../../src/server/raised-dialog';
 import { raisedDecideScript } from '../../src/server/raised-decide';
 import { actionDialogScript } from '../../src/server/action-dialog';
+import { controlRefusalScript } from '../../src/server/control-refusal';
 import { verifyCopyScript, verifyRunScript } from '../../src/server/review-verify';
 import { taskLiveStatusScript } from '../../src/server/task-live-status';
 import { domMorphScript } from '../../src/server/dom-morph';
@@ -63,6 +64,8 @@ import { subtasksSectionHtml } from '../../src/server/subtasks';
 import { copyMarkdownScript } from '../../src/server/copy-markdown';
 import { servicesCardHtml } from '../../src/server/services-card';
 import { runShaChoiceScript } from '../../src/server/runs-page';
+import { taskSessionsClientScript } from '../../src/server/task-sessions-panel';
+import { taskServiceWaitPageHtml } from '../../src/server/task-service-wait';
 import type { Task } from '../../src/types';
 import { progressiveLoaderScript } from '../../src/server/review-progressive';
 
@@ -140,6 +143,7 @@ const ISLANDS: Record<string, () => string> = {
   raisedDialogScript: () => raisedDialogScript(),
   raisedDecideScript: () => raisedDecideScript(),
   actionDialogScript: () => actionDialogScript(),
+  controlRefusalScript: () => controlRefusalScript(),
   verifyCopyScript: () => verifyCopyScript(),
   verifyRunScript: () => verifyRunScript(),
   taskLiveStatusScript: () => taskLiveStatusScript(),
@@ -158,6 +162,10 @@ const ISLANDS: Record<string, () => string> = {
   modifierKeyScript: () => modifierKeyScript(),
   screenshotLightboxScript: () => screenshotLightboxScript(),
   runShaChoiceScript: () => runShaChoiceScript(),
+  taskSessionsClientScript: () => taskSessionsClientScript(),
+  taskServiceWaitPageHtml: () => taskServiceWaitPageHtml({
+    taskSeg: 'island-demo', service: 'web', port: 3000, command: 'bun run dev',
+  }),
   // Private islands, reached through what ships them.
   navBadgeScript: () => layoutHtml('t', '<p>body</p>'),
   navProgressScript: () => layoutHtml('t', '<p>body</p>'),

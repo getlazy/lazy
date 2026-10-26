@@ -1,5 +1,18 @@
 # The daemon, the task container and the proxy
 
+```mermaid
+%% caption: Clients send task actions to the daemon while an agent sends model traffic through the proxy
+flowchart LR
+  CLI[CLI] --> Daemon[Project daemon]
+  Browser[Dashboard or Teams] --> Daemon
+  Agent[Agent in task container] --> MCP[MCP server]
+  MCP --> Daemon
+  Daemon --> Store[(Task store)]
+  Agent --> Proxy[Model proxy]
+  Proxy --> Provider[Model provider]
+```
+
+
 Lazy is not one program that you run and that exits. Each project has a
 long-running **daemon** that owns everything, and every other part of lazy is a
 client of it. This page explains that split, where an agent actually runs, and
@@ -41,6 +54,18 @@ honest. Everything else is a client that asks it to do things:
 
 By default the daemon listens on loopback only, so none of this is reachable
 from other machines unless you change `[server] bind`.
+
+Lazy Teams serves the project UI itself and assigns the daemon's listener.
+On a single-person install, this config keeps the dashboard on the local
+machine:
+
+```toml
+[server]
+bind = "127.0.0.1"
+port = 26024
+```
+
+The dashboard starts at port 26024 and stays on the loopback interface.
 
 ## The task container
 

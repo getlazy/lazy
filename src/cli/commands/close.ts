@@ -50,6 +50,7 @@ export async function commandClose(args: string[]): Promise<void> {
     { name: 'yes', aliases: ['y'], takesValue: false },
     { name: 'reason', takesValue: true },
     { name: 'accept-dirty-worktree', takesValue: false },
+    { name: 'end-sessions', takesValue: false },
   ], 'close');
 
   const taskId = parsed.positional[0];
@@ -61,6 +62,7 @@ export async function commandClose(args: string[]): Promise<void> {
   const skipEditor = parsed.flags.get('yes') === true;
   const argReason = parsed.flags.get('reason') as string | undefined;
   const acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
+  const endMemberSessions = parsed.flags.get('end-sessions') === true;
 
   // INVARIANT: Pre-flight checks before editor — the user should never type
   // feedback only to have it discarded by a validation failure.
@@ -133,6 +135,7 @@ export async function commandClose(args: string[]): Promise<void> {
         taskId,
         reason,
         acceptDirtyWorktree,
+        endMemberSessions,
       }, display);
     } finally {
       display.close();
@@ -171,7 +174,7 @@ export async function commandClose(args: string[]): Promise<void> {
 }
 
 export function closeUsage(): void {
-  console.log(`Usage: lazy close <task_id> [--reason "reason text"] [--yes] [--accept-dirty-worktree]
+  console.log(`Usage: lazy close <task_id> [--reason "reason text"] [--yes] [--accept-dirty-worktree] [--end-sessions]
 
 Close a task — stop work and mark it as abandoned.
 
@@ -184,6 +187,9 @@ Options:
   --yes, -y               Skip editor prompt (non-interactive mode)
                           Requires --reason or piped stdin
   --accept-dirty-worktree Allow closing even if worktree has uncommitted changes
+  --end-sessions          End any member's open sessions in the task's environment
+                          first (Lazy Teams); without it, the close is refused
+                          while they have sessions open
 
 Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 

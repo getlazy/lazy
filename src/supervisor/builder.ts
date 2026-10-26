@@ -29,6 +29,8 @@ import { basename, join } from 'path';
 import { getHome } from '../utils/home';
 import { log, logError, setLogFile } from './log';
 import { builderSupervisorLogPath } from '../builder/supervisor-log-path';
+import { composeCodexBuilderArgs } from '../builder/codex-args';
+import { CODEX_ENDPOINT_ENV } from '../proxy/codex-route';
 
 // JSONL discovery / capture for conversation capture
 import { discoverProjectSessionFiles } from '../import/claude-code-logs';
@@ -39,6 +41,7 @@ import { AGENT_SELFCHECK_SENTINEL } from '../agent/binary-identity';
 import {
   snapshotSessionFiles,
   captureNewOrModifiedConversations,
+  type CaptureResult,
   type SessionSnapshot,
 } from '../import/capture-session';
 
@@ -61,7 +64,15 @@ function captureIntervalMs(): number {
   return DEFAULT_CAPTURE_INTERVAL_MS;
 }
 
+/** The harnesses the builder supervisor can drive (src/builder/builder-profile.ts). */
+export type BuilderHarness = 'claude-code' | 'codex';
+
 export interface BuilderSupervisorConfig {
+  /**
+   * Which agent CLI this session runs — the builder profile's harness, passed
+   * by the runner as `--harness`. Absent means Claude Code.
+   */
+  harness?: BuilderHarness;
   /** Path to the repo root (working directory for Claude Code) */
   worktreePath: string;
   /**
@@ -185,10 +196,15 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   const builderConfig = JSON.parse(await readFile(config.builderConfigPath, 'utf-8'));
   log(`[builder] Builder config loaded (host: ${builderConfig.host}, port: ${builderConfig.port})`);
 
+  const harness: BuilderHarness = config.harness ?? 'claude-code';
+  const codex = harness === 'codex' ? await prepareCodexBuilder(config) : null;
+
   // Snapshot the project's session files before launch. Any file new-or-modified
   // after this baseline belongs to this run and must be captured — there can be
   // several (Claude opens a fresh JSONL on /clear, compaction, and resume).
-  const beforeSnapshot = await snapshotSessionFiles(config.worktreePath);
+  // A Codex builder records nothing there: its rollouts are captured from its
+  // own CODEX_HOME instead (codex.backend below).
+  const beforeSnapshot: SessionSnapshot = codex ? new Map() : await snapshotSessionFiles(config.worktreePath);
 
   // When launched with `--resume <id>`, that session is where the run STARTED —
   const initialResumeSessionId = parseResumeSessionId(config.claudeExtraArgs);
@@ -201,13 +217,19 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // initial launch keeps whatever `--resume` arrived via CLI after `--`.
   const claudeExtraWithoutResume = stripResumeFromClaudeArgs(config.claudeExtraArgs);
   const buildClaudeArgs = (resumeId: string | null, directive?: BuilderLaunchDirective): string[] =>
-    composeBuilderClaudeArgs({
-      systemPrompt,
-      systemPromptFile: config.systemPromptFile,
-      resumeId: resumeId ?? initialResumeSessionId,
-      extraArgs: claudeExtraWithoutResume,
-      directive,
-    });
+    codex
+      ? composeCodexBuilderLaunchArgs({
+          resumeId: resumeId ?? initialResumeSessionId,
+          extraArgs: claudeExtraWithoutResume,
+          directive,
+        })
+      : composeBuilderClaudeArgs({
+          systemPrompt,
+          systemPromptFile: config.systemPromptFile,
+          resumeId: resumeId ?? initialResumeSessionId,
+          extraArgs: claudeExtraWithoutResume,
+          directive,
+        });
 
   if (config.debug) {
     log(`[builder] Claude args: ${buildClaudeArgs(initialResumeSessionId).join(' ')}`);
@@ -232,9 +254,11 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
       ? (storage, sessionId) =>
           stampSessionIdOnStorage(storage, builderId, config.worktreePath, sessionId)
       : undefined,
+    codex?.backend,
   );
 
-  log('[builder] Launching Claude Code interactively...');
+  const agentName = codex ? 'Codex' : 'Claude Code';
+  log(`[builder] Launching ${agentName} interactively...`);
 
   let exitCode: number;
   if (config.daemonConfigPath) {
@@ -248,12 +272,17 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
       log,
       errorOut: (msg) => console.error(msg),
       resolveResumeId: () => monitor.activeSessionId(),
+      agentName,
+      ...(codex
+        ? { prepareLaunch: (env: Record<string, string>) => codex.writeConfig(env, systemPrompt, claudeExtraWithoutResume) }
+        : {}),
     });
     exitCode = continuity.exitCode;
     if (continuity.restarts > 0) {
       log(`[builder] Continuity: ${continuity.restarts} in-place relaunch(es) across daemon restart(s)`);
     }
   } else {
+    if (codex) throw new Error('A Codex builder needs the daemon MCP config (--daemon-config); none was given.');
     const proc = spawn(buildClaudeArgs(null), {
       cwd: config.worktreePath,
       stdin: 'inherit',
@@ -263,7 +292,7 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
     });
     exitCode = await proc.exited;
   }
-  log(`[builder] Claude Code exited with code ${exitCode}`);
+  log(`[builder] ${agentName} exited with code ${exitCode}`);
 
   // The launch probe proves the MCP server can start; it cannot see a loss that
   // happens LATER (daemon restart, token evicted, server crash on some tool
@@ -271,7 +300,9 @@ export async function runBuilderSupervisor(config: BuilderSupervisorConfig): Pro
   // no signal. Claude Code does record the server's stderr — into its own MCP
   // log — so read that back and say so out loud once the terminal is ours again.
   // Not printed mid-session: that would corrupt Claude Code's TUI.
-  if (config.daemonConfigPath) {
+  // Claude Code only: it is what writes that MCP log. Codex keeps no such log
+  // (its MCP client reports failures in its own TUI, where the human sees them).
+  if (config.daemonConfigPath && !codex) {
     const { collectMcpServerErrors } = await import('../builder/mcp-config-check');
     const mcpErrors = await collectMcpServerErrors({
       home: getHome(),
@@ -888,6 +919,12 @@ export function startCaptureMonitor(
     storage: import('../storage/interface').Storage,
     sessionId: string,
   ) => Promise<void>,
+  /**
+   * Where conversations come from when they are not Claude Code session files
+   * in the project's projects dir — a Codex builder's rollouts. Owns both the
+   * capture and the resume target.
+   */
+  backend?: CaptureBackend,
 ): {
   stop: () => Promise<string | null>;
   failures: () => string[];
@@ -946,7 +983,9 @@ export function startCaptureMonitor(
   /** Capture all new-or-modified files once. Returns true if anything was saved. */
   async function captureOnce(): Promise<void> {
     const s = await getStorage();
-    const result = await captureNewOrModifiedConversations(lazyRoot, beforeSnapshot, s, captured);
+    const result = backend
+      ? await backend.capture(s)
+      : await captureNewOrModifiedConversations(lazyRoot, beforeSnapshot, s, captured);
     for (const { sessionId, error } of result.errors) {
       recordFailure(`[builder] Incremental capture failed for ${sessionId}: ${describeError(error)}`);
     }
@@ -956,9 +995,13 @@ export function startCaptureMonitor(
     // Resume target: prefer the explicit --resume id when its file still exists,
     // otherwise the newest owned session (handles /clear and compaction rolling
     // to a fresh sessionId mid-run).
-    const activeFile = await findActiveSessionFile(beforeTimes, lazyRoot, resumeSessionId);
-    if (activeFile) lastDetectedSessionId = basename(activeFile, '.jsonl');
-    else if (result.newestSessionId) lastDetectedSessionId = result.newestSessionId;
+    if (backend) {
+      lastDetectedSessionId = (await backend.activeSessionId()) ?? result.newestSessionId ?? lastDetectedSessionId;
+    } else {
+      const activeFile = await findActiveSessionFile(beforeTimes, lazyRoot, resumeSessionId);
+      if (activeFile) lastDetectedSessionId = basename(activeFile, '.jsonl');
+      else if (result.newestSessionId) lastDetectedSessionId = result.newestSessionId;
+    }
 
     // After the session id is resolved, so scratch files are stamped with the
     // conversation that produced them. Isolated failure domain for the THROW
@@ -1065,6 +1108,10 @@ export function startCaptureMonitor(
     // Continuity may relaunch within the first CAPTURE_INTERVAL_MS after Claude
     // starts — before the timer tick would have learned the session id. Scan the
     // projects dir now so `--resume` targets this conversation, not a fresh one.
+    if (backend) {
+      lastDetectedSessionId = (await backend.activeSessionId()) ?? lastDetectedSessionId;
+      return lastDetectedSessionId;
+    }
     const activeFile = await findActiveSessionFile(beforeTimes, lazyRoot, resumeSessionId);
     if (activeFile) lastDetectedSessionId = basename(activeFile, '.jsonl');
     return lastDetectedSessionId;
@@ -1135,4 +1182,99 @@ export function createCaptureFailureRecorder(
     },
     count: () => seen.size,
   };
+}
+
+/** A non-Claude conversation source for {@link startCaptureMonitor}. */
+export interface CaptureBackend {
+  capture: (storage: import('../storage/interface').Storage) => Promise<CaptureResult>;
+  /** The conversation a relaunch or a later `--resume` should continue, or null. */
+  activeSessionId: () => Promise<string | null>;
+}
+
+/**
+ * The full `codex` argv for one builder launch: the Claude-spelled tail the
+ * host composed, with the daemon's directive applied, translated by
+ * src/builder/codex-args.ts. Always externally sandboxed: the Codex builder
+ * only ever runs in a builder container (the host-process runner refuses it).
+ */
+export function composeCodexBuilderLaunchArgs(opts: {
+  resumeId: string | null;
+  extraArgs: string[];
+  directive?: BuilderLaunchDirective;
+}): string[] {
+  const tail = [
+    ...(opts.resumeId ? ['--resume', opts.resumeId] : []),
+    ...applyLaunchDirective(opts.extraArgs, opts.directive),
+  ];
+  const args = composeCodexBuilderArgs({ claudeArgs: tail, externallySandboxed: true });
+  assertArgvBounded(args, 'Builder Codex');
+  return args;
+}
+
+/**
+ * Everything a Codex builder needs beyond the shared supervisor: its
+ * CODEX_HOME, the rollout capture over it, and the config.toml write that
+ * runs before every launch.
+ *
+ * The lazy MCP entry Codex is told to spawn is read from the SAME
+ * `~/.claude.json` the preflights above just proved (the runner writes one
+ * for every builder, whatever its harness), so the tool channel the human
+ * gets is exactly the one that answered the handshake.
+ */
+async function prepareCodexBuilder(config: BuilderSupervisorConfig): Promise<{
+  backend: CaptureBackend;
+  writeConfig: (env: Record<string, string>, systemPrompt: string, extraArgs: string[]) => Promise<void>;
+}> {
+  if (!config.daemonConfigPath) {
+    throw new Error('A Codex builder needs the daemon MCP config (--daemon-config); none was given.');
+  }
+  const codexHome: string | undefined = process.env.CODEX_HOME;
+  if (!codexHome) {
+    throw new Error('A Codex builder needs its own CODEX_HOME, and this container was started without one.');
+  }
+  const home: string = codexHome;
+  const { snapshotCodexRollouts, captureCodexBuilderRollouts, discoverCodexRollouts } =
+    await import('../import/codex-builder-logs');
+  const before = await snapshotCodexRollouts(codexHome);
+  const captured = new Map<string, { mtimeMs: number; size: number }>();
+  const backend: CaptureBackend = {
+    capture: (storage) => captureCodexBuilderRollouts(home, before, storage, captured),
+    async activeSessionId() {
+      const owned = (await discoverCodexRollouts(home)).filter((f) => {
+        const prior = before.get(f.filePath);
+        return !prior || prior.mtimeMs !== f.mtimeMs || prior.size !== f.size;
+      });
+      // A resumed thread appends to its own rollout; otherwise the newest one
+      // this run wrote (a fresh conversation, or Codex's /new).
+      owned.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      // Nothing written yet: the monitor keeps what it knew (the --resume id).
+      return owned[0]?.sessionId ?? null;
+    },
+  };
+
+  const claudeConfigPath = join(getHome(), '.claude.json');
+  async function writeConfig(env: Record<string, string>, systemPrompt: string, extraArgs: string[]): Promise<void> {
+    const proxyBaseUrl = env[CODEX_ENDPOINT_ENV];
+    if (!proxyBaseUrl) {
+      throw new Error(
+        'The daemon gave this Codex builder no proxy address, so Codex would dial OpenAI directly with ' +
+        'nothing recorded — refusing. Check `lazy daemon status`, then start the builder again.',
+      );
+    }
+    const { lazyMcpEntryFromClaudeConfig } = await import('../builder/mcp-config-check');
+    const entry = lazyMcpEntryFromClaudeConfig(JSON.parse(await readFile(claudeConfigPath, 'utf-8')));
+    if (!entry) {
+      throw new Error(`The builder's MCP entry is missing from ${claudeConfigPath}, so Codex would start with no lazy tools.`);
+    }
+    const { writeCodexConfig } = await import('../agent/codex-config');
+    await writeCodexConfig({
+      proxyBaseUrl,
+      mcpServer: { command: entry.command, args: entry.args },
+      developerInstructions: systemPrompt,
+      // --no-autonomous: Codex asks before each lazy tool call, as Claude Code
+      // asks before its mutating ones.
+      toolsApproval: extraArgs.includes('--dangerously-skip-permissions') ? 'approve' : 'prompt',
+    }, join(home, 'config.toml'));
+  }
+  return { backend, writeConfig };
 }

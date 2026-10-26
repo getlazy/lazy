@@ -39,6 +39,9 @@ import {
   mintDashboardLoginUrl,
   signInToDashboard,
 } from '../helpers/dashboard-session';
+import { browserSuiteSkipped, launchBrowser } from '../helpers/cdp-browser';
+
+const browserUnavailable = browserSuiteSkipped('service waiting page');
 
 /**
  * A `docker` that answers only what discovery asks — `ps` (is it running?) and
@@ -540,6 +543,140 @@ describe('serve proxy', () => {
     expect(res.status).toBe(302);
     expect(new URL(res.headers.get('location')!).searchParams.get('serve_reason')).toBe('not-listening');
   });
+
+  // INVARIANT: a ready sibling never makes a closed declared port bounce to
+  // the task page. Its own waiting page retains the full requested path.
+  test('a direct visit waits for its port and opens the exact requested URL', async () => {
+    await declareServe('[serve]\nmain_service = 9000\n[serve.services]\nweb = 3000\napi = 9000');
+    const taskId = await createTask(ctx, 'Two services starting');
+    const dead = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } });
+    const deadPort = dead.port;
+    dead.stop(true);
+    await publish([`3000/tcp -> 127.0.0.1:${upstream.port}`, `9000/tcp -> 127.0.0.1:${deadPort}`]);
+    const { base, fetch: signedIn } = await signInToDashboard(ctx);
+    const configured = await signedIn(`${base}/settings/services/start-cmd`, {
+      method: 'POST', body: new URLSearchParams({ command: 'bin/dev' }), redirect: 'manual',
+    });
+    expect(configured.status).toBe(303);
+
+    const visit = await proxyFetch(taskId, '/deep/page?x=1&y=2', {
+      service: 'api', headers: { 'sec-fetch-mode': 'navigate', accept: 'text/html' }, redirect: 'manual',
+    });
+    expect(visit.status).toBe(302);
+    const wait = new URL(visit.headers.get('location')!);
+    expect(wait.pathname).toMatch(/\/services\/open\/api$/);
+    expect(wait.searchParams.get('return_to')).toBe('/deep/page?x=1&y=2');
+    const page = await signedIn(`${base}${wait.pathname}${wait.search}`);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('Services are starting');
+    expect(html).toContain('port 9000');
+    expect(html).toContain('Start command live progress');
+    expect(html).not.toContain('serve_reason');
+
+    await publish([`3000/tcp -> 127.0.0.1:${upstream.port}`, `9000/tcp -> 127.0.0.1:${upstream.port}`]);
+    const ready = await signedIn(`${base}${wait.pathname}${wait.search}`, { redirect: 'manual' });
+    expect(ready.status).toBe(302);
+    expect(new URL(ready.headers.get('location')!).pathname + new URL(ready.headers.get('location')!).search)
+      .toBe('/deep/page?x=1&y=2');
+  });
+
+  // INVARIANT: a declared port without a container binding is still a port
+  // being started, even if another declared port is already published.
+  test('an unpublished declared port enters its waiting page', async () => {
+    await declareServe('[serve.services]\nweb = 3000\napi = 9000');
+    const taskId = await createTask(ctx, 'Port not published yet');
+    await publish([`3000/tcp -> 127.0.0.1:${upstream.port}`]);
+    const { base, fetch: signedIn } = await signInToDashboard(ctx);
+    const configured = await signedIn(`${base}/settings/services/start-cmd`, {
+      method: 'POST', body: new URLSearchParams({ command: 'bin/dev' }), redirect: 'manual',
+    });
+    expect(configured.status).toBe(303);
+
+    const visit = await proxyFetch(taskId, '/deep/page?x=1', {
+      service: 'api', headers: { 'sec-fetch-mode': 'navigate', accept: 'text/html' }, redirect: 'manual',
+    });
+    expect(visit.status).toBe(302);
+    const wait = new URL(visit.headers.get('location')!);
+    expect(wait.pathname).toMatch(/\/services\/open\/api$/);
+    expect(wait.searchParams.get('return_to')).toBe('/deep/page?x=1');
+    const page = await signedIn(`${base}${wait.pathname}${wait.search}`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('Services are starting');
+  });
+
+  // INVARIANT: Chromium exposes a manual fetch redirect as opaqueredirect,
+  // with status zero. The waiting page must still navigate when its port opens.
+  test.skipIf(browserUnavailable)('the dashboard waiting page opens the requested URL in one browser tab', async () => {
+    await declareServe('[serve.services]\nweb = 3000');
+    const taskId = await createTask(ctx, 'Wait for web');
+    const dead = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } });
+    const deadPort = dead.port;
+    dead.stop(true);
+    await publish([`3000/tcp -> 127.0.0.1:${deadPort}`]);
+    const signedIn = await signInToDashboard(ctx);
+    await signedIn.fetch(`${signedIn.base}/settings/services/start-cmd`, {
+      method: 'POST', body: new URLSearchParams({ command: 'bin/dev' }), redirect: 'manual',
+    });
+
+    const { loginUrl } = await mintDashboardLoginUrl(ctx);
+    const browser = await launchBrowser([]);
+    try {
+      await browser.goto(loginUrl);
+      const waiting = await browser.goto(`${signedIn.base}/tasks/${taskId}/services/open/web?return_to=%2Fdeep%2Fpage%3Fx%3D1`);
+      expect(waiting.text).toContain('Services are starting');
+      await publish([`3000/tcp -> 127.0.0.1:${upstream.port}`]);
+
+      let arrived = false;
+      for (let i = 0; i < 60; i++) {
+        const page = await browser.state();
+        if (new URL(page.url).pathname === '/deep/page' && new URL(page.url).search === '?x=1') {
+          arrived = true;
+          break;
+        }
+        await Bun.sleep(100);
+      }
+      expect(arrived).toBe(true);
+    } finally {
+      await browser.close();
+    }
+  }, 20_000);
+
+  if (process.env.LAZY_SERVICES_SCREENSHOTS === '1') {
+    test('captures the dashboard Services card and waiting page', async () => {
+      await declareServe('[serve]\nmain_service = 9000\n[serve.services]\nweb = 3000\napi = 9000');
+      const taskId = await createTask(ctx, 'Two services starting');
+      const dead = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } });
+      const deadPort = dead.port;
+      dead.stop(true);
+      await publish([`3000/tcp -> 127.0.0.1:${upstream.port}`, `9000/tcp -> 127.0.0.1:${deadPort}`]);
+      const signedIn = await signInToDashboard(ctx);
+      await signedIn.fetch(`${signedIn.base}/settings/services/start-cmd`, {
+        method: 'POST', body: new URLSearchParams({ command: 'bin/dev' }), redirect: 'manual',
+      });
+      const out = join(process.cwd(), 'lazy-teams/tmp/services-banner-screenshots');
+      await mkdir(out, { recursive: true });
+      const chrome = process.env.CHROME_BIN || '/usr/local/bin/chromium';
+      for (const [screen, size] of [['card', '1400,1200'], ['waiting', '1400,1200'],
+        ['card-phone', '390,844'], ['waiting-phone', '390,844']] as const) {
+        const { base, loginUrl } = await mintDashboardLoginUrl(ctx);
+        const token = new URL(loginUrl).searchParams.get('lazy_login');
+        if (!token) throw new Error('dashboard login link has no lazy_login token');
+        const path = screen.startsWith('card')
+          ? `/tasks/${taskId}/services`
+          : `/tasks/${taskId}/services/open/api?return_to=%2Fdeep%2Fpage%3Fx%3D1`;
+        const separator = path.includes('?') ? '&' : '?';
+        const imagePath = join(out, `dashboard-services-${screen}.png`);
+        const profile = join(fakeRoot, `chrome-${screen}`);
+        const child = Bun.spawn([chrome, '--headless', '--disable-gpu', '--no-sandbox',
+          `--user-data-dir=${profile}`, `--window-size=${size}`, '--virtual-time-budget=3000',
+          `--screenshot=${imagePath}`, `${base}${path}${separator}lazy_login=${token}`],
+        { stdout: 'ignore', stderr: 'pipe' });
+        const exit = await child.exited;
+        if (exit !== 0) throw new Error(`Chromium screenshot failed (${exit}): ${await new Response(child.stderr).text()}`);
+      }
+    }, 60_000);
+  }
 
   // A name nobody owns is not a task in a bad state — it is a wrong address, and
   // redirecting it to a task page would be a lie about which task.

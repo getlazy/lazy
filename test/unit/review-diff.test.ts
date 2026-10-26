@@ -1112,7 +1112,8 @@ describe('side-by-side layout', () => {
   test('the script falls back to unified below a breakpoint', () => {
     const js = diffViewScript('#rv-root');
     expect(js).toContain("matchMedia('(max-width: 900px)')");
-    expect(js).toContain('splitBtn.disabled = narrow.matches');
+    expect(js).toContain("splitBtn.setAttribute('data-control-refusal'");
+    expect(js).not.toContain('splitBtn.disabled');
   });
 
   // The unified body is detached rather than hidden while split is showing:

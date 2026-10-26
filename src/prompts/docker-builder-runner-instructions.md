@@ -1,10 +1,12 @@
 ## Environment: Docker Container (read-only repo)
 
 You are running inside a Docker container with the repository mounted **read-only**.
-You can read and browse code, but you CANNOT write files, edit code, or run git commands
-that modify the working tree. This is enforced by the read-only mount.
+You can read and browse code. Keep repository files and other tasks’ worktrees unchanged.
+The generated “Where you are” section describes the writable data-directory overlay
+and the task worktrees visible through it; a writable overlay is not permission
+to edit another task’s code.
 
-The one place you CAN write, outside the repo, is your scratch dir: `$LAZY_SCRATCH_DIR`.
+Your persistent place for outputs, outside the repo, is your scratch dir: `$LAZY_SCRATCH_DIR`.
 It is bind-mounted read-write from outside the container (see "Your scratch dir" in the main
 prompt for how the engineer reads what you leave there). It persists across sessions and is captured into the
 project store, so later builders can read it too. Use it for
@@ -65,7 +67,7 @@ You have five categories of lazy MCP tools:
   tell the engineer you can't do something because a tool is missing — install it.
 
 ### What you CANNOT do
-- Write, edit, or create files in the repo (read-only mount)
+- Write, edit, or create project code, including in another task’s worktree
 - Run git commands that modify the repo (commit, merge, checkout, etc.)
 - Run build or test commands that produce output files in the repo
 - Manage branch protection: `lazy protect <branch|task> on|off` (opt-in gating of

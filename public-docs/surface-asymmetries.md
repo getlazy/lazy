@@ -38,6 +38,17 @@ refused; read-only tools still answer. During a read-only turn (an ask, a
 review, a reflective unblock, or an agent's self-review), only the tools that turn is offered are
 accepted, however the call reaches lazy.
 
+**Teams Pair and Chat act for their member.** Their connection credentials are
+independent of the task's running turn. Neither connection can call
+`lazy_final`, `lazy_report`, `lazy_update_progress`, `lazy_justify_protected`,
+`lazy_justify_maintain`, `lazy_commit`, `lazy_raise` or `lazy_raised_item_comment`:
+these declare or alter the task agent's own work. Lazy refuses these calls even
+if a client bypasses the advertised tool list. Pair can still run the task's
+subtasks and add comments as the member; Chat only offers reads. Their waits
+leave the task agent's comments queued and can wait on the paired task itself;
+their usage limits show the member's own account. Pair cannot accept a child
+into a parent whose agent is working.
+
 **Reads are not gated at all, on purpose.** Every read-only tool — `lazy_search`, `lazy_show`, `lazy_diff`, `lazy_list`,
 `lazy_blocked`, `lazy_active`, `lazy_status`, `lazy_wait`, the conversation
 reads, `lazy_memory_recall` — works on ANY task in the project for an agent
@@ -1349,6 +1360,15 @@ log and the machine's service logs and can rebuild or cancel the build;
 restarting a machine service is reserved to the installation's administrator.
 Members see neither. The daemon backs that up on its side: the log-bearing reads
 and the restart refuse a member's own credential outright.
+
+## 38. Re-homing a store is a local operator action
+
+`lazy system store-rehome --from <previous-checkout|unowned>` transfers a stopped
+store to the checkout it runs in. It has no MCP or remote-storage equivalent:
+an agent or remote client cannot transfer the data its daemon serves. Lazy Teams
+uses its existing explicit store-adoption flow, which copies into a separate
+store and leaves the source owned by its original checkout. See
+[Store ownership](store-ownership.md).
 
 ## When you find an asymmetry that is not listed here
 

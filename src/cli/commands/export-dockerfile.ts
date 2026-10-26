@@ -85,8 +85,8 @@ export async function commandExportDockerfile(args: string[]): Promise<void> {
     console.log(`    dockerfile = "${targetName}"`);
   }
   console.log('');
-  console.log('  If your tasks run an agent other than Claude Code, add its install line');
-  console.log('  (after USER user) — the default image only carries Claude Code.');
+  console.log('  The default image includes Claude Code, Codex, Cursor and Pi.');
+  console.log('  Add your project’s development tools to the exported Dockerfile.');
   console.log(`  Lazy will rebuild the agent image from your Dockerfile on the next task run.`);
 }
 

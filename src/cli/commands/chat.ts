@@ -9,6 +9,13 @@ import { encodeProjectPath } from '../../import/claude-code-logs';
 import { VALID_EFFORT_LEVELS, type EffortLevel } from '../../config/types';
 import { logger } from '../../utils/logger';
 import { runInteractiveSupervisor } from '../../supervisor/interactive';
+import { interactiveChatRefusal } from '../../agent/interactive-modes';
+import { profileForAgentName, DEFAULT_AGENT_PROFILE_NAME } from '../../config/agent-profiles';
+import { createContainerPairLauncher } from './pair-container';
+import { createRunner, createRunnerFromType } from '../../runner';
+import { containerCliOf } from '../../runner/container-cli';
+import { hostRunnerRemovedMessage, isHostRunnerType } from '../../runner/host-runner-gate';
+import { isTTY } from '../editor';
 import { admitInteractive, admitInteractiveOrExit } from '../usage-pause-preflight';
 import { loadConfig } from '../../config/loader';
 import { pairSessionModel } from '../../task/launch-identity-view';
@@ -150,14 +157,16 @@ async function chatLive(
 ): Promise<void> {
   const taskShortId = shortId(task.id);
 
-  // Chat is built on Claude Code's session machinery (host-side ~/.claude
-  // session rehydration + `claude --resume`). Other agents have no equivalent
-  // documented session surface yet — refuse honestly rather than resuming the
-  // wrong agent's session with Claude.
-  if (task.agent_id && task.agent_id !== 'claude-code') {
-    console.error(`Task ${displayId(task)} runs on the "${task.agent_id}" agent — \`lazy chat\` only supports Claude Code tasks.`);
-    console.error(`Use \`lazy ask ${displayId(task)} "<question>"\` (agent-aware) or \`lazy pair ${displayId(task)}\` instead.`);
-    process.exit(1);
+  // Claude Code chats on the host, over its session machinery (host-side
+  // ~/.claude session rehydration + `claude --resume`), below. Every other
+  // agent chats where its sessions live — inside the task's container, the
+  // same way `lazy pair` runs, locked read-only per agent.
+  const chatConfig = await loadConfig(root);
+  const agentId = task.agent_id || DEFAULT_AGENT_PROFILE_NAME;
+  const harness = profileForAgentName(chatConfig, agentId, `task ${displayId(task)}`).harness;
+  if (harness !== 'claude-code') {
+    await chatLiveInContainer(root, storage, task, sess, agentId, harness, overrideUsagePause);
+    return;
   }
 
   if (!sess.agent_session_id) {
@@ -277,6 +286,105 @@ async function chatLive(
 }
 
 /**
+ * Live chat with a task whose agent is not Claude Code: run that agent inside
+ * the task's container, as `lazy pair` does, with the read-only lockdown of
+ * src/agent/interactive-modes.ts (Cursor's ask mode, Pi without its write
+ * tools) and the read-only lazy tool set. Codex is refused there, with why.
+ *
+ * Same contract as {@link chatLive}: only a paused task, the worktree lock for
+ * the chat's duration, no status change and no turn. The conversation stays in
+ * the agent's own session files in the task's sandbox, where its turns read it.
+ */
+async function chatLiveInContainer(
+  root: string,
+  storage: Storage,
+  task: Task,
+  sess: Session,
+  agentId: string,
+  harness: string,
+  overrideUsagePause: boolean,
+): Promise<void> {
+  const refusal = interactiveChatRefusal(harness);
+  if (refusal) {
+    console.error(`Task ${displayId(task)} runs on the "${agentId}" agent. ${refusal}`);
+    console.error(`  lazy ask ${displayId(task)} "<question>"   # read-only, one question`);
+    console.error(`  lazy pair ${displayId(task)}               # work with the agent directly`);
+    process.exit(1);
+  }
+  if (task.status !== 'blocked' && task.status !== 'conflict') {
+    console.error(`Task ${displayId(task)} is '${task.status}', not 'blocked' or 'conflict'.`);
+    console.error('A chat only runs against a paused task — wait until the agent is paused for review.');
+    process.exit(1);
+  }
+  const worktreePath = getWorktreePath(root, task);
+  if (!await pathExists(worktreePath)) {
+    console.error(`Worktree missing for task ${displayId(task)} at ${worktreePath}.`);
+    console.error(`Run 'lazy sync ${displayId(task)}' to recover it.`);
+    process.exit(1);
+  }
+  rejectIfPairing(root, taskRef(task), displayId(task));
+  const config = await loadConfig(root);
+  const runnerType = sess.runner_type ?? task.runner_type ?? config.runner.type;
+  if (isHostRunnerType(runnerType)) {
+    console.error(hostRunnerRemovedMessage('task runner'));
+    console.error(`Give the task a container runner, then chat in it:  lazy edit ${displayId(task)} --runner docker`);
+    process.exit(1);
+  }
+  const runner = runnerType === 'smolvm' ? await createRunner(root, 'smolvm') : createRunnerFromType(runnerType);
+  const existingLock = await checkLock(worktreePath);
+  if (existingLock) {
+    console.error(`Task ${displayId(task)} is locked by another process (PID ${existingLock.pid}, ${existingLock.command}).`);
+    console.error('A chat needs the task idle. Retry once that operation finishes.');
+    process.exit(1);
+  }
+  await acquireLock(worktreePath, 'lazy chat');
+  let exitCode = 0;
+  let refused: string | null = null;
+  try {
+    refused = await admitInteractive('chat', task.id, { overrideUsagePause });
+    if (refused) {
+      console.error(refused);
+      exitCode = 1;
+    } else {
+      const taskShortId = shortId(task.id);
+      console.log(`\nChatting with the agent of task ${theme.taskId(taskShortId)}: ${task.goal}`);
+      console.log(`  ${theme.label('Status:')}   ${task.status} (unchanged by this chat)`);
+      console.log(`  ${theme.label('Agent:')}    ${agentId === harness ? agentId : `${agentId} (${harness})`}, in the task's ${runnerType} container`);
+      console.log(`  ${theme.label('Mode:')}     read-only (no edits, no commands, no state changes)`);
+      console.log(`\nThe task is held while you chat — start/unblock/sync will refuse until you exit.\n`);
+      const launcher = createContainerPairLauncher({
+        root,
+        taskId: task.id,
+        worktreePath,
+        harness,
+        profile: agentId,
+        model: await chatSessionModel(root, storage, task),
+        runnerType,
+        containerName: runner.runNameForTask(taskShortId),
+        binary: containerCliOf(runner),
+        tty: isTTY(),
+        claudeSessions: false,
+        extraEnv: { LAZY_TASK: taskShortId },
+        chat: true,
+      });
+      ({ exitCode } = await runInteractiveSupervisor({
+        kind: 'chat',
+        root,
+        cwd: worktreePath,
+        taskId: taskShortId,
+        ...(sess.agent_session_id ? { resumeSessionId: sess.agent_session_id } : {}),
+        launcher,
+        extraEnv: { LAZY_TASK: taskShortId },
+      }));
+      console.log(`\nChat ended for task ${theme.taskId(taskShortId)}. Task left ${task.status}.`);
+    }
+  } finally {
+    await removeLock(worktreePath);
+  }
+  if (exitCode !== 0) process.exit(exitCode);
+}
+
+/**
  * Terminal chat: resume a finished task's archived session.
  *
  * Flow:
@@ -300,6 +408,18 @@ async function chatTerminal(
   overrideUsagePause: boolean,
 ): Promise<void> {
   const taskShortId = shortId(task.id);
+
+  // The archive is resumed by Claude Code on this machine; another agent's
+  // session is not something Claude Code can resume, and its worktree and
+  // container — where that agent would chat — are gone with the task.
+  const agentId = task.agent_id || DEFAULT_AGENT_PROFILE_NAME;
+  const harness = profileForAgentName(await loadConfig(root), agentId, `task ${displayId(task)}`).harness;
+  if (harness !== 'claude-code') {
+    console.error(`Task ${displayId(task)} is finished, and it ran on the "${agentId}" agent: a finished task's chat`);
+    console.error(`resumes its archived Claude Code session, and this agent's work is not one. Read the work with:`);
+    console.error(`  lazy show ${displayId(task)}`);
+    process.exit(1);
+  }
 
   // The raw session JSONL is captured into storage when a task is closed
   // (accept/reject/close/abandon). Its presence is the gate for chat: if
@@ -442,7 +562,12 @@ Interactive, read-only chat with a task's agent — ask it what it did and why.
 The chat is "reflective": the agent reflects and answers, it does not act. No
 edits, no commands, no commits, no task state changes are possible.
 
-Works on any task whose agent has run at least once:
+Works after the task’s agent has run at least once:
+
+  Paused tasks: Claude Code, Cursor and Pi. Codex has no read-only
+  interactive mode that works in a container; use lazy ask instead.
+  Finished tasks: archived Claude Code sessions only.
+  The browser Chat tab uses Ask turns and also works on Codex.
 
   Paused task (blocked/conflict)  Resumes the agent's live session in its
                                   worktree. The task is left exactly as it was

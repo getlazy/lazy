@@ -6,7 +6,7 @@
  */
 
 import { remotePrUrl } from '../task/remote-pr';
-import { withPromotedTaskCodes } from '../task/show-sections';
+import { withPromotedTaskCodes, buildShowChat } from '../task/show-sections';
 import { reviewSettingsViewOf, type ReviewSettingsView } from '../review/mode';
 import type { Storage, Task, Session, StatusChange, Turn } from '../storage';
 import { getCommitPatch } from '../git/operations';
@@ -70,6 +70,7 @@ import {
 } from './review-actions';
 import { isValidMessageId, type MessageActions } from './message-actions';
 import type { ReviewSessionActions } from './review-session-actions';
+import { taskDataView } from '../daemon/task-data-view';
 import type { TaskActions, TaskCreateInput, TaskEditInput, TaskUsagePauseView } from './task-actions';
 import { parseCreateTaskForm, type TaskCreateDraft } from './task-create-form';
 import { parseLinkTaskForm, type TaskLinkDraft } from './task-link-form';
@@ -194,6 +195,7 @@ import type { RunActions } from './run-actions';
 import { stoppableClaimOf } from '../daemon/in-flight-turn';
 import { turnText } from '../utils/turn-content';
 import type { FileViolation } from '../types';
+import { loadTaskSessionsFragment } from './task-sessions-panel';
 import { findLazyRoot } from '../project-paths';
 import { resolveOutstandingViolations } from '../protection/outstanding-resolver';
 import { outstandingFromRecords, violationRecordsByFile } from '../protection/outstanding';
@@ -212,6 +214,8 @@ import {
 } from '../protection/status';
 import { getTaskServeState } from '../serve/discovery';
 import { probeServices } from '../serve/probe';
+import { displayUrlFor, serviceHostLabel } from '../serve/subdomain';
+import { safeServiceReturnPath, taskServiceWaitPageHtml } from './task-service-wait';
 import type { ProbedServeState, ServicesCardControls } from './services-card';
 import { beginContainerStart, getContainerStart, containerStartJson } from './container-start';
 import {
@@ -791,6 +795,40 @@ async function serveStateForTask(task: Task, session: Session | null): Promise<P
   }
 }
 
+async function handleTaskServiceWait(
+  storage: Storage,
+  serveActions: ServeActions | undefined,
+  url: URL,
+  taskRef: string,
+  label: string,
+): Promise<Response> {
+  const task = (await storage.resolveTask(taskRef)).task;
+  if (!task) return html(errorHtml('Task not found', `No task matches ${taskRef}.`), 404);
+  const seg = taskPathSegment(task, duplicateTaskCodes(await storage.listTaskCodes()));
+  const back = `/tasks/${seg}/services`;
+  const serve = await serveStateForTask(task, await storage.getSessionByTaskId(task.id));
+  if (!serve) return html(errorHtml('Services unavailable', 'The task services could not be read right now.'), 503);
+  const declared = serve.declared.find((s) => serviceHostLabel(s) === label);
+  if (!declared) return html(errorHtml('Unknown service', `This task declares no service named ${label}.`), 404);
+
+  const live = serve.services.find((s) => s.port === declared.port);
+  if (live?.listening === true) {
+    const target = displayUrlFor(live) ?? live.url;
+    if (target) {
+      const destination = new URL(target);
+      const requested = new URL(safeServiceReturnPath(url.searchParams.get('return_to')), destination);
+      destination.pathname = requested.pathname;
+      destination.search = requested.search;
+      return new Response(null, { status: 302, headers: { Location: destination.href, 'Cache-Control': 'no-store' } });
+    }
+  }
+
+  const command = await readStartServicesCmd(serveActions);
+  if (!command) return new Response(null, { status: 302, headers: { Location: back, 'Cache-Control': 'no-store' } });
+  return new Response(taskServiceWaitPageHtml({ taskSeg: seg, service: declared.name, port: declared.port, command }),
+    { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
 /**
  * Whether a web shell can be opened into this task, as far as a page render is
  * allowed to ask: does the task have a session, and does its runner have a
@@ -1310,7 +1348,7 @@ async function handleContainerStart(
     return html(errorHtml('Not Allowed', shell.reason), 409);
   }
 
-  beginContainerStart(task.id, taskActions);
+  beginContainerStart(task.id, taskActions, task.id, url.searchParams.get('restart') === 'true');
   return Response.redirect(await taskPageUrl(storage, url.origin, task), 303);
 }
 
@@ -1673,10 +1711,16 @@ async function handleTaskDetail(
 
   // Worktree lazy.toml is untrusted data. Missing root / missing file /
   // unparseable TOML all mean "no advice" — the page still renders.
+  let taskData: Awaited<ReturnType<typeof taskDataView>> | undefined;
   let branchAdvice: Awaited<ReturnType<typeof branchServeAdviceFor>> | undefined;
   if (tab === 'services' && !omitBody) {
     const root = findLazyRoot();
     if (root) {
+      try {
+        taskData = await taskDataView(root, task, session);
+      } catch (err) {
+        logger.warn(`Could not read the data directory for ${task.code ?? task.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
       const declared = serve?.declared ?? [];
       branchAdvice = await timings.measure('branch_advice', () =>
         branchServeAdviceFor(getWorktreePath(root, task), declared, taskRef(task)),
@@ -1752,6 +1796,11 @@ async function handleTaskDetail(
     ? null
     : await timings.measure('head_sha', () => taskBranchHeadSha(task));
 
+  // Every render: the Chat tab's body, and the `chat` live-region key the
+  // poll compares against (loadLiveRegionSources builds the same).
+  const chat = await timings.measure('chat', async () =>
+    buildShowChat(turns, await storage.getTaskReviewComments(task.id)));
+
   const linkify: MarkdownLinkifyTable[] = [buildTaskCodeLinkify(taskCodes)];
   // Changes merges symbols from its own diff parse. Landing/raised/turns
   // need the table here so `` `name()` `` in a report or dialog still jumps.
@@ -1805,6 +1854,7 @@ async function handleTaskDetail(
       chrome,
       omitBody,
       headSha,
+      chat,
       viewedFiles,
       lineDrafts,
       progress,
@@ -1814,6 +1864,7 @@ async function handleTaskDetail(
       review: reviewExtras,
       subtreeCounts,
       branchAdvice,
+      taskData,
       upstream,
       launchIdentity,
       reviewSettings,
@@ -1905,7 +1956,7 @@ async function loadLiveRegionSources(
   task: Task,
   session: Session | null,
 ): Promise<TaskLiveRegionSources> {
-  const [children, turns, comments, journal, raised, commits, headSha] = await Promise.all([
+  const [children, turns, comments, journal, raised, commits, headSha, reviewComments] = await Promise.all([
     storage.getChildTasks(task.id),
     session ? storage.getSessionTurns(session.id) : Promise.resolve([]),
     storage.getTaskComments(task.id),
@@ -1913,6 +1964,7 @@ async function loadLiveRegionSources(
     storage.getTaskRaisedItems(task.id),
     session ? storage.getSessionCommits(session.id) : Promise.resolve([]),
     taskBranchHeadSha(task),
+    storage.getTaskReviewComments(task.id),
   ]);
   return {
     children: children.map((c) => ({ id: c.id, status: c.status })),
@@ -1922,6 +1974,7 @@ async function loadLiveRegionSources(
     raised: raised.map((r) => ({ id: r.id, status: r.status })),
     commits: commits.map((c) => ({ sha: c.sha })),
     headSha,
+    chat: buildShowChat(turns, reviewComments).map((m) => ({ id: m.id, state: m.state })),
   };
 }
 
@@ -3514,6 +3567,24 @@ async function routeWebRequest(
     if (params) {
       return await handleContainerEnsure(storage, taskActions, req, params.id, 'state');
     }
+    // The Services tab's Sessions panel, polled by the page: an HTML fragment
+    // of the container's tmux sessions (task-sessions-panel.ts). A read.
+    params = matchRoute(path, '/tasks/:id/container/sessions');
+    if (params) {
+      if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
+      const task = await storage.getTask(params.id);
+      if (!task) return json({ error: `Task not found: ${params.id}` }, 404);
+      const root = findLazyRoot();
+      if (!root) return json({ error: 'No lazy project here.' }, 500);
+      const html = await loadTaskSessionsFragment(root, storage, task.id, { taskSeg: params.id, canAttach: true });
+      return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+    }
+
+    params = matchRoute(path, '/tasks/:id/services/open/:service');
+    if (params) {
+      if (req.method !== 'GET') return json({ error: 'Method not allowed' }, 405);
+      return await handleTaskServiceWait(storage, serveActions, url, params.id, params.service);
+    }
 
     // Live action-dialog follow: snapshot of one in-flight verb.
     params = matchRoute(path, '/tasks/:id/action-runs/:runId');
@@ -3873,7 +3944,8 @@ async function handleReviewRoute(
           intent: 'ask',
           threadId,
         }, { waitForAsk: true, onProgress });
-        return { redirect: `${url.origin}${taskPath({ id: taskId, code: resolved.task?.code ?? null }, await reviewDupCodes())}/review` };
+        // An ask lands in Chat: the question and its answer are shown there.
+        return { redirect: `${url.origin}${taskPath({ id: taskId, code: resolved.task?.code ?? null }, await reviewDupCodes())}/chat` };
       });
     }
     const comment = await actions.postComment(resolved.task.id, {
@@ -3885,7 +3957,8 @@ async function handleReviewRoute(
     if (wantsJson || contentType.includes('application/json')) {
       return json({ comment }, 201);
     }
-    return Response.redirect(`${url.origin}${taskPath(resolved.task, await reviewDupCodes())}/review`, 303);
+    // An ask lands in Chat (the Chat tab's own box posts here too).
+    return Response.redirect(`${url.origin}${taskPath(resolved.task, await reviewDupCodes())}/chat`, 303);
   }
 
   params = matchRoute(path, '/tasks/:id/review/comment');

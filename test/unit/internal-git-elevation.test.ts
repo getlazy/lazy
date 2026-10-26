@@ -22,6 +22,10 @@ import { allTools, createCommitHandler } from '../../src/mcp/tools';
 import type { McpToolContext } from '../../src/mcp/tools';
 import { branchTarget } from '../../src/task-target';
 import { elevatedTag, resetElevatedGitChannel } from '../../src/supervisor/elevated-git';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 function git(cwd: string, ...args: string[]): string {
   const r = spawnSyncUnsupervised(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
@@ -47,6 +51,7 @@ describe('lazy_internal_git', () => {
     git(repo, 'init', '-b', 'main');
     git(repo, 'config', 'user.email', 'test@example.com');
     git(repo, 'config', 'user.name', 'Test');
+    await writeFile(join(repo, '.gitignore'), '.lazy/\n');
     await writeFile(join(repo, 'base.txt'), 'base\n');
     git(repo, 'add', '.');
     git(repo, 'commit', '-m', 'init');
@@ -65,7 +70,7 @@ describe('lazy_internal_git', () => {
     git(repo, 'add', '.');
     git(repo, 'commit', '-m', 'upstream commit');
 
-    storage = await createStorage(repo, { backend: 'external' });
+    storage = await createStorage(repo, testStorageOptions(repo));
     const task = await storage.createTask('Test task');
     await storage.updateTaskTarget(task.id, branchTarget('main'));
     ctx = { taskId: task.id, worktreePath: worktree, storage };

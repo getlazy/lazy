@@ -7,7 +7,7 @@
  * write runs next to the member's credential. It passes the options that make
  * Claude Code ignore the worktree's own settings (`--setting-sources user`,
  * so a hook in the worktree's .claude/settings.json is never loaded) and every
- * MCP server lazy did not write (`--strict-mcp-config` with no --mcp-config),
+ * MCP server lazy did not write (`--strict-mcp-config` with a daemon-written --mcp-config),
  * and it never copies the turn-writable sandbox's .claude.json into $HOME or
  * writes $HOME back into it. That Claude Code honours those two options is
  * its documented contract (`claude --help`, cited in pair.ts); what lazy
@@ -61,7 +61,7 @@ exit 0
   const proc = Bun.spawn(['bun', 'run', ENTRY, 'pair',
     '--task-id', '11111111-2222-3333-4444-555555555555',
     '--worktree', worktree, '--agent', 'claude-code', '--runner', 'docker',
-    '--model', 'claude-opus-5-5', ...extra], {
+    '--model', 'claude-opus-5-5', '--member-mcp-config', '/run/lazy-member-mcp/0123456789abcdef0123456789abcdef.json', ...extra], {
     cwd: worktree,
     env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ''}`, LAZY_DAEMON_CONFIG: '' },
     stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
@@ -85,7 +85,10 @@ describe('a member session in their own container', () => {
     expect(at).toBeGreaterThan(-1);
     expect(r.argv[at + 1]).toBe('user');
     expect(r.argv).toContain('--strict-mcp-config');
-    expect(r.argv).not.toContain('--mcp-config');
+    const config = JSON.parse(r.argv[r.argv.indexOf('--mcp-config') + 1]!);
+    expect(Object.keys(config.mcpServers)).toEqual(['lazy']);
+    expect(config.mcpServers.lazy.command).toBe('lazy-agent');
+    expect(config.mcpServers.lazy.args).toContain('/run/lazy-member-mcp/0123456789abcdef0123456789abcdef.json');
     // Claude Code started on the lazy-built home, not the sandbox's copy with
     // the planted server — and nothing was written back into the sandbox.
     expect(r.homeSeen).not.toContain('thief');
@@ -98,5 +101,7 @@ describe('a member session in their own container', () => {
     expect(r.code).toBe(0);
     expect(r.argv).toContain('--strict-mcp-config');
     expect(r.homeSeen).not.toContain('thief');
+    const config = JSON.parse(r.argv[r.argv.indexOf('--mcp-config') + 1]!);
+    expect(config.mcpServers.lazy.args).toContain('--read-only');
   }, 60_000);
 });

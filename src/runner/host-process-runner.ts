@@ -75,6 +75,7 @@ import { DEFAULT_ONESHOT_TIMEOUT_MS, ONESHOT_KILL_GRACE_MS } from '../oneshot/ar
 import { buildBuilderHeadlessClaudeArgs, builderHeadlessModel, parseBuilderHeadlessStdout } from './builder-headless';
 import { buildBuilderPermissionArgs } from './host-sandbox';
 
+import { assertHeadlessBuilderHarness } from '../builder/codex-args';
 import hostProcessBuilderInstructions from '../prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
 
 // Agent packaging for availability checks and tool checks.
@@ -1339,6 +1340,16 @@ export class HostProcessRunner implements Runner {
 
     // Fail hard before launch if the builder's backend is unreachable.
     const builderTarget = this.builderTarget();
+    if (builderTarget.harness !== 'claude-code') {
+      // This launch runs Claude Code directly with no supervisor, MCP channel or
+      // isolated home; a Codex builder needs all three, which the container
+      // runners provide. Refused rather than starting Claude Code under a
+      // profile that names another harness (and bills another credential).
+      throw new Error(
+        `The builder profile "${builderTarget.profile}" runs ${builderTarget.harness}, which the host-process runner ` +
+        `cannot launch as a builder. Use [runner] type = "docker" (or "podman") for a ${builderTarget.harness} builder.`,
+      );
+    }
     await preflightRoleTarget('builder', builderTarget);
 
     // Inject the builder target's backend env vars (base URL for ollama/proxy,
@@ -1403,6 +1414,7 @@ export class HostProcessRunner implements Runner {
 
   async launchBuilderHeadless(params: LaunchBuilderHeadlessParams): Promise<LaunchBuilderHeadlessResult> {
     const { lazyRoot, systemPrompt, prompt, resumeSessionId, authEnvVars, debug } = params;
+    assertHeadlessBuilderHarness(this.builderTarget().harness, this.builderTarget().profile);
 
     await preflightRoleTarget('builder', this.builderTarget());
 

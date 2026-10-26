@@ -34,7 +34,7 @@ import { daemonRedactor, redactAnswer, REDACTION_UNAVAILABLE, STRUCTURAL_FIELDS 
 import { putUserCredential, clearUserCredentialCache } from '../../src/daemon/user-credentials';
 import { mintCredentialGrant, clearCredentialGrantCache } from '../../src/proxy/credential-broker';
 import { getLogPath, getUserCredentialsPath } from '../../src/daemon/paths';
-import { handleImageBuildLog, handleMachineState, handleRestartMachineService, handleRunnerImage, handleShow, initDaemonStorage, getOrCreateStorage, closeAllStorage } from '../../src/daemon/rpc-handlers';
+import { handleImageBuildLog, handleMachineState, handleMachineRestartPreview, handleRestartMachineService, handleRunnerImage, handleShow, initDaemonStorage, getOrCreateStorage, closeAllStorage } from '../../src/daemon/rpc-handlers';
 import { REDACTED } from '../../src/utils/redact';
 import { startForeignProcess } from '../helpers/foreign-process';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
@@ -638,6 +638,22 @@ describe('redaction of everything an admin reads', () => {
     job.observer().onLine('img:1', '#5 [2/3] RUN make tools');
     expect(job.read(0, 10).lines[0].text).toBe('#5 [2/3] RUN make tools');
     expect(JSON.stringify(await redactAnswer(root, job.read(0, 10)))).toContain(REDACTION_UNAVAILABLE);
+  });
+
+  // INVARIANT: a restart preview must identify the work it authorizes stopping.
+  // Withheld IDs could make different running containers appear identical.
+  test('an unreadable secret registry refuses a confirmable restart preview', async () => {
+    clearUserCredentialCache();
+    await writeFile(getUserCredentialsPath(root), '{ not json');
+    const saved = { managed: process.env.LAZY_MANAGED, backend: process.env.LAZY_MANAGED_BACKEND };
+    process.env.LAZY_MANAGED = '1';
+    process.env.LAZY_MANAGED_BACKEND = 'microvm';
+    try {
+      await expect(handleMachineRestartPreview(root, { kind: 'control' })).rejects.toThrow('Cannot safely show running work');
+    } finally {
+      if (saved.managed === undefined) delete process.env.LAZY_MANAGED; else process.env.LAZY_MANAGED = saved.managed;
+      if (saved.backend === undefined) delete process.env.LAZY_MANAGED_BACKEND; else process.env.LAZY_MANAGED_BACKEND = saved.backend;
+    }
   });
 
   // INVARIANT: if the secret set cannot be loaded, EVERY string is WITHHELD,

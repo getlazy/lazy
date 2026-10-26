@@ -149,9 +149,10 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
     async ensureContainer(
       taskId: string,
       onProgress?: (detail: string) => void,
+      restart?: boolean,
     ): Promise<EnsureContainerResult> {
       const result = await ensureTaskContainer(projectRoot, {
-        taskId,
+        taskId, restart,
         ...(onProgress ? { notify: onProgress } : {}),
       });
       return { containerName: result.containerName, alreadyRunning: result.alreadyRunning };

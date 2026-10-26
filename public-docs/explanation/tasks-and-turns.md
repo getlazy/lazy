@@ -1,5 +1,17 @@
 # Tasks and turns
 
+```mermaid
+%% caption: One task session contains work, feedback, and review turns; writable turns can produce commits
+flowchart LR
+  Task[Task] --> Session[Session on its branch]
+  Session --> Turn1[Work turn]
+  Session --> Turn2[Feedback turn]
+  Session --> Review[Review turn]
+  Turn1 --> Commits[Git commits]
+  Turn2 --> Commits
+```
+
+
 A task is the unit of work in lazy: a goal, a prompt, and everything that
 happens while an agent works toward it. Work happens in turns, and a human
 steers by sending feedback between them.
@@ -60,6 +72,25 @@ Builder and agent starts are bounded: `[limits] max_turns_without_human`
 (default 10, `0` for unlimited) caps consecutive turns they start without a
 human. A human action always resets the count.
 
+In Lazy Teams, a project admin can set this budget under **Settings →
+Configuration**:
+
+```toml
+[limits]
+max_turns_without_human = 10
+```
+
+After ten consecutive agent or builder starts, the task waits for a person to
+start its next turn.
+
+## How a turn ends
+
+An agent can declare its work done with `lazy_final`, raise a blocking item when it needs a decision, or stop without either declaration. These endings are recorded separately from status: a finished turn normally leaves the task `blocked` (or `conflict` while a protected-file decision is due). A final declaration starts automatic review; it does not itself end the turn or gate a person's accept. A blocking item does gate accept until it is resolved.
+
+## Work left uncommitted when a turn ends
+
+The task's diff and accept use commits, so an uncommitted edit is not part of the work offered for review. Before a writable turn closes, lazy asks the agent once to commit or discard loose files. If they remain, lazy names the paths on the turn and in a notice; accept refuses until the worktree is clean. Lazy never commits those files on the agent's behalf.
+
 ## How feedback reaches the agent
 
 The agent only sees your words in the prompt of a turn.
@@ -94,6 +125,17 @@ daemon feeds them to the agent.
   [Lazy Teams task review](../lazy-teams-task-review.md).
 
 ## Limits
+
+In Lazy Teams, a project admin can set the watchdog under **Settings →
+Configuration**:
+
+```toml
+[agent]
+watchdog_output_timeout_ms = 1800000
+```
+
+This gives an agent 30 minutes without a completed step before the watchdog
+stops its turn.
 
 - A turn is dispatched only from `blocked`, `conflict`, `submitted` or
   `interrupted` (and `backlog` for the first start). A task being paired on or

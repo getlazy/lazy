@@ -8,6 +8,11 @@
  *
  * Prompt templates stay in `src/prompts/*.md` with `{{placeholder}}` substitution.
  */
+import { join } from 'node:path';
+import { appendRuntimeContext, daemonRuntimeFacts } from '../runtime-context';
+import { hasDaemonContext } from '../daemon/context';
+import { checkDaemonHealth } from '../daemon/lifecycle';
+import { builderScratchDir } from './scratch';
 import { loadConfig, hasExplicitModelConfig } from '../config/loader';
 import { renderChattinessSnippet, resolveBuilderChattiness } from '../config/chattiness';
 import { buildMemorySection } from '../memory';
@@ -21,6 +26,7 @@ import type { Storage } from '../storage';
 import type { ResolvedConfig } from '../config/types';
 import { resolveProjectAgent } from '../daemon/project-settings';
 import type { Runner } from '../runner';
+
 
 import lazySystemPrompt from '../prompts/builder-system-prompt.md' with { type: 'text' };
 import scratchHostSection from '../prompts/builder-scratch-host.md' with { type: 'text' };
@@ -45,14 +51,9 @@ export interface AssembleBuilderSystemPromptOpts {
    * you are already running) and nothing else; the prompt is byte-identical.
    */
   announceMemorySize?: boolean;
-  /**
-   * Where the human reads the builder's scratch dir. `host` (default): the
-   * `lazy builder` launches, which mount scratch at its own host path, so a
-   * printed path opens in the operator's shell. `store`: a daemon-owned
-   * detached (Lazy Teams) builder, whose scratch is mounted at a container-only
-   * path (BUILDER_CONTAINER_PATHS.scratchDir) — members read it only through
-   * the captured copy, so the prompt must never promise the path works for them.
-   */
+  /** Actual scratch mount path; independent of how the human reads it. */
+  scratchDir?: string;
+  /** Where the human reads scratch: the daemon filesystem or its stored copy. */
   scratchAccess?: ScratchAccess;
 }
 
@@ -140,5 +141,13 @@ export async function assembleBuilderSystemPrompt(
     prompt += '\n\n' + modelGuidance.trimEnd();
   }
 
-  return prompt;
+  const facts = hasDaemonContext()
+    ? daemonRuntimeFacts()
+    : (await checkDaemonHealth(opts.lazyRoot)).runtimeFacts;
+  return appendRuntimeContext(prompt, {
+    facts, runner: opts.runner.type, audience: 'builder', permissionMode: config.runner.permission_mode,
+    dataDir: join(opts.lazyRoot, config.data.path),
+    scratch: opts.scratchDir ?? builderScratchDir(opts.lazyRoot),
+    dashboardUrl: availability.available ? availability.url : null,
+  });
 }

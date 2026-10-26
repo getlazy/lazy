@@ -8,6 +8,10 @@ import { tmpdir } from 'os';
 import { createSearchHandler, searchTool, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 // The handler's own plural-stripping, restated so the test fails if the enum and the
 // entity types drift: any type search can emit must be reachable from some enum value.
@@ -29,7 +33,7 @@ describe('lazy_search filter', () => {
     writeFileSync(join(dir, 'README.md'), '#\n');
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: dir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'i'], { cwd: dir });
-    storage = await createStorage(dir, { backend: 'external' });
+    storage = await createStorage(dir, testStorageOptions(dir));
     ctx = { taskId: '', worktreePath: dir, storage };
   });
 

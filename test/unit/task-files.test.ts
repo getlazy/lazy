@@ -36,6 +36,10 @@ import {
   findDeliveredFilesInRange,
   readDeliveredManifest,
 } from '../../src/git/delivered-files';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 const SECRET = 'API_TOKEN=sk-test-0123456789abcdef-secret\n';
 
@@ -613,7 +617,7 @@ describe('task files: lazy_commit', () => {
     const { createStorage } = await import('../../src/storage');
     const { createCommitHandler } = await import('../../src/mcp/tools');
     const { root, worktree, git } = await setupProject(base);
-    const storage = await createStorage(root, { backend: 'external' });
+    const storage = await createStorage(root, testStorageOptions(root));
     try {
       const task = await storage.createTask('Secret files commit');
       await storage.createSession(task.id, 'claude-code', 'lazy/task-a', (await git(['rev-parse', 'HEAD'], worktree)).stdout);

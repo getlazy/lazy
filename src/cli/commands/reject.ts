@@ -14,6 +14,7 @@ export async function commandReject(args: string[]): Promise<void> {
     { name: 'yes', aliases: ['y'], takesValue: false },
     { name: 'reason', takesValue: true },
     { name: 'accept-dirty-worktree', takesValue: false },
+    { name: 'end-sessions', takesValue: false },
   ], 'reject');
 
   const taskId = parsed.positional[0];
@@ -25,6 +26,7 @@ export async function commandReject(args: string[]): Promise<void> {
   const skipConfirmation = parsed.flags.get('yes') === true;
   const reasonFromFlag = parsed.flags.get('reason') as string | undefined;
   const acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
+  const endMemberSessions = parsed.flags.get('end-sessions') === true;
 
   // INVARIANT: Pre-flight checks before editor — the user should never type
   // feedback only to have it discarded by a validation failure.
@@ -139,6 +141,7 @@ export async function commandReject(args: string[]): Promise<void> {
         taskId,
         reason: reason.trim(),
         acceptDirtyWorktree,
+        endMemberSessions,
       }, display);
     } finally {
       display.close();
@@ -176,7 +179,7 @@ export async function commandReject(args: string[]): Promise<void> {
 }
 
 export function rejectUsage(): void {
-  console.log(`Usage: lazy reject <task_id> [--reason "..."] [--yes] [--accept-dirty-worktree]
+  console.log(`Usage: lazy reject <task_id> [--reason "..."] [--yes] [--accept-dirty-worktree] [--end-sessions]
 
 Reject a task's work and close its PR, if it has one (no comment is posted).
 
@@ -187,6 +190,9 @@ Options:
   --reason "..."          Provide rejection reason inline instead of opening editor
   --yes, -y               Skip confirmation prompt
   --accept-dirty-worktree Allow rejecting even if worktree has uncommitted changes
+  --end-sessions          End any member's open sessions in the task's environment
+                          first (Lazy Teams); without it, the reject is refused
+                          while they have sessions open
 
 Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 

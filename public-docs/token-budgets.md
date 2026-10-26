@@ -50,6 +50,16 @@ holding the rest. Cluster tasks do the same for their waves of subtasks. This is
 advice to you, not a gate: to have lazy actually hold new turns near a limit,
 configure `[usage_pause]` in `lazy.toml` (see `lazy stats limits`).
 
+In Lazy Teams, a project admin can set this under **Settings → Configuration**:
+
+```toml
+[usage_pause]
+threshold_percent = 95
+```
+
+New turns wait when the credential's reported usage reaches 95% of a
+subscription window. Existing turns continue.
+
 ## Who sees what
 
 On a single-person install you see every credential. On Lazy Teams, a member

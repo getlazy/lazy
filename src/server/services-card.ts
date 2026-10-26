@@ -19,7 +19,7 @@
 import type { TaskServeState } from '../serve/discovery';
 import type { ProbedService } from '../serve/probe';
 import type { BranchServeAdvice } from '../serve/branch-advice';
-import { displayUrlFor } from '../serve/subdomain';
+import { displayUrlFor, serviceHostLabel } from '../serve/subdomain';
 import { viewedCardHtml } from './viewed-cards';
 import { startContainerHtml, type ContainerControls } from './container-start';
 import { escapeHtml } from './escape';
@@ -63,8 +63,8 @@ export interface ServicesCardOptions {
   subject?: 'task' | 'run';
   /**
    * Where Open goes for a published service nothing answers on yet, or null
-   * for none. The caller offers it only while Start services is running, so a
-   * page that would wait forever is never linked.
+   * for none. Commit runs provide their own waiting route; tasks use the
+   * declared service's host label when a Start services command is configured.
    */
   waitHref?: (serviceName: string) => string | null;
 }
@@ -118,6 +118,9 @@ export function servicesBodyHtml(
   opts: ServicesCardOptions = {},
 ): string {
   const isRun = opts.subject === 'run';
+  const waitHref = opts.waitHref ?? (controls?.startServicesCmd
+    ? (name: string, port: number) => `/tasks/${controls.taskId}/services/open/${encodeURIComponent(serviceHostLabel({ name, port }))}`
+    : undefined);
   // Start services + Configure ride every card state: starting the command
   // only needs a shell (which brings the container up itself), and designating
   // the project-wide command (in Settings) does not depend on ports being published.
@@ -157,11 +160,11 @@ export function servicesBodyHtml(
       let target: string;
       if (!s.url) {
         target = `<span class="text-muted">not published — ${isRun ? 'stop the environment and run services again' : 'restart the task'} to pick up [serve]</span>`;
-      } else if (s.listening === false && opts.waitHref?.(s.name)) {
+      } else if (s.listening === false && waitHref?.(s.name, s.port)) {
         // Starting: Open goes to a page that waits for the port to answer and
         // then sends the browser on — what the bare link would do once the
         // server is up, without a "nothing is listening" bounce first.
-        target = `<a class="svc-wait-link" href="${escapeHtml(opts.waitHref(s.name)!)}">Open when it answers</a>` +
+        target = `<a class="svc-wait-link" href="${escapeHtml(waitHref(s.name, s.port)!)}">Open when it answers</a>` +
           `<span class="text-muted">nothing listening on port ${s.port} yet</span>`;
       } else if (s.listening === false) {
         // Published, but the app is not up. NOT a link: the subdomain URL

@@ -40,9 +40,9 @@ export type OwnedRuns = Map<string, Task>;
  * two agree for every launched task; indexing both means a run whose task_ref
  * write did not survive is still recognized as ours rather than leaked.
  */
-export async function indexRunsByName(storage: Storage, runner: Pick<Runner, 'runNameForTask'>): Promise<OwnedRuns> {
+export async function indexRunsByName(storage: Storage, runner: Pick<Runner, 'runNameForTask'>, options?: { strict: boolean }): Promise<OwnedRuns> {
   const owned: OwnedRuns = new Map();
-  const tasks = await storage.listTasks();
+  const tasks = options?.strict ? await storage.listTasksStrict() : await storage.listTasks();
   for (const task of tasks) {
     for (const ref of new Set([taskRef(task), deriveTaskRef(task, tasks)])) {
       owned.set(runner.runNameForTask(ref), task);

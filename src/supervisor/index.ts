@@ -1,3 +1,4 @@
+import { withRuntimeContext } from '../runtime-context';
 /**
  * Supervisor loop.
  *
@@ -71,6 +72,7 @@ import { getAgent, getAgentPackaging } from '../agent/registry';
 import { log, logError, logWarn, resetTimer } from './log';
 import { adoptBeforeCommand } from '../utils/worktree-ownership';
 import { applyTurnCredentialEnv } from './turn-credential-env';
+import { applyProxyAddressEnv } from './proxy-address-env';
 import { prepareTurnMcp } from './mcp-setup';
 import { clearTurnHandoff, handoffField, handoffTurnEnding } from './turn-handoff';
 import { createRunnerFromType } from '../runner';
@@ -393,6 +395,12 @@ export async function runSupervisor(config: SupervisorConfig): Promise<number> {
     // reused container (and the services running in it) survives a turn whose
     // owner's credential kind differs from the one it was created with.
     // See ./turn-credential-env.ts.
+    // The proxy of the daemon that wrote this command: a kept container may
+    // have been created under a previous daemon, whose proxy port is gone.
+    // Before the credential below, which never carries an address.
+    const movedTo = applyProxyAddressEnv((command as { proxy_port?: number }).proxy_port);
+    if (movedTo) log(`[supervisor] Pointed this turn at the live daemon's proxy (${movedTo}).`);
+
     const credentialCmd = command as { session_credential_env?: Array<{ key: string; value: string }>; harness?: string; agent_id?: string };
     if (applyTurnCredentialEnv(credentialCmd.session_credential_env, credentialCmd.harness ?? credentialCmd.agent_id)) {
       log('[supervisor] Installed this turn\'s session credential placeholder.');
@@ -541,6 +549,7 @@ async function recoverWorktreeState(
  * here — both arrive on the command, already resolved from the task record.
  */
 function mergeTurnOptions(cmd: {
+  runtime_context?: string;
   watchdog_output_timeout_ms?: number;
   wind_down_timeout_ms?: number;
   harness?: string;
@@ -550,6 +559,7 @@ function mergeTurnOptions(cmd: {
 }): MergeTurnOptions {
   const harness = commandHarness(cmd);
   return {
+    runtimeContext: cmd.runtime_context,
     harness,
     noProgressTimeoutMs: resolveWatchdogTimeout(
       cmd.watchdog_output_timeout_ms ?? 0,
@@ -786,6 +796,7 @@ export async function addGitPointerDenies(command: Command, worktreePath: string
  * Handle a start, unblock, or sync command: run phases and write response.
  */
 async function handleTurnCommand(command: Command, config: SupervisorConfig, runner: Runner): Promise<Response> {
+  command = withRuntimeContext(command);
   const { protocolDir, worktreePath } = config;
 
   if (command.type === 'stop') throw new Error('Stop command must be handled by the supervisor loop');

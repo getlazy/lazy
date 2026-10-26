@@ -1,3 +1,4 @@
+import { currentDiskSpaceManager } from '../docker/disk-space';
 /**
  * The project's custom runner image (`[docker] dockerfile`) is built when the
  * daemon BOOTS, and the daemon owns its state.
@@ -24,15 +25,19 @@
  * and a daemon adoption resolve before the gate in `ensureImage`, exactly as
  * before, and nothing here ever reads a task worktree.
  */
-import { readFile, writeFile, mkdir, rm } from 'fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { logger } from '../utils/logger';
+import { spawn } from '../utils/spawn';
+import { autoBuildsRootDockerfile } from '../config/managed-mode';
 import { loadConfig } from '../config/loader';
 import { registerCustomImageGate, type CustomImageVerdict } from '../capture/custom-image-gate';
-import { ensureImage, forgetBuildFailure, resetBuildFailuresForTests, resolveImageRepository, IMAGE_TAG, resolveCustomDockerfile, describeDockerfileSource } from '../capture/claude';
+import { ensureImage, forgetBuildFailure, resetBuildFailuresForTests, resolveImageRepository, IMAGE_TAG, resolveCustomDockerfile, describeDockerfileSource, runWithBuildContext, rootIntegrationBranch, gitInRoot } from '../capture/claude';
 import { runWithoutBuildObserver } from '../capture/build-observer';
 import { startImageBuildJob, whileNotCancelled, type ImageBuildJob } from './image-build-job';
 import { forgetFailedDamagedImageRepair } from '../docker/damaged-image';
+import { exportTree, adoptionBuildStatus } from './image-adoption';
+import { readBuiltFromLabel } from '../docker/image-built-from';
 
 /**
  * Carried by `building` and `failed` when the build REPLACES a ready image (a
@@ -43,10 +48,17 @@ interface Replacing {
   replacing?: boolean;
 }
 
+/** A commit on the project's acting branch an image was built from, or is being built from. */
+export interface BranchCommit {
+  branch: string;
+  /** The full commit sha. */
+  sha: string;
+}
+
 export type RunnerImageState =
   /** No custom image is configured, or the runner has no image: nothing to wait for. */
   | { state: 'none' }
-  | { state: 'checking'; imageName: string; dockerfile: string; defaultImage: string; startedAt: string; buildId?: string | null }
+  | { state: 'checking'; imageName: string; dockerfile: string; defaultImage: string; startedAt: string; buildId?: string | null; attemptedFrom?: BranchCommit }
   | ({
       state: 'building'; imageName: string; dockerfile: string; defaultImage: string; startedAt: string;
       /** Why the build runs (missing, inputs changed, too old, requested). */
@@ -55,8 +67,14 @@ export type RunnerImageState =
       progress: string | null;
       /** The build's log (`imageBuildLog`). */
       buildId?: string | null;
+      /** The branch commit this build is from, when it follows the branch. */
+      attemptedFrom?: BranchCommit;
+      /** While replacing: the commit the image still in use was built from. */
+      builtFrom?: BranchCommit;
     } & Replacing)
   | { state: 'ready'; imageName: string; dockerfile: string; defaultImage: string; readyAt: string; buildId?: string | null;
+      /** The branch commit the image was last built from (set when the branch advanced and the daemon rebuilt it). */
+      builtFrom?: BranchCommit;
       /** The last background refresh failed; the next one is not tried before this (ISO 8601). */
       refreshRetryAt?: string }
   | ({
@@ -68,6 +86,10 @@ export type RunnerImageState =
       retryAt?: string;
       /** The ref adoption's commit can no longer be found, so it cannot be rebuilt. */
       adoptionUnavailable?: boolean;
+      /** The branch commit the failed build was from, when it follows the branch. */
+      attemptedFrom?: BranchCommit;
+      /** While replacing: the commit the image still in use was built from. */
+      builtFrom?: BranchCommit;
     } & Replacing);
 
 interface Tracker {
@@ -90,6 +112,16 @@ interface Tracker {
   refreshRetryAtMs: number;
   /** The build running now (or last run), for its log and its Cancel. */
   job: ImageBuildJob | null;
+  /** The acting branch's tip the daemon last looked at; null until the first look (which only records it). */
+  seenTip?: string | null;
+  /** The newest tip that arrived while a build ran: built once that one ends. Older ones in between are skipped. */
+  queuedTip?: BranchCommit | null;
+  /** An advance is being exported, resolved or built: another waits (queuedTip) until it ends. */
+  advancing?: boolean;
+  /** Test seams of the latest note, so a drain started by a build's end uses them too. */
+  advanceDeps?: AdvanceDeps;
+  /** The branch commit the image in use was built from; undefined when it was built from anything else. */
+  servingFrom?: BranchCommit;
 }
 
 let tracker: Tracker | null = null;
@@ -117,6 +149,11 @@ export function runnerImageJob(): ImageBuildJob | null {
   return tracker?.job ?? null;
 }
 
+/** "main @ 1a2b3c4d5e6f" — the branch and the shortened commit an image was built from. */
+export function describeBranchCommit(c: BranchCommit): string {
+  return `${c.branch} @ ${c.sha.substring(0, 12)}`;
+}
+
 /** One sentence for a refusal, a banner or a start timeline. */
 export function describeRunnerImage(s: RunnerImageState = runnerImageStatus()): string {
   switch (s.state) {
@@ -126,10 +163,11 @@ export function describeRunnerImage(s: RunnerImageState = runnerImageStatus()): 
       if (s.replacing) return `The project's runner image ${s.imageName} is being rebuilt from ${s.dockerfile}; the current one stays in use until it succeeds.`;
       return `The project's runner image ${s.imageName} (from ${s.dockerfile}) is still building` +
         (s.reason ? ` — ${s.reason}` : '') + '.';
-    case 'ready': return `The project's runner image ${s.imageName} is ready.` +
+    case 'ready': return `The project's runner image ${s.imageName} is ready` +
+      (s.builtFrom ? `, built from ${describeBranchCommit(s.builtFrom)}` : '') + '.' +
       (s.refreshRetryAt ? ` Refreshing it failed; the next attempt is not before ${s.refreshRetryAt}.` : '');
     case 'failed':
-      if (s.replacing) return `Rebuilding the project's runner image ${s.imageName} from ${s.dockerfile} failed; the current one stays in use: ${s.error}`;
+      if (s.replacing) return `Rebuilding the project's runner image ${s.imageName} from ${s.dockerfile}${s.attemptedFrom ? ` (${describeBranchCommit(s.attemptedFrom)})` : ''} failed; the current one stays in use: ${s.error}`;
       return `The project's runner image ${s.imageName} failed to build from ${s.dockerfile}: ${s.error}`;
   }
 }
@@ -210,35 +248,53 @@ function startBuild(
   imageName: string,
   dockerfile: string,
   defaultImage: string,
-  opts: { rebuild?: boolean; noCache?: boolean; replacing?: boolean; explicit?: boolean } = {},
+  opts: {
+    rebuild?: boolean; noCache?: boolean; replacing?: boolean; explicit?: boolean;
+    /** A rebuild because the acting branch advanced: built from `dir`, that commit's exported tree. */
+    advance?: { commit: BranchCommit; dir: string; /** The image id the tag named before: a build that leaves it unchanged did not build. */ imageBefore: string | null };
+    /** The boot build: export `commit` inside the job and build from it (only if the image needs it, as before). */
+    committed?: { commit: BranchCommit };
+  } = {},
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const generation = ++t.generation;
   const startedAt = new Date().toISOString();
   // A superseded build is stopped, not left running beside its replacement.
   if (t.job && t.job.outcome === 'running') t.job.controller.abort();
   const job = startImageBuildJob('project', `${opts.rebuild ? 'Rebuild' : 'Build'} ${imageName} from ${dockerfile}`, t.projectRoot || undefined);
+  job.metadata = { trigger: opts.advance ? 'branch advance' : opts.rebuild ? 'rebuild' : opts.explicit ? 'retry' : 'boot', commit: (opts.advance?.commit ?? opts.committed?.commit)?.sha, dockerfile, image: imageName };
   t.job = job;
   const replacing = opts.replacing === true;
+  const attemptedFrom = opts.advance?.commit;
+  const from = attemptedFrom ? { attemptedFrom } : {};
+  // The image still in use while a rebuild replaces it keeps saying where it came from.
+  const serving = replacing && t.servingFrom ? { builtFrom: t.servingFrom } : {};
   t.status = replacing
-    ? { state: 'building', imageName, dockerfile, defaultImage, startedAt, reason: 'rebuild requested', progress: null, buildId: job.id, replacing }
-    : { state: 'checking', imageName, dockerfile, defaultImage, startedAt, buildId: job.id };
+    ? { state: 'building', imageName, dockerfile, defaultImage, startedAt, reason: attemptedFrom ? `${attemptedFrom.branch} advanced to ${attemptedFrom.sha.substring(0, 12)}` : 'rebuild requested', progress: null, buildId: job.id, replacing, ...from, ...serving }
+    : { state: 'checking', imageName, dockerfile, defaultImage, startedAt, buildId: job.id, ...from };
   const current = () => t.generation === generation;
   // Retry / Rebuild are the person asking again: the launch-level failure memory must not refuse them.
   if (opts.explicit || opts.rebuild) forgetBuildFailure(imageName);
+  // Whether this build actually rebuilt the image (a boot check of a current image does not).
+  let rebuilt = false;
+  // The boot build's export of the acting commit, made inside this job (the state already says `checking`).
+  let committedDir: string | null = null;
   const done = (async () => {
     // Attempt memory across restarts (see BootAttemptRecord). A deferred build
     // is shown as failed with its next-attempt time; Retry / Rebuild ignore it.
     let failuresSoFar = 0;
-    if (t.projectRoot) {
+    // A rebuild for an advance is not the boot build: its failures must not
+    // defer the next daemon boot's build of an image that is fine.
+    if (t.projectRoot && !opts.advance) {
       try {
         const rec = await readBootAttempt(t.projectRoot, imageName);
         failuresSoFar = rec ? (rec.inProgress ? rec.failures + 1 : rec.failures) : 0;
+        if (failuresSoFar && job.metadata.trigger === 'boot') job.metadata.trigger = 'retry';
         const deferral = opts.explicit || opts.rebuild ? null : bootDeferral(rec);
         if (deferral) {
           job.finish('failed', deferral.error);
           if (!current()) return;
           const error = `${deferral.error}; ${deferral.failures} attempt(s) failed, so the daemon will not try again before ${deferral.retryAt} (Retry builds it now)`;
-          t.status = { state: 'failed', imageName, dockerfile, defaultImage, failedAt: new Date().toISOString(), error, buildId: job.id, retryAt: deferral.retryAt, ...(replacing ? { replacing } : {}) };
+          t.status = { state: 'failed', imageName, dockerfile, defaultImage, failedAt: new Date().toISOString(), error, buildId: job.id, retryAt: deferral.retryAt, ...(replacing ? { replacing } : {}), ...serving };
           logger.warn(`Runner image: not building ${imageName}: ${error}`);
           return;
         }
@@ -248,6 +304,16 @@ function startBuild(
       }
     }
     try {
+      if (!job.metadata.commit && t.projectRoot) {
+        const { loadValidAdoptedImage } = await import('./adopted-image');
+        const adopted = await loadValidAdoptedImage(t.projectRoot);
+        if (adopted?.source?.kind === 'ref') job.metadata.commit = adopted.source.commit;
+        else {
+          const ref = await gitInRoot(t.projectRoot, ['rev-parse', '--verify', 'HEAD']);
+          if (ref.exitCode === 0) job.metadata.commit = ref.stdout.toString().trim();
+          else job.note('Build commit unavailable: ' + ref.stderr.trim());
+        }
+      }
       // The default image alongside: it is what builders and confirmed agents
       // run on meanwhile. Concurrently, not first — an up-to-date custom image
       // must not read as "checking" for as long as a missing default takes to
@@ -260,7 +326,7 @@ function startBuild(
       void runWithoutBuildObserver(() => ensureImage(t.binary, { useDefaultImage: true })).catch((err) => {
         logger.warn(`Runner image: lazy's default image ${defaultImage} could not be prepared: ${err instanceof Error ? err.message : String(err)}`);
       });
-      await whileNotCancelled(job, job.run(() => ensureImage(t.binary, {
+      const build = () => ensureImage(t.binary, {
         bypassGate: true,
         rebuild: opts.rebuild,
         noCache: opts.noCache,
@@ -269,18 +335,38 @@ function startBuild(
           if (!current()) return;
           const s = t.status;
           const building = /^(re)?building /.test(detail);
+          if (building) rebuilt = true;
           if (s.state === 'checking' && building) {
-            t.status = { state: 'building', imageName, dockerfile, defaultImage, startedAt, reason: detail, progress: null, buildId: job.id };
+            t.status = { state: 'building', imageName, dockerfile, defaultImage, startedAt, reason: detail, progress: null, buildId: job.id, ...from };
             logger.info(`Runner image: ${detail}`);
           } else if (s.state === 'building') {
             t.status = { ...s, progress: detail };
           }
         },
-      })));
+      });
+      if (opts.committed) committedDir = await prepareBootContext(t, opts.committed.commit, imageName, job.controller.signal);
+      if (job.cancelled) throw new Error('the build was cancelled');
+      const committedFrom = committedDir && opts.committed ? opts.committed.commit : undefined;
+      const context = opts.advance ?? (committedDir && committedFrom ? { dir: committedDir, commit: committedFrom } : null);
+      await whileNotCancelled(job, job.run(() => context ? runWithBuildContext(context.dir, build, context.commit) : build()));
+      // ensureImage falls back to the existing image when a build fails while
+      // offline and returns normally. For an advance that is a failure: the
+      // image was NOT built from this commit.
+      if (opts.advance) {
+        const after = await imageId(t.binary, imageName);
+        if (after === null || after === opts.advance.imageBefore) {
+          throw new Error(`the image ${imageName} was not rebuilt from ${describeBranchCommit(opts.advance.commit)} (the build did not complete — offline, or it fell back to the existing image)`);
+        }
+      }
+      job.metadata.imageProduced = rebuilt;
       job.finish('succeeded');
-      if (t.projectRoot) await clearBootAttempt(t.projectRoot).catch((e) => logger.warn(`Runner image: could not clear the attempt record: ${e instanceof Error ? e.message : String(e)}`));
+      if (t.projectRoot && !opts.advance) await clearBootAttempt(t.projectRoot).catch((e) => logger.warn(`Runner image: could not clear the attempt record: ${e instanceof Error ? e.message : String(e)}`));
       if (!current()) return;
-      t.status = { state: 'ready', imageName, dockerfile, defaultImage, readyAt: new Date().toISOString(), buildId: job.id };
+      // An image the check left alone keeps saying where it came from.
+      // A boot build that rebuilt from the committed tree came from that commit.
+      if (attemptedFrom || rebuilt) t.servingFrom = attemptedFrom ?? committedFrom;
+      const nowFrom = t.servingFrom;
+      t.status = { state: 'ready', imageName, dockerfile, defaultImage, readyAt: new Date().toISOString(), buildId: job.id, ...(nowFrom ? { builtFrom: nowFrom } : {}) };
       t.checkedAt = Date.now();
       logger.info(`Runner image: ${imageName} is ready`);
     } catch (err) {
@@ -294,15 +380,17 @@ function startBuild(
       }
       job.finish('failed', error);
       if (!current()) return; // superseded: the newer build owns the attempt record
-      if (t.projectRoot) await writeBootAttempt(t.projectRoot, { imageName, failures: failuresSoFar + 1, lastAttemptAt: new Date().toISOString(), inProgress: false, error }).catch((e) => logger.warn(`Runner image: could not record the failed attempt: ${e instanceof Error ? e.message : String(e)}`));
+      if (t.projectRoot && !opts.advance) await writeBootAttempt(t.projectRoot, { imageName, failures: failuresSoFar + 1, lastAttemptAt: new Date().toISOString(), inProgress: false, error }).catch((e) => logger.warn(`Runner image: could not record the failed attempt: ${e instanceof Error ? e.message : String(e)}`));
       if (!current()) return;
-      t.status = { state: 'failed', imageName, dockerfile, defaultImage, failedAt: new Date().toISOString(), error, buildId: job.id, ...(replacing ? { replacing } : {}) };
+      t.status = { state: 'failed', imageName, dockerfile, defaultImage, failedAt: new Date().toISOString(), error, buildId: job.id, ...(replacing ? { replacing } : {}), ...from, ...serving };
       logger.warn(`Runner image: building ${imageName} from ${dockerfile} FAILED: ${error}`);
     }
   })();
   // Settles when this build is over and never rejects: callers that start a
   // build and walk away ignore it; the damaged-image repair awaits it.
-  return done.then(() => job.outcome === 'succeeded'
+  // The queued advance (if any) starts on its own: whoever awaits THIS build
+  // — a damaged-image repair a launch waits on — never waits for the next one.
+  return done.then(async () => { if (committedDir) await removeExport(committedDir); }).then(() => { void drainQueuedAdvance(t); }).then(() => job.outcome === 'succeeded'
     ? { ok: true as const }
     : { ok: false as const, error: job.failure?.error ?? (job.outcome === 'cancelled' ? 'the build was cancelled' : 'the build did not finish') });
 }
@@ -323,13 +411,243 @@ export function cancelRunnerImageBuild(): RunnerImageState | null {
   t.job?.finish('cancelled');
   const replacing = s.state === 'building' && s.replacing === true;
   t.status = replacing
-    ? { state: 'ready', imageName: s.imageName, dockerfile: s.dockerfile, defaultImage: s.defaultImage, readyAt: new Date().toISOString(), buildId: t.job?.id ?? null }
+    ? { state: 'ready', imageName: s.imageName, dockerfile: s.dockerfile, defaultImage: s.defaultImage, readyAt: new Date().toISOString(), buildId: t.job?.id ?? null, ...(s.builtFrom ? { builtFrom: s.builtFrom } : {}) }
     : {
         state: 'failed', imageName: s.imageName, dockerfile: s.dockerfile, defaultImage: s.defaultImage,
         failedAt: new Date().toISOString(), error: 'The build was cancelled before it finished.', buildId: t.job?.id ?? null, cancelled: true,
       };
   logger.info(`Runner image: the build of ${s.imageName} was cancelled`);
   return t.status;
+}
+
+/**
+ * The project image follows the ACTING branch: when it gets a new commit, the
+ * image is rebuilt in the background from THAT COMMIT's exported tree (never the
+ * working tree, never a task branch), and the tag moves only if the build
+ * succeeds — launches use the current image the whole time, running containers
+ * are untouched, and a failed build is shown and changes nothing else.
+ *
+ * "The acting branch" is the branch the root image already resolves from: the
+ * project root's checked-out branch (the project's branch on Teams). A task
+ * branch checked out there, or a detached HEAD, means no branch to follow.
+ */
+async function actingBranchTip(projectRoot: string): Promise<BranchCommit | null> {
+  let branch: string | null;
+  try {
+    branch = await rootIntegrationBranch(projectRoot);
+  } catch (err) {
+    // A detached HEAD or a task branch checked out mid-accept is "no branch to
+    // follow", not a failure: the image never follows either. Reported at debug
+    // because the caller asks on every tick.
+    logger.debug(`Runner image: not following a branch: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+  if (!branch) return null;
+  const local = await revParse(projectRoot, `refs/heads/${branch}`);
+  if (!local) return null;
+  // On a protected branch work lands on the FORGE (a PR/MR merged there), and
+  // the checkout's branch moves only if the daemon's fast-forward of it
+  // succeeds. So the remote-tracking ref the daemon's periodic fetch updates
+  // counts too — read straight from git: nothing here fetches, and the
+  // checked-out branch is never moved. Origin's tip wins only when it CONTAINS
+  // the local one; a local branch with commits origin lacks (an accept not yet
+  // pushed) stays what the image follows. Only the acting branch's refs are
+  // read, so a task branch moving on origin is never followed.
+  const remote = await actingRemote(projectRoot);
+  const upstream = remote ? await revParse(projectRoot, `refs/remotes/${remote}/${branch}`) : null;
+  if (upstream && upstream !== local) {
+    const contains = await gitInRoot(projectRoot, ['merge-base', '--is-ancestor', local, upstream]);
+    if (contains.exitCode === 0) return { branch, sha: upstream };
+  }
+  return { branch, sha: local };
+}
+
+async function revParse(projectRoot: string, ref: string): Promise<string | null> {
+  const rev = await gitInRoot(projectRoot, ['rev-parse', '--verify', '-q', `${ref}^{commit}`]);
+  return rev.exitCode === 0 ? rev.stdout.toString().trim() || null : null;
+}
+
+/** The git remote the daemon's sync fetches (`[remote] git_remote`); null when lazy.toml does not load. */
+async function actingRemote(projectRoot: string): Promise<string | null> {
+  try {
+    return (await loadConfig(projectRoot)).remote.git_remote || null;
+  } catch (err) {
+    logger.debug(`Runner image: not reading the remote's branch: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/** Seams for tests: which commit the branch is at, and how a commit's tree is exported. */
+export interface AdvanceDeps {
+  tip?: (projectRoot: string) => Promise<BranchCommit | null>;
+  exportTree?: (projectRoot: string, commit: string, dir: string) => Promise<void>;
+}
+
+/**
+ * Tell the daemon the acting branch may have moved (an accept landed, the
+ * daemon's periodic fetch saw origin's branch move — a PR/MR merged on the
+ * forge — or the reconciler's tick). The first look only
+ * records the tip; a different tip afterwards queues a rebuild from it. Never
+ * throws.
+ */
+export async function noteActingBranchAdvance(projectRoot: string, deps: AdvanceDeps = {}): Promise<void> {
+  const t = tracker;
+  if (!t || !t.projectRoot || t.projectRoot !== projectRoot) return;
+  try {
+    const tip = await (deps.tip ?? actingBranchTip)(projectRoot);
+    if (!tip) return;
+    if (t.seenTip == null) {
+      t.seenTip = tip.sha;
+      return;
+    }
+    if (tip.sha === t.seenTip) return;
+    t.seenTip = tip.sha;
+    // Newest wins: a tip still waiting behind a running build is replaced, so
+    // the commits in between are never built.
+    t.queuedTip = tip;
+    t.advanceDeps = deps;
+    // Not awaited: a build takes minutes and the callers (an accept, the reconciler's tick) must not wait for it.
+    void drainQueuedAdvance(t, deps);
+  } catch (err) {
+    logger.warn(`Runner image: could not follow the ${projectRoot} branch: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Start the build of the queued tip when nothing is building; otherwise the running build's end calls this again. Never rejects. */
+async function drainQueuedAdvance(t: Tracker, deps: AdvanceDeps = t.advanceDeps ?? {}): Promise<void> {
+  if (!t.queuedTip || t.advancing) return;
+  if (t.status.state === 'checking' || t.status.state === 'building') return;
+  t.advancing = true;
+  const tip = t.queuedTip;
+  t.queuedTip = null;
+  try {
+    // The image in use already came from this commit (the boot build built it from there).
+    if (t.servingFrom?.sha === tip.sha) return;
+    const s = t.status;
+    // Nothing to follow: no project image, or one a person's adoption governs.
+    if (s.state === 'none' || (s.state === 'failed' && s.adoptionUnavailable)) return;
+    // The shared-dockerd backend never auto-builds a project Dockerfile (AGENTS.md).
+    if (!autoBuildsRootDockerfile()) return;
+    const { loadValidAdoptedImage } = await import('./adopted-image');
+    if (await loadValidAdoptedImage(t.projectRoot)) return;
+    await buildFromAdvance(t, tip, deps);
+  } catch (err) {
+    logger.warn(`Runner image: the rebuild after ${describeBranchCommit(tip)} did not start: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    t.advancing = false;
+  }
+  if (t.queuedTip) await drainQueuedAdvance(t, deps);
+}
+
+async function buildFromAdvance(t: Tracker, tip: BranchCommit, deps: AdvanceDeps): Promise<void> {
+  const probe = await resolveTarget(t.projectRoot);
+  if (!probe) return;
+  const parent = advanceContextsRoot(t.projectRoot);
+  const s = t.status;
+  // Docker moves the tag only when the build succeeds, so a ready image (or
+  // one a failed rebuild left in place) stays in use throughout.
+  const inUse = s.state === 'ready' || (s.state === 'failed' && s.replacing === true) ? s : null;
+  let dir: string | null = null;
+  let target = probe;
+  try {
+    try {
+      await mkdir(parent, { recursive: true });
+      dir = await mkdtemp(join(parent, `${tip.sha.substring(0, 12)}-`));
+      await (deps.exportTree ?? exportTree)(t.projectRoot, tip.sha, dir);
+      // Named from the exported commit too: its Dockerfile is what gets built.
+      target = (await runWithBuildContext(dir, () => resolveTarget(t.projectRoot), tip)) ?? probe;
+    } catch (err) {
+      // A build that fails is shown; so is a commit that could not even be
+      // exported, or the image would read "ready" while the project's branch
+      // has moved on without it.
+      const error = `could not prepare ${describeBranchCommit(tip)} for the rebuild: ${err instanceof Error ? err.message : String(err)}`;
+      logger.warn(`Runner image: ${error}; the current image stays in use`);
+      if (inUse && t.status === s) {
+        t.status = {
+          state: 'failed', imageName: inUse.imageName, dockerfile: inUse.dockerfile, defaultImage: inUse.defaultImage,
+          failedAt: new Date().toISOString(), error, replacing: true, attemptedFrom: tip,
+          ...(t.servingFrom ? { builtFrom: t.servingFrom } : {}),
+        };
+      }
+      return;
+    }
+    const replacing = inUse !== null && inUse.imageName === target.imageName;
+    const before = await imageId(t.binary, target.imageName);
+    logger.info(`Runner image: ${describeBranchCommit(tip)} is the new tip; rebuilding ${target.imageName} from it in the background`);
+    const result = await startBuild(t, target.imageName, target.dockerfile, target.defaultImage, { rebuild: true, replacing, advance: { commit: tip, dir, imageBefore: before } });
+    if (!result.ok) {
+      logger.warn(`Runner image: the rebuild from ${describeBranchCommit(tip)} failed; the current image stays in use: ${result.error}`);
+      return;
+    }
+    await pruneSuperseded(t.binary, target.imageName, before);
+  } finally {
+    if (dir) await removeExport(dir);
+  }
+}
+
+/** Remove one exported tree. Never throws. */
+async function removeExport(dir: string): Promise<void> {
+  await rm(dir, { recursive: true, force: true }).catch((e) => logger.warn(`Runner image: could not remove the exported context ${dir}: ${e instanceof Error ? e.message : String(e)}`));
+}
+
+/** Where the boot build exports the acting commit — its own directory, so it never races an advance's export. */
+function bootContextsRoot(projectRoot: string): string {
+  return join(projectRoot, '.lazy', 'image-boot');
+}
+
+/**
+ * Export `commit` for the boot build and check it names the same image the
+ * checkout does. Null — build from the checkout, as before — when the export
+ * fails or the commit's Dockerfile names a different image than the one
+ * launches resolve (a build of that one would be aborted by the next sync).
+ */
+async function prepareBootContext(t: Tracker, commit: BranchCommit, imageName: string, signal: AbortSignal): Promise<string | null> {
+  let dir: string | null = null;
+  try {
+    const parent = bootContextsRoot(t.projectRoot);
+    await mkdir(parent, { recursive: true });
+    dir = await mkdtemp(join(parent, `${commit.sha.substring(0, 12)}-`));
+    await exportTree(t.projectRoot, commit.sha, dir, signal);
+    const exportedDir = dir;
+    const resolved = await runWithBuildContext(exportedDir, () => resolveTarget(t.projectRoot), commit);
+    if (resolved && resolved.imageName !== imageName) {
+      logger.info(`Runner image: ${describeBranchCommit(commit)} names ${resolved.imageName}, the checkout ${imageName}; the boot build uses the checkout, which is what launches resolve`);
+      await removeExport(dir);
+      return null;
+    }
+    return dir;
+  } catch (err) {
+    logger.warn(`Runner image: could not export ${describeBranchCommit(commit)} for the boot build; building from the checkout instead: ${err instanceof Error ? err.message : String(err)}`);
+    if (dir) await removeExport(dir);
+    return null;
+  }
+}
+
+/** Where advance rebuilds export a commit — inside the project's own checkout, like a ref adoption's context. */
+function advanceContextsRoot(projectRoot: string): string {
+  return join(projectRoot, '.lazy', 'image-advance');
+}
+
+async function imageId(binary: string, ref: string): Promise<string | null> {
+  const proc = spawn([binary, 'image', 'inspect', ref, '--format', '{{.Id}}'], { stdout: 'pipe', stderr: 'ignore', timeout: 30_000 });
+  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  return code === 0 ? out.trim() || null : null;
+}
+
+/**
+ * Remove the image the moved tag used to name. By ID and never forced: docker
+ * refuses while a container (a task's, stopped or not) still uses it or another
+ * tag — a task's pin — still names it, which is exactly when it must stay.
+ */
+async function pruneSuperseded(binary: string, imageName: string, before: string | null): Promise<void> {
+  // Guest disk maintenance retains the previous image and reclaims older ones.
+  if (currentDiskSpaceManager()) return;
+  const after = await imageId(binary, imageName);
+  if (!before || !after || before === after) return;
+  const proc = spawn([binary, 'image', 'rm', before], { stdout: 'ignore', stderr: 'pipe', timeout: 60_000 });
+  const [err, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  if (code === 0) logger.info(`Runner image: removed the superseded image ${before}`);
+  else logger.info(`Runner image: kept the superseded image ${before} (still in use): ${err.trim()}`);
 }
 
 /** How often a READY image is re-checked against its inputs and its age. */
@@ -353,14 +671,17 @@ function maybeRefresh(t: Tracker, force = false): void {
   const s = t.status;
   if (s.state !== 'ready' || t.refreshing || Date.now() < t.refreshRetryAtMs || (!force && Date.now() - t.checkedAt < REFRESH_INTERVAL_MS)) return;
   t.refreshing = true;
-  void ensureImage(t.binary, { bypassGate: true })
+  // A refresh builds from the checkout, so an image it actually rebuilt is no longer "built from" a branch commit.
+  let rebuilt = false;
+  void ensureImage(t.binary, { bypassGate: true, notify: (detail) => { if (/^(re)?building /.test(detail)) rebuilt = true; } })
     .then(() => {
       logger.debug(`Runner image: ${s.imageName} re-checked`);
+      if (rebuilt) t.servingFrom = undefined;
       t.refreshFailures = 0;
       t.refreshRetryAtMs = 0;
       if (t.status === s || (t.status.state === 'ready' && t.status.imageName === s.imageName)) {
-        const { refreshRetryAt: _cleared, ...rest } = t.status as Extract<RunnerImageState, { state: 'ready' }>;
-        t.status = rest;
+        const { refreshRetryAt: _cleared, builtFrom: _from, ...rest } = t.status as Extract<RunnerImageState, { state: 'ready' }>;
+        t.status = rebuilt || !t.servingFrom ? rest : { ...rest, builtFrom: t.servingFrom };
       }
     })
     .catch((err) => {
@@ -479,6 +800,13 @@ export async function startRunnerImageBoot(
     if (!runner) return;
     const t: Tracker = { projectRoot, binary: runner.binary, ...(runner.prepare ? { prepare: runner.prepare } : {}), status: { state: 'none' }, generation: 0, checkedAt: 0, refreshing: false, refreshFailures: 0, refreshRetryAtMs: 0, job: null };
     tracker = t;
+    // An export a killed daemon left behind: no build runs yet, so none is in use.
+    await rm(bootContextsRoot(projectRoot), { recursive: true, force: true })
+      .catch((e) => logger.warn(`Runner image: could not clear ${bootContextsRoot(projectRoot)}: ${e instanceof Error ? e.message : String(e)}`));
+    await rm(advanceContextsRoot(projectRoot), { recursive: true, force: true })
+      .catch((e) => logger.warn(`Runner image: could not clear ${advanceContextsRoot(projectRoot)}: ${e instanceof Error ? e.message : String(e)}`));
+    // The branch's tip now is what the boot build below covers; only a LATER tip is an advance.
+    t.seenTip = (await actingBranchTip(projectRoot))?.sha ?? null;
     registerCustomImageGate({
       repair: (imageName) => repairTrackedImage(t, imageName),
       check(imageName) {
@@ -517,7 +845,23 @@ export async function startRunnerImageBoot(
     // adopted commit gone after a machine was recreated) is recorded as a
     // failed image the surfaces show, not lost.
     const target = await resolveTarget(projectRoot);
-    if (target) startBuild(t, target.imageName, target.dockerfile, target.defaultImage);
+    if (target) {
+      // The image in use may be one an advance rebuilt: it says so on a label.
+      // Seed what it came from, and when the branch has moved on since — an
+      // advance build a restart killed — queue one for the tip. The boot
+      // build below only rebuilds for Dockerfile/input changes or age, so
+      // without this the advance would be lost for good. No label: as before.
+      const labelled = await readBuiltFromLabel(target.imageName, runner.binary).catch((err) => {
+        logger.warn(`Runner image: could not read the built-from label of ${target.imageName}: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
+      if (labelled) {
+        t.servingFrom = labelled;
+        const tip = await actingBranchTip(projectRoot);
+        if (tip && tip.sha !== labelled.sha) t.queuedTip = tip; // drained when the boot build ends
+      }
+      await startBootBuild(t, target);
+    }
   } catch (err) {
     if (tracker && await recordUnavailableAdoption(tracker, err)) return;
     // A config that cannot resolve its Dockerfile (a typo in the path) is a
@@ -543,7 +887,7 @@ export async function startRunnerImageBoot(
  * Retry a failed build (or rebuild after the Dockerfile was fixed). Refuses
  * while a build is in flight — the daemon never runs two of the same image.
  */
-export async function retryRunnerImageBuild(): Promise<{ ok: true; status: RunnerImageState } | { ok: false; message: string }> {
+export async function retryRunnerImageBuild(): Promise<{ ok: true; status: RunnerImageState } | { ok: false; message: string; buildId?: string }> {
   return startRequestedBuild({});
 }
 
@@ -555,7 +899,7 @@ export async function retryRunnerImageBuild(): Promise<{ ok: true; status: Runne
  * current one until the new one succeeds, and after a failure. Refused while
  * a build runs (Cancel it first).
  */
-export async function rebuildRunnerImage(opts: { noCache?: boolean } = {}): Promise<{ ok: true; status: RunnerImageState; defaultBuild?: { id: string; imageName: string } } | { ok: false; message: string }> {
+export async function rebuildRunnerImage(opts: { noCache?: boolean } = {}): Promise<{ ok: true; status: RunnerImageState; defaultBuild?: { id: string; imageName: string } } | { ok: false; message: string; buildId?: string }> {
   return startRequestedBuild({ rebuild: true, noCache: opts.noCache === true });
 }
 
@@ -570,16 +914,19 @@ let defaultRebuildJob: ImageBuildJob | null = null;
  * narrated into a build job an admin can watch and cancel. Only ever the
  * default image: nothing here reads a task branch or a worktree Dockerfile.
  */
-async function startDefaultImageRebuild(t: Tracker): Promise<{ ok: true; status: RunnerImageState; defaultBuild?: { id: string; imageName: string } } | { ok: false; message: string }> {
+async function startDefaultImageRebuild(t: Tracker, trigger = 'retry'): Promise<{ ok: true; status: RunnerImageState; defaultBuild?: { id: string; imageName: string } } | { ok: false; message: string; buildId?: string }> {
   const { repository } = await resolveImageRepository(t.projectRoot, true);
   // Checked AFTER the await and with none until the job is recorded below: a
   // check before it let an admin's Rebuild and a damaged-image repair both
   // pass it and start two builds of the same image.
+  const busy = trigger === 'rebuild' ? runningImageBuildRefusal() : null;
+  if (busy) return busy;
   if (defaultRebuildJob?.outcome === 'running') {
-    return { ok: false, message: `lazy's default runner image is already being rebuilt (build ${defaultRebuildJob.id}).` };
+    return { ok: false, message: `lazy's default runner image is already being rebuilt (build ${defaultRebuildJob.id}).`, buildId: defaultRebuildJob.id };
   }
   const imageName = `${repository}:${IMAGE_TAG}`;
   const job = startImageBuildJob('project', `Rebuild lazy's default image ${imageName}`, t.projectRoot || undefined);
+  job.metadata = { trigger, image: imageName, dockerfile: 'Lazy default runner Dockerfile' };
   defaultRebuildJob = job;
   forgetBuildFailure(imageName);
   job.narrate(`rebuilding lazy's default runner image ${imageName} — rebuild requested`);
@@ -592,6 +939,7 @@ async function startDefaultImageRebuild(t: Tracker): Promise<{ ok: true; status:
         noCache: true,
         notify: (detail) => job.narrate(detail),
       })));
+      job.metadata.imageProduced = true;
       job.finish('succeeded');
       logger.info(`Runner image: lazy's default image ${imageName} was rebuilt`);
     } catch (err) {
@@ -649,12 +997,28 @@ export function defaultImageRebuildJob(): ImageBuildJob | null {
   return defaultRebuildJob?.outcome === 'running' ? defaultRebuildJob : null;
 }
 
-async function startRequestedBuild(opts: { rebuild?: boolean; noCache?: boolean }): Promise<{ ok: true; status: RunnerImageState; defaultBuild?: { id: string; imageName: string } } | { ok: false; message: string }> {
+/** Synchronous so the last refusal check and recording a new job are atomic. */
+export function runningImageBuildRefusal(): { ok: false; message: string; buildId?: string } | null {
+  const adoption = adoptionBuildStatus();
+  if (adoption.state === 'building') {
+    return { ok: false, message: `An adoption of ${adoption.branch} is building; cancel it before rebuilding the project's image.`, buildId: adoption.buildId ?? undefined };
+  }
+  const job = defaultImageRebuildJob() ?? runnerImageJob();
+  if (job?.outcome === 'running') {
+    return { ok: false, message: 'An image build is already running. Open its log or cancel it before rebuilding.', buildId: job.id };
+  }
+  const status = runnerImageStatus();
+  if (status.state === 'checking' || status.state === 'building') {
+    return { ok: false, message: describeRunnerImage(status), buildId: status.buildId ?? undefined };
+  }
+  return null;
+}
+
+async function startRequestedBuild(opts: { rebuild?: boolean; noCache?: boolean }): Promise<{ ok: true; status: RunnerImageState; defaultBuild?: { id: string; imageName: string } } | { ok: false; message: string; buildId?: string }> {
   const t = tracker;
   if (!t) return { ok: false, message: 'This project has no custom runner image to build: it does not run its tasks in containers.' };
-  if (t.status.state === 'checking' || t.status.state === 'building') {
-    return { ok: false, message: describeRunnerImage(t.status) };
-  }
+  const busy = runningImageBuildRefusal();
+  if (busy) return busy;
   const wasReady = t.status.state === 'ready' || (t.status.state === 'failed' && t.status.replacing === true);
   const readyImage = t.status.state === 'ready' || t.status.state === 'failed' ? t.status.imageName : null;
   let target: Awaited<ReturnType<typeof resolveTarget>>;
@@ -678,13 +1042,17 @@ async function startRequestedBuild(opts: { rebuild?: boolean; noCache?: boolean 
       // which the automated repair also calls.
       const { repository } = await resolveImageRepository(t.projectRoot, true);
       forgetFailedDamagedImageRepair(`${repository}:${IMAGE_TAG}`);
-      return startDefaultImageRebuild(t);
+      return startDefaultImageRebuild(t, 'rebuild');
     }
     return {
       ok: false,
       message: 'This project has no custom runner image to build ([docker] dockerfile is not set, or an adopted image is in use).',
     };
   }
+  // No await may separate this check from startBuild: another request or
+  // branch advance may have started a build while resolveTarget was reading.
+  const nowBusy = runningImageBuildRefusal();
+  if (nowBusy) return nowBusy;
   // A rebuild replaces the working image only when it IS that image: a
   // Dockerfile changed since resolves to a new name, which was never ready.
   const replacing = opts.rebuild === true && wasReady && readyImage === target.imageName;
@@ -714,4 +1082,26 @@ export function resetRunnerImageForTests(state?: RunnerImageState): void {
   defaultRebuildJob = null;
   tracker = state ? { projectRoot: '', binary: 'docker', status: state, generation: 0, checkedAt: Date.now(), refreshing: false, refreshFailures: 0, refreshRetryAtMs: 0, job: null } : null;
   registerCustomImageGate(state ? { check: () => verdict(), invalidate: () => {}, stale: () => {}, ready: () => customImageReady(), sync: async () => {} } : null);
+}
+
+/**
+ * The boot build, from the acting branch's COMMITTED tree like an advance
+ * build. It still builds only when the image needs it (Dockerfile or inputs
+ * changed, missing, aged). It falls back to the checkout's working tree with
+ * no branch commit to export (a detached HEAD, a task branch checked out
+ * mid-accept), under a ref adoption (whose own exported commit is the
+ * context), when the export fails, or when the commit names a different image
+ * than the checkout (see prepareBootContext) — each logged.
+ */
+async function startBootBuild(t: Tracker, target: NonNullable<Awaited<ReturnType<typeof resolveTarget>>>): Promise<void> {
+  const projectRoot = t.projectRoot;
+  const { loadValidAdoptedImage } = await import('./adopted-image');
+  const adopted = await loadValidAdoptedImage(projectRoot).catch((err) => {
+    // Unknown whether an adoption governs: build exactly as before (the checkout), never an export beside an adoption.
+    logger.warn(`Runner image: could not read the adoption for the boot build; building from the checkout: ${err instanceof Error ? err.message : String(err)}`);
+    return 'unknown' as const;
+  });
+  const tip = adopted ? null : await actingBranchTip(projectRoot);
+  // The export runs INSIDE the build job, so the state reads `checking` from the start and Cancel stops it.
+  startBuild(t, target.imageName, target.dockerfile, target.defaultImage, tip ? { committed: { commit: tip } } : {});
 }

@@ -58,7 +58,7 @@ function getLazyBinaryPath(): string {
 const ACTIVE_TASK_ID_COMMANDS = withAliases([
   'active',
   'show', 'start', 'edit', 'comment', 'tag', 'untag', 'journal', 'clone', 'unblock', 'review', 'browse', 'ask', 'resume',
-  'branch', 'diff', 'regions', 'status', 'shell', 'url', 'forward', 'pair', 'accept', 'reject',
+  'branch', 'diff', 'regions', 'sessions', 'status', 'shell', 'url', 'forward', 'pair', 'accept', 'reject',
   'close', 'submit', 'sync', 'wait', 'watch', 'doctor', 'stop', 'reparent',
 ]);
 
@@ -73,7 +73,7 @@ const ALL_TASK_ID_COMMANDS = withAliases([
 // Commands that dispatch to a fixed set of subcommands as their first
 // positional argument (e.g. `lazy system prompts`). Completed from this map.
 const SUBCOMMANDS: Record<string, string[]> = expandAliasKeys({
-  'system': ['prompts', 'build', 'status', 'source-id', 'agent', 'offline', 'online', 'passphrase', 'export-dockerfile', 'repair-commits', 'store-check', 'store-backup', 'store-backups', 'store-restore', 'runner-image', 'machine', 'guest-init-script', 'smolvm-build-image', 'smolvm-install'],
+  'system': ['prompts', 'build', 'status', 'source-id', 'agent', 'offline', 'online', 'passphrase', 'export-dockerfile', 'repair-commits', 'store-check', 'store-rehome', 'store-backup', 'store-backups', 'store-restore', 'runner-image', 'machine', 'guest-init-script', 'smolvm-build-image', 'smolvm-install'],
   'daemon': ['start', 'stop', 'restart', 'status', 'health', 'reload', 'dashboard-url', 'list', 'kill-stray', 'logs', 'auto-budget', 'config', 'resume-queue'],
   'config': ['set', 'get'],
   'memory': ['list', 'show', 'save', 'rm', 'history', 'compact'],
@@ -95,7 +95,7 @@ const ALL_COMMANDS = withAliases([
   'create', 'start', 'fix', 'document', 'refactor', 'edit', 'comment', 'tag', 'untag', 'journal', 'memory', 'artifact', 'messages', 'raised', 'scratch', 'conversations', 'clone',
   'list', 'active', 'blocked', 'show', 'search', 'report',
   'review', 'browse', 'ask', 'loop', 'unblock', 'resume', 'reopen', 'branch', 'wait', 'watch',
-  'diff', 'regions', 'status', 'shell', 'url', 'forward', 'pair', 'chat', 'accept', 'reject', 'revert', 'rework',
+  'diff', 'regions', 'sessions', 'status', 'shell', 'url', 'forward', 'pair', 'chat', 'accept', 'reject', 'revert', 'rework',
   'close', 'redo', 'stop', 'reparent', 'protect',
   'link', 'describe', 'import-conversation', 'submit', 'sync', 'stats', 'env', 'customize',
   'daemon', 'dashboard', 'playground', 'config',
@@ -125,9 +125,10 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'raised':              ['--status', '--query', '--min-age', '--min-recurrence', '--sort', '--order', '--limit', '--offset', '--recurring-only', '--all', '--blocking', '--non-blocking', '--note', '--reason', '--message', '--goal', '--prompt', '--code', '--parent', '--subtask', '--peer'],
   'scratch':             ['--yes'],
   'conversations':       ['--search', '--limit', '--offset', '--from', '--to', '--goal', '--code', '--parent', '--yes'],
-  'close':               ['--yes', '--reason', '--accept-dirty-worktree'],
-  'reject':              ['--yes', '--reason', '--accept-dirty-worktree'],
+  'close':               ['--yes', '--reason', '--accept-dirty-worktree', '--end-sessions'],
+  'reject':              ['--yes', '--reason', '--accept-dirty-worktree', '--end-sessions'],
   'diff':                ['--turn', '--full', '--full-branch', '--region', '--lines'],
+  'sessions':            ['--lines', '--log-bytes', '--json'],
   'regions':             ['--region', '--files', '--depth', '--all', '--name', '--owner', '--sign-off', '--unsign', '--json'],
   'branch':              ['--goal', '--prompt', '--model', '--code', '--yes'],
   'accept':              ['--yes', '--reason', '--wait', '--approve-file', '--respond-raised', '--promote-raised-subtask', '--promote-raised-peer', '--dismiss-raised', '--acknowledge-raised', '--allow-broken', '--allow-review-issues', '--allow-queued-comments'],
@@ -144,7 +145,7 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'unblock':             ['--message', '--model', '--effort', '--agent', '--follow', '--respond-raised', '--promote-raised-subtask', '--promote-raised-peer', '--dismiss-raised', '--acknowledge-raised', '--yes', '--override-usage-pause', '--default-image'],
   'loop':                ['--model', '--follow', '--pipeline', '--backlog', '--parent', '--tag'],
   'wait':                ['--follow', '--next', '--json'],
-  'shell':               ['--host', '--local', '--container', '--restart'],
+  'shell':               ['--host', '--local', '--container', '--restart', '--ssh-config', '--install', '--yes'],
   'url':                 ['--direct'],
   'dashboard':           ['--print', '--no-open', '--project'],
   'playground':          ['--root', '--teams', '--fleet', '--repo', '--memory', '--model'],
@@ -154,10 +155,11 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'link':                ['--parent', '--code'],
   'describe':            ['--yes'],
   'import-conversation': ['--list', '--show-imported', '--show', '--all', '--yes'],
-  'builder':             ['--autonomous', '--no-autonomous', '--yes', '--resume', '--import', '--effort', '--model', '--override-usage-pause'],
+  'builder':             ['--autonomous', '--no-autonomous', '--yes', '--resume', '--import', '--effort', '--model', '--agent', '--override-usage-pause'],
   'daemon':              ['--foreground', '--background', '--project', '--yes', '--prune-dirs', '--reason', '--lines', '--follow', '--no-follow', '--json', '--verbose', '--task'],
   'config':              ['--task', '--reason'],
   'doctor':              ['--no-resume', '--dry-run', '--yes', '--fix', '--reimport-conversations', '--purge-housekeeping-conversations', '--import-memory', '--probe-agent', '--clean-worktrees', '--clean-docker-images', '--clean-orphaned-containers', '--unset-upstream-tracking', '--resume-interrupted-tasks', '--clean-local-command-conversations', '--delete-empty-local-command-conversations', '--repair-git-pointers'],
+  'auth':                ['--set', '--kind', '--none'],
   'init':                ['--external-path', '--skip-auth-check', '--skip-remote-check', '--skip-github-check', '--skip-completion-check', '--non-interactive'],
   'login':               ['--project', '--device-name', '--device'],
   'upgrade':             ['--force', '--dry-run', '--wait', '--images', '--skip-store-backup'],

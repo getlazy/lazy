@@ -51,6 +51,8 @@ export interface McpMessage {
 }
 
 export interface McpSessionOptions {
+  /** Speak through the real daemon MCP proxy with this session credential. */
+  daemonConfigPath?: string;
   /** Per-request wait before failing with context. Default 30s. */
   timeoutMs?: number;
   /** Extra env for the MCP subprocess. */
@@ -70,7 +72,9 @@ export async function runMcpSession(
 ): Promise<JsonRpcResponse[]> {
   const timeoutMs = options?.timeoutMs ?? 30_000;
 
-  const proc = spawn(['bun', 'run', AGENT_ENTRY, 'mcp', '--task-id', taskId, '--worktree', worktreePath], {
+  const proc = spawn(['bun', 'run', AGENT_ENTRY, 'mcp', '--task-id', taskId, '--worktree', worktreePath,
+    ...(options?.daemonConfigPath ? ['--daemon-config', options.daemonConfigPath] : []),
+  ], {
     cwd: root,
     stdin: 'pipe',
     stdout: 'pipe',

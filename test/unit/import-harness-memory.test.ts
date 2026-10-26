@@ -26,6 +26,10 @@ import {
 } from '../../src/import/import-harness-memory';
 import { MAX_MEMORY_DESCRIPTION_LENGTH } from '../../src/memory';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('parseHarnessMemory', () => {
   test('parses the frontmatter format the harness writes', () => {
@@ -90,7 +94,7 @@ describe('harness memory import', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {

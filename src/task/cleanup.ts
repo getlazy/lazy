@@ -17,6 +17,7 @@ import { captureAgentSessionLog } from '../import/capture-agent-session-log';
 import { logger } from '../utils/logger';
 import { runGit } from '../utils/git';
 import type { Storage } from '../storage';
+import type { RunnerType } from '../runner';
 
 /**
  * Remove a task's worktree only (preserve the branch for recovery).
@@ -96,14 +97,30 @@ export async function cleanupWorktreeAndBranch(
  */
 export async function cleanupTaskContainer(
   storage: Storage,
-  session: { id: string; container_name: string | null },
+  session: { id: string; task_id: string; container_name: string | null; runner_type?: RunnerType | null },
   tRef: string,
   lazyRoot: string,
 ): Promise<void> {
-  const runner = await createRunner(lazyRoot);
+  const runner = await createRunner(lazyRoot, session.runner_type ?? undefined);
   const runName = session.container_name ?? runner.runNameForTask(tRef);
-  await runner.removeRun(runName);
+  await runner.removeRun(runName, { strict: true });
+  // Some runners retain a best-effort removeRun API. Teardown must verify it
+  // before clearing the run name or deleting files the environment mounts.
+  const probe = runner.probeRunInfo ? await runner.probeRunInfo(runName)
+    : { kind: 'answered' as const, info: await runner.getRunInfo(runName) };
+  if (probe.kind === 'no-answer') throw new Error(`Could not verify removal of ${runName}: ${probe.reason}`);
+  if (probe.info) throw new Error(`Task environment ${runName} still exists after removal; its worktree was kept for retry.`);
   if (session.container_name) {
     await storage.updateSessionContainerName(session.id, null);
+  }
+  // The task's data dir ($LAZY_TASK_DATA) ends with the task. Not fatal: a
+  // member container still holding it keeps it, and finished-task cleanup
+  // lists it until a person removes it.
+  if (runner.removeTaskData) {
+    try {
+      await runner.removeTaskData(session.task_id);
+    } catch (err) {
+      logger.warn(`Kept the data directory of ${tRef}; finished-task cleanup can remove it: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }

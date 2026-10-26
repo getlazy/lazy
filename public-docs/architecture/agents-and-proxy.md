@@ -1,5 +1,21 @@
 # Agents, the proxy and credentials
 
+```mermaid
+%% caption: An agent sends a placeholder token to the proxy, which resolves a credential and forwards the model request
+sequenceDiagram
+  participant A as Agent in task container
+  participant P as Proxy
+  participant C as Credential store
+  participant M as Model provider
+  A->>P: Request with task placeholder
+  P->>C: Resolve real credential
+  C-->>P: Credential
+  P->>M: Forward request
+  M-->>P: Response and usage headers
+  P-->>A: Response
+```
+
+
 Lazy runs four agent harnesses: Claude Code, Codex, Cursor and Pi. A task picks one through an [agent profile](../lazy-toml.md#agentsname--named-agent-profiles). All four are launched the same way, in a task container, and all four reach their model through the same proxy.
 
 ## What the proxy does
@@ -10,6 +26,16 @@ The proxy is a process the daemon runs on the host, always on, listening on loop
 2. picks the upstream the caller's profile points at (a provider, or an endpoint such as a local Ollama);
 3. swaps in the real credential;
 4. records the call (tokens, timing, which task) in a bounded audit log, and reads the provider's usage-limit headers.
+
+On a single-person install, the project root's `lazy.toml` can state the local
+listener explicitly. Lazy Teams assigns the listener address for its projects.
+
+```toml
+[proxy]
+bind = "127.0.0.1"
+```
+
+This confines the proxy listener to the local machine.
 
 ## Placeholder tokens
 

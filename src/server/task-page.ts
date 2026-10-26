@@ -18,6 +18,7 @@ import { parentTaskIdOf } from '../task-target';
 import { resolveTaskForgeLink, taskForgeLinkHtml } from '../task-forge-link';
 import { isLinkedTask, formatLinkedMarker, linkedBranchOf } from '../task/linked';
 import { countWithheldFeedbackTurns } from '../task/queued-feedback';
+import type { taskDataView } from '../daemon/task-data-view';
 import { escapeHtml } from './review-diff';
 import { taskTurnFailure, turnFailureLabel } from '../task/turn-failure';
 import { renderMarkdown, type RenderMarkdownOptions } from './markdown';
@@ -31,6 +32,7 @@ import { servicesCardHtml, branchServeAdviceHtml, toProbedState, type ServicesCa
 import { hubRollupHtml, subtasksSectionHtml } from './subtasks';
 import type { BranchServeAdvice } from '../serve/branch-advice';
 import { shellPanelHtml, shellClientScript, shellTabHtml, type ShellAvailability } from './shell-ui';
+import { taskSessionsPanelHtml, taskSessionsClientScript } from './task-sessions-panel';
 import { verifyCopyScript, verifyRunScript } from './review-verify';
 import { watchPanelHtml, watchClientScript } from './watch-ui';
 import { reviewActivityCardHtml, type ReviewActivity } from './review-activity';
@@ -43,7 +45,7 @@ import { actionDialogChromeHtml, actionDialogScript, actionDialogButtonHtml, act
 import { raisedDisplayTitle } from '../raised/content';
 import { raisedGateBadgeHtml } from './raised-badges';
 import { raisedGateVocabulary } from '../raised/vocabulary';
-import { resolveAskAvailability, unblockUnavailableReason, hasAnyAsk, hasAnyQueuedComment, type ReviewQueueEntry } from './review-actions';
+import { resolveAskAvailability, unblockUnavailableReason, hasAnyAsk, hasAnyQueuedComment, awaitsAnswer, type ReviewQueueEntry } from './review-actions';
 import { currentReviewHtml } from './current-review';
 import { acceptGateTurns } from '../review/accept-gate';
 import { buildShowFinal } from '../task/show-sections';
@@ -110,6 +112,8 @@ import { taskUsagePauseHtml } from './usage-pause-banner';
 import { taskRunnerImageHtml, runnerImageSyncCheckboxHtml } from './runner-image-banner';
 import type { TaskUsagePauseView } from './task-actions';
 import { revertedProtectedFiles } from '../protection/reverted-files';
+import type { ChatMessage } from '../task/chat';
+import { chatTabHtml } from './task-chat';
 
 export interface TaskProgressLine {
   message: string;
@@ -191,6 +195,12 @@ export interface TaskPageInput {
    * branch does not exist yet. Never used for rendering.
    */
   headSha?: string | null;
+  /**
+   * The Chat's messages (src/task/chat.ts) — rendered by the Chat tab and
+   * keyed into the `chat` live region on every render, so the page and the
+   * live-status poll agree.
+   */
+  chat?: ChatMessage[];
   viewedFiles?: Record<string, string>;
   /** Half-typed comment boxes from the stored draft, seeded into the island. */
   lineDrafts?: Record<string, string>;
@@ -208,6 +218,7 @@ export interface TaskPageInput {
   subtreeCounts?: Map<string, number>;
   /** Branch `[serve]` ports the root config lacks. Services tab only. */
   branchAdvice?: BranchServeAdvice[];
+  taskData?: Awaited<ReturnType<typeof taskDataView>>;
   /** No-network upstream indicator — Landing header and Current review. */
   upstream?: TaskUpstreamStatusView | null;
   /**
@@ -854,6 +865,13 @@ function tabBodyHtml(input: TaskPageInput): string {
       });
     case 'journal':
       return taskJournalTabHtml(input.journal, input.markdown);
+    case 'chat':
+      return chatTabHtml({
+        taskId: seg,
+        messages: input.chat ?? [],
+        ended: isTerminalStatus(task.status),
+        markdown: input.markdown,
+      });
     case 'artifacts':
       return artifactsTabHtml({
         taskId: seg,
@@ -886,11 +904,17 @@ function tabBodyHtml(input: TaskPageInput): string {
     case 'services': {
       const advice = branchServeAdviceHtml(input.branchAdvice ?? []);
       const card = servicesCardHtml(task, input.serve ? toProbedState(input.serve) : null, input.controls);
-      const body =
-        serveNoticeBannerHtml(task, input.serveNotice, input.serve ? toProbedState(input.serve) : null, input.controls) +
+      // The task container's named tmux sessions, filled in and polled by
+      // the page (task-sessions-panel.ts) — on every task, declared services
+      // or not.
+      return serveNoticeBannerHtml(task, input.serveNotice, input.serve ? toProbedState(input.serve) : null, input.controls) +
         (card || '') +
-        advice;
-      return body.trim() ? body : emptyTab('No services declared.');
+        advice +
+        (input.taskData && 'restartAvailable' in input.taskData && input.taskData.restartAvailable
+          ? `<section class="card" id="task-data-directory"><h3>Data directory</h3><p>${escapeHtml(input.taskData.notice ?? '')}</p>` +
+            `<form method="post" action="/tasks/${escapeHtml(seg)}/container/start?restart=true" onsubmit="return confirm('Restart the environment? Anything installed outside the worktree and services in memory will be lost.')"><button class="btn" type="submit">Restart environment</button></form></section>`
+          : '') +
+        taskSessionsPanelHtml(seg);
     }
     case 'review': {
       const session = input.session;
@@ -1017,6 +1041,7 @@ function liveRegionSources(input: TaskPageInput): TaskLiveRegionSources {
     raised: input.raisedItems.map((r) => ({ id: r.id, status: r.status })),
     commits: input.commits.map((c) => ({ sha: c.sha })),
     headSha: input.headSha ?? null,
+    chat: (input.chat ?? []).map((m) => ({ id: m.id, state: m.state })),
   };
 }
 
@@ -1059,7 +1084,7 @@ export function taskPageHtml(input: TaskPageInput): string {
     input.task,
     live,
     pendingDeliveryComments(reviewComments).length,
-    reviewComments.filter((c) => c.ask_state === 'pending').length,
+    reviewComments.filter(awaitsAnswer).length,
     {
       // The full child list, so a loop's k/n in the bar is the same derivation
       // the Subtasks rollup and `lazy show` print.
@@ -1122,6 +1147,7 @@ export function taskPageHtml(input: TaskPageInput): string {
     verifyCopyScript() +
     (input.shell ? verifyRunScript() : '') +
     (input.shell?.available ? shellClientScript() : '') +
+    taskSessionsClientScript() +
     (!isTerminalStatus(input.task.status) ? watchClientScript() : '') +
     // Always wire the poller: a backlog/blocked page still needs to notice
     // a start or unblock that happened in another tab. Terminal tasks omit

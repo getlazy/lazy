@@ -14,14 +14,20 @@ when running lazy on your own machine.
 
 Accepting, rejecting or closing the task cleans up its container. Explicitly
 restarting the environment, changing its agent, environment variables or image,
-and daemon upgrades or restarts can also replace it. An out-of-memory kill or
-an external container stop can end it independently of lazy.
+can also replace it. An out-of-memory kill or an external container stop can
+stop it independently of lazy. When lazy starts that same container again for
+a work turn or Run services, its files and installed tools are kept. A missing
+container, or one that cannot start again, needs a replacement.
 
-Before creating a replacement, lazy records the loss in the task's journal and
-tells the next work turn. For an exited container, the record includes its exit
-code, whether Docker reported an out-of-memory kill, and when it exited, when
-those facts are available. Lazy Teams also keeps an **Environment replaced**
-notice on the task page after the agent has seen it.
+Lazy records an observed exit in the task's journal, including its exit code,
+whether Docker reported an out-of-memory kill, and when it exited, when those
+facts are available. Starting the container again in place does not produce a
+replacement warning. The journal is visible in Lazy Teams and the dashboard.
+
+Before creating a replacement, lazy records the loss and tells the next work
+turn, including when replacement is needed to launch that turn. Lazy Teams also
+keeps an **Environment replaced** notice on the task page after the agent has
+seen it.
 
 Keep data you need beyond the task in durable storage: container files outside
 the checkout do not survive environment replacement or task cleanup.
@@ -36,6 +42,7 @@ at its root runs agents in lazy's default image, `lazy-runner`, which is deliber
 | --- | --- |
 | `git`, `curl`, `jq`, `wget`, `unzip`, `less`, `openssh-client`, `gnupg`, `sudo` | Basic tools |
 | Chromium (`$CHROME_BIN`) | Screenshots for visual checks of UI work |
+| `tmux` | A task's services run in a named terminal session you can watch and attach to (see below) |
 | Claude Code, Codex, Cursor CLI, Pi | Every agent lazy can run in a container, so one image serves whichever agent a task uses |
 
 The agent runs as `user`, with passwordless `sudo`, so it can install what it
@@ -102,7 +109,12 @@ another directory, name it instead (relative to the project root):
 ```toml
 [docker]
 dockerfile = "docker/agents.Dockerfile"
+build_inputs = ["package-lock.json"]
 ```
+
+The project image uses `docker/agents.Dockerfile` and rebuilds when the
+lockfile changes. In Lazy Teams, a project admin sets this on **Settings →
+Configuration**.
 
 A file named there must exist — a missing one fails the launch rather than
 falling back to the default image, and so does a Dockerfile that fails to build
@@ -155,6 +167,16 @@ with two ways out:
 If your task containers need to be *created* with extra Docker flags (for
 example `--cap-add=SYS_PTRACE`), that is `[docker] run_args` — a container
 setting, not an image one, so no Dockerfile change can provide it.
+
+In Lazy Teams, a project admin can set it under **Settings → Configuration**:
+
+```toml
+[docker]
+run_args = ["--cap-add=SYS_PTRACE"]
+```
+
+Every new task container gets that capability. Review container arguments
+before saving them, since they apply to every task in the project.
 
 ### Scripts that call `node`
 
@@ -254,8 +276,9 @@ page under **Docker storage**; an operator on the machine runs
 lazy system machine reset-docker-storage    # asks first; --yes skips the question
 ```
 
-**This deletes every image, container, volume and build cache on the machine**
-and stops everything running in Docker, so it asks for confirmation. It then
+**This deletes every image, container, volume and build cache on the machine**,
+including every open task's data directory (`$LAZY_TASK_DATA`, where its
+services keep their databases), and stops everything running in Docker, so it asks for confirmation. It then
 holds lazy's automatic Docker recovery off, stops Docker, unmounts everything
 under its storage, removes the storage without crossing a mount point, and
 starts Docker again, telling you each step as it happens (on the page, or in the
@@ -271,19 +294,135 @@ in progress is not interrupted; `lazy system runner-image use-project <task>`
 from a terminal), and for a builder it is a stop and a start that keeps the
 conversation.
 
+## How long a task's container lives
+
+A task normally keeps its container between turns, including packages,
+toolchains and caches installed outside its worktree. The operations below
+determine when that environment is kept or replaced.
+
+- **Stop** ends the agent’s turn and keeps its container and services.
+- **A daemon restart** (`lazy daemon restart` or a crash) stops only
+  the agent. The container and everything running in it keep running; a turn
+  that was cut off resumes in the same container.
+- **A container that stopped** — the machine rebooted, Docker restarted, it ran
+  out of memory, or was stopped outside lazy — is started again, with its files, the
+  next time the task needs it. What was running in it, its services included,
+  ended with it.
+- **It is created anew** only when it has to be: the task's agent, environment
+  variables, credential or image changed, you restart the environment
+  (`lazy shell <task> --restart`), or the container cannot be started again.
+- **A full `lazy upgrade`** stops and removes this project’s running task
+  containers before restarting the daemon. Running services end, and packages,
+  caches or other files kept only inside those containers are lost. The
+  worktree, saved agent history and mounted data, including `$LAZY_TASK_DATA`,
+  survive; later launches create containers on the upgraded image.
+- **It is removed** when the task is accepted, rejected or closed.
+
+`lazy upgrade --images` only refreshes the image: it stops no containers and
+does not restart the daemon. Existing containers keep their current image.
+Containers already stopped when a full upgrade runs are kept too. Restart the
+task’s environment with `lazy shell <task> --restart` to move a kept container
+to the refreshed image; this also loses its container-only files.
+
+### Services and other long-running commands
+
+A task's services — the project's Start services command — run in a named
+terminal session called `services` inside the task's container, using
+[tmux](https://github.com/tmux/tmux). Because it is a real terminal, a debugger
+or a REPL the command opens waits for your input instead of hanging. The session
+keeps running between turns and across daemon restarts, so a dev server you
+started is still up when you come back.
+
+- **Its output** is kept in a log of at most about 16 MiB (two 8 MiB files), and
+  its live screen can be read at any time, without attaching. An agent reads both
+  with the `lazy_sessions` tool, so it can check whether a server came up or why
+  it stopped.
+- **Attaching** to the session opens a terminal on it: you see the same screen,
+  and what you type goes to the command. On your own machine, from a shell in the task's container
+  (`lazy shell <task>`), run `tmux -S /tmp/lazy-tmux/default attach -t services`
+  (add `-r` to watch without typing); detach with `Ctrl-b d` and the command keeps
+  running. Watching or typing into a session never holds up the agent, and a
+  running turn never keeps you out.
+- **After every work turn**, lazy restarts the command inside the same session,
+  so a terminal attached to it stays attached and sees the restart. The previous
+  run's output is kept as the older of the two log files, so if the command
+  crashed during the turn you can still read why.
+
+An image of your own needs `tmux` installed to get the session (or
+`FROM lazy-runner`); without it, Start services still runs the command, detached with a log, but there is no screen to watch or attach to.
+
+### Keep your services' data across restarts: put it in `$LAZY_TASK_DATA`
+
+An existing environment from before this directory was added stays as it is
+after an upgrade. Its Services tab and `lazy doctor` explain when to use
+**Restart environment** to get the directory and the rule that leaves services'
+files alone. Restarting loses anything installed outside the worktree and what
+running services hold in memory.
+
+
+Every task has a data directory of its own at `/lazy/data`, named by the
+`LAZY_TASK_DATA` environment variable in the task's container. Put the data of
+the services your task runs there — a Postgres or Redis data directory, an
+uploads folder, a local cache:
+
+```sh
+initdb -D "$LAZY_TASK_DATA/postgres"
+redis-server --dir "$LAZY_TASK_DATA/redis"
+```
+
+- **It survives** the container being created anew, daemon and machine
+  restarts, and image changes. It is not in git and not in the worktree.
+- **Terminals see it too**: a shell or pairing session on the task mounts the
+  same directory, so a service you start from your own terminal uses the same
+  data.
+- **Lazy never changes it while the task is open**: it does not change who owns
+  its files, prune it, or remove it to free disk space. The disk-space page shows
+  each task's data directory and its size. The one exception is
+  [resetting a machine's Docker storage](#resetting-a-machines-docker-storage),
+  which you confirm and which deletes every task's data directory with
+  everything else in Docker.
+- **It is removed** when the task is accepted, rejected or closed. If it was
+  still in use at that moment, the finished-task cleanup lists it until you
+  remove it there.
+- **An existing environment without this mount** needs to be rebuilt to get
+  the data directory. Rebuilding loses running processes and files kept only
+  inside the container; the worktree and mounted data remain.
+
+Lazy also never takes over files in the worktree that belong to another user:
+when a service runs as its own user (`postgres`, `redis`), its files keep
+that owner across every turn.
+
 ## Rebuilding
 
 Lazy names a custom image after the content of its Dockerfile
 (`lazy-custom-<hash>`), so editing the Dockerfile in the project root makes
 the daemon build the new image the next time a launch asks for it — the launch
-itself waits or runs on the default image, as above.
+itself waits or runs on the default image, as above. The build when the daemon
+starts uses the latest commit of the project's branch, not uncommitted files
+in your checkout.
 
-Lazy also rebuilds an image it BUILT on two schedules:
+Lazy also rebuilds an image it BUILT on three occasions:
 
 - **`lazy upgrade` always rebuilds**, from scratch.
 - **After 14 days**, an older image is rebuilt once, without the build cache —
   when the daemon starts, or in the background while it runs. Launches keep
   using the current image until the new one is built.
+- **Whenever the project's branch advances.** When an accepted task, a fast-forward, a
+  pull, or a pull request merged on GitHub or GitLab gives the branch a new
+  commit, the daemon rebuilds the project's image
+  in the background from that commit — the commit's own files, Dockerfile
+  included, never the files in your checkout and never a task's branch. A
+  merge on the forge is noticed by the daemon's regular fetch of the remote
+  (about once a minute), even when your checkout's branch has not moved yet. If a rebuild is already running,
+  the newest commit is built once it ends and the ones in between are skipped.
+  Launches and running containers keep the current image the whole time; the
+  new one is used by the next container that is created, and only if it built.
+  A failed build is shown where the image state is (the project page, the dashboard,
+  `lazy system runner-image`) and changes nothing else. After a swap the image
+  it replaced is removed unless something still uses it. The image state says
+  which commit it was built from (`built from main @ 1a2b3c4d5e6f`). This does
+  not apply to a Dockerfile a person adopted, or to a Teams install whose
+  builds run on a shared host.
 
 A default image that was pulled from a release is never rebuilt for its age.
 A default image lazy BUILT is replaced, when it reaches 14 days, by the

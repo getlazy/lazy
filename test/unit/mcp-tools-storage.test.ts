@@ -14,6 +14,10 @@ import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { isStoppedParked } from '../../src/task/user-stop';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('MCP tools with injected storage', () => {
   let testDir: string;
@@ -37,7 +41,7 @@ describe('MCP tools with injected storage', () => {
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
 
     // Create storage instance
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
 
     // Create context with injected storage
     ctx = {
@@ -231,7 +235,7 @@ describe('lazy_list stop marker', () => {
     writeFileSync(join(testDir, 'README.md'), '# Test\n');
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial commit'], { cwd: testDir });
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {

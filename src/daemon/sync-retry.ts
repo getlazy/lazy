@@ -18,7 +18,6 @@ import { syncTask } from './task-lifecycle';
 import { isLinkedTask } from '../task/linked';
 import { isSyncDispatchable } from '../task/sync-dispatch';
 import { unstartedParentOf } from '../task/unstarted-parent';
-import { memberInsideTask } from '../server/member-terminals';
 import { daemonHealthRecorder, SYNC_RETRY_LOOP } from './health-registry';
 
 /** Maximum backoff interval in milliseconds (5 minutes). */
@@ -108,16 +107,12 @@ export async function runSyncRetryTick(
   succeeded: string[];
   backedOff: string[];
   skipped: string[];
-  /** Held by a member's open terminal: skipped with no backoff and no fetch. */
-  heldByMember: string[];
 }> {
   const result = {
     attempted: [] as string[],
     succeeded: [] as string[],
     backedOff: [] as string[],
     skipped: [] as string[],
-    /** Held by a member's open terminal: skipped with no backoff and no fetch. */
-    heldByMember: [] as string[],
   };
 
   const storage = await getOrCreateStorage();
@@ -142,16 +137,6 @@ export async function runSyncRetryTick(
       continue;
     }
 
-    // A member working in the task's files: nothing to try until their
-    // session ends. Not a failure — no backoff, no fetch, no counter bump,
-    // nothing logged above debug. The sync stays queued and runs on the first
-    // tick after they leave.
-    if (memberInsideTask(task.id)) {
-      result.heldByMember.push(shortTaskId);
-      logger.debug(`Sync retry: ${shortTaskId} held by a member's terminal, waiting`);
-      continue;
-    }
-
     // A parent that has not started has no branch: nothing to try, and nothing
     // to fetch. A local check (store + `git rev-parse`), no backoff, logged at
     // debug only — the parent's start nudges this loop (./parent-started-sync.ts).
@@ -165,7 +150,7 @@ export async function runSyncRetryTick(
     result.attempted.push(shortTaskId);
 
     try {
-      const syncResult = await syncTask(projectRoot, { taskId: task.id, queueIfMemberInside: true, daemonLaunch: true });
+      const syncResult = await syncTask(projectRoot, { taskId: task.id, daemonLaunch: true });
       // The call answered, whatever it said: the run of throws is over.
       failureState.delete(task.id);
 
@@ -176,10 +161,6 @@ export async function runSyncRetryTick(
         backoffState.delete(task.id);
         result.skipped.push(shortTaskId);
         logger.debug(`Sync retry: ${shortTaskId} waiting for its parent to start`);
-      } else if (syncResult.status === 'held_by_member') {
-        // A member got in between the check above and the sync's lock.
-        result.heldByMember.push(shortTaskId);
-        logger.debug(`Sync retry: ${shortTaskId} held by a member's terminal, waiting`);
       } else if (syncResult.status === 'pending_sync') {
         // Fetch failed, or the usage pause held the conflict resolution the
         // merge needs — either way, retry later with a growing backoff.

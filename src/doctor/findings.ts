@@ -14,6 +14,7 @@ import type { Storage } from '../storage/interface';
 import { createRunnerFromType } from '../runner';
 import { PROJECT_LABEL_KEY } from '../runner/docker-runner';
 import { indexRunsByName } from '../runner/run-ownership';
+import { isWorkRunName } from '../task/turn-run-image';
 import { listLazyImages, type LazyImageInfo } from '../capture/claude';
 import { spawn } from '../utils/spawn';
 import { runGit } from '../utils/git';
@@ -44,7 +45,7 @@ export function formatDiskBytes(bytes: number | null): string {
 }
 
 /** On-disk size of a directory, or null when it cannot be measured in time. */
-async function directorySizeBytes(path: string): Promise<number | null> {
+export async function directorySizeBytes(path: string): Promise<number | null> {
   try {
     const proc = spawn(['du', '-sk', path], {
       stdout: 'pipe',
@@ -103,9 +104,9 @@ export async function findTerminalTaskWorktrees(
     try {
       const info = await stat(path);
       if (!info.isDirectory()) continue;
-    } catch {
-      // No worktree for this task — the common, healthy case.
-      continue;
+    } catch (error) {
+      if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) continue;
+      throw new Error(`Could not inspect finished task ${displayId(task)} at ${path}: ${error instanceof Error ? error.message : String(error)}`);
     }
     const session = await storage.getSessionByTaskId(task.id);
     found.push({
@@ -229,17 +230,17 @@ export interface OrphanedContainer {
   state: string;
   taskCode: string;
   taskStatus: string;
+  /** Canonical owner at scan time; null only for a deleted task. */
+  taskId: string | null;
   /** Session recording this container name, so the record can be cleared too. */
   sessionId: string | null;
 }
 
 /**
- * Lazy containers belonging to THIS project that nothing needs any more: a
- * stopped container for any task of ours, and a running container for a task
- * that has already reached a terminal state.
+ * Task containers belonging to THIS project whose task is finished or gone.
  *
- * A running container for a live task is never listed — that is a turn in
- * progress, and killing it is the opposite of a remedy.
+ * An open task keeps its container in EVERY runtime state. A stopped container
+ * keeps installed tools and files; the next turn or Run services restarts it.
  *
  * Ownership comes from `indexRunsByName` — the same function that NAMED the
  * run — plus the project label. Enumeration is async (`spawn`, not
@@ -252,7 +253,7 @@ export async function findOrphanedContainers(
 ): Promise<OrphanedContainer[]> {
   // Naming only — deliberately the config-free, proxy-free constructor, so
   // reading this list never depends on the daemon being up.
-  const owned = await indexRunsByName(storage, createRunnerFromType(binary));
+  const owned = await indexRunsByName(storage, createRunnerFromType(binary), { strict: true });
 
   const proc = spawn(
     [
@@ -278,25 +279,32 @@ export async function findOrphanedContainers(
     // (containers created before the label existed).
     if (label && label !== root) continue;
 
+    // Reviewers and acceptance gates have separate lifecycles. In particular,
+    // a live gate is not a deleted task merely because its name is not indexed.
+    if (!isWorkRunName(name) || /^lazy-(?:builder|oneshot|pair)-/.test(name)) continue;
+
     const task = owned.get(name);
-    // Not one of our task's runs → not ours to touch. Covers another project's
-    // containers and the suffixed one-shot/pair runs, which are `--rm` and
-    // nobody's to reap here.
-    if (!task) continue;
+    if (task) {
+      if (!TERMINAL_STATUSES.has(task.status)) continue;
+    } else {
+      // A deleted task cannot be found by name in Storage. Require positive
+      // project ownership, and exclude the separate non-task namespaces.
+      // Unlabelled legacy containers can only be claimed by an existing task.
+      if (label !== root || !name.startsWith('lazy-')) continue;
+    }
 
     // `.State` is the machine-readable one word (`running`, `exited`,
     // `created`, `paused`, `dead`, …) — `.Status` is prose ("Up 3 minutes"),
     // and sniffing it for "Up"/"Exited" silently dropped every other state.
     const running = state === 'running';
-    if (running && !TERMINAL_STATUSES.has(task.status)) continue;
-
-    const session = await storage.getSessionByTaskId(task.id);
+    const session = task ? await storage.getSessionByTaskId(task.id) : null;
     orphans.push({
       name,
       running,
       state: state ?? 'unknown',
-      taskCode: displayId(task),
-      taskStatus: task.status,
+      taskCode: task ? displayId(task) : name.slice('lazy-'.length),
+      taskStatus: task?.status ?? 'deleted',
+      taskId: task?.id ?? null,
       sessionId: session?.container_name === name ? session.id : null,
     });
   }

@@ -10,29 +10,34 @@
  *   - the services run where `servePorts` looks (the task's container, which
  *     publishes the declared `[serve]` ports), so the Services tab reports what
  *     is really running;
- *   - they run in a container that outlives member sessions and turns — nothing
- *     reaps an idle task container, and a member's entry no longer stops it
- *     (./member-entry.ts, engineer 2026-10-05) — so a build tool's state in it
- *     (a cargo registry under $HOME, anything kept outside the worktree)
- *     survives from one Start services to the next. A daemon restart does stop
- *     it (shutdown sweep, restart reaper); services then do not come back by
- *     themselves, and the next bring-up is a fresh container.
+ *   - they run in a container that outlives member sessions, turns AND daemon
+ *     restarts — nothing reaps an idle task container, a member's entry no
+ *     longer stops it (./member-entry.ts, engineer 2026-10-05), and a daemon
+ *     restart stops only the agent inside it (src/runner/agent-stop.ts) — so
+ *     the services keep running, and a build tool's state in it (a cargo
+ *     registry under $HOME, anything kept outside the worktree) survives from
+ *     one Start services to the next;
  *   - they are SHARED: one set per task, keyed by nothing but the task, which
  *     every member sees and controls. Never per member.
  *
- * WHAT IT DOES NOT DO: give anybody a terminal in the task's container. The
- * command is the project's designated Start services command, run detached with
- * no stdin; the person who pressed the button gets its OUTPUT (a log tail on the
- * Services tab), never a shell, and none of their credentials go anywhere. The
- * container holds what it always holds between turns — the task agent's own
- * placeholder — and runs code the task's branch wrote, exactly as a turn does;
- * nothing a person owns is added to it. A member's Shell, Pair and Chat keep
- * their own container, untouched.
+ * They run in the container's `services` tmux session (src/sessions/tmux.ts):
+ * a real terminal, so a debugger or a REPL the command opens waits for input
+ * instead of hanging, and anyone allowed to see the task's services can watch
+ * the live screen or attach to it. Its output is also copied into a bounded log
+ * (8 MiB, two files) in the container's /tmp/lazy-tmux, which goes away with
+ * the container, as the processes do.
  *
- * One services process per task container. Re-running stops the previous
- * process group first, so a second press is a restart, not a second dev server
- * fighting for the port. Its pid and log live in the container's /tmp, so they
- * go away with the container, as the processes do.
+ * WHAT STARTING IT DOES NOT DO: give the person who pressed the button their
+ * own credentials in the task's container. The command is the project's
+ * designated Start services command; the container holds what it always holds
+ * between turns — the task agent's own placeholder — and runs code the task's
+ * branch wrote, exactly as a turn does; nothing a person owns is added to it. A
+ * member's Shell, Pair and Chat keep their own container, untouched.
+ *
+ * One services session per task container. Re-running ends the process group
+ * its pane runs first and restarts the command IN the same session, so a second
+ * press is a restart, not a second dev server fighting for the port, and a
+ * terminal attached to the session stays attached.
  */
 
 import { ensureTaskContainer, type EnsureTaskContainerParams, type EnsureTaskContainerResult } from './task-container';
@@ -49,11 +54,23 @@ import { isTerminalStatus } from '../task-state-machine';
 import { PhaseReporter, SERVE_RUN_PHASES, RUN_SERVE_RUN_PHASES, serveRunPhasePlan, throttleNotes, type PhaseNotify, type ProgressEmitter } from './progress';
 import type { EnsureRunContainerParams, EnsureRunContainerResult } from './commit-run-container';
 import { runContainerName, runWorktreePath } from '../run/identity';
+import { DEFAULT_SCREEN_LINES, SERVICES_SESSION, sessionFunctions, tmuxPrelude, trimTrailingBlankLines } from '../sessions/tmux';
 import type { CommitRun } from '../storage/types';
+import { adoptChownShell, adoptProbeShell } from '../utils/adopt-rule';
 
-/** Where the services process's pid and output live, inside the task's container. */
-export const SERVICES_PID_FILE = '/tmp/lazy-services.pid';
-export const SERVICES_LOG_FILE = '/tmp/lazy-services.log';
+/**
+ * Where a services group started by an older lazy (before services ran in a
+ * tmux session) recorded its pid, in a container kept from then. Start and
+ * Stop end that group too, so an upgrade never leaves two dev servers fighting
+ * over a port.
+ */
+export const LEGACY_SERVICES_PID_FILE = '/tmp/lazy-services.pid';
+
+/**
+ * Where the detached run (the fallback in a container without tmux, and what
+ * older lazy always did) copies the command's output.
+ */
+export const LEGACY_SERVICES_LOG_FILE = '/tmp/lazy-services.log';
 
 /** How much of the log a status read returns. */
 const LOG_TAIL_BYTES = 16 * 1024;
@@ -66,84 +83,114 @@ export function containerBinaryFor(projectRoot: string, runnerType: string): Pro
   return containerCliForType(projectRoot, runnerType);
 }
 
+/** Shell that ends a services group an older lazy left running (see LEGACY_SERVICES_PID_FILE). */
+const STOP_LEGACY_GROUP = `if [ -s ${LEGACY_SERVICES_PID_FILE} ]; then stop_group "$(cat ${LEGACY_SERVICES_PID_FILE})"; rm -f ${LEGACY_SERVICES_PID_FILE}; fi`;
+
 /**
- * The script `sh -c` runs in the container, with the command as `$1` — never
- * interpolated, so nothing in it is parsed twice.
+ * `running` when the services process group is alive, else `finished` when
+ * the command exited 0 by itself, else `stopped` — as a shell function.
+ */
+const SERVICES_STATE_FN = [
+  'svc_state() {',
+  `  pid=$(pane_pid ${SERVICES_SESSION})`,
+  '  if [ -n "$pid" ] && kill -0 -"$pid" 2>/dev/null; then echo running;',
+  `  elif [ "$(T display-message -p -t "=${SERVICES_SESSION}:" '#{pane_dead_status}' 2>/dev/null)" = 0 ]; then echo finished;`,
+  '  else echo stopped; fi',
+  '}',
+].join('\n');
+
+/**
+ * Start services without tmux (`$1` the command): stop the previous group,
+ * then run the command in a new session (`setsid`, so a stop takes the whole
+ * group), output to {@link LEGACY_SERVICES_LOG_FILE}, pid and exit status
+ * recorded beside {@link LEGACY_SERVICES_PID_FILE}. The previous group was
+ * already ended by STOP_LEGACY_GROUP.
+ */
+const DETACHED_START = [
+  `  pidf=${LEGACY_SERVICES_PID_FILE}; dlog=${LEGACY_SERVICES_LOG_FILE}`,
+  '  : > "$dlog"; rm -f "$pidf.status"',
+  '  printf \'%s\' "$1" > "$pidf.cmd"',
+  '  setsid sh -c \'echo $$ > "$0"; sh -c "$1"; echo $? > "$0.status"\' "$pidf" "$1" < /dev/null >> "$dlog" 2>&1 &',
+  '  i=0; while [ ! -s "$pidf" ] && [ $i -lt 20 ]; do sleep 0.05; i=$((i+1)); done',
+].join('\n');
+
+/** The detached run's state, as the settle check reports it (see svc_state). */
+const DETACHED_SETTLED = [
+  '  if [ -s "$pidf" ] && kill -0 -"$(cat "$pidf")" 2>/dev/null; then echo running;',
+  '  elif [ "$(cat "$pidf.status" 2>/dev/null)" = 0 ]; then echo finished; else echo stopped; fi',
+  `  tail -c ${LOG_TAIL_BYTES} "$dlog"`,
+].join('\n');
+
+/**
+ * The script `sh -c` runs in the container: `$1` is the command, `$2` the
+ * worktree, `$3` an optional banner line — never interpolated, so nothing in
+ * them is parsed twice.
  *
- * Stops the previous services process GROUP (`setsid` made it a leader, so its
- * children — a `bin/dev`'s foreman, cargo's rustc — go with it), then starts the
- * command in a new session, detached, its output to the log.
+ * Runs the command in the `services` tmux session (src/sessions/tmux.ts):
+ * creates the session when it is not there, otherwise ends the process GROUP
+ * its pane runs (a `bin/dev`'s foreman, cargo's rustc go with it) and restarts
+ * the command in the SAME session — so a second press is a restart, never a
+ * second dev server fighting for the port, and a terminal attached to the
+ * session stays attached and watches the restart.
  */
 export function startServicesScript(settleSeconds?: number): string {
   return [
-    `pidf=${SERVICES_PID_FILE}; logf=${SERVICES_LOG_FILE}`,
+    tmuxPrelude({ requireTmux: false }),
+    sessionFunctions(),
+    SERVICES_STATE_FN,
     // `$2` is the worktree. Take ownership of anything in it the container
     // user cannot write, as a member attach does on every attach: a root guest
     // daemon keeps writing into the worktree after the container started (a
     // sync merge, a restore creating log/), and the wrapper only adopts before a
     // turn. The worktree's .git pointer is read-only by design and left alone.
-    'if [ -n "$2" ] && find "$2" ! -writable ! -path "$2/.git" -print -quit 2>/dev/null | grep -q .; then' +
-      ' sudo -n find "$2" ! -path "$2/.git" -exec chown -h "$(id -u):$(id -g)" {} + 2>/dev/null || true; fi',
-    'if [ -s "$pidf" ]; then old=$(cat "$pidf"); kill -TERM -"$old" 2>/dev/null;' +
-      ' i=0; while kill -0 -"$old" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done;' +
-      ' kill -KILL -"$old" 2>/dev/null; fi',
-    // The previous group's pid must go before the new one starts: the wait
-    // below polls for a NON-EMPTY pid file, and a stale one satisfied it at
-    // once, so a status read straight after a restart named the dead group
-    // and reported "stopped" for a command that was starting.
-    'rm -f "$pidf"',
-    ': > "$logf"',
-    // `$0` of the inner shell is its name; the command is `$1`, run by sh -c.
-    // The wrapper stays the group leader (so a stop still takes the whole group)
-    // and records the command's exit status, so a command that daemonizes and
-    // exits 0 is told apart from one that failed.
-    'rm -f "$pidf.status"',
-    // The command as launched, for the inventory (servicesStatusScript): the
-    // project's command can change while an older one is still running.
-    'printf \'%s\' "$1" > "$pidf.cmd"',
-    'setsid sh -c \'echo $$ > "$0"; sh -c "$1"; echo $? > "$0.status"\' "$pidf" "$1" < /dev/null >> "$logf" 2>&1 &',
-    // Give the pid file a moment to exist, so a status read straight after
-    // the call does not report "not running" for a process that is starting.
-    'i=0; while [ ! -s "$pidf" ] && [ $i -lt 20 ]; do sleep 0.05; i=$((i+1)); done',
+    // Only ROOT-owned entries, never a service's own data (src/utils/adopt-rule.ts).
+    `if [ -n "$2" ] && ${adoptProbeShell('"$2"', '! -path "$2/.git"')}; then` +
+      ` ${adoptChownShell('"$2"', '! -path "$2/.git"')} 2>/dev/null || true; fi`,
+    STOP_LEGACY_GROUP,
+    // No tmux in the image: the detached run lazy always had (own session via
+    // setsid, output to a log, pid and exit status recorded). Nothing is lost
+    // but the terminal.
+    'if [ $has_tmux = 0 ]; then',
+    DETACHED_START,
+    ...(settleSeconds === undefined ? [] : [`  sleep ${Math.max(0, Math.floor(settleSeconds))}`, DETACHED_SETTLED]),
+    'else',
+    `run_in ${SERVICES_SESSION} "\${2:-$PWD}" "$3" "$1" || { echo "could not start the ${SERVICES_SESSION} tmux session" >&2; exit 1; }`,
+    // The command starts once the log pipe is open (run_in's flag); wait for
+    // that, so a status read straight after the call sees it running.
+    `  i=0; while [ -f "$D/${SERVICES_SESSION}.go" ] && [ $i -lt 60 ]; do sleep 0.05; i=$((i+1)); done`,
     // `settleSeconds`, when given, is how long to wait before reporting whether
     // the command is still alive — in the status script's shape — so a command
     // that dies at once (a typo, a missing binary, a port in use) is caught by
     // the same exec that started it instead of looking started.
     ...(settleSeconds === undefined ? [] : [
-      `sleep ${Math.max(0, Math.floor(settleSeconds))}`,
+      `  sleep ${Math.max(0, Math.floor(settleSeconds))}`,
       // `finished`: the command exited 0 by itself (a pm2/overmind/supervisord
       // start that daemonized) — not a failure.
-      'if [ -s "$pidf" ] && kill -0 -"$(cat "$pidf")" 2>/dev/null; then echo running;' +
-        ' elif [ "$(cat "$pidf.status" 2>/dev/null)" = 0 ]; then echo finished; else echo stopped; fi',
-      `tail -c ${LOG_TAIL_BYTES} "$logf"`,
+      '  svc_state',
+      `  logf=$L/${SERVICES_SESSION}.log; [ -f "$logf" ] && cat "$logf.1" "$logf" 2>/dev/null | tail -c ${LOG_TAIL_BYTES}`,
     ]),
+    'fi',
     'exit 0',
   ].join('\n');
 }
 
 /**
- * Stop the services process group, if any. With `withCommand`, the project's
- * Stop services command (`$1`, never interpolated) runs first; its exit status
- * becomes the script's, but the process group is ended after it EITHER way, so
- * a stop command that fails or forgets a process still leaves nothing running.
+ * Stop the services. With `withCommand`, the project's Stop services command
+ * (`$1`, never interpolated) runs first; its exit status becomes the script's,
+ * but the process group is ended after it EITHER way, so a stop command that
+ * fails or forgets a process still leaves nothing running. The session is then
+ * closed — unless `keepSession`, which a restart uses so attached terminals
+ * stay attached while the command is started again in it.
  */
-export function stopServicesScript(withCommand = false): string {
-  if (withCommand) {
-    return [
-      `pidf=${SERVICES_PID_FILE}`,
-      'sh -c "$1" < /dev/null 2>&1; rc=$?',
-      'if [ -s "$pidf" ]; then old=$(cat "$pidf"); kill -TERM -"$old" 2>/dev/null;' +
-        ' i=0; while kill -0 -"$old" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done;' +
-        ' kill -KILL -"$old" 2>/dev/null; rm -f "$pidf"; fi',
-      'exit $rc',
-    ].join('\n');
-  }
+export function stopServicesScript(withCommand = false, opts: { keepSession?: boolean } = {}): string {
   return [
-    `pidf=${SERVICES_PID_FILE}`,
-    '[ -s "$pidf" ] || exit 0',
-    'old=$(cat "$pidf"); kill -TERM -"$old" 2>/dev/null',
-    'i=0; while kill -0 -"$old" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done',
-    'kill -KILL -"$old" 2>/dev/null; rm -f "$pidf"; exit 0',
+    tmuxPrelude({ requireTmux: false }),
+    sessionFunctions(),
+    withCommand ? 'sh -c "$1" < /dev/null 2>&1; rc=$?' : 'rc=0',
+    STOP_LEGACY_GROUP,
+    `stop_group "$(pane_pid ${SERVICES_SESSION})"`,
+    ...(opts.keepSession ? [] : [`T kill-session -t "=${SERVICES_SESSION}" 2>/dev/null`]),
+    'exit $rc',
   ].join('\n');
 }
 
@@ -159,26 +206,45 @@ export const MAX_LOG_TAIL_BYTES = 512 * 1024;
  *
  * The inventory is read straight from /proc, so it needs nothing the image may
  * lack (no `ps`, no `ss`): every process in the services process GROUP (the
- * one `setsid` made — the command and everything it started), each one's
- * listening TCP sockets, and the wrapper's record of how the command ended.
+ * one the `services` session's pane leads — the command and everything it
+ * started), each one's listening TCP sockets, how the command ended, and the
+ * session's live screen.
  *
- *   @@pid <group leader>     @@started <epoch the pid file was written>
+ *   @@pid <group leader>     @@started <epoch the command was started>
  *   @@exit <code>            @@cmd <the command as launched>
- *   @@logbytes <log size>
+ *   @@logbytes <log size>    @@screen <base64 of the live pane>
+ *   @@notmux                 (the container has no tmux)
  *   @@proc <pid> <ppid> <state> <cmdline>
  *   @@sock <pid> <inode>     @@listen <port> <inode>
  */
 export function servicesStatusScript(tailBytes: number = LOG_TAIL_BYTES): string {
   const tail = Math.max(1, Math.min(MAX_LOG_TAIL_BYTES, Math.floor(tailBytes)));
   return [
-    `pidf=${SERVICES_PID_FILE}; logf=${SERVICES_LOG_FILE}`,
-    'if [ -s "$pidf" ] && kill -0 -"$(cat "$pidf")" 2>/dev/null; then echo running;' +
+    tmuxPrelude({ requireTmux: false }),
+    sessionFunctions(),
+    SERVICES_STATE_FN,
+    `sn=${SERVICES_SESSION}; logf=$L/$sn.log; has=0; T has-session -t "=$sn" 2>/dev/null && has=1`,
+    // No tmux in the image: the detached run's pid file, exit status and log.
+    'if [ $has_tmux = 0 ]; then',
+    `  pidf=${LEGACY_SERVICES_PID_FILE}; logf=${LEGACY_SERVICES_LOG_FILE}`,
+    '  if [ -s "$pidf" ] && kill -0 -"$(cat "$pidf")" 2>/dev/null; then echo running;' +
       ' elif [ -e "$logf" ]; then echo stopped; else echo never; fi',
-    'pg=; if [ -s "$pidf" ]; then pg=$(cat "$pidf"); echo "@@pid $pg";' +
-      ' echo "@@started $(stat -c %Y "$pidf" 2>/dev/null)"; fi',
-    '[ -s "$pidf.status" ] && echo "@@exit $(cat "$pidf.status")"',
-    '[ -s "$pidf.cmd" ] && echo "@@cmd $(head -n 1 "$pidf.cmd")"',
-    '[ -e "$logf" ] && echo "@@logbytes $(wc -c < "$logf")"',
+    '  echo "@@notmux"',
+    '  pg=; if [ -s "$pidf" ]; then pg=$(cat "$pidf"); echo "@@pid $pg"; echo "@@started $(stat -c %Y "$pidf" 2>/dev/null)"; fi',
+    '  [ -s "$pidf.status" ] && echo "@@exit $(cat "$pidf.status")"',
+    '  [ -s "$pidf.cmd" ] && echo "@@cmd $(head -n 1 "$pidf.cmd")"',
+    '  [ -e "$logf" ] && echo "@@logbytes $(cat "$logf.1" "$logf" 2>/dev/null | wc -c)"',
+    'else',
+    '  if [ $has = 1 ]; then st=$(svc_state); [ "$st" = running ] && echo running || echo stopped;' +
+      ' elif [ -f "$logf" ]; then echo stopped; else echo never; fi',
+    '  pg=; if [ $has = 1 ]; then pg=$(pane_pid "$sn"); [ -n "$pg" ] && echo "@@pid $pg"; fi',
+    '  [ -s "$D/$sn.started" ] && echo "@@started $(cat "$D/$sn.started")"',
+    `  if [ $has = 1 ] && [ "$(T display-message -p -t "=$sn:" '#{pane_dead}' 2>/dev/null)" = 1 ]; then` +
+      ` echo "@@exit $(T display-message -p -t "=$sn:" '#{pane_dead_status}' 2>/dev/null)"; fi`,
+    '  [ -s "$D/$sn.cmd" ] && echo "@@cmd $(head -n 1 "$D/$sn.cmd")"',
+    '  [ -f "$logf" ] && echo "@@logbytes $(cat "$logf.1" "$logf" 2>/dev/null | wc -c)"',
+    `  [ $has = 1 ] && echo "@@screen $(T capture-pane -p -e -J -S -${DEFAULT_SCREEN_LINES} -t "=$sn:" 2>/dev/null | base64 | tr -d '\\n')"`,
+    'fi',
     // Every process whose group is the services group. /proc/<pid>/stat is
     // `pid (comm) state ppid pgrp …`, and comm may hold spaces: cut at the
     // LAST `) ` before splitting.
@@ -195,7 +261,7 @@ export function servicesStatusScript(tailBytes: number = LOG_TAIL_BYTES): string
       ' while read -r _ local _ st _ _ _ _ _ inode _; do [ "$st" = 0A ] || continue;' +
       ' echo "@@listen $((0x${local##*:})) $inode"; done < "$t"; done',
     'echo "@@end"',
-    `[ -e "$logf" ] && tail -c ${tail} "$logf"`,
+    `[ -f "$logf" ] && cat "$logf.1" "$logf" 2>/dev/null | tail -c ${tail}`,
     'exit 0',
   ].join('\n');
 }
@@ -229,8 +295,8 @@ export interface ServicesRunState {
   /** The tail of the command's combined output ('' when none). */
   log: string;
   /**
-   * The one-word answer for a person: `starting` (alive, listening on nothing
-   * yet, launched within {@link STARTING_WINDOW_SECONDS}s), `running`, `exited`
+   * The one-word answer for a person: `starting` (alive, while the main
+   * service port is not answering), `running`, `exited`
    * (ended by itself — see `exitCode`), `stopped` (stopped, or ended without
    * recording a code), `never`.
    */
@@ -248,6 +314,15 @@ export interface ServicesRunState {
   /** The whole log's size in bytes; `logTruncated` when `log` holds less. */
   logBytes?: number | null;
   logTruncated?: boolean;
+  /**
+   * The `services` session's live screen, ANSI kept ('' when it has none). The
+   * log is the full history; this is what an attached terminal shows now.
+   */
+  screen?: string;
+  /** The tmux session the services run in (attach to it to type into them). */
+  session?: string;
+  /** False when the container has no tmux, so services cannot run there at all. */
+  tmux?: boolean;
 }
 
 /**
@@ -274,6 +349,18 @@ export interface ServeRunDeps {
   now?: () => number;
   /** Where `serve.run` narrates its phases (the request's heartbeat envelope). */
   progress?: ProgressEmitter;
+  /**
+   * A line the services session prints before the command starts — the
+   * end-of-turn restart says which turn it follows, so whoever is watching
+   * the session sees why the command started again.
+   */
+  startBanner?: string;
+  /**
+   * Stop only: end the command but keep the `services` session open, so a
+   * terminal attached to it stays attached for the start that follows (the
+   * end-of-turn restart).
+   */
+  keepSession?: boolean;
 }
 
 async function defaultExec(argv: string[], timeoutMs: number) {
@@ -419,7 +506,7 @@ export async function runStartServices(
   const exec = deps.exec ?? defaultExec;
   const binary = await containerBinaryFor(projectRoot, container.runnerType);
   const result = await exec(
-    [binary, 'exec', '-w', container.worktreePath, container.containerName, 'sh', '-c', startServicesScript(SETTLE_SECONDS), 'lazy-services', command, container.worktreePath],
+    [binary, 'exec', '-w', container.worktreePath, container.containerName, 'sh', '-c', startServicesScript(SETTLE_SECONDS), 'lazy-services', command, container.worktreePath, ...(deps.startBanner ? [deps.startBanner] : [])],
     30_000,
   );
   if (result.exitCode !== 0) {
@@ -511,8 +598,8 @@ export async function stopStartServices(
   // The worktree is mounted at the same path inside the container.
   const argv = stopCmd
     ? [target.binary, 'exec', '-w', worktreePath, target.name,
-        'sh', '-c', stopServicesScript(true), 'lazy-services-stop', stopCmd]
-    : [target.binary, 'exec', target.name, 'sh', '-c', stopServicesScript()];
+        'sh', '-c', stopServicesScript(true, { keepSession: deps.keepSession }), 'lazy-services-stop', stopCmd]
+    : [target.binary, 'exec', target.name, 'sh', '-c', stopServicesScript(false, { keepSession: deps.keepSession })];
   const result = await (deps.exec ?? defaultExec)(argv, 30_000);
   if (result.exitCode !== 0) {
     const detail = lastLines(`${result.stdout}\n${result.stderr}`, 5) || `exit ${result.exitCode}`;
@@ -558,14 +645,17 @@ export function parseServicesStatus(stdout: string, now: number = Date.now()): S
   const rest = nl === -1 ? '' : stdout.slice(nl + 1);
   const lines = rest.split('\n');
   const endIdx = rest.startsWith('@@') ? lines.indexOf('@@end') : -1;
-  if (endIdx === -1) return { state, log: rest };
-  const log = lines.slice(endIdx + 1).join('\n');
+  if (endIdx === -1) return { state, log: terminalLines(rest) };
+  const rawLog = lines.slice(endIdx + 1).join('\n');
+  const log = terminalLines(rawLog);
 
   let pid: number | null = null;
   let started: number | null = null;
   let exitCode: number | null = null;
   let command: string | null = null;
   let logBytes: number | null = null;
+  let screen = '';
+  let tmux = true;
   const procs: ServicesProcess[] = [];
   const sockets = new Map<number, string[]>();
   const listening = new Map<string, number>();
@@ -581,6 +671,8 @@ export function parseServicesStatus(stdout: string, now: number = Date.now()): S
       case 'exit': exitCode = int(value); break;
       case 'cmd': command = value || null; break;
       case 'logbytes': logBytes = int(value); break;
+      case 'screen': screen = trimTrailingBlankLines(Buffer.from(value.trim(), 'base64').toString('utf-8')); break;
+      case 'notmux': tmux = false; break;
       case 'proc': {
         const p = int(parts[0]);
         if (p === null) break;
@@ -637,8 +729,19 @@ export function parseServicesStatus(stdout: string, now: number = Date.now()): S
     exitCode: running ? null : exitCode,
     processes: running ? procs : [],
     logBytes,
-    logTruncated: logBytes !== null && logBytes > Buffer.byteLength(log),
+    logTruncated: logBytes !== null && logBytes > Buffer.byteLength(rawLog),
+    screen,
+    session: SERVICES_SESSION,
+    tmux,
   };
+}
+
+/**
+ * A terminal's output as text: the pane is a pty, so every line it logs ends
+ * `\r\n`. Lines, not bytes, are what a log tail is read for.
+ */
+export function terminalLines(text: string): string {
+  return text.replace(/\r\n/g, '\n');
 }
 
 /**
@@ -673,9 +776,15 @@ export interface ProcessServiceLink {
 export function linkProcessesToServices(
   run: ServicesRunState,
   services: Array<{ name: string; port: number; listening: boolean | null }>,
+  mainPort?: number | null,
 ): Omit<ServicesRunState, 'processes'> & { processes: Array<ServicesProcess & { services: ProcessServiceLink[] }> } {
+  const main = mainPort == null ? null : services.find((s) => s.port === mainPort);
   return {
     ...run,
+    // The command can bind a side port before the main app answers. Its
+    // process inventory stays intact; this human-facing phase follows the
+    // selected service's actual published-port probe.
+    phase: run.state === 'running' && main ? (main.listening === true ? 'running' : 'starting') : run.phase,
     processes: (run.processes ?? []).map((proc) => ({
       ...proc,
       services: services

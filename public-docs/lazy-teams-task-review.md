@@ -23,7 +23,7 @@ last row always opens the full search page with your query.
 
 ## How the page is laid out
 
-The task page has **fourteen sections** you move between, and below them everything
+The task page has these sections you move between, and below them everything
 you act with.
 
 | Section | What is in it |
@@ -38,6 +38,7 @@ you act with.
 | **Comments** | Notes to the agent — saved now, delivered with your next feedback |
 | **Journal** | The agent's record of what it decided and why |
 | **Reviews** | Formal reviews an agent ran over the work |
+| **Chat** | A conversation with the task's agent: what people asked it and what it answered — see [Chat](#chat) |
 | **Artifacts** | Files attached for the agent to read, and files it published back |
 | **Subtasks** | Tasks stacked on this one, grouped by where they stand |
 | **Stats** | Where the time and the tokens went, per turn and per tool |
@@ -229,8 +230,8 @@ step, in your own environment for the task (see [Shell](#shell-working-inside-th
 with the command typed in and run. **Open** brings that shell back into view;
 **Re-run** types the command into it again (or opens a fresh shell if that one
 has closed). Blocks that are data rather than commands — JSON, source code,
-output — get no button. When you cannot open a terminal at all (for example, no
-Claude account is connected, or a turn is running), the section says why once,
+output — get no button. When you cannot open a terminal at all (for example, a
+required model connection is missing), the section says why once,
 above the steps.
 
 Steps from earlier turns are kept under **Earlier verification steps**, folded
@@ -259,11 +260,14 @@ through Teams' sign-in and then lands on the service; someone who is not a
 member of the project is refused, and leaving the team ends access on the next
 request. Opening a declared service that is not answering yet shows a page
 that says whether something is bringing it up and how long it has waited,
-checks again every few seconds, opens the service as soon as it answers, and
+shows the `services` session's live screen, checks that port without leaving the page,
+opens the exact address requested as soon as it answers, and
 offers **Run services** when nothing is starting it (see
 [Reaching a task's running services](self-hosting-lazy-teams.md#reaching-a-tasks-running-services)).
 A service the task does not declare or serve takes you to the task's
 **Services** tab instead. Older service links keep working.
+The same page appears when you visit a service address directly while its port starts.
+Without a Start services command, a direct visit goes to the task's Services tab.
 
 When the install has no services host, the card shows no address and says what
 an operator must set up — see
@@ -298,10 +302,13 @@ Once running, it keeps running between turns. The tab shows whether it is runnin
 latest output, with **Restart services** and **Stop services**.
 Under **Running in this environment** the tab lists what the command actually started, read
 from the task's environment each time you open the tab: the command and when it started,
-whether it is starting (up, but not yet listening on any port), running, or ended by itself
+whether it is starting (waiting for the main service port to answer), running, or ended by itself
 (with its exit code), and each of its processes — process id, command line, and the ports it
 listens on, named after the declared service each one serves and whether that service
 answers. The output shows its most recent part; **Show more output** loads a longer stretch.
+The start command's live screen refreshes on the Services tab and on the waiting page.
+Every project member who can open a service can watch this screen. The full task sessions
+list and its other sessions keep their separate access rules.
 The services are **shared**: one set per task, which every member sees on the tab and
 reaches through its addresses, and which any member can start, restart or stop. They keep
 running while members have terminals open. When the project itself restarts (for example
@@ -327,6 +334,38 @@ owns the task's current turn, and it gets a 401 between turns. See
 Saving or clearing the command returns you to the tab.
 
 Each service row also carries its `lazy url <task> <service>` command with a Copy button. When the task's environment is not running, **Start container** brings it up without starting a turn. Ports that only the task's own branch declares are listed under **Ports on this branch only**, each with a copyable `lazy forward` command; they are advice, and the project's own configuration still decides what is published.
+
+#### Sessions
+
+Below the services, **Sessions** first says who else is in the task right now under
+**In this task now**: each member with a terminal open in it (or sessions kept for them to
+come back to), with their session names and whether they are attached or idle — never what
+they typed or what their sessions printed — and whether the agent is running a turn, and
+since when. Several people and the agent can work in one task at once and nothing makes
+them take turns, so this is what you coordinate by. Opening a shell on the task shows the
+same in one line at the bottom of the terminal for a few seconds (when the task's image has
+tmux 3.2 or later), and `lazy sessions <task>`
+lists it.
+
+The list then shows what is running in the task's own environment, each
+in a named session: `services` is what **Run services** started, and any other long-running
+command started there has its own. Each row says whether the session is running or how it
+exited (with its exit code), how long it has been up, and when it last printed anything.
+Under the list, each session shows its current screen and, folded away, the end of its
+log. Both refresh by themselves every few seconds while the tab is open.
+
+**Attach** opens a running session in a new browser tab, in a terminal that watches it live
+without typing into it; **Take control** (on that page, or beside Attach) opens one you can
+type into — to answer a prompt, stop a server with
+Ctrl-C, or use a debugger. Everyone attached to the session sees the same screen, including
+what you type. Closing the terminal leaves the session running. Attaching never waits for
+the agent's turn and never holds it up. Sessions are seen and attached to by the same
+people who can open terminals on the **Shell** tab.
+
+![The Sessions list on a task's Services tab: two members in the task, the agent working on turn 7, the services session running for 42 minutes and a worker session that exited with code 1, each with its current screen](images/teams-topics/teams-task-sessions.png)
+
+From a terminal, `lazy sessions <task>` lists the same sessions, and
+`lazy sessions <task> <name>` prints one session's screen and the end of its log.
 
 ### Maintained files
 
@@ -445,7 +484,7 @@ are three things you can do with what you type:
 
 | Button | Effect |
 | --- | --- |
-| **Ask the agent** | Puts the question to the paused agent now and shows its answer on that line. Nothing in the work changes — it is a read-only turn, and it spends your own Claude credential |
+| **Ask the agent** | Puts the question to the paused agent now and shows its answer on that line. Nothing in the work changes — it is a read-only turn, and it spends your own connection for the task’s agent profile |
 | **Add comment** | Stores the note on that line. It travels to the agent with your next feedback, along with everything else you wrote |
 | **Unblock** | Stores the note on that line, then resumes the task so the agent starts working on it now. If the task cannot be resumed, the note stays queued and the page says why |
 
@@ -776,6 +815,25 @@ first. The list is the whole branch's, not the last turn's: a file changed
 early and never looked at again is still on it, and the refusal names the
 files.
 
+## Chat
+
+The **Chat** section is a conversation with the task's agent. Type a message
+and press **Send**: the agent answers from the same session that did the work,
+so it remembers the task and everything you asked before. Only what people
+typed and what the agent answered is shown — never the instructions lazy adds
+around a question — and an answer appears without reloading the page.
+
+A chat message never changes the task. The agent answers in text, changes no
+code and starts no work, and the turn uses your own connection for the task’s
+agent profile — Claude Code, Codex, Cursor or Pi. A
+message sent while the agent is busy with a turn waits, marked **Waiting for the
+agent to finish its turn**, and goes out by itself as soon as that turn ends. To
+have the agent act on what you discussed, send feedback from **Current review**.
+
+Every question asked with **Ask** — about the task, a line of the diff or a
+sentence of the report — appears in Chat too, and the conversation it came from
+has an **Asked in Chat →** link.
+
 ## Give feedback
 
 Below Overview and Current review are three tabs — **Unblock**, **Ask** and **Accept**. Unblock is
@@ -800,7 +858,8 @@ Not every question is about a line. The **Ask** tab has a box for questions
 about the work as a whole — the approach, the scope, why a trade-off went the
 way it did — and the conversations it has produced are listed above it, with the
 agent's answers. As with a line question, the agent answers without changing
-anything, and it spends your own Claude credential.
+anything, and it uses your own connection for the task’s agent profile. Sending a question opens
+[Chat](#chat), where it and its answer appear.
 
 **A task that is over can still be asked**, which is when most questions about a
 piece of work get asked. Once a task is finished, abandoned or has not started,
@@ -827,15 +886,15 @@ question standing on its own.
 
 A reply can go to one of two places, and you pick with the button you press:
 
-- **Ask the agent** gets you an answer now. It runs a turn on your own Claude
-  credential, and the agent answers without changing any code.
+- **Ask the agent** gets you an answer now. It runs a turn on your own
+  connection for the task’s agent profile, and the agent answers without changing any code.
 - **Leave a note for next time** changes nothing now. The note is saved and
   handed to the agent at the start of its next turn, along with everything else
   you have queued. Reading an answer and wanting to say "alright, do that" is
   the common case, and it does not need to interrupt anything.
 
 A note never starts a turn, so it works whether or not the agent is free, and it
-does not need a Claude credential of your own. The second button appears only on
+does not need a model connection of your own. The second button appears only on
 a reply: a note about the work as a whole that answers nothing is what the
 **Unblock** message box already is, so there is deliberately no second way to
 write one.
@@ -878,9 +937,9 @@ back so you can start it or send it feedback when you are ready. It comes
 back with its own work, exactly as it was when it finished; if that work cannot
 be found, Reopen refuses and changes nothing rather than start the task empty.
 
-**Start** and **Resume** run the agent, so they spend your own Claude
-credential and are offered only if you have connected your Claude account. If
-you have not, the page says so and points you at connecting one, exactly as
+**Start** and **Resume** run the task’s agent profile, so they spend your own
+connection for that profile. If a required connection is missing, clicking
+explains which endpoint to connect under **Connections**, exactly as
 creating a task does. **Reopen** runs nothing and needs no credential.
 
 Starting a task is real work before a single word is read: the agent's
@@ -946,7 +1005,7 @@ change what tasks exist are folded away so they cannot be pressed by accident.
 **Ask the agent to review its work** sends the agent back over its own change
 before you read it. It reads what it wrote and files what it finds on this page,
 as questions and notes — it does not change any code. This runs a turn, on your
-own Claude credential.
+own connection for the review’s agent profile.
 
 **Make a copy of this task** creates a new task beside this one with the same
 goal, the same prompt and the same agent and model, and none of the history. The
@@ -978,7 +1037,7 @@ connected, nothing to send — the page says why.
 
 The push and the pull request use the forge connection the project is connected
 through, never credentials from your own machine. Submitting runs no agent and spends
-nothing on your Claude account.
+nothing on your model accounts.
 
 ### Submit on a repository Lazy Teams hosts
 
@@ -995,7 +1054,7 @@ target branch and pushes that branch there, so teammates see it with
 **Reparent…**, in the header of any task that is not running or finished, moves
 the task under another task or branch — the same as `lazy reparent`. Pick one
 from the suggestions or type it. The task's branch is then synced onto its new
-parent straight away, which runs a turn on **your** Claude account, like
+parent straight away, which runs a turn on **your** connection for the task’s agent profile, like
 **Sync** below. A task that has not started yet simply branches from the new
 parent when it does. If the new parent has not started yet, there is nothing to
 merge yet and the page says so; the task merges the parent's work as soon as
@@ -1205,26 +1264,24 @@ an agent turn. The branch must still exist locally or on the project's remote.
 
 - **Shell** opens a new shell. Open as many as you like; each has its own
   **Close**.
-- **Pair** takes over the agent's own session, so you drive it. If your
-  connection drops, the page reconnects to the same session by itself; if it
-  cannot within 5 minutes, pairing ends 30 seconds later. Pair is not
-  offered while the agent is mid-turn or while somebody else is already
-  pairing. (Like any open terminal, it also holds the task — see
-  [Taking turns with the agent](#taking-turns-with-the-agent).)
-- **Chat** is a conversation with the agent about the task. It doesn't take
-  over the agent's session and leaves the task's model alone, but like any
-  terminal it keeps turns off the task while it is open. It is offered only
-  while the task is waiting for you.
+- **Pair** opens your own conversation from the task agent’s saved session
+  where the harness supports resuming it. It takes no task-wide lock: the
+  agent and other members can keep working while you pair.
+- **Chat** opens an interactive, read-only conversation about the task in your
+  own environment. It leaves the task’s model alone and can run beside a turn.
+  On Codex, use **Ask** or the **Chat tab** instead.
 - **Watch** shows what the agent is doing right now — its requests, what it is
   running and its own session — as it happens. It is read-only.
 
 If a terminal's connection drops — Wi-Fi changing, a laptop waking from sleep —
-the program in it keeps running for 5 minutes and the page reconnects to it by
-itself. The status line says **Connection lost. Reconnecting…** meanwhile, and
+the page tries to reconnect to the same session for 5 minutes.
+The status line says **Connection lost. Reconnecting…** meanwhile, and
 typing is paused until it is back; the output you missed is then drawn once.
 Your builder's terminal, the Verify tab's shells and god mode's machine shell
-behave the same way. A terminal whose session really ended — the program exited,
-you closed it, or you are no longer allowed in — says so and does not retry.
+use the same browser reconnect window. A shell backed by tmux keeps running
+after that window; open Shell again to rejoin it. Without tmux, a plain shell
+ends with its connection. A terminal whose session really ended — the program
+exited or you are no longer allowed in — says so and does not retry.
 
 ### Your own environment
 
@@ -1238,9 +1295,12 @@ server you start in one shell is reachable from another.
 
 Its settings are lazy's own, not the agent's. The agent's configuration (the
 hooks, MCP servers and git settings in its home) is not carried into your
-environment. Pair and Chat also start Claude Code so that it ignores the task's
-own `.claude/settings.json` and any MCP server lazy did not configure. Your
-Claude credential only works from your environment (on a Linux server, which
+environment. Pair and interactive Chat use the task’s harness: Claude Code
+ignores the checkout’s settings, Codex treats it as untrusted, Cursor asks
+before trusting it, and Pi ignores its Pi files. Only the lazy MCP connection
+prepared for your session is supplied. Interactive Chat works on Claude Code,
+Cursor and Pi; on Codex use **Ask** or the **Chat tab** instead. Your
+model connection only works from your environment (on a Linux server, which
 is where Lazy Teams runs; lazy on macOS or Windows cannot tell environments
 apart this way): copied anywhere else, the
 request is refused.
@@ -1251,12 +1311,30 @@ yourself there (which reads the project's own settings), you are running code
 the agent wrote, with your credential in the environment. That is the same as
 checking out a colleague's branch and running it. Read what you run.
 
-About 30 seconds after you close your last terminal, the environment is
-discarded, together with anything still running in it. There is nothing to
-start beforehand and nothing to clean up afterwards. The first terminal can take
+**Your shells keep running when you leave.** Each Shell is a named session in
+your environment (the first is `shell`, a second one on the page `shell-2`, and
+so on). Closing the page, a reload or a dropped connection detaches you; opening
+Shell again on the task takes you back into the same session, with whatever you
+started still running and its screen as you left it. Typing `exit` ends a
+shell. Your environment is discarded, together with anything still running in
+it, about 30 seconds after your last terminal closes once no shell session is
+left in it, when the task ends, or when you leave the team. There is no idle
+timeout. A restart of the project (for example when Lazy Teams
+is upgraded) does not end it: your terminals reconnect to the same sessions
+once the project is back. If the environment itself stopped, Lazy restarts it
+with your installed tools and files intact; its old processes have ended, so
+your next terminal opens a new shell. A program you started before the restart that talks
+to Claude (for example `claude` left running in a shell) keeps the old
+connection details; restart it to continue. There is nothing to start beforehand and nothing to
+clean up afterwards. The first terminal can take
 a moment while the environment starts, and the terminal shows what it is doing
 meanwhile. Right after Lazy Teams has been upgraded, that first start can take a
 few minutes.
+
+If the project cannot inspect or restart your environment yet, it keeps your
+tools and files and retries recovery. Terminal access waits until your account
+connection and the environment are checked. A refused or interrupted reconnect
+does not discard an environment waiting for its first shell after a restart.
 
 **What your environment shares with other tasks.** This task's own environment
 keeps running while you work — with its shared services and anything a turn
@@ -1282,7 +1360,7 @@ is why: ask a project admin to mark it `readonly = true` if every task only
 needs to read it.
 
 Services you start (a dev server, a database) run in your environment for as
-long as your session lasts. Your environment has a network of its own, so they
+long as it lasts (see above). Your environment has a network of its own, so they
 are reachable from your own terminals only — not from the agent's turns, and not
 through the task's service links — and nothing the agent left listening is
 reachable from yours. To run services everyone on the task sees and reaches
@@ -1327,39 +1405,51 @@ agent to commit them.
 
 ### Who pays, and who is named
 
-Every terminal runs **as you**. Anything you or the agent do in it uses your own
-Claude account — never a key the project configured, and never another member's
-— and what it records, such as a pairing session starting and ending, names you.
-If you have no Claude account connected, the tab says so and links to where you
-connect one. Because Pair and Chat run on your account, they are offered only
-for a task whose agent is Claude Code on Anthropic's own service; on a task that
-runs another agent, open a **Shell** instead.
+Every terminal runs **as you**. Pair and interactive Chat use your own
+connections for the task’s agent profile, including named endpoints and tiered
+profiles — never another member’s connection. What the session records, such
+as pairing starting and ending, names you. If a required connection is missing,
+clicking the action explains which endpoint to connect under **Connections**.
 
-In Pair and Chat the agent cannot use lazy's own tools (committing, raising
-questions, starting subtasks), and cannot `git commit` either (see above).
-Commit your changes by closing your terminals, then unblocking the task and
-asking the agent to; or leave them for its next turn.
+Pair supports Claude Code, Codex, Cursor and Pi. Interactive terminal Chat
+supports Claude Code, Cursor and Pi; on Codex, use **Ask** or the **Chat tab**
+for read-only questions instead.
 
-### Taking turns with the agent
+Pair gets member-scoped lazy tools to create, start, wait on and accept
+subtasks. Chat offers read-only tools. Neither mode can claim the task agent’s
+turn, replace its report, file its raises or commit through `lazy_commit`.
+Neither can `git commit` from your environment (see above). Leave file changes
+for the task agent’s next turn, or unblock it and ask it to commit them.
 
-- Nobody can open a terminal while a turn is running on the task; wait for it
-  to pause.
-- While **any** of your terminals is open — Shell, Pair, Chat or Run in shell,
-  not only Pair — the task is held: no turn starts (unblocking or resuming it is
-  refused with your name), and it cannot be synced, accepted, rejected or closed.
-  An automatic sync waits and runs afterwards. All of it works again once your
-  session has ended, about 30 seconds after you close your last terminal.
+### Working beside the agent
+
+- **You and the agent work at the same time.** You can open a terminal while a
+  turn is running, and a turn starts, resumes or is unblocked while your
+  terminals are open — exactly as with `lazy shell` on your own machine. Both
+  of you are working in the same files, so what one changes the other sees.
+- **Syncing and accepting go ahead too.** A sync or a subtask's accept merges
+  into the files you are working in, as a turn would; when a subtask's accept
+  merges while you have sessions open, the task gets a comment saying so. When
+  the task itself is accepted, its work is merged at once and its files are
+  removed only once your sessions have ended.
+- **Rejecting or closing the task waits for you.** It would remove the files
+  under your shells, so it is refused while anyone has sessions open, naming
+  everyone who does — unless whoever rejects or closes it ticks **End open
+  sessions first** (`--end-sessions` on the command line), which ends every
+  member's sessions and then goes ahead.
+- **Pair and interactive Chat** have their own conversations and tool
+  connections. They do not lock the task or exclude another member, so they
+  can run while the task’s agent is working.
 - Your terminals run in an environment of your own, never in the task's. The
   task's own environment keeps running while you work, and so do the task's
   services (see **Services**), which everyone on the task shares. Anything a
   turn left running there keeps running too; your terminal's git reads only
   copies of the task's git pointers that lazy checked when you opened it.
-- One person at a time can work in a task, with as many terminals as they like.
-  The tab says who it is.
-- A terminal left open doesn't hold the task forever. It closes after an hour
-  with nobody typing in it — even if something in it is still printing output,
-  such as a dev server's log — and after twelve hours in any case. Open a new
-  one to carry on.
+- Several people can work in a task at once, each in an environment of their
+  own and with as many terminals as they like. They share the task's files, so
+  coordinate with each other the way you would on any shared checkout. Your
+  environment lasts until you exit every shell, the task ends, or you leave the
+  team. Project restarts preserve it, including when it was stopped.
 
 ## Related
 

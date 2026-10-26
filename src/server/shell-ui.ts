@@ -39,7 +39,7 @@ export type ShellAvailability =
 
 /**
  * Render the Shell button and its (hidden) terminal panel for a task. When the
- * shell is unavailable the button is disabled and its reason is shown, so the
+ * shell is unavailable the button explains its refusal on click, so the
  * reviewer learns WHY (container not running, host-process runner) rather than
  * finding a dead button.
  *
@@ -61,7 +61,7 @@ export function shellPanelHtml(taskId: string, avail: ShellAvailability, opts: {
   if (!avail.available) {
     return (
       `<div class="lz-shell" data-lz-shell-task="${escapeHtml(taskId)}">` +
-      `<button type="button" class="btn" disabled title="${escapeHtml(avail.reason)}">Shell</button>` +
+      `<button type="button" class="btn" data-control-refusal="${escapeHtml(avail.reason)}">Shell</button>` +
       `<span class="text-muted lz-shell-reason">${escapeHtml(avail.reason)}</span>` +
       `</div>`
     );
@@ -86,8 +86,8 @@ export function shellPanelHtml(taskId: string, avail: ShellAvailability, opts: {
 
 /**
  * The Shell tab body: an index of this document's sessions (not a second
- * terminal), Pair/Chat origins, and the one-line warning that sessions die
- * on reload — there is no server-side registry.
+ * terminal), Pair/Chat origins, and the one line saying that a shell outlives
+ * its terminal (it is the container's tmux session).
  */
 export function shellTabHtml(input: {
   taskId: string;
@@ -96,22 +96,23 @@ export function shellTabHtml(input: {
 }): string {
   const code = escapeHtml(input.taskCode);
   const persistNote =
-    `<p class="rv-hint">Sessions close when you reload or leave the page. ` +
-    `There is no server-side registry — <code>lazy shell ${code}</code> survives a reload.</p>`;
+    `<p class="rv-hint">Closing a terminal, reloading or leaving the page detaches from its shell; ` +
+    `the shell keeps running in the container (when its image has tmux). + New, or ` +
+    `<code>lazy shell ${code}</code>, takes you back to it.</p>`;
   const reason = input.avail.available ? null : input.avail.reason;
-  const disabled = reason ? ' disabled' : '';
+  const refusal = reason ? ` data-control-refusal="${escapeHtml(reason)}"` : '';
   const pairTitle = reason
     ?? 'You drive the agent\'s session. The task is locked until you stop.';
   const chatTitle = reason
     ?? 'Talk to the agent about the task without taking over its session. Turns wait while it is open; the task\'s model is unchanged.';
   const newTitle = reason ?? 'Open a new shell in this task\'s container';
-  // The tab is always an index — New / Pair / Chat disable with the same
+  // The tab is always an index — New / Pair / Chat explain the same
   // reason when no container can be entered, rather than disappearing.
   const actions =
     `<div class="lz-shell-tab-actions">` +
-    `<button type="button" class="btn" data-lz-shell-mode="shell"${disabled} title="${escapeHtml(newTitle)}">+ New</button>` +
-    `<button type="button" class="btn" data-lz-shell-mode="pair"${disabled} title="${escapeHtml(pairTitle)}">Pair</button>` +
-    `<button type="button" class="btn" data-lz-shell-mode="chat"${disabled} title="${escapeHtml(chatTitle)}">Chat</button>` +
+    `<button type="button" class="btn" data-lz-shell-mode="shell"${refusal} title="${escapeHtml(newTitle)}">+ New</button>` +
+    `<button type="button" class="btn" data-lz-shell-mode="pair"${refusal} title="${escapeHtml(pairTitle)}">Pair</button>` +
+    `<button type="button" class="btn" data-lz-shell-mode="chat"${refusal} title="${escapeHtml(chatTitle)}">Chat</button>` +
     `</div>` +
     `<p class="rv-hint">Pair takes over the agent's session and locks the task until you stop. ` +
     `Chat is a read-only conversation — it does not lock the task or change its model. ` +
@@ -207,13 +208,17 @@ ${TERMINAL_RECONNECT_JS}
     const openBtn = root.querySelector('[data-lz-shell-open]');
     const closeBtn = root.querySelector('[data-lz-shell-close]');
     const newTabBtn = root.querySelector('[data-lz-shell-newtab]');
-    // The unavailable variant is a disabled button and a reason — same root
+    // The unavailable variant is a clickable refusal — same root
     // class, nothing to wire. Bail rather than throw on the missing panel.
     if (!panel || !openBtn || !sessionsEl) return;
 
     const sessions = [];
     let active = null;
     let seq = 0;
+    // Plain shells opened here, for their tmux session names: the first is the
+    // container's "shell" session, the next "shell-2", … (a Run gets its own
+    // "run-<n>"), so two terminals are two sessions, not one mirrored twice.
+    let plainShells = 0;
 
     // The status line and Reconnect belong to whichever tab is in front.
     function refreshStatus() {
@@ -528,6 +533,8 @@ ${TERMINAL_RECONNECT_JS}
           return true;
         });
         s.term.onData((d) => {
+          // A read-only Attach sends nothing typed (tmux's attach -r ignores it too).
+          if (s.attach && s.attach.readonly) return;
           if (s.ws && s.ws.readyState === WebSocket.OPEN) s.ws.send(new TextEncoder().encode(d));
         });
         s.ro = new ResizeObserver(() => sendResize(s));
@@ -577,6 +584,12 @@ ${TERMINAL_RECONNECT_JS}
         : proto + '//' + location.host + '/tasks/' + taskId +
           '/shell/ws?cols=' + cols + '&rows=' + rows;
       if (s.mode && s.mode !== 'shell') url += '&mode=' + encodeURIComponent(s.mode);
+      if (s.tmuxSession) url += '&session=' + encodeURIComponent(s.tmuxSession);
+      // A named session in the task's container (the Services tab's Attach /
+      // Take control): its own query, never mixed with mode or session.
+      if (s.attach) {
+        url = url.replace(/&(mode|session)=[^&]*/g, '') + '&tmux=' + encodeURIComponent(s.attach.name) + (s.attach.readonly ? '&readonly=1' : '');
+      }
       if (s.resume) url += '&resume=' + encodeURIComponent(s.resume) + '&offset=' + s.drawn;
       const ws = new WebSocket(url);
       s.ws = ws;
@@ -738,8 +751,14 @@ ${TERMINAL_RECONNECT_JS}
     function openSession(label, run, opts) {
       opts = opts || {};
       seq++;
+      let tmuxSession = null;
+      if (!opts.attach && (!opts.mode || opts.mode === 'shell')) {
+        if (run) tmuxSession = 'run-' + seq;
+        else { plainShells++; tmuxSession = plainShells > 1 ? 'shell-' + plainShells : null; }
+      }
       const s = {
         id: 's' + seq,
+        tmuxSession: tmuxSession,
         label: label || ('Shell ' + seq),
         run: run || null,
         ran: false,
@@ -753,6 +772,7 @@ ${TERMINAL_RECONNECT_JS}
         mount: opts.mount || null,
         origin: opts.origin || (opts.mount ? 'Verification' : 'here'),
         mode: opts.mode || 'shell',
+        attach: opts.attach || null,
       };
 
       const tab = document.createElement('span');
@@ -859,7 +879,7 @@ ${TERMINAL_RECONNECT_JS}
         if (live && opts.rerun) closeSession(live);
         else if (live && (live.connected || live.ws)) return 'live';
         else if (live) closeSession(live);
-        openSession(label, text, { mount: opts.mount, origin: opts.origin, mode: opts.mode });
+        openSession(label, text, { mount: opts.mount, origin: opts.origin, mode: opts.mode, attach: opts.attach });
         return true;
       }
       setOpen(true);
@@ -925,6 +945,24 @@ ${TERMINAL_RECONNECT_JS}
     if (cmd && root.__lzShellRun) {
       root.__lzShellRun(cmd.replace(/\\n+$/, '') + '\\n', label, { mount: mount || undefined, origin: 'Services' });
     }
+  });
+
+  // Attach / Take control on the Services tab's sessions (task-sessions-panel.ts):
+  // a terminal on a named session, mounted in place under it. Pressing either
+  // again replaces the open one, so switching to Take control is one click.
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest ? ev.target.closest('[data-lz-shell-attach]') : null;
+    if (!btn) return;
+    const taskId = btn.getAttribute('data-lz-shell-for');
+    const root = document.querySelector('.lz-shell[data-lz-shell-task="' + (window.CSS && CSS.escape ? CSS.escape(taskId) : taskId) + '"]');
+    if (!root) return;
+    wire(root);
+    const step = btn.closest('[data-lz-shell-step]');
+    const mount = step ? step.querySelector('[data-lz-shell-mount]') : null;
+    const name = btn.getAttribute('data-lz-shell-attach');
+    const readonly = btn.getAttribute('data-lz-shell-readonly') === '1';
+    if (!mount || !name || !root.__lzShellRun) return;
+    root.__lzShellRun('', (readonly ? 'Attach ' : 'Control ') + name, { mount: mount, origin: 'Services', rerun: true, attach: { name: name, readonly: readonly } });
   });
 
   document.addEventListener('click', (ev) => {

@@ -4,6 +4,7 @@
  * Server-rendered HTML with inline CSS. No frontend build step needed.
  */
 
+import { controlRefusalScript } from './control-refusal';
 import { REVIEW_GATE_INPUTS, REVIEW_MODE_INPUTS, REVIEW_TOGGLE_INPUTS } from '../review/mode';
 import type { Task, Session, Turn, Commit, Comment, JournalEntry, RaisedItem, SearchResult, TaskPromptVersion } from '../storage';
 import { escapeHtml, scriptJson } from './escape';
@@ -463,7 +464,8 @@ export function layoutCloseHtml(options?: { mermaid?: boolean }): string {
   // Relative times are rendered once, on the server, and these pages stay open
   // for hours — so every page frame carries the island that keeps them honest.
   // Global for the same reason the palette is: no page should have to remember.
-  return `  ${commandPaletteChromeHtml()}
+  return `  ${controlRefusalScript()}
+  ${commandPaletteChromeHtml()}
   ${navBadgeScript()}
   ${navProgressScript()}
   ${modifierKeyScript()}

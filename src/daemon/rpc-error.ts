@@ -33,7 +33,7 @@
  *   (src/daemon/commit-run-checkout.ts). The client shows `details.dirtyFiles`
  *   and asks again with `confirmDiscard: true`.
  */
-export type RpcErrorCode = 'task_busy' | 'usage_paused' | 'runner_image_not_ready' | 'run_checkout_dirty';
+export type RpcErrorCode = 'task_busy' | 'usage_paused' | 'runner_image_not_ready' | 'run_checkout_dirty' | 'image_build_running' | 'image_build_disk_hold';
 
 export class RpcError extends Error {
   /**

@@ -29,6 +29,10 @@ import {
   shortMessageId,
 } from '../../src/messages';
 import type { Task } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('system messages', () => {
   let testDir: string;
@@ -45,7 +49,7 @@ describe('system messages', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     task = await storage.createTask('Report task', undefined, undefined, 'weekly-report');
   });
 
@@ -224,7 +228,7 @@ describe('system messages', () => {
   test('messages survive a fresh storage instance', async () => {
     const created = await storage.createSystemMessage({ source: 'daemon', title: 'T', body: 'b', kind: 'notice' });
     await storage.close();
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
 
     expect((await storage.getSystemMessage(created.id))!.title).toBe('T');
   });

@@ -71,11 +71,17 @@ describe('signal shutdown budget', () => {
   // `docker kill` (immediate, the default) to `docker stop --time <n>`, so
   // passing it unconditionally makes production's runner spend wall clock
   // inside a budget that was sized assuming it would not.
+  //
+  // Since a daemon restart stops only the AGENT in a task container (design
+  // docs/design/task-sessions-and-ssh.md §2, approved 2026-10-21), the sweep
+  // goes through stopTaskAgent: the in-container agent stop is bounded by
+  // SHUTDOWN_STOP_GRACE_SECONDS, and the whole-run fallback is still given
+  // shutdownStopOpts — so Docker's fallback stays its immediate `docker kill`.
   test('the shutdown sweep leaves the Docker runner on its own default stop', async () => {
     const server = await readFile(join(repoRoot, 'src', 'daemon', 'server.ts'), 'utf-8');
     expect(server).toContain(
       "const shutdownStopOpts = runner.type === 'dangerously-host-process-without-any-isolation'",
     );
-    expect(server).toContain('await runner.stopRun(runName, shutdownStopOpts)');
+    expect(server).toContain('await stopTaskAgent(runner, runName, { gracefulTimeoutSeconds: SHUTDOWN_STOP_GRACE_SECONDS, fallback: shutdownStopOpts ?? null })');
   });
 });

@@ -79,8 +79,11 @@ describe('the wrapper adopts what it cannot write', () => {
       '/home/user/.claude.json', '/home/user/.claude', '/home/user/.pi', '/home/user/.codex', '/home/user/.cursor',
     ]);
     const script = buildSupervisorWrapperScript('/lazy-protocol/abc', '/repo/.lazy/worktrees/t', paths);
-    expect(script).toContain('find "$p" ! -writable -print -quit');
-    expect(script).toContain('sudo -n chown -R "$(id -u):$(id -g)" "$p"');
+    // INVARIANT: adopt takes back only ROOT-owned entries and never recurses
+    // blindly — a service's own data dir (postgres, redis) keeps its owner.
+    expect(script).toContain('-uid 0 ! -writable -print -quit');
+    expect(script).toContain('-uid 0 -exec chown -h "$(id -u):$(id -g)" {} +');
+    expect(script).not.toContain('chown -R');
     expect(script.indexOf('adopt "/lazy-protocol/abc" "/repo/.lazy/worktrees/t"')).toBeLessThan(script.indexOf('lazy-agent --one-shot'));
   });
 

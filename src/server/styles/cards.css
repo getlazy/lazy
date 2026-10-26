@@ -160,3 +160,15 @@
 }
 .md-copy:hover, .md-copy:focus-visible { border-color: color-mix(in srgb, var(--color-text) 40%, transparent); }
 .md-copy-bad { color: var(--color-danger); border-color: var(--color-danger); }
+
+/* The Services tab's Sessions panel (task-sessions-panel.ts): the task
+   container's tmux sessions, each with its screen, log and terminals. */
+.lz-presence { margin: 0 0 var(--space-3); }
+.lz-presence h4 { margin: 0 0 var(--space-1); }
+.lz-presence ul { margin: 0; padding-left: var(--space-4, 1rem); }
+.lz-sessions-list { border-collapse: collapse; margin: var(--space-2) 0 var(--space-3); }
+.lz-sessions-list th, .lz-sessions-list td { text-align: left; padding: var(--space-1) var(--space-3) var(--space-1) 0; vertical-align: top; }
+.lz-session { margin: var(--space-3) 0 0; padding-top: var(--space-3); border-top: 1px solid var(--border, #e5e5e5); }
+.lz-session h4 { margin: 0 0 var(--space-2); }
+.lz-session-screen { max-height: 20rem; overflow: auto; margin: 0 0 var(--space-2); padding: var(--space-2); border: 1px solid var(--border, #e5e5e5); white-space: pre-wrap; word-break: break-word; }
+.lz-session-attach { display: flex; gap: var(--space-2); flex-wrap: wrap; margin: var(--space-2) 0 0; }

@@ -229,7 +229,7 @@ describe('currentReviewHtml', () => {
     expect(script).toContain("st.status === 'working' || st.status === 'pairing'");
   });
 
-  test('reenableable disabled Unblock keeps data-lz-action-open for a live flip', () => {
+  test('refused Unblock keeps its action hook and explains a click', () => {
     const html = actionDialogButtonHtml({
       verb: 'unblock',
       label: 'Unblock',
@@ -239,7 +239,8 @@ describe('currentReviewHtml', () => {
     });
     expect(html).toContain('data-lz-action-open="unblock"');
     expect(html).toContain('data-rv-busy-gate');
-    expect(html).toContain('disabled');
+    expect(html).toContain('data-control-refusal');
+    expect(html).not.toMatch(/<button[^>]*\sdisabled/);
     expect(html).toContain('wait for it to finish');
   });
 

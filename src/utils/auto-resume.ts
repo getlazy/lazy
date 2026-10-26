@@ -1,3 +1,4 @@
+import { refreshEnvironmentReplacedCommand } from '../daemon/environment-replaced-command';
 /**
  * Auto-resume logic for interrupted tasks.
  *
@@ -6,6 +7,7 @@
  * launch supervisor container, update session state.
  */
 
+import { keptRunNote, reuseOrStartTaskRun } from '../runner/start-or-recreate';
 import { shouldLogImageHold, runnerImageHold, mustRecreateForRunnerImage } from '../daemon/runner-image-choice';
 import { pathExists } from './fs';
 import { setupSandbox } from './sandbox';
@@ -37,13 +39,12 @@ import { takeTaskAllowanceAtLaunch, usagePauseHold } from '../daemon/usage-pause
 import { hasDaemonContext } from '../daemon/context';
 import { findPendingFeedback, buildFeedbackRedeliveryPrompt } from './feedback-redelivery';
 import { isTurnInFlight } from '../daemon/in-flight-turn';
-import { memberInsideTask } from '../server/member-terminals';
 import { withTaskLifecycleLock } from '../daemon/task-lifecycle-lock';
 import { supervisorStillOwnsTurn } from '../daemon/supervisor-handback';
 import { buildAgentSwitchHandoffContext } from '../agent/switch-handoff';
 import { rediscoverSessionIdForHarness } from '../agent/session-discovery';
 import { typeConstraintsSection } from '../task/type-constraints';
-import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
+import { recordContainerBeforeLaunch, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { buildTurnHistoryContext } from '../task/turn-context';
 import { systemActor } from '../identity/system-identity';
 
@@ -113,17 +114,6 @@ export async function autoResumeTask(
   // through here, so this is the one place that has to say it.
   if (await isTurnInFlight(storage, task.id)) {
     logger.debug(`Auto-resume ${taskShortId}: a synchronous daemon turn is in flight for this task, skipping`);
-    return false;
-  }
-
-  // A member has a terminal open on the task (a Teams Shell, Pair or Chat): no
-  // turn starts underneath them. Checked here, before anything is written, so
-  // a pass that finds them still there leaves no trace; the launch below
-  // re-checks under the lifecycle lock (refuseLaunchWhileMemberInside), which
-  // is the authority.
-  const memberInside = memberInsideTask(task.id);
-  if (memberInside) {
-    logger.debug(`Auto-resume ${taskShortId}: ${memberInside} has a terminal open on this task, skipping`);
     return false;
   }
 
@@ -328,17 +318,11 @@ export async function autoResumeTask(
     });
 
     // UNDER THE TASK'S LIFECYCLE LOCK, like every launch path, and the notice
-    // turn with it: a member's entry into this task (src/daemon/member-entry.ts)
-    // takes the same lock, so either this launch sees the member inside and refuses
-    // BEFORE writing anything
-    // (refuseLaunchWhileMemberInside, inside mustRecreateForCredentialPlan), or the entry sees
-    // this task `working` and is refused — never a member working in the
-    // worktree while a turn runs on it.
+    // turn with it.
     const mustRecreateForCredential = await withTaskLifecycleLock(task.id, async () => {
       const recreate = await mustRecreateForCredentialPlan(lazyRoot, task.id, credentialPlan);
-      // The notice is written only once the member check above has passed,
-      // in the same lock: a member entering between the two would otherwise
-      // leave a notice for a resume refused a moment later.
+      // The notice is written only once the credential plan above has passed,
+      // in the same lock.
       // Record synthetic human turn for the auto-resume.
       //
       // NOBODY ASKED FOR THIS TURN — the reconciler noticed a stranded one and
@@ -381,13 +365,13 @@ export async function autoResumeTask(
     if (mustRecreateForEnv) logger.info('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
     // See src/task/environment-replaced.ts: a replaced container is told to the
     // turn that runs in its successor.
-    await recordRecreationIfRunning(
+    await recordContainerBeforeLaunch(
       storage,
       task.id,
       recreationReason(mustRecreateForCredential, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)),
       runner, containerName,
     );
-    const envNotice = await environmentReplacedPrefix(storage, task.id);
+    let envNotice = await environmentReplacedPrefix(storage, task.id);
     if (mustRecreateForAgent) {
       logger.info(
         `Auto-resume ${taskShortId}: recreating container — agent changed ` +
@@ -492,7 +476,7 @@ export async function autoResumeTask(
         config,
       })),
       ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
-      ...commonCommandFields(config),
+      ...commonCommandFields(config, { runner: runner.type }),
     };
     // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
     await deliverTaskFilesForLaunch(lazyRoot, task.id, worktreePath);
@@ -505,10 +489,12 @@ export async function autoResumeTask(
     }
 
     // Check if supervisor is already running
-    if (!mustRecreateForCredential && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
-      logger.debug(`Auto-resume ${taskShortId}: supervisor already running, command written`);
+    const kept = await reuseOrStartTaskRun(runner, storage, session, containerName, mustRecreateForCredential || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForRunnerImage(task), task.agent_id);
+    if (kept) {
+      logger.debug(`Auto-resume ${taskShortId}: ${keptRunNote(kept, containerName)}, command written`);
     } else {
       await removeTaskRun(runner, storage, session, containerName);
+      envNotice = await refreshEnvironmentReplacedCommand(storage, protoDir, unblockCommand, envNotice);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath, tRef, task.id, launchImagePin(task));

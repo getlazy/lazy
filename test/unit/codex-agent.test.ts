@@ -356,17 +356,19 @@ describe('CodexAgent', () => {
       expect(event?.toolName).toBe('lazy.lazy_status');
     });
 
-    test('reasoning and message items, turn.started, and in-stream errors are progress', () => {
+    test('reasoning and messages advance work; reconnect errors only report liveness', () => {
       const stream = new CodexActivityStream();
       expect(stream.parseLine(TURN_STARTED)?.kind).toBe('progress');
-      expect(stream.parseLine(RECONNECT_ERROR)?.kind).toBe('progress');
+      expect(stream.parseLine(RECONNECT_ERROR)?.kind).toBe('heartbeat');
+      expect(stream.parseLine(RECONNECT_ERROR)?.failureMessage).toBeTruthy();
       expect(stream.parseLine('{"type":"item.completed","item":{"id":"i","type":"reasoning","text":"…"}}')?.kind).toBe('progress');
       expect(stream.parseLine(AGENT_MESSAGE)?.kind).toBe('progress');
     });
 
     test('turn.failed does NOT emit result (no summary to protect)', () => {
       const stream = new CodexActivityStream();
-      expect(stream.parseLine(TURN_FAILED)?.kind).toBe('progress');
+      expect(stream.parseLine(TURN_FAILED)?.kind).toBe('heartbeat');
+      expect(stream.parseLine(TURN_FAILED)?.failureMessage).toBeTruthy();
     });
 
     test('malformed and non-JSON lines are null, never a throw', () => {

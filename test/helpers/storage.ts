@@ -13,6 +13,7 @@
  */
 
 import { join } from 'path';
+import type { CreateStorageOptions } from '../../src/storage';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'fs';
 
 /**
@@ -312,4 +313,9 @@ export function readProjectSettingsFile(root: string): Record<string, unknown> |
   const path = join(storageDirFor(root), 'project-settings.json');
   if (!existsSync(path)) return null;
   return readJson<Record<string, unknown>>(path);
+}
+
+/** A temporary fixture owns its store; never write to the real HOME default. */
+export function testStorageOptions(root: string): CreateStorageOptions {
+  return { backend: 'external', externalPath: join(root, '.lazy', 'test-store') };
 }

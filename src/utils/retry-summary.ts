@@ -58,6 +58,8 @@ export function formatErrorSnippet(message: string, max: number = RETRY_SNIPPET_
 /** The retry fields any surface needs to render a summary. */
 export interface RetrySummaryInput {
   retryCount?: number;
+  retry_next_at?: string;
+  retry_recovery_deadline?: string;
   errors?: RetryError[];
   retry_failure_class?: AgentFailureClass;
 }
@@ -77,6 +79,10 @@ export function formatRetrySummary(
   let summary = `attempt ${status.retryCount}`;
   if (status.retry_failure_class) {
     summary += ` (${status.retry_failure_class})`;
+  }
+  if (status.retry_recovery_deadline) {
+    summary += status.retry_next_at ? `; next retry at ${status.retry_next_at}` : '; waiting for model recovery';
+    summary += `; recovery deadline ${status.retry_recovery_deadline}`;
   }
   const latest = latestRetryError(status.errors);
   if (latest) {

@@ -14,6 +14,7 @@ import {
   decideRetry,
   decideWatchdogRetry,
   appliesFastFailDetection,
+  TRANSIENT_MAX_ATTEMPTS,
   TRANSIENT_BACKOFF_MS,
   TRANSIENT_BACKOFF_CAP_MS,
   UNREACHABLE_MAX_ATTEMPTS,
@@ -40,14 +41,14 @@ describe('decideRetry — fatal classes stop immediately', () => {
 
 describe('decideRetry — transient classes retry on a tight ladder', () => {
   test('overload starts at 5s and caps at 60s', () => {
-    const delays = [1, 2, 3, 4, 5, 6, 20].map(a => {
+    const delays = [1, 2, 3, 4, 5].map(a => {
       const d = decideRetry(f('transient_overload'), a);
       if (d.action !== 'retry') throw new Error(`expected retry at attempt ${a}`);
       return d.delayMs;
     });
     expect(delays.slice(0, 4)).toEqual(TRANSIENT_BACKOFF_MS);
     expect(delays[4]).toBe(TRANSIENT_BACKOFF_CAP_MS);
-    expect(delays[6]).toBe(TRANSIENT_BACKOFF_CAP_MS);
+
   });
 
   test('network uses the same ladder', () => {
@@ -55,10 +56,10 @@ describe('decideRetry — transient classes retry on a tight ladder', () => {
     expect(d).toEqual({ action: 'retry', delayMs: 5_000, reason: 'transient_network: transient_network reason' });
   });
 
-  test('overload and network never stop, however many attempts', () => {
-    // A rate limit must not need a human to un-stick the task.
-    expect(decideRetry(f('transient_overload'), 500).action).toBe('retry');
-    expect(decideRetry(f('transient_network'), 500).action).toBe('retry');
+  test('overload and network end the turn after bounded attempts', () => {
+    // INVARIANT: persistent transient errors end the turn so auto-resume can act.
+    expect(decideRetry(f('transient_overload'), TRANSIENT_MAX_ATTEMPTS).action).toBe('stop');
+    expect(decideRetry(f('transient_network'), TRANSIENT_MAX_ATTEMPTS).action).toBe('stop');
   });
 
   // Regression bound: the old ladder was 30s/60s/120s/240s/300s. The first two

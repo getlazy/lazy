@@ -3,7 +3,9 @@
 
 FROM debian:bookworm-slim
 
-# System deps: git, curl, jq, and basic dev utilities
+# System deps: git, curl, jq, and basic dev utilities. tmux: a task's services and
+# long-running commands run in named tmux sessions in its container, which
+# survive daemon restarts and can be watched or attached to.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -12,9 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     less \
     openssh-client \
+    openssh-server \
     unzip \
     wget \
     sudo \
+    tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Headless browser, for screenshots.
@@ -36,6 +40,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     && rm -rf /var/lib/apt/lists/*
 ENV CHROME_BIN=/usr/bin/chromium
+
+# SSH into a task (`lazy shell <task> --ssh-config`): lazy starts `sshd -i`
+# per connection over the container runtime's own exec — nothing listens and
+# no port is published, so the package's own service and host keys are unused.
+RUN rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
 # Non-root user with sudo — passes Claude Code's root check while allowing tool installs
 RUN useradd --create-home --shell /bin/bash user \

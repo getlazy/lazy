@@ -43,6 +43,7 @@ import { taskPathSegment, duplicateTaskCodes } from './task-urls';
 import { DASHBOARD_COOKIE_NAME } from '../daemon/dashboard-auth';
 import type { UpgradeOutcome, WebSocketUpgrader } from './ws';
 import { logger } from '../utils/logger';
+import { resolveProjectStartServicesCmd } from '../serve/start-cmd';
 import { forwardableBody } from '../utils/forward-body';
 
 /**
@@ -420,14 +421,26 @@ function downText(reason: ServeNoticeReason | 'unknown-task', service: string, t
  * not start containers, does not run `start_services_cmd`, and must not grow a
  * "while we're here" that does.
  */
-function downResponse(
+async function downResponse(
+  deps: ServeProxyDeps,
   req: Request,
   dashboardOrigin: string,
   service: string,
   task: string,
   target: Extract<ProxyTarget, { ok: false }>,
-): Response {
+): Promise<Response> {
   if (target.reason !== 'unknown-task' && target.taskId && isNavigationRequest(req)) {
+    if (!target.page && target.seg && (target.reason === 'not-running' || target.reason === 'not-listening' || target.reason === 'not-published')) {
+      const command = await resolveProjectStartServicesCmd(await deps.getStorage(), deps.root);
+      if (command) {
+        const asked = new URL(req.url);
+        const query = new URLSearchParams({ return_to: asked.pathname + asked.search });
+        return new Response(null, { status: 302, headers: {
+          Location: `${dashboardOrigin}/tasks/${target.seg}/services/open/${encodeURIComponent(service)}?${query}`,
+          'Cache-Control': 'no-store',
+        } });
+      }
+    }
     return new Response(null, {
       status: 302,
       headers: {
@@ -496,7 +509,7 @@ export function createServeProxy(deps: ServeProxyDeps) {
       });
     }
 
-    if (!target.ok) return downResponse(req, dashboardOrigin, ref.service, ref.task, target);
+    if (!target.ok) return await downResponse(deps, req, dashboardOrigin, ref.service, ref.task, target);
 
     const url = new URL(req.url);
     const upstreamUrl = `http://${bracket(target.hostAddress)}:${target.hostPort}${url.pathname}${url.search}`;
@@ -543,7 +556,7 @@ export function createServeProxy(deps: ServeProxyDeps) {
         return new Response(null, { status: 499 });
       }
       logger.debug(`serve proxy: ${ref.task}.${ref.service} -> ${upstreamUrl} failed: ${errText(err)}`);
-      return downResponse(req, dashboardOrigin, ref.service, ref.task, {
+      return await downResponse(deps, req, dashboardOrigin, ref.service, ref.task, {
         ok: false,
         taskId: target.taskId,
         seg: target.seg,

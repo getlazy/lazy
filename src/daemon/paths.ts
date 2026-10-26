@@ -84,6 +84,19 @@ export const TASK_FILES_FILE = 'task-files.json';
  */
 export const USER_CREDENTIALS_FILE = 'user-credentials.json';
 /**
+ * The forge token Lazy Teams last pushed to a managed daemon
+ * (src/daemon/forge-credential.ts). Same placement rule as USER_CREDENTIALS_FILE:
+ * a real credential, so never under the project root a container mounts.
+ */
+export const FORGE_CREDENTIAL_FILE = 'forge-credential.json';
+/**
+ * Written by a daemon started in managed mode (Lazy Teams). Its presence tells
+ * the CLI that this daemon belongs to Teams, so a `lazy daemon start/restart`
+ * from a shell without the fleet's environment is refused rather than starting
+ * a daemon that has lost its credentials and managed settings.
+ */
+export const MANAGED_DAEMON_MARKER = 'managed-daemon';
+/**
  * Session-bound placeholder tokens handed to containers in place of a real
  * credential. See src/daemon/session-credentials.ts. Lives beside the real
  * credentials for the same reason: only the daemon may map one to the other.
@@ -197,6 +210,16 @@ export function getTaskFilesPath(projectRoot: string): string {
 /** Per-user real credential store: ~/.lazy/daemon/<slug>/user-credentials.json */
 export function getUserCredentialsPath(projectRoot: string): string {
   return join(getDaemonDir(projectRoot), USER_CREDENTIALS_FILE);
+}
+
+/** The forge token Teams last pushed: ~/.lazy/daemon/<slug>/forge-credential.json */
+export function getForgeCredentialPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), FORGE_CREDENTIAL_FILE);
+}
+
+/** Marker of a daemon Lazy Teams manages: ~/.lazy/daemon/<slug>/managed-daemon */
+export function getManagedDaemonMarkerPath(projectRoot: string): string {
+  return join(getDaemonDir(projectRoot), MANAGED_DAEMON_MARKER);
 }
 
 /** Credential-store secrets (file backend): ~/.lazy/daemon/<slug>/credentials.json */

@@ -1,11 +1,13 @@
 /**
- * INVARIANT: every turn launch checks for a member inside the task
- * (`refuseLaunchWhileMemberInside`, reached through
- * `mustRecreateForCredentialPlan` / `prepareTurnLaunch`) and flips the task to
- * `working` INSIDE `withTaskLifecycleLock`. A member's entry
- * (src/daemon/member-entry.ts) takes the same lock; a launch path outside it
- * could pass the check just before a member got in, and run a turn on the
- * worktree underneath them.
+ * INVARIANT: every turn launch decides its credential and container
+ * (`mustRecreateForCredentialPlan` / `prepareTurnLaunch`) and flips the task
+ * to `working` INSIDE `withTaskLifecycleLock`, the lock every other lifecycle
+ * change (accept, reject, close, sync) takes, so no two of them interleave.
+ *
+ * It used to also carry a check for a member inside the task; that check is
+ * RETIRED (engineer, 2026-10-21): a member's sessions and a turn never block
+ * each other, exactly like solo `lazy shell <task>`. The last test below
+ * keeps it from coming back.
  *
  * A source scan, because the property is WHERE a call sits: every
  * `prepareTurnLaunch(` / `mustRecreateForCredentialPlan(` call in the launch
@@ -62,8 +64,7 @@ describe('turn launches decide their container under the lifecycle lock', () => 
     ['src/daemon/task-lifecycle.ts', 'prepareTurnLaunch\\('],
     ['src/utils/auto-resume.ts', 'mustRecreateForCredentialPlan\\('],
     ['src/daemon/auto-deliver.ts', 'mustRecreateForCredentialPlan\\('],
-    // The start path: its member check and its flip to `working`.
-    ['src/daemon/task-launcher.ts', 'refuseLaunchWhileMemberInside\\('],
+    // The start path: its flip to `working`.
     ['src/daemon/task-launcher.ts', "storage\\.updateTaskStatus\\(t\\.id, 'working'"],
   ] as const) {
     test(`${file}: every /${callee}/ is inside withTaskLifecycleLock`, async () => {
@@ -74,51 +75,28 @@ describe('turn launches decide their container under the lifecycle lock', () => 
   }
 });
 
-// INVARIANT: a launch refused because a member has a terminal open on the task
-// is refused BEFORE it records a turn. A human turn written ahead of the
-// refusal is half-dispatched: the task stays paused, and the redelivery path
-// later hands its text to the agent as unconsumed feedback. The human's words
-// are kept by the surface that sent them (recovery file, review draft, Teams'
-// ask record) until a delivery succeeds.
-describe('a launch refuses a member-occupied task before it records anything', () => {
-  for (const [label, anchor] of [
-    ['unblock', 'while the unblock was being prepared'],
-    ['ask', 'assertAskableStatus(task, fresh.status);'],
-    ['review', 'assertReviewableStatus(task, fresh.status);'],
-    ['manual resume', '// --- Persist state BEFORE launch ---\n    // The resume notice'],
-  ] as const) {
-    test(`${label}: assertNoMemberInside precedes its first turn write`, async () => {
-      const src = await readFile(join(ROOT, 'src/daemon/task-lifecycle.ts'), 'utf-8');
-      const at = src.indexOf(anchor);
-      expect(at).toBeGreaterThan(-1);
-      const guard = src.indexOf('assertNoMemberInside(task.id)', at);
-      const writes = ['storage.createTurn(', 'claimSyncTurn(']
-        .map((w) => src.indexOf(w, at))
-        .filter((i) => i > -1);
-      expect(guard).toBeGreaterThan(-1);
-      expect(guard).toBeLessThan(Math.min(...writes));
-    });
-  }
-});
-
-// INVARIANT: a manual resume checks for a member and writes its notice turn
-// INSIDE the lifecycle lock, with the launch — a member's entry between the
-// check and the write would otherwise leave a notice for a resume refused
-// moments later.
-test("manual resume's member check and notice turn are inside the lifecycle lock", async () => {
+// INVARIANT: a manual resume writes its notice turn INSIDE the lifecycle
+// lock, with the launch — never a notice for a resume refused moments later.
+test("manual resume's notice turn is inside the lifecycle lock", async () => {
   const src = await readFile(join(ROOT, 'src/daemon/task-lifecycle.ts'), 'utf-8');
   const notice = src.indexOf("'[system] Session interrupted and resumed'");
-  const check = src.lastIndexOf('assertNoMemberInside(task.id)', notice);
   expect(notice).toBeGreaterThan(-1);
-  const ranges = lockedRanges(src);
-  for (const at of [notice, check]) {
-    expect(ranges.some(([a, b]) => at > a && at < b)).toBe(true);
+  expect(lockedRanges(src).some(([a, b]) => notice > a && notice < b)).toBe(true);
+});
+
+// INVARIANT (engineer, 2026-10-21): no launch path refuses a turn because a
+// member is inside the task. The guards that did are gone from every launch
+// module, and must not come back under another name in these files.
+test('no launch path consults the member hold', async () => {
+  for (const file of ['src/daemon/task-lifecycle.ts', 'src/daemon/task-launcher.ts', 'src/utils/auto-resume.ts', 'src/daemon/auto-deliver.ts', 'src/daemon/turn-credentials.ts', 'src/daemon/sync-retry.ts']) {
+    const src = await readFile(join(ROOT, file), 'utf-8');
+    expect(src).not.toMatch(/refuseLaunchWhileMemberInside|assertNoMemberInside|standDownForMember|queueIfMemberInside/);
   }
 });
 
 // INVARIANT: the daemon's own launches — auto-resume and auto-deliver — write
-// their synthetic turn INSIDE the lifecycle lock and AFTER the in-lock member
-// check (mustRecreateForCredentialPlan), as manual resume does. Written before
+// their synthetic turn INSIDE the lifecycle lock and AFTER the in-lock
+// credential plan (mustRecreateForCredentialPlan), as manual resume does. Written before
 // it, a launch the check refused left a notice for a resume that never
 // happened, or a feedback-carrying turn nobody dispatched that redelivery would
 // later hand the agent again.
@@ -126,7 +104,7 @@ for (const [file, marker] of [
   ['src/utils/auto-resume.ts', "'[system] Session interrupted and auto-resumed'"],
   ['src/daemon/auto-deliver.ts', 'content: `[system] ${neutralizeLazyMarkers(safeMessage)}`'],
 ] as const) {
-  test(`${file}: the synthetic turn is written inside the lock, after the member check`, async () => {
+  test(`${file}: the synthetic turn is written inside the lock, after the credential plan`, async () => {
     const src = await readFile(join(ROOT, file), 'utf-8');
     const turn = src.indexOf(marker);
     expect(turn).toBeGreaterThan(-1);

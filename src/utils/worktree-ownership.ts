@@ -25,18 +25,16 @@ import { stat } from 'fs/promises';
 import { spawn } from './spawn';
 import { resolveGitMountPaths } from '../capture/git-mounts';
 import { logger } from './logger';
+import { adoptChownArgv, adoptProbeArgv } from './adopt-rule';
 
 /**
- * `find` argv that chowns every entry under `paths` not owned by `uid` to
- * `uid:gid` (symlinks themselves, never their targets). Prefixed with
+ * `find` argv that chowns every ROOT-owned entry under `paths` to `uid:gid`
+ * (symlinks themselves, never their targets), never descending into a
+ * directory another user owns (src/utils/adopt-rule.ts). Prefixed with
  * `sudo -n` when the caller is not root.
  */
 export function realignOwnershipArgv(paths: string[], uid: number, gid: number, useSudo: boolean): string[] {
-  return [
-    ...(useSudo ? ['sudo', '-n'] : []),
-    'find', ...paths, '!', '-uid', String(uid),
-    '-exec', 'chown', '-h', `${uid}:${gid}`, '{}', '+',
-  ];
+  return adoptChownArgv(paths, uid, gid, useSudo);
 }
 
 /** Run the realignment. Throws with context when it fails. */
@@ -76,9 +74,9 @@ export async function realignAfterDaemonWrite(worktreePath: string): Promise<voi
   }
 }
 
-/** True when any entry under `paths` is owned by a uid other than `uid`. */
+/** True when any entry under `paths` is ROOT-owned (another user's dirs are pruned, never reported). */
 export async function hasForeignEntries(paths: string[], uid: number): Promise<boolean> {
-  const proc = spawn(['find', ...paths, '!', '-uid', String(uid), '-print', '-quit'], { stdout: 'pipe', stderr: 'ignore' });
+  const proc = spawn(adoptProbeArgv(paths, uid), { stdout: 'pipe', stderr: 'ignore' });
   const [, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
   return out.trim() !== '';
 }

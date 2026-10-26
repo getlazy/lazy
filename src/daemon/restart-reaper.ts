@@ -54,7 +54,12 @@
  *
  *  - **Task agents** are stopped with a grace period and moved to `interrupted`
  *    with an honest reason, which the reconciler auto-resumes (see
- *    `interruptForDaemonRestart` in src/utils/reconcile.ts).
+ *    `interruptForDaemonRestart` in src/utils/reconcile.ts). Only the AGENT
+ *    is stopped — its supervisor and what that started — never the task's
+ *    container: the services in its tmux sessions and everything else in it
+ *    keep running, and the resumed turn reuses it (src/runner/agent-stop.ts).
+ *    The resumed agent gets this daemon's proxy address from its command
+ *    (src/supervisor/proxy-address-env.ts).
  *  - **Builders** are NOT stopped here. They supervise themselves in-container
  *    (src/builder/continuity.ts) — same as pair/chat on the host
  *    (src/supervisor/interactive.ts). The in-container supervisor notices the
@@ -74,6 +79,7 @@ import { indexRunsByName } from '../runner/run-ownership';
 import type { Storage } from '../storage/interface';
 import { logger } from '../utils/logger';
 import { interruptForDaemonRestart } from '../utils/reconcile';
+import { stopTaskAgent } from '../runner/agent-stop';
 
 /**
  * Seconds a stopped child gets to shut down cleanly before the runner escalates.
@@ -243,7 +249,10 @@ export async function reapTaskAgents(
     const runName = entry.runName;
     try {
       logger.info(`Daemon restart: stopping task supervisor ${runner.runDisplayName(runName)}...`);
-      await runner.stopRun(runName, { gracefulTimeoutSeconds: RESTART_STOP_GRACE_SECONDS });
+      // The agent, never the container (src/runner/agent-stop.ts): the task's
+      // tmux sessions — its services — keep running across the restart.
+      const { ok } = await stopTaskAgent(runner, runName, { gracefulTimeoutSeconds: RESTART_STOP_GRACE_SECONDS });
+      if (!ok) logger.warn(`Daemon restart: supervisor ${runName} did not confirm it stopped.`);
       return entry;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

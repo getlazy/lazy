@@ -40,3 +40,10 @@ Variables are delivered to the task's agent and to its services (Run services) b
 When a file stops applying to a task (you untick or delete its entry), it is no longer written, but it is not deleted: it stays in the task's worktree, still kept out of every commit. The task's Environment section lists such files so you can remove them yourself if you no longer want them there.
 
 A variable that stops applying is unset at the next delivery; variables set with `lazy env set` are left alone. A change made to a task that has already ended is saved but not delivered. An entry added for one task alone can be removed but not edited: remove it and add it again.
+
+## Data directory
+
+A task's Services tab also shows its **data directory**: the path services
+should keep their data in (`$LAZY_TASK_DATA`, `/lazy/data`) and how much it
+holds. It survives the task's environment being recreated and is removed when
+the task is finished. See [the agent container](agent-container.md#keep-your-services-data-across-restarts-put-it-in-lazy_task_data).

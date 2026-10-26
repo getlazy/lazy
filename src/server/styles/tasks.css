@@ -145,3 +145,26 @@
 
 /* Usage-pause "Let its next turn through" / Clear: a button inline with its line. */
 .usage-pause-allow { display: inline; margin-left: 0.4em; }
+
+/* — Chat tab —
+   The person's words on the right, the agent's answers on the left; the box
+   to send the next message sits under the conversation. */
+.lz-chat-log { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-4); }
+.lz-chat-msg {
+  max-width: min(72ch, 88%);
+  border: 1px solid var(--color-divider);
+  border-radius: 8px;
+  padding: var(--space-2) var(--space-3);
+}
+.lz-chat-person { align-self: flex-end; background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.lz-chat-agent { align-self: flex-start; }
+.lz-chat-meta { font-size: 11px; color: color-mix(in srgb, var(--color-text) 55%, transparent); margin-bottom: var(--space-1); }
+.lz-chat-about { font-style: italic; }
+.lz-chat-person .lz-chat-body { white-space: pre-wrap; }
+.lz-chat-state { font-size: 12px; margin: var(--space-1) 0 0; color: color-mix(in srgb, var(--color-text) 60%, transparent); }
+.lz-chat-failed { color: var(--color-danger, #b42318); }
+.lz-chat-form { display: flex; flex-direction: column; gap: var(--space-2); }
+.lz-chat-form textarea { width: 100%; box-sizing: border-box; }
+.lz-chat-label { font-weight: 600; font-size: 13px; }
+.lz-chat-actions { display: flex; gap: var(--space-3); align-items: center; flex-wrap: wrap; }
+@media (max-width: 640px) { .lz-chat-msg { max-width: 100%; } }

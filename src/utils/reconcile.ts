@@ -10,7 +10,7 @@
  * Called automatically by list/blocked commands before displaying results.
  */
 
-import { recordRecreationIfRunning, recordRecreation } from '../task/environment-replaced';
+import { recordContainerBeforeLaunch, recordRecreation } from '../task/environment-replaced';
 import { shouldLogImageHold, runnerImageHold } from '../daemon/runner-image-choice';
 import { SUPERVISED_HEADINGS } from '../task/supervised-headings';
 import { announceUncommittedLeftBehind } from '../task/uncommitted-left-behind';
@@ -105,6 +105,7 @@ import { readAgentReportFromSessionLog } from '../import/recover-agent-report';
 import { ACTIVE_HARNESS_PHASES } from './working-substate';
 import { runRecordedSweep, RECONCILE_LOOP } from '../daemon/health-registry';
 import { supervisedTurnContent } from '../task/wrapper-fold';
+import { stopTaskAgent } from '../runner/agent-stop';
 import {
   isWatchdogKill,
   watchdogTurnLines,
@@ -392,6 +393,18 @@ export async function reconcileTasks(
       logger.warn(`Root Dockerfile.lazy notice failed: ${describe(err)}`);
     });
 
+    // Sweep 9d: the project's runner image follows its acting branch. An accept
+    // calls this itself; this tick also catches every other way the branch
+    // moves (a fast-forward, a manual pull, or origin's branch moving under
+    // the daemon's periodic fetch — a PR/MR merged on the forge). A few cheap rev-parses; a new tip
+    // starts a background rebuild from that commit (src/daemon/runner-image.ts).
+    await sweep('runner-image-advance', async () => {
+      const { noteActingBranchAdvance } = await import('../daemon/runner-image');
+      await noteActingBranchAdvance(lazyRoot);
+    }, (err) => {
+      logger.warn(`Runner image advance sweep failed: ${describe(err)}`);
+    });
+
     // Sweep 10: repair task worktrees whose git pointers (.git, commondir,
     // gitdir) or submodule git dirs were changed from what lazy created — within a tick, before a
     // human's own git in that worktree follows them. lazy's own git already
@@ -547,15 +560,23 @@ async function abandonPreviousGenerationClaim(
   try {
     const runner = await createRunner(lazyRoot, runnerType);
     const name = runName ?? session.container_name ?? runner.runNameForTask(taskRef(task));
+    // An ask runs in the task's own container, which also holds its services:
+    // stop the agent and keep the container (src/runner/agent-stop.ts). A
+    // review's container is its own and is removed, as before.
+    const workContainer = name === (session.container_name ?? runner.runNameForTask(taskRef(task)));
     if (await runner.isRunning(name)) {
-      await runner.stopRun(name, { gracefulTimeoutSeconds: PREVIOUS_GENERATION_STOP_GRACE_SECONDS });
-      stopped = true;
+      if (workContainer) {
+        stopped = (await stopTaskAgent(runner, name, { gracefulTimeoutSeconds: PREVIOUS_GENERATION_STOP_GRACE_SECONDS })).ok;
+      } else {
+        await runner.stopRun(name, { gracefulTimeoutSeconds: PREVIOUS_GENERATION_STOP_GRACE_SECONDS });
+        stopped = true;
+      }
     }
-    if (await runner.runExists(name)) {
+    if (!workContainer && await runner.runExists(name)) {
       if (record.owner === 'ask') {
         // Restart survival is handled separately; until then, do not erase
         // this shared environment's runtime evidence with the visiting claim.
-        await recordRecreationIfRunning(storage, task.id, 'the daemon restarted while an ask was running', runner, name);
+        await recordContainerBeforeLaunch(storage, task.id, 'the daemon restarted while an ask was running', runner, name);
       }
       await runner.removeRun(name);
     }
@@ -889,7 +910,7 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
   }
 
   if (await taskRunner.runExists(containerName)) {
-    await recordRecreationIfRunning(storage, task.id, null, taskRunner, containerName);
+    await recordContainerBeforeLaunch(storage, task.id, null, taskRunner, containerName);
   } else if (taskRunner.usesSandbox()) {
     await recordRecreation(storage, task.id, 'the previous environment disappeared; exit code, OOM status and exit time are unavailable');
   }
@@ -900,10 +921,11 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
   // response. Recover those to 'blocked' with commits backfilled instead of
   // interrupting — interrupting would re-run the agent and lose the completion.
   if (await recoverStrandedCompletion(storage, task, session, worktreePath, protoDir, lazyRoot)) {
-    await storage.updateSessionContainerName(session.id, null);
-    if (await taskRunner.runExists(containerName)) {
-      await taskRunner.removeRun(containerName);
-    }
+    // The stopped container is KEPT, not removed: the next launch starts it
+    // again with everything in it (src/runner/start-or-recreate.ts). Its
+    // recorded name and agent stamp stay, because it still exists: the stamp
+    // is what makes an agent switch recreate it, and the name is what the
+    // terminal-task sweep removes it by.
     return;
   }
 
@@ -928,9 +950,11 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
     }, lazyRoot);
     await storage.updateTaskStatus(taskId, 'interrupted', await systemActor(lazyRoot));
     await storage.recordInterrupt(session.id, { reason, exit_code: exitCode, logs });
-    await storage.updateSessionContainerName(session.id, null);
     clearStatus(protoDir);
-    await taskRunner.removeRun(containerName);
+    // The stopped container is KEPT: the resume starts it again in place
+    // (src/runner/start-or-recreate.ts) rather than discarding what was built
+    // or installed in it. A container that cannot be started is recreated.
+    // Its recorded name and agent stamp stay (see the stranded recovery above).
 
     // Auto-resume if circuit breaker allows
     await maybeAutoResume(storage, taskId, session.id, lazyRoot);
@@ -1036,14 +1060,9 @@ export async function interruptForDaemonRestart(
     return false;
   }
 
-  if (session.container_name) {
-    // Keep the current restart boundary, but explain its environment loss
-    // before clearing the last durable reference (upgrade may already have
-    // removed the runtime record).
-    const runner = await createRunner(lazyRoot, session.runner_type ?? undefined);
-    await recordRecreationIfRunning(storage, taskId, `the daemon ${trigger === 'stop' ? 'stopped' : 'restarted'}`, runner, session.container_name);
-  }
-
+  // This interrupts only the turn; it does not replace the environment. Do
+  // not probe Docker or record a recreation here: even an unavailable runtime
+  // must not prevent the departing daemon from recording the interruption.
   await storage.updateTaskStatus(taskId, 'interrupted', await systemActor(lazyRoot));
   await storage.recordInterrupt(session.id, {
     reason: trigger === 'stop'
@@ -1062,7 +1081,11 @@ export async function interruptForDaemonRestart(
     await storage.resetConsecutiveInterruptions(session.id);
     await resetSlowLaneState(storage, taskId);
   }
-  await storage.updateSessionContainerName(session.id, null);
+  // The container is KEPT: only its agent was stopped (src/runner/agent-stop.ts),
+  // or — when that could not be done — the container was stopped, and the
+  // resume starts it again (src/runner/start-or-recreate.ts). Its recorded
+  // name and agent stamp stay: the stamp is what makes an agent switch
+  // recreate it, the name what the terminal-task sweep removes it by.
 
   // The dead supervisor's last status line describes a turn that no longer
   // exists. Left behind it is read as live progress by anything polling the
@@ -1153,6 +1176,7 @@ async function maybeAutoResume(
   if (task.status !== 'interrupted') return;
 
   const config = await loadConfig(lazyRoot);
+  if (!config.daemon.auto_resume) return;
   const dataDir = join(lazyRoot, config.data.path);
 
   // Usage pause ([usage_pause]): FIRST among the pacing gates, because it must
@@ -2774,9 +2798,10 @@ export async function handleErrorResponse(
   // only ever report `unknown`, and an unclassifiable failure has never been a
   // reason to stop auto-resume. So `unknown` is carried for DIAGNOSIS only and
   // keeps the pre-existing interrupted + auto-resume behavior, exactly as an
-  // absent class does.
+  // absent class does. Exhausted overload/network failures are likewise
+  // temporary; only unreachable retains its deliberate escalation.
   const classified = response.failure_class;
-  const fatalClass = classified && classified !== 'unknown' ? classified : undefined;
+  const fatalClass = classified && !['unknown', 'transient_overload', 'transient_network'].includes(classified) ? classified : undefined;
 
   const watchdogKill = isWatchdogKill(response);
   const turnContent = buildErrorTurnContent(response, fatalClass, classified, watchdogKill);
@@ -3480,7 +3505,7 @@ async function recordSupersededErrorTurn(
 ): Promise<void> {
   const taskShortId = shortId(taskId);
   const classified = response.failure_class;
-  const fatalClass = classified && classified !== 'unknown' ? classified : undefined;
+  const fatalClass = classified && !['unknown', 'transient_overload', 'transient_network'].includes(classified) ? classified : undefined;
   const content = buildErrorTurnContent(response, fatalClass, classified, isWatchdogKill(response));
 
   await journalWorktreeRecovery(storage, taskId, response.worktree_recovery);
@@ -4072,14 +4097,12 @@ export async function recoverStrandedWorkingTasks(
       if (await taskRunner.isRunning(containerName)) continue;
 
       if (await taskRunner.runExists(containerName)) {
-        await recordRecreationIfRunning(storage, task.id, null, taskRunner, containerName);
+        await recordContainerBeforeLaunch(storage, task.id, null, taskRunner, containerName);
       }
       const recovered = await recoverStrandedCompletion(storage, task, session, worktreePath, protoDir, lazyRoot);
       if (recovered) {
-        await storage.updateSessionContainerName(session.id, null);
-        if (await taskRunner.runExists(containerName)) {
-          await taskRunner.removeRun(containerName);
-        }
+        // Kept, not removed, name and agent stamp recorded — see the primary
+        // sweep's stranded recovery.
         logger.info(`Task ${taskShortId}: recovered stranded 'working' task to 'blocked' (commits backfilled).`);
       }
     } catch (err) {

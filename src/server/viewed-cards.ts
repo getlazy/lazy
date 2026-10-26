@@ -328,7 +328,7 @@ ${store}
       var step = run.closest ? run.closest('[data-lz-shell-step]') : null;
       var live = step && step.querySelector('.lz-shell-mount.is-live');
       if (live) continue;
-      if (run.disabled || typeof window.lzShellRun === 'function') run.hidden = false;
+      if (run.hasAttribute('data-control-refusal') || typeof window.lzShellRun === 'function') run.hidden = false;
     }
   }
 

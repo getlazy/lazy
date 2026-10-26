@@ -146,6 +146,24 @@ describe('recoverStrandedWorkingTasks', () => {
     await env.cleanup();
   });
 
+  // INVARIANT: recovery keeps a stopped container. Saving its exit evidence
+  // must not tell the next work turn or the person that its files were lost.
+  test('recovering committed work keeps exit evidence separate from replacement', async () => {
+    const { taskId, ref } = await makeWorkingTask(env, 'externally stopped with work', true);
+    const session = (await env.storage.getSessionByTaskId(taskId))!;
+    await env.storage.updateSessionContainerName(session.id, 'lazy-' + ref, 'claude-code');
+    const runner = makeRunner(false);
+    runner.usesSandbox = () => true;
+    runner.runExists = async () => true;
+    runner.getRunInfo = async () => ({ running: false, exitCode: 137, oomKilled: true, finishedAt: '2026-10-23T10:00:00Z' });
+    await recoverStrandedWorkingTasks(env.storage, env.lazyRoot, runner);
+    expect((await env.storage.getTask(taskId))?.status).toBe('blocked');
+    expect(await env.storage.getTaskMetadata(taskId, 'environment_replaced')).toBeFalsy();
+    expect(await env.storage.getTaskMetadata(taskId, 'last_environment_replaced')).toBeFalsy();
+    expect((await env.storage.getTaskJournal(taskId)).some(entry => entry.content.includes('Container stopped') && entry.content.includes('code 137'))).toBe(true);
+    expect((await env.storage.getSessionByTaskId(taskId))?.container_name).toBe('lazy-' + ref);
+  });
+
   // INVARIANT 1: stranded `working` task with real committed work + dead run →
   // recovered to `blocked`, commits backfilled, recovery turn recorded.
   test('recovers a stranded working task whose run is dead and backfills commits', async () => {

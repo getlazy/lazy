@@ -11,12 +11,29 @@ Each tab appears only for people who may open it.
 | Tab | What it is | Shown to |
 | --- | --- | --- |
 | **Memory** | The project's shared memory. See [Memory](../../memory.md). | Every member |
+| **Image** | Rebuild the project image and read saved build history. | Project admins |
 | **General** | This page. | Project admins |
 | **Environment** | Variables and files for tasks. See [Environment](project-environment.md). | Project admins |
 | **Configuration** | The project's configuration. | Every member |
 | **Your credentials** | Your own credentials for this project. | Every member |
 | **Doctor** | The project's health check. | Every member |
 | **Rename** | Renames the project. | Project admins |
+
+## Image and build history
+
+Open **Settings → Image** as a project admin. The current image names its tag, Dockerfile source, commit and build time. Choose **Rebuild image** to reuse cached layers, or **Rebuild without cache** to build fresh. During a build, either button explains that a build is running and links to its log; **Cancel build** stops it. A disk-capacity refusal shows the measured requirement and links to **Free space**. If cleanup cannot meet it, ask the site admin to raise the disk size.
+
+![Image settings with rebuild buttons and a saved build](../../images/teams/teams-image-history.png)
+
+[Image settings at phone width](../../images/teams/teams-image-history-phone.png).
+
+Build history lists automatic and requested builds with who requested them, their commit, result, timestamps and duration. Open a build to read its saved log. The newest 20 builds keep full logs; older entries keep their summaries. A saved build page remains available after completion and daemon restarts.
+
+![A completed build with its source, timing and full log](../../images/teams/teams-image-build-log.png)
+
+[Build details at phone width](../../images/teams/teams-image-build-log-phone.png).
+
+When the project’s acting branch advances, including a merge on GitHub or GitLab, lazy builds the image from that commit in the background. A successful image is used for later container launches; existing containers keep running.
 
 ## In force now
 

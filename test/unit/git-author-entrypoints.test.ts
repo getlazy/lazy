@@ -27,6 +27,10 @@ import {
 } from '../../src/daemon/user-credentials';
 import { MANAGED_ENV, MANAGED_STORAGE_ENV } from '../../src/config/managed';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 const FIXTURE_AUTHOR = {
   GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.com',
@@ -90,7 +94,7 @@ describe('the real handlers author commits from their scope', () => {
     git(repo, 'add', '.');
     git(repo, 'commit', '-m', 'upstream commit');
 
-    storage = await createStorage(repo, { backend: 'external' });
+    storage = await createStorage(repo, testStorageOptions(repo));
     const task = await storage.createTask('Test task');
     await storage.updateTaskTarget(task.id, branchTarget('main'));
     ctx = { taskId: task.id, worktreePath: worktree, storage };

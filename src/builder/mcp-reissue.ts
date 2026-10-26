@@ -70,6 +70,12 @@ export interface BuilderMcpReissueOptions {
   /** Injectable for tests. Defaults to asking the daemon to (re)write our config. */
   reissue?: (name: string) => Promise<void>;
   /**
+   * The agent profile this session runs on. Carried on every re-issue: a daemon
+   * that lost the token record must re-record it, or every later launch-env
+   * refresh answers for the builder ROLE's profile instead of this session's.
+   */
+  profile?: string;
+  /**
    * Where to report. Defaults to the log file only: this runs underneath an
    * interactive Claude Code TUI, and writing to the console would corrupt it.
    */
@@ -83,6 +89,11 @@ export interface BuilderMcpReissueOptions {
  */
 function instanceKey(status: DaemonStatus): string {
   return `${status.pid ?? '?'}|${status.buildTime ?? ''}|${status.codeSha ?? ''}`;
+}
+
+/** What a re-issue asks the daemon for: the same identity, owner and profile as the first mint. */
+export function reissueRequest(name: string, profile: string | undefined): { name: string; ownerPid: number; profile?: string } {
+  return { name, ownerPid: process.pid, ...(profile ? { profile } : {}) };
 }
 
 /**
@@ -99,7 +110,7 @@ export function startBuilderMcpReissueWatcher(
     // Re-issue carries the owner pid too: this watcher runs in the process that
     // owns the session, and a daemon that re-minted our record must learn who
     // owns it or the record goes back to being first in line for eviction.
-    ?? (async (name: string) => { await queryDaemonMcpConfig({ name, ownerPid: process.pid }); });
+    ?? (async (name: string) => { await queryDaemonMcpConfig(reissueRequest(name, options.profile)); });
 
   let known: string | null = null;
   let sawDown = false;

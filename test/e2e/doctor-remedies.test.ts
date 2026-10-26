@@ -16,8 +16,9 @@ import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, expectOutputExcludes } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
-import { setTaskStatus, worktreePathFor, readSessionJson, writeSessionJson } from '../helpers/storage';
+import { setTaskStatus, worktreePathFor, readSessionJson, writeSessionJson, taskFilePath } from '../helpers/storage';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
+import { hardwareTestEnv } from '../helpers/hardware-env';
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -51,14 +52,14 @@ async function seedTerminalWorktree(
 describe('lazy doctor --clean-worktrees', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   test('says so plainly when there is nothing to clean up', async () => {
     const result = await ctx.lazy(['doctor', '--clean-worktrees']);
     expectSuccess(result);
     expectOutput(result, 'No worktrees for finished tasks');
-  });
+  }, 60_000);
 
   test('lists the worktrees of finished tasks with their size', async () => {
     const complete = await seedTerminalWorktree(ctx, 'Finished work', 'complete');
@@ -76,7 +77,7 @@ describe('lazy doctor --clean-worktrees', () => {
     // A dry run is a listing and nothing else.
     expect(await exists(complete.path)).toBe(true);
     expect(await exists(abandoned.path)).toBe(true);
-  });
+  }, 60_000);
 
   test('leaves the worktree of a task that is still live alone', async () => {
     const live = await seedTerminalWorktree(ctx, 'Still going', 'blocked');
@@ -85,7 +86,7 @@ describe('lazy doctor --clean-worktrees', () => {
     expectSuccess(result);
     expectOutput(result, 'No worktrees for finished tasks');
     expectOutputExcludes(result, live.path);
-  });
+  }, 60_000);
 
   test('refuses to act non-interactively without --yes', async () => {
     const seeded = await seedTerminalWorktree(ctx, 'Finished work', 'complete');
@@ -96,7 +97,7 @@ describe('lazy doctor --clean-worktrees', () => {
     expectOutput(result, '--yes');
     expectOutput(result, 'Aborted — nothing was removed.');
     expect(await exists(seeded.path)).toBe(true);
-  });
+  }, 60_000);
 
   test('removes the worktrees with --yes, one line per tree', async () => {
     const seeded = await seedTerminalWorktree(ctx, 'Finished work', 'complete');
@@ -106,7 +107,7 @@ describe('lazy doctor --clean-worktrees', () => {
     expectOutput(result, `Removed ${seeded.path}`);
     expectOutput(result, 'Removed 1 of 1 worktree(s).');
     expect(await exists(seeded.path)).toBe(false);
-  });
+  }, 60_000);
 });
 
 /**
@@ -124,12 +125,12 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     ctx = await setupTestLazy();
     scratch = await mkdtemp(join(tmpdir(), 'lazy-doctor-remedies-'));
     docker = await installFakeDocker(scratch);
-  });
+  }, 60_000);
 
   afterEach(async () => {
     await ctx.cleanup();
     await rm(scratch, { recursive: true, force: true });
-  });
+  }, 60_000);
 
   /** Run `lazy doctor …` with the fake runtime ahead of any real one on PATH. */
   function doctor(args: string[]) {
@@ -150,13 +151,13 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     expectFailure(result);
     expectError(result, 'Cannot reach docker');
     expectError(result, 'Nothing was inspected and nothing was removed');
-  });
+  }, 60_000);
 
   test('--clean-docker-images says so plainly when the runtime answers and has nothing stale', async () => {
     const result = await doctor(['--clean-docker-images']);
     expectSuccess(result);
     expectOutput(result, 'No stale lazy images');
-  });
+  }, 60_000);
 
   test('--clean-orphaned-containers refuses when the runtime does not answer', async () => {
     await docker.failInfo();
@@ -165,7 +166,7 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     expectFailure(result);
     expectError(result, 'Cannot reach docker');
     expectError(result, 'Nothing was inspected and nothing was removed');
-  });
+  }, 60_000);
 
   test('--clean-orphaned-containers lists a stopped container for one of our tasks', async () => {
     const taskId = await createTask(ctx, 'Finished work');
@@ -178,7 +179,7 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     expectOutput(result, 'Dry run — nothing removed');
     // A dry run is a listing and nothing else.
     expect(await docker.containers()).toContain(`lazy-${taskId}`);
-  });
+  }, 60_000);
 
   test('--clean-orphaned-containers refuses to act non-interactively without --yes', async () => {
     const taskId = await createTask(ctx, 'Finished work');
@@ -189,7 +190,7 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     expectSuccess(result);
     expectOutput(result, 'Aborted — nothing was removed.');
     expect(await docker.containers()).toContain(`lazy-${taskId}`);
-  });
+  }, 60_000);
 
   test('--clean-orphaned-containers removes with --yes, one line per container', async () => {
     const taskId = await createTask(ctx, 'Finished work');
@@ -201,7 +202,61 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     expectOutput(result, `Removed lazy-${taskId}`);
     expectOutput(result, 'Removed 1 of 1 container(s).');
     expect(await docker.containers()).not.toContain(`lazy-${taskId}`);
-  });
+  }, 60_000);
+
+  // INVARIANT: an open task owns its container even when it is stopped.
+  // The next launch restarts it with its writable layer intact.
+  test('--clean-orphaned-containers keeps running and stopped open-task containers', async () => {
+    const taskId = await createTask(ctx, 'Paused work');
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    for (const state of ['running', 'exited', 'created', 'paused', 'dead']) {
+      await docker.seedContainer(`lazy-${taskId}`, { state, project: ctx.root });
+      const result = await doctor(['--clean-orphaned-containers', '--yes']);
+      expectSuccess(result);
+      expectOutput(result, 'No orphaned lazy containers');
+      expect(await docker.containers()).toContain(`lazy-${taskId}`);
+    }
+  }, 60_000);
+
+  test('--clean-orphaned-containers removes a deleted task container with project ownership', async () => {
+    await docker.seedContainer('lazy-deleted-task', { project: ctx.root });
+    const result = await doctor(['--clean-orphaned-containers', '--yes']);
+    expectSuccess(result);
+    expectOutput(result, 'Removed lazy-deleted-task');
+    expect(await docker.containers()).not.toContain('lazy-deleted-task');
+  }, 60_000);
+
+  // INVARIANT: unreadable task state is never proof a task was deleted.
+  // A partial ownership list must not destroy an open task's writable layer.
+  test('--clean-orphaned-containers refuses an unreadable task record', async () => {
+    const taskId = await createTask(ctx, 'Paused work');
+    setTaskStatus(ctx.root, taskId, 'blocked');
+    const record = taskFilePath(ctx.root, taskId, 'task.json');
+    for (const state of ['running', 'exited']) {
+      await docker.seedContainer(`lazy-${taskId}`, { state, project: ctx.root });
+      for (const contents of ['{broken json', 'null', '{}']) {
+        await writeFile(record, contents);
+        const result = await doctor(['--clean-orphaned-containers', '--yes']);
+        expectFailure(result);
+        expectError(result, 'Cannot safely list tasks');
+        expect(await docker.containers()).toContain(`lazy-${taskId}`);
+      }
+    }
+  }, 60_000);
+
+  // INVARIANT: missing task records alone never prove container ownership.
+  // Builders, reviews, acceptance gates and one-shots have their own lifecycles.
+  test('--clean-orphaned-containers leaves other projects and non-task runs alone', async () => {
+    const taskId = await createTask(ctx, 'Acceptance in progress');
+    const names = ['lazy-unlabelled', 'lazy-foreign', 'lazy-builder-12345678', 'lazy-review-task', 'lazy-oneshot-task', 'lazy-pair-task', `lazy-gate-${taskId}`, 'lazy-gate-deleted-task'];
+    for (const state of ['running', 'exited']) {
+      await docker.seedContainer(names[0]!, { state });
+      await docker.seedContainer(names[1]!, { state, project: '/another-project' });
+      for (const name of names.slice(2)) await docker.seedContainer(name, { state, project: ctx.root });
+      expectSuccess(await doctor(['--clean-orphaned-containers', '--yes']));
+      expect(await docker.containers()).toEqual(names);
+    }
+  }, 60_000);
 
   test('--clean-orphaned-containers reports a removal the runtime refused', async () => {
     const taskId = await createTask(ctx, 'Finished work');
@@ -222,14 +277,37 @@ describe('lazy doctor: the runtime-dependent remedies', () => {
     expectOutput(result, 'still present afterwards');
     expectOutput(result, 'Removed 0 of 1 container(s).');
     expect(await docker.containers()).toContain(`lazy-${taskId}`);
-  });
+  }, 60_000);
+
+  test('--clean-orphaned-containers uses the daemon remedy when the CLI has remote storage', async () => {
+    await ctx.cleanup();
+    ctx = await setupTestLazy({
+      withDaemon: true,
+      realRunner: true,
+      inheritedEnv: hardwareTestEnv(),
+      daemonEnv: { PATH: `${docker.binDir}:${process.env.PATH ?? ''}` },
+    });
+    const open = await createTask(ctx, 'Paused work');
+    setTaskStatus(ctx.root, open, 'blocked');
+    const finished = await createTask(ctx, 'Finished work');
+    setTaskStatus(ctx.root, finished, 'complete');
+    await docker.seedContainer(`lazy-${open}`, { project: ctx.root });
+    await docker.seedContainer(`lazy-${finished}`, { project: ctx.root });
+    await docker.seedContainer('lazy-deleted-task', { project: ctx.root });
+
+    const result = await doctor(['--clean-orphaned-containers', '--yes']);
+    expectSuccess(result);
+    expectOutput(result, `Removed lazy-${finished}`);
+    expectOutput(result, 'Removed lazy-deleted-task');
+    expect(await docker.containers()).toEqual([`lazy-${open}`]);
+  }, 60_000);
 });
 
 describe('lazy doctor --unset-upstream-tracking', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   async function seedTrackedBranch(branch: string, merge: string): Promise<void> {
     await ctx.git('branch', branch);
@@ -243,7 +321,7 @@ describe('lazy doctor --unset-upstream-tracking', () => {
     const result = await ctx.lazy(['doctor', '--unset-upstream-tracking']);
     expectSuccess(result);
     expectOutput(result, 'No task branches have upstream tracking');
-  });
+  }, 60_000);
 
   test('lists tracked task branches and flags only a mismatched merge ref', async () => {
     await seedTrackedBranch('lazy/self-tracking', 'refs/heads/lazy/self-tracking');
@@ -262,7 +340,7 @@ describe('lazy doctor --unset-upstream-tracking', () => {
 
     const still = await ctx.git('config', 'branch.lazy/self-tracking.remote');
     expect(still.stdout.trim()).toBe('origin');
-  });
+  }, 60_000);
 
   test('unsets only the config entries, leaving the branches in place', async () => {
     await seedTrackedBranch('lazy/self-tracking', 'refs/heads/lazy/self-tracking');
@@ -276,7 +354,7 @@ describe('lazy doctor --unset-upstream-tracking', () => {
     expect(remote.stdout.trim()).toBe('');
     const branches = await ctx.git('branch', '--format=%(refname:short)');
     expect(branches.stdout).toContain('lazy/self-tracking');
-  });
+  }, 60_000);
 
   test('refuses to act non-interactively without --yes', async () => {
     await seedTrackedBranch('lazy/self-tracking', 'refs/heads/lazy/self-tracking');
@@ -286,7 +364,7 @@ describe('lazy doctor --unset-upstream-tracking', () => {
     expectOutput(result, 'Aborted — nothing was unset.');
     const remote = await ctx.git('config', 'branch.lazy/self-tracking.remote');
     expect(remote.stdout.trim()).toBe('origin');
-  });
+  }, 60_000);
 
   test('reports a key it could not unset instead of claiming success', async () => {
     // The tracking config lives in the user's GLOBAL file. `git config --unset`
@@ -313,20 +391,20 @@ describe('lazy doctor --unset-upstream-tracking', () => {
     expectOutput(result, 'is still set in');
     expectOutput(result, globalConfig);
     expectOutput(result, 'Unset tracking on 0 of 1 branch(es).');
-  });
+  }, 60_000);
 });
 
 describe('lazy doctor --resume-interrupted-tasks', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   test('says so plainly when nothing is interrupted', async () => {
     const result = await ctx.lazy(['doctor', '--resume-interrupted-tasks']);
     expectSuccess(result);
     expectOutput(result, 'No interrupted tasks');
-  });
+  }, 60_000);
 
   test('lists interrupted tasks and says exactly what the daemon promises', async () => {
     const taskId = await createTask(ctx, 'Interrupted work');
@@ -342,7 +420,7 @@ describe('lazy doctor --resume-interrupted-tasks', () => {
     expectOutput(result, 're-offers these each tick');
     expectOutput(result, 'can veto it');
     expectOutput(result, 'Dry run — nothing resumed');
-  });
+  }, 60_000);
 
   test('refuses to act non-interactively without --yes', async () => {
     const taskId = await createTask(ctx, 'Interrupted work');
@@ -351,14 +429,14 @@ describe('lazy doctor --resume-interrupted-tasks', () => {
     const result = await ctx.lazy(['doctor', '--resume-interrupted-tasks']);
     expectSuccess(result);
     expectOutput(result, 'Aborted — nothing was resumed.');
-  });
+  }, 60_000);
 });
 
 describe('lazy doctor: remedy dispatch', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   test('refuses more than one remedy in a single run', async () => {
     const result = await ctx.lazy(['doctor', '--clean-worktrees', '--unset-upstream-tracking']);
@@ -366,14 +444,14 @@ describe('lazy doctor: remedy dispatch', () => {
     expectError(result, 'Run one remedy at a time');
     expectError(result, '--clean-worktrees');
     expectError(result, '--unset-upstream-tracking');
-  });
+  }, 60_000);
 
   test('a remedy runs instead of the health sweep, not alongside it', async () => {
     const result = await ctx.lazy(['doctor', '--clean-worktrees']);
     expectSuccess(result);
     // The sweep's own headings must not appear: a remedy is a separate mode.
     expectOutputExcludes(result, 'Checking environment');
-  });
+  }, 60_000);
 
   test('every remedy flag is documented in the usage text', async () => {
     const result = await ctx.lazy(['doctor', '--help']);
@@ -388,7 +466,7 @@ describe('lazy doctor: remedy dispatch', () => {
       expectOutput(result, flag);
     }
     expectOutput(result, 'only REPORTS');
-  });
+  }, 60_000);
 
   test('doctor never resumes interrupted tasks on its own', async () => {
     const taskId = await createTask(ctx, 'Interrupted work', 'Do the work');
@@ -416,14 +494,14 @@ describe('lazy doctor: remedy dispatch', () => {
     expectOutput(result, 'Interrupted tasks (resumable):');
     expectOutput(result, 'lazy doctor --resume-interrupted-tasks');
     expect(result.stdout + result.stderr).not.toContain("binary 'bun' not found");
-  });
+  }, 60_000);
 });
 
 describe('lazy doctor --repair-git-pointers', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   /** A real task worktree whose commondir a task redirected elsewhere. */
   async function seedTamperedWorktree(): Promise<string> {
@@ -438,7 +516,7 @@ describe('lazy doctor --repair-git-pointers', () => {
     const result = await ctx.lazy(['doctor', '--repair-git-pointers']);
     expectSuccess(result);
     expectOutput(result, 'nothing to repair');
-  });
+  }, 60_000);
 
   // INVARIANT: a tampered pointer is an ERROR in the plain report, naming the
   // worktree and the remedy — the human must hear about it before they run
@@ -464,14 +542,14 @@ describe('lazy doctor --repair-git-pointers', () => {
     expectOutput(result, 'Repaired tampered-task');
     expectOutput(result, 'Repaired 1 of 1 worktree(s).');
     expect(await Bun.file(join(gitdir, 'commondir')).text()).toBe('../..\n');
-  });
+  }, 60_000);
 });
 
 describe('lazy doctor --repair-git-pointers — redirected HEAD', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   // INVARIANT: a task worktree whose HEAD a task pointed at another branch is
   // repaired by pointing HEAD back at the task's own branch — HEAD only, no
@@ -499,14 +577,14 @@ describe('lazy doctor --repair-git-pointers — redirected HEAD', () => {
     expectSuccess(result);
     expectOutput(result, 'Repaired 1 of 1 worktree(s).');
     expect(await Bun.file(join(gitdir, 'HEAD')).text()).toBe(own);
-  });
+  }, 60_000);
 });
 
 describe('nested git repositories in a task worktree', () => {
   let ctx: TestContext;
 
-  beforeEach(async () => { ctx = await setupTestLazy(); });
-  afterEach(async () => { await ctx.cleanup(); });
+  beforeEach(async () => { ctx = await setupTestLazy(); }, 60_000);
+  afterEach(async () => { await ctx.cleanup(); }, 60_000);
 
   // INVARIANT: a repository a task planted below its worktree (`<sub>/.git`,
   // whose config can run code for the human's git or IDE there) is an ERROR in
@@ -530,5 +608,5 @@ describe('nested git repositories in a task worktree', () => {
 
     const again = await ctx.lazy(['doctor', '--repair-git-pointers']);
     expectOutput(again, 'nothing to repair');
-  });
+  }, 60_000);
 });

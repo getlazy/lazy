@@ -1,3 +1,4 @@
+import { refreshEnvironmentReplacedCommand } from './environment-replaced-command';
 /**
  * Daemon-side lifecycle orchestration for unblock, accept, reject, close.
  *
@@ -19,7 +20,9 @@
  * daemon code — it causes deadlocks and storage lock contention.
  */
 
+import { keptRunNote, reuseOrStartTaskRun } from '../runner/start-or-recreate';
 import { stopTaskAgent } from '../runner/stop-task-agent';
+import { maskUrlCredentials } from './push-failure';
 import { isFatalFailureClass } from '../agent/failure-taxonomy';
 import { markAcceptGateRunning, clearAcceptGateRunning } from './accept-gate-marker';
 import { confirmRunnerImageForLaunch, mustRecreateForRunnerImage, readOnlyLaunchPin, runnerImageHold, RUNNER_IMAGE_NOT_READY_MARKER } from './runner-image-choice';
@@ -85,7 +88,7 @@ import { getOrCreateStorage, RpcError } from './rpc-handlers';
 import { assertTaskWorktreeHead, TaskHeadBranchError } from '../git/worktree-pointers';
 import { isUsagePauseRefusal } from './rpc-error';
 import { runSelfSync, planSelfSyncSteps, type SelfSyncStep } from './self-sync';
-import { memberInsideTask, memberInsideSyncMessage } from '../server/member-terminals';
+import { endMemberSessions, memberNamesInsideTask } from '../server/member-terminals';
 import { beginWorktreeTeardown } from './member-entry';
 
 /** The release a reject or close holds while it may tear the worktree down. */
@@ -123,13 +126,13 @@ import { DEFAULT_PRE_ACCEPT_TIMEOUT_SECS } from '../supervisor/accept-gate';
 import type { DestinationRestoreConflict } from '../git/operations';
 import { checkLock, acquireLock, removeLock } from '../utils/lock';
 import { checkPairingLock } from '../utils/pairing-lock';
-import { protocolDir as getProtocolDir, reviewProtocolDir, acceptGateProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, computeAgentExtraArgs, newCommandId, removeProtocolDir, consumeResponse, clearStatus, completedResponses, readResponse, inFlightResponseCorrelates } from '../protocol';
+import { protocolDir as getProtocolDir, reviewProtocolDir, acceptGateProtocolDir, writeCommand, writeResponse, consumeCommand, ensureProtocolDir, commonCommandFields, taskRuntimeContext, computeAgentExtraArgs, newCommandId, removeProtocolDir, consumeResponse, clearStatus, completedResponses, readResponse, inFlightResponseCorrelates } from '../protocol';
 import { shortId, displayId, displayIdFor, taskRef, getWorktreePath, getWorktreePathForRef, getBranchName, getBranchNameFromId } from '../task/identity';
 import { renderTaskTurnPrompt } from '../task/turn-prompt-render';
 import { buildNotesContext, buildJournalNotice, buildArtifactNotice, buildSystemPrompt, buildPromptWithInstructions, buildTurnHistoryContext, resolveNotesCutoff, selectNotesForDelivery, getNewJournalSince } from '../task/turn-context';
 import { typeConstraintsSection } from '../task/type-constraints';
 import { lazyFold, neutralizeLazyMarkers } from '../task/wrapper-fold';
-import { recordRecreationIfRunning, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
+import { recordContainerBeforeLaunch, recreationReason, environmentReplacedPrefix, clearEnvironmentReplaced } from '../task/environment-replaced';
 import { restoreWorktreeSnapshot } from '../task/worktree-snapshot-restore';
 import { runSyncWithRemote } from '../task/sync-remote';
 import { cleanupWorktree, cleanupWorktreeAndBranch, cleanupTaskContainer } from '../task/cleanup';
@@ -202,12 +205,13 @@ import {
 } from './submit-target';
 import { getActor } from '../constants';
 import { writeDaemonMcpConfig } from './task-launcher';
-import { prepareTurnLaunch, assertNoMemberInside, assertTurnCredentialAvailable, releaseTurnCredential, turnCredentialProblem, sessionCredentialCommandField } from './turn-credentials';
+import { prepareTurnLaunch, assertTurnCredentialAvailable, releaseTurnCredential, turnCredentialProblem, sessionCredentialCommandField } from './turn-credentials';
 import { assertBesideLaunchAllowed, assertBesideUsagePauseOverrideAllowed, assertTurnStartAllowed, takeTaskAllowanceAtLaunch, usagePauseHold } from './usage-pause';
 import { USAGE_PAUSE_PENDING_FIX_KEY } from '../usage-pause/hold';
 import { createAgentTurn, createRecoveredAgentTurn, pendingTurnOwnerPerson, turnOwnerOfClaim } from './turn-owner';
 import { revokeTaskMcpTokens } from './mcp-tokens';
 import { clearTaskEnv } from './task-env';
+import { removeTaskSshHostKeys } from '../ssh/host-keys';
 import { assertNoDeliveredSecretsToPush, deliverTaskFilesForLaunch, deliveredGuardFor, forgetTaskFiles } from './task-files';
 import { forgetContainerCredentialLaunches } from './container-credential-launch';
 import { deliveredFilesRefusal, findDeliveredFilesAtRef, findDeliveredFilesInRange } from '../git/delivered-files';
@@ -283,6 +287,7 @@ import { toTurnUsage, rollUpSessionUsage } from '../utils/usage-recording';
 import type { Storage } from '../storage';
 import { sanitizeUserText } from '../utils/sanitize-text';
 import { isWatchdogKill, watchdogTurnLines, WATCHDOG_TURN_HEADING } from '../utils/watchdog-turn';
+import { AGENT_CRASHED_HEADING } from '../task/ask-failure';
 import { buildMemorySection } from '../memory';
 import { buildLazyMdSection } from '../task/lazy-md';
 
@@ -381,6 +386,17 @@ async function revokeTaskTokens(projectRoot: string, task: Task): Promise<void> 
   } catch (err) {
     logger.warn(
       `Failed to clear per-task env for task ${shortId(taskId)}: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Its SSH host keys (../ssh/host-keys.ts): the environment they identify is
+  // gone with the session, and a key left behind would only accumulate.
+  try {
+    await removeTaskSshHostKeys(projectRoot, taskId);
+  } catch (err) {
+    logger.warn(
+      `Failed to remove the SSH host keys of task ${shortId(taskId)}: ` +
       `${err instanceof Error ? err.message : String(err)}`,
     );
   }
@@ -1610,9 +1626,6 @@ async function launchUnblockTaskRun(
           `Nothing was delivered — retry once it is paused again.`,
         );
       }
-      // A member working in the task keeps turns off it. Refused BEFORE the
-      // feedback turn is recorded, so nothing is half-dispatched.
-      assertNoMemberInside(task.id);
       // INVARIANT (AGENTS.md, never lose human feedback): a refusal for want of a
       // credential happens AFTER the words are durably recorded, never before.
       // On the profile this unblock will RUN (the `--agent` switch included).
@@ -1653,7 +1666,7 @@ async function launchUnblockTaskRun(
       // installed with it; this turn is told so (src/task/environment-replaced.ts).
       // `lazy env set` since this container was created: env is fixed at create.
       const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
-      await recordRecreationIfRunning(
+      await recordContainerBeforeLaunch(
         storage,
         task.id,
         recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv, mustRecreateForRunnerImage(task)),
@@ -1741,15 +1754,16 @@ async function launchUnblockTaskRun(
           config,
         })),
         ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(unblockConfig, task)),
-        ...commonCommandFields(config, { command_id: turnCommandId }),
+        ...commonCommandFields(config, { command_id: turnCommandId, runner: runner.type }),
       };
       // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
       await deliverTaskFilesForLaunch(projectRoot, task.id, worktreePath, phases.notify);
       writeCommand(protoDir, unblockCommand);
 
-      return { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, envNotice };
+      return { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, envNotice, unblockCommand };
     });
-    const { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, envNotice } = claim;
+    const { nextSeq, mustRecreateContainer, mustRecreateForEnv, protoDir, unblockCommand } = claim;
+    let { envNotice } = claim;
 
     // --- Generate daemon MCP config ---
     // The daemon knows its own webPort — no health check, no fallback.
@@ -1771,15 +1785,17 @@ async function launchUnblockTaskRun(
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
+    const kept = await reuseOrStartTaskRun(runner, storage, sess, containerName, mustRecreateContainer || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForRunnerImage(task), task.agent_id);
+    if (kept) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
       // now reports itself instead of running toolless. See the "CONTAINER
       // REUSE" note on writeDaemonMcpConfig in src/daemon/task-launcher.ts.
-      phases.note(`reusing running container ${containerName}`);
+      phases.note(keptRunNote(kept, containerName));
     } else {
       await removeTaskRun(runner, storage, sess, containerName);
+      envNotice = await refreshEnvironmentReplacedCommand(storage, protoDir, unblockCommand, envNotice);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, launchImagePin(task), phases.notify);
@@ -1887,6 +1903,15 @@ export interface AskTaskParams {
   /** Explicit override of this record ask's builder credential (not a task-turn allowance). */
   overrideUsagePause?: boolean;
   message: string;
+  /**
+   * The person's OWN words, when `message` wraps them in a prompt template
+   * (the review surface frames a whole thread for the agent). The recorded
+   * human turn stores THESE as its content — the framed text the agent
+   * received stays in the turn's `prompt` — so the task's Chat shows what the
+   * person typed and never lazy's framing (src/task/chat.ts). Absent: the
+   * message is the person's words.
+   */
+  chatText?: string;
   effortOverride?: string;
   /** Channel actor (MCP → 'builder', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
   actor?: ActorInput;
@@ -2649,8 +2674,6 @@ async function launchAskTaskRun(
         throw new RpcError(404, `Task not found: ${params.taskId}`);
       }
       assertAskableStatus(task, fresh.status);
-      // Before the question's turn is recorded — see assertNoMemberInside.
-      assertNoMemberInside(task.id);
       // A turn with no credential for its profile is refused here: this launch carries
       // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
       await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
@@ -2708,7 +2731,9 @@ async function launchAskTaskRun(
         sessionId: sess.id,
         sequence: askClaim.humanSeq,
         role: 'human',
-        content: neutralizeLazyMarkers(askMessage.trim()),
+        content: neutralizeLazyMarkers(
+          (params.chatText !== undefined ? sanitizeUserText(params.chatText) : askMessage).trim(),
+        ),
         agent: task.agent_id,
         model: modelName,
         effort: effortValue,
@@ -2748,7 +2773,7 @@ async function launchAskTaskRun(
         effort: effortValue,
         agent_session_id: agentSessionId,
         ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(config, task)),
-        ...commonCommandFields(config, { command_id: askClaim.commandId }),
+        ...commonCommandFields(config, { command_id: askClaim.commandId, runner: runner.type }),
       };
       writeCommand(protoDir, askCommand);
 
@@ -2775,18 +2800,19 @@ async function launchAskTaskRun(
     if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
       // Not a work turn: a replacement here is only RECORDED, and told to the
       // next work turn (src/task/environment-replaced.ts).
-      await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)), runner, containerName);
+      await recordContainerBeforeLaunch(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)), runner, containerName);
       if (mustRecreateForAgent) {
         phases.note(
           `recreating container: agent changed ` +
           `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
         );
       }
-      const reusedExistingSupervisor =
-        !mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName));
-      if (reusedExistingSupervisor) {
-        // Supervisor already running — it will pick up the ask command
-        phases.note(`reusing running container ${containerName}`);
+      const kept = await reuseOrStartTaskRun(runner, storage, sess, containerName, mustRecreateContainer || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForRunnerImage(task), task.agent_id);
+      // A container started again runs a FRESH supervisor, like a new launch.
+      const reusedExistingSupervisor = kept === 'reused';
+      if (kept) {
+        // Supervisor already running (or started again) — it will pick up the ask command
+        phases.note(keptRunNote(kept, containerName));
       } else {
         await removeTaskRun(runner, storage, sess, containerName);
         try {
@@ -3965,8 +3991,6 @@ async function launchReviewTaskRun(
         throw new RpcError(404, `Task not found: ${params.taskId}`);
       }
       assertReviewableStatus(task, fresh.status);
-      // Before the review's turn is recorded — see assertNoMemberInside.
-      assertNoMemberInside(task.id);
       // A turn with no credential for its profile is refused here: this launch carries
       // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
       await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
@@ -4052,7 +4076,7 @@ async function launchReviewTaskRun(
         system_prompt: systemPrompt,
         model_id: modelName,
         effort: effortValue,
-        ...commonCommandFields(config, { command_id: reviewClaim.commandId }),
+        ...commonCommandFields(config, { command_id: reviewClaim.commandId, runner: runner.type }),
       };
       writeCommand(protoDir, reviewCommand);
       wroteReviewCommand = true;
@@ -4256,7 +4280,7 @@ async function recordAskErrorTurn(
   parkInterrupted = true,
 ): Promise<void> {
   const watchdogKill = isWatchdogKill(response);
-  const lines: string[] = [watchdogKill ? WATCHDOG_TURN_HEADING : '[Agent crashed]', ''];
+  const lines: string[] = [watchdogKill ? WATCHDOG_TURN_HEADING : AGENT_CRASHED_HEADING, ''];
   if (watchdogKill) {
     lines.push(...watchdogTurnLines(response), '');
   }
@@ -4786,6 +4810,12 @@ export interface RejectTaskParams {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  /**
+   * End any member's open sessions in the task's environment first, instead of
+   * being refused while they are there — the caller's explicit confirmation
+   * (`--end-sessions`, Teams' "End open sessions first").
+   */
+  endMemberSessions?: boolean;
   /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
   actor?: ActorInput;
   /** Phase-narration sink (see ./progress.ts). Supplied by the transport — CLI only. */
@@ -4872,9 +4902,10 @@ async function rejectTaskRun(
   if (task.status === 'pairing') {
     throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
   }
-  // A member with a terminal open on the task is working in the files this
-  // would clean up: refuse, and keep members out until this run ends.
-  teardown.release = await beginWorktreeTeardown(task.id);
+  // A member with sessions open in the task is working in the files this
+  // would clean up: refuse (or, confirmed, end their sessions), and keep
+  // members out until this run ends.
+  teardown.release = await beginWorktreeTeardown(task.id, { endSessions: params.endMemberSessions === true });
 
   // --- Pairing lock check ---
   checkPairingLockOrThrow(projectRoot, shortId(task.id), displayId(task));
@@ -4971,6 +5002,12 @@ export interface CloseTaskParams {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  /**
+   * End any member's open sessions in the task's environment first, instead of
+   * being refused while they are there — the caller's explicit confirmation
+   * (`--end-sessions`, Teams' "End open sessions first").
+   */
+  endMemberSessions?: boolean;
   /** Channel actor (MCP → 'builder'/'agent', CLI → 'human'); falls back to getActor(). See {@link MCP_ACTOR}. */
   actor?: ActorInput;
   /** Phase-narration sink (see ./progress.ts). Supplied by the transport — CLI only. */
@@ -5035,9 +5072,10 @@ async function closeTaskRun(
   if (task.status === 'pairing') {
     throw new RpcError(409, `Task ${displayId(task)} is locked (pairing in progress). End the pairing session first.`);
   }
-  // A member with a terminal open on the task is working in the files this
-  // would clean up: refuse, and keep members out until this run ends.
-  teardown.release = await beginWorktreeTeardown(task.id);
+  // A member with sessions open in the task is working in the files this
+  // would clean up: refuse (or, confirmed, end their sessions), and keep
+  // members out until this run ends.
+  teardown.release = await beginWorktreeTeardown(task.id, { endSessions: params.endMemberSessions === true });
 
   // --- Worktree uncommitted changes check ---
   const worktreePath = getWorktreePath(projectRoot, task);
@@ -5187,99 +5225,105 @@ export async function reopenTask(
   params: ReopenTaskParams,
 ): Promise<ReopenTaskResult> {
   const storage = await getOrCreateStorage();
-  // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
-  // caller's channel, so the MCP boundary threads it through params.
-  const actor = params.actor ?? getActor();
-
   const resolved = await storage.resolveTask(params.taskId);
-  if (!resolved.task) {
-    if (resolved.ambiguousMatches?.length) {
-      throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+  // Canonical identity makes reopen atomic with orphan cleanup and launches,
+  // including when callers use different spellings of the same task id.
+  const taskId = resolved.task?.id ?? params.taskId;
+  return withTaskLifecycleLock(taskId, async (): Promise<ReopenTaskResult> => {
+    // Channel actor — see rejectTask: a daemon-side getActor() cannot see the
+    // caller's channel, so the MCP boundary threads it through params.
+    const actor = params.actor ?? getActor();
+
+    const resolved = await storage.resolveTask(taskId);
+    if (!resolved.task) {
+      if (resolved.ambiguousMatches?.length) {
+        throw new RpcError(409, `Ambiguous task ID '${params.taskId}'.`);
+      }
+      throw new RpcError(404, `Task not found: ${params.taskId}`);
     }
-    throw new RpcError(404, `Task not found: ${params.taskId}`);
-  }
-  const task = resolved.task;
+    const task = resolved.task;
 
-  if (!isTerminalStatus(task.status)) {
-    throw new RpcError(409, `Task ${displayId(task)} is ${task.status} — only abandoned or complete tasks can be reopened.`);
-  }
-  const reason = params.reason?.trim();
-  if (task.status === 'complete' && !reason && !params.checkOnly) {
-    throw new RpcError(400, 'A reason is required to reopen a completed task.');
-  }
+    if (!isTerminalStatus(task.status)) {
+      throw new RpcError(409, `Task ${displayId(task)} is ${task.status} — only abandoned or complete tasks can be reopened.`);
+    }
+    const reason = params.reason?.trim();
+    if (task.status === 'complete' && !reason && !params.checkOnly) {
+      throw new RpcError(400, 'A reason is required to reopen a completed task.');
+    }
 
-  // Give back what was closed — BEFORE any write, so a refusal changes nothing.
-  // A task that ran comes back on its own branch at its last head (local, then
-  // the remote, then a recorded commit) or not at all; a fresh start is clone's
-  // or redo's job (src/daemon/reopen-restore.ts). A task that never ran has no
-  // branch to restore.
-  const priorSession = await storage.getSessionByTaskId(task.id);
-  const restore = priorSession
-    ? await restoreTaskBranchForReopen({
-      projectRoot,
-      config: await loadConfig(projectRoot),
-      storage,
-      session: priorSession,
-      displayId: displayId(task),
-      checkOnly: params.checkOnly,
-    })
-    : null;
+    // Give back what was closed — BEFORE any write, so a refusal changes nothing.
+    // A task that ran comes back on its own branch at its last head (local, then
+    // the remote, then a recorded commit) or not at all; a fresh start is clone's
+    // or redo's job (src/daemon/reopen-restore.ts). A task that never ran has no
+    // branch to restore.
+    const priorSession = await storage.getSessionByTaskId(task.id);
+    const restore = priorSession
+      ? await restoreTaskBranchForReopen({
+        projectRoot,
+        config: await loadConfig(projectRoot),
+        storage,
+        session: priorSession,
+        displayId: displayId(task),
+        checkOnly: params.checkOnly,
+      })
+      : null;
 
-  if (params.checkOnly) {
+    if (params.checkOnly) {
+      return {
+        taskId: task.id,
+        displayId: displayId(task),
+        previousStatus: task.status,
+        newStatus: priorSession ? 'blocked' : 'backlog',
+        hadSession: !!priorSession,
+        gitBranch: priorSession?.git_branch ?? null,
+        restore,
+        warnings: [],
+      };
+    }
+
+    if (reason) {
+      await storage.createComment(task.id, `[Reopened] ${reason}`, actor);
+    }
+
+    // An accepted task keeps its accept tag; record in the store that this
+    // reopen supersedes it, BEFORE the session is reset, so the zombie sweep
+    // never re-ends the reopened session from it (src/task/reopen-after-accept.ts).
+    if (task.status === 'complete') {
+      const acceptCommit = await getAcceptTagCommit(task.id, projectRoot);
+      if (acceptCommit) await recordReopenAfterAccept(storage, task.id, acceptCommit);
+    }
+
+    // Reset the session BEFORE the status leaves terminal. A non-terminal task
+    // with an ended `accepted` session is exactly what storage's list-time
+    // self-heal flips back to `complete`, so the other order let any concurrent
+    // read undo the reopen. A terminal task with a reset session is inert: every
+    // sweep skips terminal tasks.
+    const session = await storage.getSessionByTaskId(task.id);
+    if (session) {
+      // Clear ended_at/outcome and the agent session id so the next turn starts
+      // a fresh agent conversation rather than resuming the finished one.
+      await storage.resetSession(session.id);
+    }
+
+    // storage.reopenTask itself lands the task on 'blocked' (has a session) or
+    // 'backlog' (never ran) and clears completed_at — no separate status write.
+    await storage.reopenTask(task.id, actor);
+
+    // A reopened child owes its cluster a fresh fix-round budget: the count is
+    // "since it was last started or accepted", and reopening ends that episode.
+    await resetClusterFixRound(storage, task.id);
+
     return {
       taskId: task.id,
       displayId: displayId(task),
       previousStatus: task.status,
-      newStatus: priorSession ? 'blocked' : 'backlog',
-      hadSession: !!priorSession,
-      gitBranch: priorSession?.git_branch ?? null,
+      newStatus: session ? 'blocked' : 'backlog',
+      hadSession: !!session,
+      gitBranch: session?.git_branch ?? null,
       restore,
       warnings: [],
     };
-  }
-
-  if (reason) {
-    await storage.createComment(task.id, `[Reopened] ${reason}`, actor);
-  }
-
-  // An accepted task keeps its accept tag; record in the store that this
-  // reopen supersedes it, BEFORE the session is reset, so the zombie sweep
-  // never re-ends the reopened session from it (src/task/reopen-after-accept.ts).
-  if (task.status === 'complete') {
-    const acceptCommit = await getAcceptTagCommit(task.id, projectRoot);
-    if (acceptCommit) await recordReopenAfterAccept(storage, task.id, acceptCommit);
-  }
-
-  // Reset the session BEFORE the status leaves terminal. A non-terminal task
-  // with an ended `accepted` session is exactly what storage's list-time
-  // self-heal flips back to `complete`, so the other order let any concurrent
-  // read undo the reopen. A terminal task with a reset session is inert: every
-  // sweep skips terminal tasks.
-  const session = await storage.getSessionByTaskId(task.id);
-  if (session) {
-    // Clear ended_at/outcome and the agent session id so the next turn starts
-    // a fresh agent conversation rather than resuming the finished one.
-    await storage.resetSession(session.id);
-  }
-
-  // storage.reopenTask itself lands the task on 'blocked' (has a session) or
-  // 'backlog' (never ran) and clears completed_at — no separate status write.
-  await storage.reopenTask(task.id, actor);
-
-  // A reopened child owes its cluster a fresh fix-round budget: the count is
-  // "since it was last started or accepted", and reopening ends that episode.
-  await resetClusterFixRound(storage, task.id);
-
-  return {
-    taskId: task.id,
-    displayId: displayId(task),
-    previousStatus: task.status,
-    newStatus: session ? 'blocked' : 'backlog',
-    hadSession: !!session,
-    gitBranch: session?.git_branch ?? null,
-    restore,
-    warnings: [],
-  };
+  });
 }
 
 // =====================================================================
@@ -6209,6 +6253,35 @@ function formatAcceptMergeFailure(error: string | undefined): string {
  * lock makes the loser re-run preflight after the winner commits, see the
  * accepted session outcome, and return a clean "already accepted".
  */
+/**
+ * After a child's accept merged into its parent's worktree: if a member had
+ * sessions open in the parent's environment (before or after the merge), say so
+ * on the parent. A warning, not a wait — the engineer's sanctioned choice for a
+ * merge into a live session (docs/design/task-sessions-and-ssh.md §1). Best
+ * effort: the merge has landed, and a failed note must not read as a failed
+ * accept.
+ */
+export async function warnMemberDuringChildMerge(
+  storage: Pick<Storage, 'createComment'>,
+  parentId: string,
+  memberBefore: string | null,
+  childDisplayId: string,
+): Promise<boolean> {
+  const member = memberBefore ?? memberNamesInsideTask(parentId);
+  if (!member) return false;
+  try {
+    await storage.createComment(
+      parentId,
+      `${member} had sessions open in this task while ${childDisplayId} was merged into it; the merge may have changed files under them.`,
+      'system',
+    );
+    return true;
+  } catch (err) {
+    logger.warn(`Could not note on ${parentId.substring(0, 8)} that ${member} had sessions open during a merge: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 export async function acceptTask(
   projectRoot: string,
   params: AcceptTaskParams,
@@ -6221,21 +6294,13 @@ export async function acceptTask(
   const resolved = await storageForResolve.resolveTask(params.taskId);
   const lockKey = resolved.task?.id ?? params.taskId;
   // A child's merge lands in its PARENT's worktree. A member working there
-  // refuses the accept (409, naming them) — checked under the parent's
-  // lifecycle lock, the one the member's entry takes, FIRST: before any step of
-  // the accept has run, so a refused accept has no effect anywhere (no check or
-  // gate command, no push, no PR/MR, no forge write) — and members stay out of
-  // the parent until the accept has returned. Claimed BEFORE this task's lock and never inside it: taking
-  // one task's lock while holding another's could deadlock against a path
-  // that takes them the other way round.
+  // does NOT refuse it (engineer, 2026-10-21): the merge can change or delete
+  // files under their session, exactly as a turn can, so it proceeds and the
+  // parent says so afterwards (`warnMemberDuringChildMerge`).
   const parentId = resolved.task ? parentTaskIdOf(resolved.task) : null;
-  const releaseParent = parentId ? await beginWorktreeTeardown(parentId) : null;
-  let result: AcceptTaskResult;
-  try {
-    result = await withTaskLifecycleLock(lockKey, () => acceptTaskInner(projectRoot, params));
-  } finally {
-    releaseParent?.();
-  }
+  const memberInParent = parentId ? memberNamesInsideTask(parentId) : null;
+  const result = await withTaskLifecycleLock(lockKey, () => acceptTaskInner(projectRoot, params));
+  if (parentId && result.status === 'merged') await warnMemberDuringChildMerge(storageForResolve, parentId, memberInParent, result.displayId);
   // Reached only when the accept was NOT refused (a refusal throws, and must
   // leave the draft where it is). The review is over: the reason has been
   // delivered, and nothing about this task is still in progress.
@@ -6430,12 +6495,6 @@ export async function commitAcceptTransition(
 export interface FollowThroughOutcome {
   pending: FollowThroughStep[];
   error?: string;
-  /**
-   * Cleanup is waiting for this member's terminal session to end — not a
-   * failure: it is not counted, backed off or reported, and the next pass
-   * after their session ends runs it.
-   */
-  waitingForMember?: string;
 }
 
 /**
@@ -6458,7 +6517,18 @@ export interface FollowThroughOutcome {
 export async function runAcceptFollowThrough(
   projectRoot: string,
   taskId: string,
-  ctx: {
+  ctx: FollowThroughContext = {},
+): Promise<FollowThroughOutcome> {
+  try {
+    return await runAcceptFollowThroughSteps(projectRoot, taskId, ctx);
+  } finally {
+    // The accept moved the project's branch: the project image follows it
+    // (src/daemon/runner-image.ts). Fire and forget, and never throws.
+    void import('./runner-image').then((m) => m.noteActingBranchAdvance(projectRoot));
+  }
+}
+
+interface FollowThroughContext {
     warnings?: string[];
     driver?: ReturnType<typeof createDriver>;
     config?: ResolvedConfig;
@@ -6466,7 +6536,12 @@ export async function runAcceptFollowThrough(
     record?: AcceptFollowThrough;
     /** The caller's storage handle (remote-sync passes its own); the daemon's otherwise. */
     storage?: Storage;
-  } = {},
+}
+
+async function runAcceptFollowThroughSteps(
+  projectRoot: string,
+  taskId: string,
+  ctx: FollowThroughContext,
 ): Promise<FollowThroughOutcome> {
   const storage = ctx.storage ?? await getOrCreateStorage();
   const task = await storage.getTask(taskId);
@@ -6600,6 +6675,9 @@ export async function runAcceptFollowThrough(
       await regenerateParentFidelity(storage, task, driver, config, projectRoot, warnings, record.payerEmail ?? null);
     },
     cleanup: async () => {
+      // INVARIANT: a completed task ends its member environments. Teardown is
+      // fallible follow-through after acceptance, never between merge and complete.
+      await endMemberSessions(task.id);
       const sess = await storage.getSessionByTaskId(task.id);
       const worktreePath = getWorktreePath(projectRoot, task);
       if (sess) await cleanupTaskContainer(storage, sess, taskRef(task), projectRoot);
@@ -6632,7 +6710,6 @@ export async function runAcceptFollowThrough(
   // `complete`.
   const persist = () => storage.updateTaskMetadata(task.id, ACCEPT_FOLLOWTHROUGH_KEY, JSON.stringify(record));
   const errors: string[] = [];
-  let waitingForMember: string | null = null;
   for (const step of FOLLOWTHROUGH_STEPS) {
     if (record.done.includes(step)) continue;
     // A step with nothing to do is done whatever its prerequisites did: held
@@ -6644,18 +6721,6 @@ export async function runAcceptFollowThrough(
       continue;
     }
     if ((FOLLOWTHROUGH_DEPENDS_ON[step] ?? []).some((dep) => !record.done.includes(dep))) continue;
-    // A member working in the task's files keeps them: a merge the forge made
-    // while they were inside (their task was `submitted`) is committed, but
-    // the worktree, branch, container and tokens are not removed under them.
-    // Cleanup stays pending — not a failure — and the next pass after their
-    // session ends (the daemon's follow-through sweep) runs it.
-    if (step === 'cleanup') {
-      const holder = memberInsideTask(task.id);
-      if (holder) {
-        waitingForMember = holder;
-        continue;
-      }
-    }
     try {
       await steps[step]();
     } catch (err) {
@@ -6667,21 +6732,14 @@ export async function runAcceptFollowThrough(
   }
   if (errors.length > 0) {
     record.attempts += 1;
-    record.lastError = errors.join('; ');
+    // Masked: a git error can carry a remote URL with credentials in it, and this
+    // text is stored, shown on the task and quoted in a system message.
+    record.lastError = maskUrlCredentials(errors.join('; '));
     record.nextAttemptAt = Date.now() + followThroughBackoffMs(record.attempts);
     await persist();
     const pending = FOLLOWTHROUGH_STEPS.filter((s) => !record.done.includes(s));
     logger.warn(`Task ${displayId(task)}: accepted, but post-accept follow-through failed at ${record.lastError} (attempt ${record.attempts}; still pending: ${pending.join(', ')})`);
-    return { pending, error: record.lastError, ...(waitingForMember ? { waitingForMember } : {}) };
-  }
-  if (waitingForMember) {
-    await persist();
-    logger.debug(`Task ${displayId(task)}: accepted; its worktree is cleaned up once ${waitingForMember} has closed their terminals.`);
-    return {
-      pending: ['cleanup'],
-      error: `cleanup waits for ${waitingForMember}'s terminal session to end`,
-      waitingForMember,
-    };
+    return { pending, error: record.lastError };
   }
   await storage.updateTaskMetadata(task.id, ACCEPT_FOLLOWTHROUGH_KEY, '');
   if (record.attempts > 0) {
@@ -7131,20 +7189,10 @@ async function acceptTaskRun(
     warnings.push(...delivered.warnings);
   }
 
-  // A member working in the task's files keeps a fresh accept from doing
-  // ANYTHING to it: refused here, before the first step with an effect beyond
-  // the store — the accept check and the `[automation.pre_accept]` gate (which
-  // run project commands in those files), the branch push, PR/MR creation,
-  // approveForMerge and the forge's gates. Only the raised-item resolutions
-  // above come first: they are the human's own words, saved before anything
-  // that can refuse. This whole accept runs under the task's lifecycle lock —
-  // the lock a member's entry takes — and once `merging` is stamped the entry
-  // refuses the task, so the check holds for the whole accept. A `merging`
-  // task (a resume, or a forge merge re-entering) cannot have a member inside.
-  if (preflight.taskStatus !== 'merging') {
-    const holder = memberInsideTask(task.id);
-    if (holder) throw new RpcError(409, memberInsideSyncMessage(holder));
-  }
+  // A member with sessions in the task's own environment does not refuse its
+  // accept: nothing fallible may follow the merge (the accept commit point), so
+  // the merge lands and only the worktree CLEANUP waits for their sessions to
+  // end — a follow-through step (`runAcceptFollowThrough`, step `cleanup`).
 
   const worktreePath = preflight.worktreePath;
   const mergeTargetBranch = preflight.mergeTargetBranch;
@@ -8384,15 +8432,6 @@ export interface SyncTaskParams {
    */
   liftPin?: boolean;
   /**
-   * An AUTOMATIC sync (the auto-sync after an upstream accept, the pending-sync
-   * retry loop). While a member has a terminal open on the task such a sync is
-   * QUEUED (`pending_sync`) instead of refused: nobody is waiting on it, and the
-   * retry loop merges it once the member's session has ended. Every other
-   * caller — a person, the builder, an agent — is refused with a 409 naming
-   * the member.
-   */
-  queueIfMemberInside?: boolean;
-  /**
    * The DAEMON is starting this sync by itself — the auto-sync after an
    * upstream change, the pending-sync retry loop. Only a conflict runs an
    * agent, and on a credential the usage pause stops that conflict resolution
@@ -8410,16 +8449,11 @@ export interface SyncTaskResult {
    * merges inline rather than launching a supervisor to do them.
    */
   /**
-   * `held_by_member`: a member has a terminal open on the task and the caller
-   * asked to queue rather than be refused (`queueIfMemberInside`). Nothing was
-   * fetched or merged; the sync stays on the pending counter.
-   */
-  /**
    * `waiting_for_parent`: the parent task has not started, so it has no branch
    * and there is nothing to merge yet. Not a failure: the sync stays queued and
    * runs when the parent starts.
    */
-  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'pinned' | 'held_by_member' | 'waiting_for_parent';
+  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'pinned' | 'waiting_for_parent';
   message: string;
   warnings: string[];
   /** Self-sync only: what each of the two steps did. */
@@ -8565,27 +8599,6 @@ export async function syncTask(
     phases.fail(err instanceof Error ? err.message : String(err));
     throw err;
   }
-}
-
-/**
- * A member has a terminal open on the task (src/server/member-terminals.ts):
- * sync must not merge into, or move HEAD of, the worktree they are working
- * in. Called under the task's lifecycle lock, next to the dispatchable-status
- * check, so a member's entry cannot interleave. Returns true when the sync was
- * queued instead (automatic callers); throws 409 for everyone else.
- */
-export async function standDownForMember(
-  storage: Pick<Storage, 'incrementTaskPendingSync'>,
-  task: Pick<Task, 'id'> & { pending_sync?: number },
-  params: Pick<SyncTaskParams, 'queueIfMemberInside'>,
-): Promise<string | null> {
-  const holder = memberInsideTask(task.id);
-  if (!holder) return null;
-  if (!params.queueIfMemberInside) throw new RpcError(409, memberInsideSyncMessage(holder));
-  // Queued once: a sync already on the counter (the retry loop's own case)
-  // is not counted again on every pass while the member stays inside.
-  if (!task.pending_sync) await storage.incrementTaskPendingSync(task.id);
-  return holder;
 }
 
 async function syncTaskRun(
@@ -8961,7 +8974,6 @@ async function syncTaskRun(
   let standDownStatus: TaskStatus | null = null;
   // Set when a member has a terminal open on the task and this (automatic)
   // sync was queued instead of merging under them.
-  let standDownMember: string | null = null;
 
   try {
     // Attempt both merges on the host before asking a runner for anything. A
@@ -8977,8 +8989,6 @@ async function syncTaskRun(
         await storage.incrementTaskPendingSync(task.id);
         return null;
       }
-      standDownMember = await standDownForMember(storage, fresh, params);
-      if (standDownMember) return null;
       const outcome = await runSelfSync({
         storage,
         taskId: task.id,
@@ -9010,16 +9020,6 @@ async function syncTaskRun(
       return outcome;
     });
 
-    if (!hostMerge && standDownMember) {
-      phases.skip(SYNC_PHASES.launch, `${standDownMember} has a terminal open — sync stays queued`);
-      return {
-        taskId: task.id,
-        displayId: displayId(task),
-        status: 'held_by_member',
-        message: `${standDownMember} has a terminal open on task ${displayId(task)}. The sync stays queued and will merge ${resolvedParentBranch} once their session has ended.`,
-        warnings,
-      };
-    }
     if (!hostMerge) {
       phases.skip(SYNC_PHASES.launch, `task became '${standDownStatus}' — sync stays queued`);
       return {
@@ -9236,8 +9236,6 @@ async function syncTaskRun(
         await storage.incrementTaskPendingSync(task.id);
         return null;
       }
-      standDownMember = await standDownForMember(storage, fresh, params);
-      if (standDownMember) return null;
       priorStatus = fresh.status;
 
       // The id this sync's command and its restore marker share. Allocated here
@@ -9271,6 +9269,7 @@ async function syncTaskRun(
       // Write a sync command — semantically distinct from start/unblock
       const syncCommand: SyncCommand = {
         type: 'sync',
+        runtime_context: taskRuntimeContext(runner.type),
         task_id: task.id,
         command_id: syncCommandId,
         protocol_version: PROTOCOL_VERSION,
@@ -9321,16 +9320,6 @@ async function syncTaskRun(
       return { mustRecreateContainer };
     });
 
-    if (!dispatch && standDownMember) {
-      phases.skip(SYNC_PHASES.launch, `${standDownMember} has a terminal open — sync stays queued`);
-      return {
-        taskId: task.id,
-        displayId: displayId(task),
-        status: 'held_by_member',
-        message: `${standDownMember} has a terminal open on task ${displayId(task)}. The sync stays queued and will merge ${resolvedParentBranch} once their session has ended.`,
-        warnings,
-      };
-    }
     if (!dispatch) {
       phases.skip(SYNC_PHASES.launch, `task became '${standDownStatus}' — sync stays queued`);
       return {
@@ -9359,20 +9348,21 @@ async function syncTaskRun(
     if (mustRecreateForEnv) phases.note('recreating container: task environment changed (lazy env) — launch env is fixed at create time');
     // Not a work turn: a replacement here is only RECORDED, and told to the
     // next work turn (src/task/environment-replaced.ts).
-    await recordRecreationIfRunning(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)), runner, containerName);
+    await recordContainerBeforeLaunch(storage, task.id, recreationReason(mustRecreateContainer, mustRecreateForAgent, mustRecreateForEnv, mustRecreateForRunnerImage(task)), runner, containerName);
     if (mustRecreateForAgent) {
       phases.note(
         `recreating container: agent changed ` +
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
+    const kept = await reuseOrStartTaskRun(runner, storage, sess, containerName, mustRecreateContainer || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForRunnerImage(task), task.agent_id);
+    if (kept) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
       // now reports itself instead of running toolless. See the "CONTAINER
       // REUSE" note on writeDaemonMcpConfig in src/daemon/task-launcher.ts.
-      phases.note(`reusing running container ${containerName}`);
+      phases.note(keptRunNote(kept, containerName));
     } else {
       await removeTaskRun(runner, storage, sess, containerName);
 
@@ -9621,15 +9611,10 @@ async function reparentTaskRun(
   // A single canonical target — either stacked on a task or pointed at a branch.
   // There is no separate parent/branch pair to keep consistent.
   //
-  // A member working in the task's files refuses the reparent BEFORE anything
-  // is written: the sync below merges the new parent into those files and
-  // refuses while they are inside, and a repoint recorded ahead of that
-  // refusal would leave the task on a parent it was never synced with. Checked
-  // and written under the lifecycle lock a member's entry takes; released
-  // before the sync, which takes it itself.
+  // Written under the task's lifecycle lock; released before the sync, which
+  // takes it itself. A member working in the task's files does not refuse it:
+  // the sync merges like a turn does (engineer, 2026-10-21).
   await withTaskLifecycleLock(task.id, async () => {
-    const holder = memberInsideTask(task.id);
-    if (holder) throw new RpcError(409, memberInsideSyncMessage(holder));
     await storage.updateTaskTarget(
       task.id,
       newParentTaskId !== null ? taskTarget(newParentTaskId) : branchTarget(targetBranch),
@@ -10346,13 +10331,8 @@ async function resumeTaskRun(
     // human clicks Restart, and the resumed turn 401s on request one.
     //
     // UNDER THE TASK'S LIFECYCLE LOCK, like every launch path, and the notice
-    // turn with it: a member's entry into this task (src/daemon/member-entry.ts)
-    // takes the same lock, so either this launch sees the member inside and
-    // refuses BEFORE writing anything, or the entry sees this task `working`
-    // and is refused — never a member working in the worktree while a turn
-    // runs on it, and never a notice turn for a resume that did not happen.
+    // turn with it — never a notice turn for a resume that did not happen.
     const { mustRecreateContainer, plan: credentialPlan } = await withTaskLifecycleLock(task.id, async () => {
-      assertNoMemberInside(task.id);
       // A turn with no credential for its profile is refused here: this launch carries
       // no human feedback to save first (unlike unblock — recordFeedbackThenRefuse).
       await assertTurnCredentialAvailable(projectRoot, { taskId: task.id, storage });
@@ -10389,13 +10369,13 @@ async function resumeTaskRun(
     // turn that runs in its successor.
     // `lazy env set` since this container was created: env is fixed at create.
     const mustRecreateForEnv = await mustRecreateForTaskEnv(projectRoot, task.id, containerName);
-    await recordRecreationIfRunning(
+    await recordContainerBeforeLaunch(
       storage,
       task.id,
       recreationReason(mustRecreateContainer, mustRecreateForContainerAgent(sess, task.agent_id), mustRecreateForEnv, mustRecreateForRunnerImage(task)),
       runner, containerName,
     );
-    const envNotice = await environmentReplacedPrefix(storage, task.id);
+    let envNotice = await environmentReplacedPrefix(storage, task.id);
 
     const unblockCommand: UnblockCommand = {
       type: 'unblock',
@@ -10423,7 +10403,7 @@ async function resumeTaskRun(
         config,
       })),
       ...sessionCredentialCommandField(credentialPlan, () => agentTargetForTask(resumeTurnBudgetConfig, task)),
-      ...commonCommandFields(config),
+      ...commonCommandFields(config, { runner: runner.type }),
     };
     // Per-task secret files, repaired before every launch (src/daemon/task-files.ts).
     await deliverTaskFilesForLaunch(projectRoot, task.id, worktreePath, phases.notify);
@@ -10445,15 +10425,17 @@ async function resumeTaskRun(
         `(${sess.container_agent_id} → ${task.agent_id}) — launch env is fixed at create time`,
       );
     }
-    if (!mustRecreateContainer && !mustRecreateForAgent && !mustRecreateForEnv && !mustRecreateForRunnerImage(task) && (await runner.isRunning(containerName))) {
+    const kept = await reuseOrStartTaskRun(runner, storage, sess, containerName, mustRecreateContainer || mustRecreateForAgent || mustRecreateForEnv || mustRecreateForRunnerImage(task), task.agent_id);
+    if (kept) {
       // Supervisor already running — it will pick up the new command. The
       // config written just above still reaches it (in-place write, pinned
       // inode); a container whose FIRST launch had none stays without one, but
       // now reports itself instead of running toolless. See the "CONTAINER
       // REUSE" note on writeDaemonMcpConfig in src/daemon/task-launcher.ts.
-      phases.note(`reusing running container ${containerName}`);
+      phases.note(keptRunNote(kept, containerName));
     } else {
       await removeTaskRun(runner, storage, sess, containerName);
+      envNotice = await refreshEnvironmentReplacedCommand(storage, protoDir, unblockCommand, envNotice);
 
       try {
         await runner.launchSupervisor(sandbox, containerName, protoDir, false, daemonConfigPath ?? undefined, tRef, task.id, launchImagePin(task), phases.notify);
@@ -10648,6 +10630,8 @@ async function stopTaskRun(
   const runner = await createRunner(projectRoot, sess.runner_type ?? undefined);
   const containerName = sess.container_name ?? runner.runNameForTask(taskRef(task));
   await stopTaskAgent(runner, containerName, getProtocolDir(task.id));
+  // Host-process Stop removes the run record; there is no container to keep.
+  if (!runner.usesSandbox()) await storage.updateSessionContainerName(sess.id, null);
 
   // INVARIANT: lazy stop writes an ErrorResponse to response.json uniformly
   // regardless of command_type. This unblocks any in-flight daemon RPC waiting
@@ -10694,9 +10678,11 @@ async function stopTaskRun(
     exit_code: null,
     logs: null,
   });
-  // Sandboxed turns keep their shared environment. Host-process Stop removes
-  // the run record, so its session must no longer name that run.
-  if (!runner.usesSandbox()) await storage.updateSessionContainerName(sess.id, null);
+  // The sandboxed turn's container is KEPT, running, with its services: only the
+  // agent was stopped (src/runner/stop-task-agent.ts). Its recorded name and
+  // agent stamp stay, because it still exists: the stamp is what makes an
+  // agent switch recreate it, and the name is what the terminal-task sweep
+  // removes it by.
   try {
     clearStatus(protoDir);
   } catch {

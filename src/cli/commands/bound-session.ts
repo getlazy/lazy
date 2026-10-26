@@ -184,8 +184,8 @@ async function endOrStopBuilderSession(root: string, verb: 'end' | 'stop', expli
  * the browser's Pair, Chat and Shell tabs, spending the member's OWN
  * credential exactly as those do. The daemon decides
  * whether the terminal may open — on a shared daemon it runs in a container
- * of the member's own, and is refused while a turn runs, before the task has
- * run one, or while another member is in — and a refusal is shown as it is.
+ * of the member's own, beside any turn and any other member; it is refused
+ * before the task has run one — and a refusal is shown as it is.
  * Nothing is launched locally either way.
  */
 export async function commandTaskTerminalBound(

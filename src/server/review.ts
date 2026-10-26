@@ -75,6 +75,7 @@ import {
   withdrawRefusalReason,
   type ReviewActions,
   type ReviewQueueEntry,
+  awaitsAnswer,
 } from './review-actions';
 import { actionDialogButtonHtml, actionDialogTemplateHtml } from './action-dialog';
 import { submitActionHtml } from './submit-action';
@@ -298,7 +299,7 @@ export function reviewScript(
       if (b.textContent === 'Saving…') continue;
       var reason = gates[b.dataset.intent];
       b.hidden = !!reason;
-      b.disabled = false;
+      b.removeAttribute('aria-busy');
       b.removeAttribute('title');
     }
     var why = gateReasonText(gates);
@@ -697,7 +698,7 @@ export function reviewScript(
       var btnEl = e.submitter || lastClicked || form.querySelector('button[type=submit]');
       var intent = intentOf(btnEl);
       var label = btnEl.textContent;
-      btnEl.disabled = true;
+      btnEl.setAttribute('aria-busy', 'true');
       btnEl.textContent = 'Saving…';
       var taskLevel = a.file === TASK_ANCHOR_FILE && a.line === TASK_ANCHOR_LINE;
       // A task-level ask has its own endpoint; a task-level COMMENT is an
@@ -730,7 +731,7 @@ export function reviewScript(
           });
         })
         .catch(function (err) {
-          btnEl.disabled = false;
+          btnEl.removeAttribute('aria-busy');
           btnEl.textContent = label;
           var msg = form.querySelector('.rv-err') || document.createElement('div');
           msg.className = 'rv-err rv-state rv-state-failed';
@@ -865,7 +866,7 @@ export function reviewScript(
       var intent = intentOf(btnEl);
       var label = btnEl.textContent;
       var a = anchor;
-      btnEl.disabled = true;
+      btnEl.setAttribute('aria-busy', 'true');
       btnEl.textContent = 'Saving…';
       fetch('/tasks/' + TASK + '/review/comment', {
         method: 'POST',
@@ -888,7 +889,7 @@ export function reviewScript(
           });
         })
         .catch(function (err) {
-          btnEl.disabled = false;
+          btnEl.removeAttribute('aria-busy');
           btnEl.textContent = label;
           var msg = form.querySelector('.rv-err') || document.createElement('div');
           msg.className = 'rv-err rv-state rv-state-failed';
@@ -1032,7 +1033,7 @@ export function reviewScript(
       var btnEl = e.submitter || lastClicked || form.querySelector('button[type=submit]');
       var intent = intentOf(btnEl);
       var label = btnEl.textContent;
-      btnEl.disabled = true;
+      btnEl.setAttribute('aria-busy', 'true');
       btnEl.textContent = 'Saving…';
       var block = findProseBlock(anchor.file, anchor.line);
       fetch('/tasks/' + TASK + '/review/comment', {
@@ -1056,7 +1057,7 @@ export function reviewScript(
           });
         })
         .catch(function (err) {
-          btnEl.disabled = false;
+          btnEl.removeAttribute('aria-busy');
           btnEl.textContent = label;
           var msg = form.querySelector('.rv-err') || document.createElement('div');
           msg.className = 'rv-err rv-state rv-state-failed';
@@ -1439,7 +1440,7 @@ export function reviewScript(
     if (m.ask_state === 'pending') {
       return 'This question has already been sent to the agent and may be answered at any moment — it cannot be withdrawn. Wait for the answer, then say so in the thread.';
     }
-    if (m.ask_state !== 'failed') {
+    if (m.ask_state !== 'failed' && m.ask_state !== 'queued') {
       return 'The agent has already answered this question — the conversation happened, so it cannot be withdrawn.';
     }
     return null;
@@ -1490,6 +1491,7 @@ export function reviewScript(
         h += '<div class="rv-state rv-state-withdrawn">withdrawn — never sent to the agent</div>';
       } else {
         if (m.ask_state === 'pending') h += '<div class="rv-state rv-state-pending">waiting for the agent…</div>';
+        if (m.ask_state === 'queued') h += '<div class="rv-state rv-state-pending">waiting for the agent to finish its turn — sent as soon as it does</div>';
         if (m.ask_state === 'failed') {
           h += '<div class="rv-state rv-state-failed">not sent: ' + esc(m.ask_error || 'unknown error') +
             ' (your question is saved)</div>' + retryFormHtml(m.id);
@@ -1637,7 +1639,7 @@ ${STATUS_BAR_LABELS_JS}
     var gates = document.querySelectorAll('[data-rv-busy-gate]');
     for (var j = 0; j < gates.length; j++) {
       gates[j].hidden = busy;
-      gates[j].disabled = false;
+      gates[j].removeAttribute('aria-busy');
     }
   }
 
@@ -1836,7 +1838,7 @@ ${STATUS_BAR_LABELS_JS}
       if (!text) return;
       var btn = form.querySelector('button[type=submit]');
       var label = btn.textContent;
-      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
       btn.textContent = 'Saving…';
       fetch('/tasks/' + TASK + '/review/ask', {
         method: 'POST',
@@ -1851,7 +1853,7 @@ ${STATUS_BAR_LABELS_JS}
           });
         })
         .catch(function (err) {
-          btn.disabled = false;
+          btn.removeAttribute('aria-busy');
           btn.textContent = label;
           alert('Could not send: ' + err.message + ' (your question may still be saved — reload to check)');
         });
@@ -2286,6 +2288,9 @@ function messageStateHtml(taskId: string, m: ReviewComment): string {
   }
   if (m.ask_state === 'pending') {
     return '<div class="rv-state rv-state-pending">waiting for the agent…</div>';
+  }
+  if (m.ask_state === 'queued') {
+    return '<div class="rv-state rv-state-pending">waiting for the agent to finish its turn — sent as soon as it does</div>';
   }
   if (m.ask_state === 'failed') {
     // The retry is a plain form, not a fetch: re-sending a question the
@@ -3547,7 +3552,7 @@ export function reviewTaskHtml(
   orphansPhase.end();
 
   const queued = pendingDeliveryComments(comments);
-  const pendingAsks = comments.filter((c) => c.ask_state === 'pending').length;
+  const pendingAsks = comments.filter(awaitsAnswer).length;
   const live = state ?? fallbackState(task);
   // No `children` here on purpose: this entry point only ever has the hub
   // split the Changes block needs (accepted + in progress), and deriving cluster
@@ -3822,7 +3827,7 @@ function hubChildrenHtml(
  */
 export function threadsJson(comments: ReviewComment[], state?: ReviewLiveState, task?: Task) {
   const threads = groupThreads(comments);
-  const pending = comments.filter((c) => c.ask_state === 'pending').length;
+  const pending = comments.filter(awaitsAnswer).length;
   const queued = pendingDeliveryComments(comments);
   return {
     threads,

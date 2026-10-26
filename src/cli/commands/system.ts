@@ -11,6 +11,7 @@ import { commandSystemSmolvmBuildImage, systemSmolvmBuildImageUsage } from './sy
 import { commandSystemSmolvmInstall, systemSmolvmInstallUsage } from './system-smolvm-install';
 import { commandSystemRepairCommits, systemRepairCommitsUsage } from './system-repair-commits';
 import { commandSystemStoreCheck, systemStoreCheckUsage } from './system-store-check';
+import { commandSystemStoreRehome, systemStoreRehomeUsage } from './system-store-rehome';
 import {
   commandSystemStoreBackup, commandSystemStoreBackups, commandSystemStoreRestore,
   systemStoreBackupUsage, systemStoreBackupsUsage, systemStoreRestoreUsage,
@@ -68,6 +69,9 @@ export async function commandSystem(args: string[]): Promise<void> {
     case 'store-check':
       await commandSystemStoreCheck(sub);
       break;
+    case 'store-rehome':
+      await commandSystemStoreRehome(sub);
+      break;
     case 'store-backup':
       await commandSystemStoreBackup(sub);
       break;
@@ -117,6 +121,7 @@ export const systemSubcommandUsage: Record<string, () => void> = {
   'smolvm-install': systemSmolvmInstallUsage,
   'repair-commits': systemRepairCommitsUsage,
   'store-check': systemStoreCheckUsage,
+  'store-rehome': systemStoreRehomeUsage,
   'store-backup': systemStoreBackupUsage,
   'store-backups': systemStoreBackupsUsage,
   'store-restore': systemStoreRestoreUsage,
@@ -150,6 +155,7 @@ Subcommands:
   export-dockerfile  Write the embedded default Dockerfile to disk for customization
   repair-commits     Fix recorded commit lists that name commits a task never made
   store-check <path> Report what a store directory holds, without opening it
+  store-rehome       Transfer a stopped project's store to this checkout
   store-backup       Copy and verify the store into <store>.backups/ (taken before every upgrade)
   store-backups      List the store's backups
   store-restore <b>  Put a backup back (daemon stopped; the current store is moved aside)

@@ -7,6 +7,10 @@ import { createStorage, type Storage } from '../../src/storage';
 import { createCommitHandler, type McpToolContext } from '../../src/mcp/tools';
 import { branchTarget } from '../../src/task-target';
 import { LAZY_COAUTHOR_TRAILER, withLazyCoauthorTrailer } from '../../src/constants';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 const AUTHOR = {
   GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.com',
@@ -67,7 +71,7 @@ describe('lazy_commit co-author trailer', () => {
     git(repo, 'add', '.');
     git(repo, 'commit', '-m', 'init');
     git(repo, 'worktree', 'add', worktree, '-b', 'lazy/mine');
-    storage = await createStorage(repo, { backend: 'external' });
+    storage = await createStorage(repo, testStorageOptions(repo));
     const task = await storage.createTask('Test task');
     await storage.updateTaskTarget(task.id, branchTarget('main'));
     // The daemon's MCP route sets projectRoot; the handler reads THAT root's

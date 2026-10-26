@@ -24,6 +24,10 @@ import { createAllHandlers, type McpToolContext } from '../../src/mcp/tools';
 import { createStorage, type Storage } from '../../src/storage';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import type { Task } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('task-level raised items', () => {
   let testDir: string;
@@ -40,7 +44,7 @@ describe('task-level raised items', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     task = await storage.createTask('Test task', undefined, undefined, 'test-task');
   });
 
@@ -108,7 +112,7 @@ describe('task-level raised items', () => {
     // A later turn / auto-resume reopens storage from scratch — the items must
     // still be there, in order, with their flags intact.
     await storage.close();
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
 
     const raised = await storage.getTaskRaisedItems(task.id);
     expect(raised.map(r => [r.content, r.blocking])).toEqual([
@@ -211,7 +215,7 @@ describe('task-level raised items', () => {
     // On disk, and after a fresh storage instance — a later turn or the review
     // page must read the same three fields.
     await storage.close();
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
 
     const raised = await storage.getTaskRaisedItems(task.id);
     expect(raised).toHaveLength(1);

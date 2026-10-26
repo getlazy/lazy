@@ -149,7 +149,7 @@ export interface TaskActions {
    * `docker build` that can run for minutes, the container start). The web layer
    * shows it verbatim; nothing here is load-bearing.
    */
-  ensureContainer(taskId: string, onProgress?: (detail: string) => void): Promise<EnsureContainerResult>;
+  ensureContainer(taskId: string, onProgress?: (detail: string) => void, restart?: boolean): Promise<EnsureContainerResult>;
 
   /** No-network behind/ahead + merge-tree preview. */
   getUpstreamStatus(taskId: string): Promise<TaskUpstreamStatusView>;

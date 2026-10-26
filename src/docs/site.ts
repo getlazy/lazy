@@ -34,6 +34,7 @@ import { fileURLToPath } from 'url';
 import { Marked } from 'marked';
 import GithubSlugger from 'github-slugger';
 import type { DocsNav, NavItem } from './nav';
+import { validateDiagram } from './diagrams';
 
 /** One rendered page, as recorded in the manifest. */
 export interface DocsSitePage {
@@ -195,6 +196,10 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
   for (const source of markdown) {
     const raw = await readFile(join(docsDir, source), 'utf-8');
     const rendered = renderPage({ source, markdown: raw, knownPages, knownAssets, local });
+    for (const diagram of rendered.diagrams) {
+      try { await validateDiagram(diagram); }
+      catch (error) { problems.push(`${source}: invalid Mermaid diagram: ${String(error)}`); }
+    }
     unresolvedLinks.push(...rendered.unresolved.map((href) => ({ source, href })));
     fragmentLinks.push(...rendered.fragmentLinks.map((link) => ({ source, ...link })));
 
@@ -273,6 +278,9 @@ export async function buildDocsSite(options: BuildDocsSiteOptions): Promise<Docs
   // blocks fetch() of a .json from file://.
   await writeOut(outDir, SEARCH_INDEX_FILE, searchIndexJs(pages, bodies));
   await copyFile(fileURLToPath(new URL('./search.js', import.meta.url)), join(outDir, SEARCH_SCRIPT_FILE));
+  const bundle = await Bun.build({ entrypoints: [fileURLToPath(new URL('./diagrams-browser.ts', import.meta.url))], target: 'browser', minify: true });
+  if (!bundle.success) throw new Error(`Could not bundle docs diagrams: ${bundle.logs.join('\n')}`);
+  await writeOut(outDir, 'diagrams.js', await bundle.outputs[0]!.text());
 
   await writeOut(
     outDir,
@@ -456,6 +464,7 @@ interface RenderedPage {
   anchors: string[];
   unresolved: string[];
   fragmentLinks: FragmentLink[];
+  diagrams: string[];
 }
 
 /**
@@ -494,6 +503,7 @@ function renderPage(input: RenderPageInput): RenderedPage {
   const anchors: string[] = [];
   const unresolved: string[] = [];
   const fragmentLinks: FragmentLink[] = [];
+  const diagrams: string[] = [];
   let title = '';
 
   // Where this page's HTML lands, so rewritten links can be relative to it.
@@ -521,6 +531,19 @@ function renderPage(input: RenderPageInput): RenderedPage {
 
   const marked = new Marked({
     renderer: {
+      code(token: { text: string; lang?: string }) {
+        if (token.lang !== 'mermaid') {
+          return false;
+        }
+        const caption = token.text.match(/^%% caption: (.+)$/m)?.[1];
+        if (!caption) {
+          diagrams.push('INVALID CAPTION');
+          return '<p>Diagram has no caption.</p>';
+        }
+        const source = token.text.replace(/^%% caption: .+\n?/m, '');
+        diagrams.push(source);
+        return `<figure class="doc-diagram"><pre>${escapeHtml(source)}</pre><figcaption>${escapeHtml(caption)}</figcaption></figure>\n`;
+      },
       heading(this: { parser: { parseInline(tokens: unknown[]): string } }, token: {
         depth: number;
         tokens: unknown[];
@@ -559,7 +582,7 @@ function renderPage(input: RenderPageInput): RenderedPage {
 
   if (!title) title = prettifyName(source);
 
-  return { html, title, anchors, unresolved, fragmentLinks };
+  return { html, title, anchors, unresolved, fragmentLinks, diagrams };
 }
 
 interface ResolveHrefInput {
@@ -711,6 +734,9 @@ code { background:var(--code); padding:.15em .35em; border-radius:4px; font-size
 pre { background:var(--code); padding:1rem; border-radius:6px; overflow-x:auto; }
 pre code { background:none; padding:0; font-size:.85em; }
 table { border-collapse:collapse; width:100%; overflow-x:auto; display:block; }
+.doc-diagram { margin:1.5rem 0; overflow-x:auto; }
+.doc-diagram svg { min-width:40rem; max-width:100%; height:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
+.doc-diagram figcaption { color:var(--muted); font-size:.9rem; text-align:center; }
 th,td { border:1px solid var(--line); padding:.4rem .6rem; text-align:left; }
 blockquote { margin:1rem 0; padding:.25rem 1rem; border-left:4px solid var(--line); color:var(--muted); }
 img { max-width:100%; }
@@ -999,6 +1025,7 @@ ${input.body}
 <title>${escapeHtml(input.title)} — lazy docs</title>
 <style>${STYLES}</style>
 <script defer src="${input.toRoot || './'}${SEARCH_INDEX_FILE}"></script>
+<script defer src="${input.toRoot || './'}diagrams.js"></script>
 <script defer src="${input.toRoot || './'}${SEARCH_SCRIPT_FILE}" data-root="${input.toRoot || './'}"${input.local ? ' data-local="1"' : ''}></script>
 </head>
 <body>

@@ -225,6 +225,7 @@ export class GracefulExitTimeoutError extends Error {
 }
 
 export interface WatchdogResult {
+  recoveryTimedOut?: boolean;
   /**
    * Agent stdout. Complete when no activity stream is parsing it; a bounded
    * tail (see STDOUT_TAIL_LIMIT_BYTES) when one is — use `resultLine` for the
@@ -348,6 +349,14 @@ export async function execWithWatchdog(
      * be stopped so the retry relaunch picks up a fresh `ANTHROPIC_BASE_URL`.
      */
     registerKill?: (kill: (signal?: 'SIGTERM' | 'SIGKILL') => void) => void;
+    /** A retry launch must prove recovery independently of the ordinary watchdog. */
+    recovery?: {
+      timeoutMs: number;
+      onProgress: () => void;
+      initiallyArmed?: boolean;
+      onFailure?: (message: string) => number | undefined;
+      isSuccessfulResult?: (raw: string) => boolean;
+    };
   },
 ): Promise<WatchdogResult> {
   const { cwd, env, timeoutMs, activityStream, windDownTimeoutMs, abortOnSessionStart, registerKill } = opts;
@@ -425,6 +434,8 @@ export async function execWithWatchdog(
   });
 
   const stderrChunks: Buffer[] = [];
+  let recoveryTimedOut = false;
+  let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let killedByWatchdog = false;
   let killedDuringWindDown = false;
   let windDownElapsedMs: number | undefined;
@@ -471,6 +482,7 @@ export async function execWithWatchdog(
   }
 
   function clearTimers() {
+    clearTimeout(recoveryTimer);
     if (watchdogTimer) {
       clearTimeout(watchdogTimer);
       watchdogTimer = null;
@@ -508,7 +520,7 @@ export async function execWithWatchdog(
   }
 
   function killForNoProgress() {
-    if (killedDuringWindDown || abortReason) return;
+    if (killedDuringWindDown || abortReason || recoveryTimedOut) return;
     killedByWatchdog = true;
     const elapsed = Date.now() - launchTime;
     const stuck = inFlightTools.size > 0
@@ -524,7 +536,7 @@ export async function execWithWatchdog(
 
   function killForWindDown() {
     // If the no-progress guard already started killing, don't double-kill.
-    if (killedByWatchdog || abortReason) return;
+    if (killedByWatchdog || abortReason || recoveryTimedOut) return;
     killedDuringWindDown = true;
     windDownElapsedMs = windDownArmedAt !== null ? Date.now() - windDownArmedAt : (windDownTimeoutMs ?? 0);
     log(
@@ -546,7 +558,7 @@ export async function execWithWatchdog(
 
   function resetWatchdog() {
     if (!enabled) return;
-    if (killedByWatchdog || killedDuringWindDown || abortReason) return; // Don't reset after we've started killing
+    if (killedByWatchdog || killedDuringWindDown || abortReason || recoveryTimedOut) return; // Don't reset after we've started killing
     // While the wind-down guard owns the process, leaving the no-progress
     // timer running would just race it to the same kill.
     if (windDownOwns()) return;
@@ -593,9 +605,22 @@ export async function execWithWatchdog(
    * Treating it as progress would remove the only backstop against a
    * permanently stuck tool call.
    */
+  function recovered() {
+    if (!recoveryTimer || recoveryTimedOut) return;
+    clearTimeout(recoveryTimer);
+    recoveryTimer = undefined;
+    opts.recovery?.onProgress();
+  }
+
   function onActivity(line: string) {
     const event = activityStream!.parseLine(line);
     if (!event) return;
+
+    // Session headers and heartbeats prove liveness only, never model recovery.
+    if (event.failureMessage) observeFailure(event.failureMessage);
+    const modelOutput = event.modelOutput;
+    const successfulResult = event.kind === 'result' && !!event.raw && opts.recovery?.isSuccessfulResult?.(event.raw);
+    if (event.kind === 'tool_start' || event.kind === 'tool_end' || modelOutput || successfulResult) recovered();
 
     switch (event.kind) {
       case 'heartbeat':
@@ -666,6 +691,21 @@ export async function execWithWatchdog(
     resetWatchdog();
   }
 
+  function armRecovery(timeoutMs: number) {
+    if (recoveryTimer || recoveryTimedOut) return;
+    recoveryTimer = setTimeout(() => {
+      recoveryTimedOut = true;
+      log(`[watchdog] Retry made no forward progress within ${timeoutMs}ms. Sending SIGTERM.`);
+      proc.kill('SIGTERM');
+      scheduleSigkill('retry recovery deadline');
+    }, timeoutMs);
+  }
+  function observeFailure(message: string) {
+    const duration = opts.recovery?.onFailure?.(message);
+    if (duration !== undefined) armRecovery(duration);
+  }
+  if (opts.recovery && opts.recovery.initiallyArmed !== false) armRecovery(opts.recovery.timeoutMs);
+
   // Start the no-progress timer.
   resetWatchdog();
 
@@ -725,11 +765,18 @@ export async function execWithWatchdog(
   const stderrDone = (async () => {
     const reader = proc.stderr.getReader();
     stderrReader = reader;
+    const decoder = new TextDecoder();
+    let pending = '';
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         stderrChunks.push(Buffer.from(value));
+        pending += decoder.decode(value, { stream: true });
+        const lines = pending.split('\n');
+        pending = lines.pop()!.slice(-4000);
+        for (const line of lines) observeFailure(line);
+        if (pending) observeFailure(pending);
         if (!activityStream) resetWatchdog();
       }
     } finally {
@@ -777,6 +824,7 @@ export async function execWithWatchdog(
   const exitCode = proc.exitCode ?? 1;
 
   return {
+    recoveryTimedOut,
     stdout,
     stderr,
     exitCode,

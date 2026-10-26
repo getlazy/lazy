@@ -95,10 +95,10 @@ export interface CredentialGrant {
   boundAddresses?: string[];
   /**
    * Credentials an upstream minted FOR this grant's holder (Cursor's key
-   * exchange), each held behind its own placeholder — see
+   * exchange), each held behind its own placeholder and source digest — see
    * {@link bindDerivedCredentials}. The container only ever sees `placeholder`.
    */
-  derived?: Array<{ placeholder: string; real: string; createdAt: string }>;
+  derived?: Array<{ placeholder: string; real: string; sourceDigest?: string; createdAt: string }>;
   createdAt: string;
 }
 
@@ -505,7 +505,7 @@ export function derivedPlaceholderFor(real: string): string {
 export async function bindDerivedCredentials(
   projectRoot: string,
   grantToken: string,
-  pairs: ReadonlyArray<{ placeholder: string; real: string }>,
+  pairs: ReadonlyArray<{ placeholder: string; real: string; sourceDigest?: string }>,
 ): Promise<boolean> {
   return mutate(projectRoot, async registry => {
     const grant = registry.grants.find(g => g.token === grantToken);
@@ -513,7 +513,7 @@ export async function bindDerivedCredentials(
     const now = new Date().toISOString();
     grant.derived = [
       ...(grant.derived ?? []),
-      ...pairs.map(p => ({ placeholder: p.placeholder, real: p.real, createdAt: now })),
+      ...pairs.map(p => ({ ...p, createdAt: now })),
     ].slice(-MAX_DERIVED_PER_GRANT);
     await persist(projectRoot, registry);
     return true;
@@ -557,12 +557,13 @@ export async function revokeGrantsByBindingKey(projectRoot: string, bindingKey: 
 /**
  * Revoke every grant whose label starts with `prefix` — the member
  * containers' grants (`member-terminal:`), whose only other revoke is the
- * container's removal, which a daemon restart interrupts. Returns how many.
+ * container's removal, which a daemon restart interrupts. `keep` names labels
+ * left alone: those of member containers the new daemon re-adopted. Returns how many.
  */
-export async function revokeGrantsByLabelPrefix(projectRoot: string, prefix: string): Promise<number> {
+export async function revokeGrantsByLabelPrefix(projectRoot: string, prefix: string, keep: ReadonlySet<string> = new Set()): Promise<number> {
   return mutate(projectRoot, async registry => {
     const before = registry.grants.length;
-    registry.grants = registry.grants.filter(g => !g.label.startsWith(prefix));
+    registry.grants = registry.grants.filter(g => !g.label.startsWith(prefix) || keep.has(g.label));
     const removed = before - registry.grants.length;
     if (removed > 0) await persist(projectRoot, registry);
     return removed;

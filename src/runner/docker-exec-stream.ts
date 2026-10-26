@@ -220,8 +220,18 @@ export interface ExecStreamOptions {
   cols: number;
   rows: number;
   env?: string[];
-  /** Called with raw output bytes from the exec's PTY. */
+  /**
+   * Allocate a PTY (the default). `false` runs the exec with plain pipes, as
+   * an SSH server needs: its stdout is a byte stream that a PTY would mangle
+   * (CRLF translation, echo). Without a TTY the engine MULTIPLEXES stdout and
+   * stderr on the hijacked connection, so the stream is demultiplexed here and
+   * stderr goes to {@link onStderr}, never into {@link onData}.
+   */
+  tty?: boolean;
+  /** Called with raw output bytes from the exec's PTY (or, without a TTY, its stdout). */
   onData: (data: Uint8Array) => void;
+  /** Without a TTY: the exec's stderr. Ignored with one (a PTY has no separate stderr). */
+  onStderr?: (data: Uint8Array) => void;
   /** Called once when the exec's stream ends; `code` is the exec exit code. */
   onExit: (code: number | null) => void;
 }
@@ -238,6 +248,15 @@ export class ExecStream {
   private closed = false;
   private sawHijackHeader = false;
   private headerBuffer = Buffer.alloc(0);
+  /** Without a TTY: bytes of an incomplete multiplexed frame. */
+  private muxBuffer: Buffer = Buffer.alloc(0);
+  /**
+   * Bytes `write()` could not hand to the socket yet. A socket write may take
+   * only part of what it is given; the rest is sent on `drain`, in order. A
+   * keystroke never fills a socket, but an SSH upload does — and dropping the
+   * tail of a write would corrupt the stream.
+   */
+  private pending: Uint8Array[] = [];
 
   constructor(private readonly opts: ExecStreamOptions) {}
 
@@ -265,7 +284,7 @@ export class ExecStream {
         AttachStdin: true,
         AttachStdout: true,
         AttachStderr: true,
-        Tty: true,
+        Tty: this.tty,
         Cmd: this.opts.cmd,
         Env: this.opts.env,
       },
@@ -277,9 +296,9 @@ export class ExecStream {
     if (!parsed.Id) throw new Error('docker exec create returned no exec Id');
     this.execId = parsed.Id;
 
-    await this.openHijacked(`/exec/${this.execId}/start`, JSON.stringify({ Detach: false, Tty: true }));
+    await this.openHijacked(`/exec/${this.execId}/start`, JSON.stringify({ Detach: false, Tty: this.tty }));
     // Apply the initial geometry now that the exec exists.
-    await this.resize(this.opts.cols, this.opts.rows);
+    if (this.tty) await this.resize(this.opts.cols, this.opts.rows);
   }
 
   private openHijacked(apiPath: string, body: string): Promise<void> {
@@ -305,6 +324,7 @@ export class ExecStream {
             resolve();
           },
           data: (_sock, data) => this.onSocketData(data),
+          drain: () => this.flush(),
           close: () => this.handleClose(),
           error: (_sock, err) => {
             if (!opened) reject(err);
@@ -321,7 +341,7 @@ export class ExecStream {
    * multiplexing frame header — the bytes are the terminal stream verbatim. */
   private onSocketData(data: Uint8Array): void {
     if (this.sawHijackHeader) {
-      this.opts.onData(data);
+      this.deliver(data);
       return;
     }
     this.headerBuffer = Buffer.concat([this.headerBuffer, Buffer.from(data)]);
@@ -330,7 +350,26 @@ export class ExecStream {
     this.sawHijackHeader = true;
     const rest = this.headerBuffer.subarray(marker + 4);
     this.headerBuffer = Buffer.alloc(0);
-    if (rest.length > 0) this.opts.onData(rest);
+    if (rest.length > 0) this.deliver(rest);
+    this.flush();
+  }
+
+  private get tty(): boolean {
+    return this.opts.tty !== false;
+  }
+
+  /** Output after the hijack header: verbatim with a TTY, demultiplexed without. */
+  private deliver(data: Uint8Array): void {
+    if (this.tty || this.opts.attach) {
+      this.opts.onData(data);
+      return;
+    }
+    const frames = demuxDockerStream(Buffer.concat([this.muxBuffer, Buffer.from(data)]));
+    this.muxBuffer = frames.rest;
+    for (const f of frames.frames) {
+      if (f.stream === 2) this.opts.onStderr?.(f.data);
+      else this.opts.onData(f.data);
+    }
   }
 
   private handleClose(): void {
@@ -368,10 +407,28 @@ export class ExecStream {
     this.opts.onExit(code);
   }
 
-  /** Forward keystroke bytes to the exec's stdin. */
+  /** Forward bytes to the exec's stdin, in order, however much the socket takes at once. */
   write(data: Uint8Array): void {
-    if (this.socket && this.started && !this.closed) {
-      this.socket.write(data);
+    if (!this.socket || !this.started || this.closed) return;
+    // Nothing reaches the exec's stdin before the engine has answered the
+    // hijack: bytes sent behind the request would be read as part of it.
+    if (this.pending.length > 0 || !this.sawHijackHeader) {
+      this.pending.push(data);
+      return;
+    }
+    const sent = this.socket.write(data);
+    if (sent < data.length) this.pending.push(data.subarray(Math.max(0, sent)));
+  }
+
+  private flush(): void {
+    while (this.socket && !this.closed && this.pending.length > 0) {
+      const head = this.pending[0]!;
+      const sent = this.socket.write(head);
+      if (sent < head.length) {
+        this.pending[0] = head.subarray(Math.max(0, sent));
+        return;
+      }
+      this.pending.shift();
     }
   }
 
@@ -404,4 +461,22 @@ export class ExecStream {
       logger.debug(`web-shell exec close failed: ${err instanceof Error ? err.message : err}`);
     }
   }
+}
+
+/**
+ * Split a non-TTY exec's multiplexed stream into frames: each is an 8-byte
+ * header — stream (0 stdin, 1 stdout, 2 stderr), three zero bytes, a
+ * big-endian uint32 length — then that many bytes. `rest` is an incomplete
+ * trailing frame to prepend to the next chunk.
+ */
+export function demuxDockerStream(buf: Buffer): { frames: Array<{ stream: number; data: Uint8Array }>; rest: Buffer } {
+  const frames: Array<{ stream: number; data: Uint8Array }> = [];
+  let off = 0;
+  while (buf.length - off >= 8) {
+    const len = buf.readUInt32BE(off + 4);
+    if (buf.length - off - 8 < len) break;
+    frames.push({ stream: buf[off]!, data: buf.subarray(off + 8, off + 8 + len) });
+    off += 8 + len;
+  }
+  return { frames, rest: Buffer.from(buf.subarray(off)) };
 }

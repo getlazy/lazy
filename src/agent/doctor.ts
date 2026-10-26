@@ -84,7 +84,7 @@ interface DoctorLinkBase {
 export interface AgentDoctorResult {
   host: string;
   taskId: string | null;
-  /** A member's own terminal container, where lazy's MCP is absent by design. */
+  /** A member's terminal, where Pair/Chat supply MCP config per connection. */
   memberSession?: boolean;
   checks: DoctorCheck[];
   /** True when every check concluded ok (warnings do not fail). */
@@ -976,17 +976,16 @@ async function firstStdoutLine(
 export async function runAgentDoctor(opts: AgentDoctorOptions = {}): Promise<AgentDoctorResult> {
   const checks: DoctorCheck[] = [];
 
-  // A member's own terminal container has no lazy MCP server, no daemon
-  // config and no lazy tool permissions ON PURPOSE (it only holds their
-  // terminals). Reporting those as three failures told a member reading doctor
-  // their install was broken; they are shown as not applicable instead.
+  // Member Pair/Chat supply MCP config on their own command line, not through
+  // the shared home or LAZY_DAEMON_CONFIG. Those shared-config checks cannot
+  // diagnose a connection; explain where its tools come from instead.
   // Only when LAZY_DAEMON_CONFIG is unset too: a member container never has
   // it, and a task container (whose home an agent can write) always does, so
   // a planted marker cannot hide a real MCP failure.
   if (!process.env.LAZY_DAEMON_CONFIG && (await exists(join(getHome(), MEMBER_SESSION_MARKER)))) {
     const na = (id: string, label: string): DoctorCheck => ({
       id, label, ok: true,
-      detail: 'not applicable — member terminal session: no MCP, no daemon config by design',
+      detail: 'not applicable — Pair and Chat supply connection-specific MCP configuration',
       data: { notApplicable: true },
     });
     return {
@@ -1028,7 +1027,7 @@ export function formatAgentDoctorReport(result: AgentDoctorResult): string {
   // Header first so a pasted transcript identifies itself without the reader
   // having to ask "which container was this?".
   lines.push(`lazy-agent doctor — container ${result.host}`);
-  if (result.memberSession) lines.push('member terminal session: no MCP, no daemon config by design');
+  if (result.memberSession) lines.push('member terminal session: Pair and Chat supply connection-specific lazy tools');
   else lines.push(`task: ${result.taskId ?? '(none — builder or project-wide mode)'}`);
   lines.push('');
 
@@ -1041,7 +1040,7 @@ export function formatAgentDoctorReport(result: AgentDoctorResult): string {
   }
 
   if (result.ok) {
-    lines.push(result.memberSession ? 'Nothing to check: lazy\'s tools are not part of a member terminal.' : 'All checks passed.');
+    lines.push(result.memberSession ? 'Shared-config checks do not diagnose Pair or Chat. If tools are disconnected, reopen that connection.' : 'All checks passed.');
   } else {
     const failed = result.checks.flatMap(c => (c.ok ? [] : [c.problem]));
     lines.push(`FAILED: ${failed.join(', ')}`);

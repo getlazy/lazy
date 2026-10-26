@@ -781,3 +781,10 @@ async function runAgentStep(step) {
   }
 }
 `;
+
+/** SDK 0.3.310 SDKAPIRetryMessage: live provider retry notification. */
+export function overloadedRetryEvent(attempt = 1): Record<string, unknown> {
+  return { type: 'system', subtype: 'api_retry', attempt, max_retries: 10,
+    retry_delay_ms: 1000, error_status: 529, error: 'overloaded',
+    uuid: `retry-${attempt}`, session_id: 'fake-live-retry' };
+}

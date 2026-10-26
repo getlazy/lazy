@@ -19,7 +19,7 @@ and notifies nobody.
 
 Filing a blocking item is the agent saying *I need a person before this goes
 further* — which is one of the three
-[turn endings](state-machine.md#how-a-turn-ends), and it excludes the other
+[turn endings](explanation/tasks-and-turns.md#how-a-turn-ends), and it excludes the other
 declared one. `lazy_final` ("the work is done") refuses while a blocking item is
 open on the task, and the refusal names the item.
 

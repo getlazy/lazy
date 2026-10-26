@@ -21,6 +21,10 @@ import {
   isSyncRestorable,
   markSyncRestoreStatus,
 } from '../../src/task/sync-restore-status';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 describe('isSyncRestorable', () => {
   // INVARIANT: `blocked` and `conflict` are the DERIVED paused label
@@ -45,7 +49,7 @@ describe('the sync restore marker', () => {
   beforeEach(async () => {
     testDir = mkdtempSync(join(tmpdir(), 'lazy-sync-restore-'));
     mkdirSync(join(testDir, '.lazy'), { recursive: true });
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
   });
 
   afterEach(async () => {

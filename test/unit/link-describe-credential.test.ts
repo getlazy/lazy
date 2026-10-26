@@ -21,6 +21,10 @@ import {
   TurnCredentialUnavailableError,
 } from '../../src/daemon/turn-credentials';
 import type { Task } from '../../src/types';
+import { openTestDaemonStorage } from '../helpers/daemon-storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 const TASK = { id: 'task-uuid-linked', code: 'linked' } as unknown as Task;
 
@@ -28,16 +32,19 @@ describe('link description credential', () => {
   let root: string;
   let base: string;
   let unpin: () => void;
+  let closeStore: () => Promise<void>;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'lazy-linkdesc-cred-'));
     base = await mkdtemp(join(tmpdir(), 'lazy-linkdesc-cred-base-'));
     unpin = pinDaemonBaseDir(base);
+    closeStore = await openTestDaemonStorage(root);
     clearUserCredentialCache();
     clearSessionCredentialCache();
   });
 
   afterEach(async () => {
+    await closeStore();
     unpin();
     clearUserCredentialCache();
     clearSessionCredentialCache();

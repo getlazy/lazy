@@ -37,6 +37,7 @@ Usage:
   lazy-agent builder --system-prompt-file <path> --worktree <path>   Run builder
   lazy-agent pair --task-id <uuid> --worktree <path> --agent <id>   Pair on a task
   lazy-agent doctor [--probe-agent] [--json]           Diagnose MCP wiring here
+  lazy-agent service-forward                           Forward a task's services for an SSH connection
 
 The default mode runs the supervisor loop: it watches for commands from the
 host via the protocol directory and manages work phases (sync, work, etc.).
@@ -80,6 +81,14 @@ if (command === 'selfcheck' || command === '--version' || command === '-v' || co
   // Sentinel string the preflight matches on. Keep 'lazy-agent ok' stable.
   console.log(`${AGENT_SELFCHECK_SENTINEL} ${await formatVersionWithEmbeddedProvenance(VERSION)}`);
   process.exit(0);
+}
+
+// `service-forward`: started by an SSH connection's wrapper in a member's own
+// container, so `ssh -L 3000:web:3000` reaches the task's services
+// (src/ssh/service-forwarder.ts). Runs until that connection's wrapper kills it.
+if (command === 'service-forward') {
+  const { runServiceForwarder } = await import('./ssh/service-forwarder');
+  process.exit(await runServiceForwarder());
 }
 
 // Handle doctor subcommand
@@ -141,7 +150,8 @@ Options:
   --builder-config <path>      Path to builder config JSON (host + port + token) (required)
   --daemon-config <path>       Path to daemon MCP config (preferred over builder-config)
   --builder-id <id>            Stable builder id; stamps sessionId onto its resume intent on exit
-  -- <args...>                 Additional args passed to Claude Code`);
+  --harness <id>               Agent CLI to run: claude-code (default) or codex
+  -- <args...>                 Additional args passed to Claude Code (translated for Codex)`);
     process.exit(0);
   }
 
@@ -151,6 +161,12 @@ Options:
   const daemonConfigIdx = args.indexOf('--daemon-config');
   const builderIdIdx = args.indexOf('--builder-id');
   const dashDashIdx = args.indexOf('--');
+  const harnessIdx = args.indexOf('--harness');
+  const harness = harnessIdx !== -1 && (dashDashIdx === -1 || harnessIdx < dashDashIdx) ? args[harnessIdx + 1] : 'claude-code';
+  if (harness !== 'claude-code' && harness !== 'codex') {
+    console.error(`Unsupported --harness ${JSON.stringify(harness)}: the builder runs claude-code or codex.`);
+    process.exit(1);
+  }
 
   if (worktreeIdx === -1 || worktreeIdx + 1 >= args.length) {
     console.error('Missing required flag: --worktree <path>');
@@ -178,6 +194,7 @@ Options:
 
   const { runBuilderSupervisor } = await import('./supervisor/builder');
   await runBuilderSupervisor({
+    harness,
     worktreePath,
     systemPromptFile,
     builderConfigPath,
@@ -206,7 +223,8 @@ Options:
   --model <id>          Model to pin
   --autonomous          Run without permission prompts
   --chat                Reflective read-only chat (no pairing lock; MCP read-only)
-  --member-session      A member's own terminal container: lazy-built home only, no MCP, no project settings`);
+  --member-session      A member's own terminal container: lazy-built home, no project settings
+  --member-mcp-config <path>  Private daemon-written MCP credential for this member connection`);
     process.exit(0);
   }
 
@@ -245,6 +263,7 @@ Options:
     autonomous: args.includes('--autonomous'),
     chat: args.includes('--chat'),
     memberSession: args.includes('--member-session'),
+    memberMcpConfig: flagValue('--member-mcp-config'),
   });
   process.exit(exitCode);
 } else if (command === 'mcp') {

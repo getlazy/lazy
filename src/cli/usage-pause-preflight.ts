@@ -146,7 +146,7 @@ export async function admitInteractiveOrExit(
   surface: 'pair' | 'chat' | 'builder',
   taskId?: string,
   /** Decide only — never take the override. For a check before the command's own refusals. */
-  opts: { peek?: boolean; overrideUsagePause?: boolean } = {},
+  opts: { peek?: boolean; overrideUsagePause?: boolean; builderProfile?: string } = {},
 ): Promise<void> {
   const refusal = await admitInteractive(surface, taskId, opts);
   if (refusal === null) return;
@@ -162,7 +162,7 @@ export async function admitInteractiveOrExit(
 export async function admitInteractive(
   surface: 'pair' | 'chat' | 'builder',
   taskId?: string,
-  opts: { peek?: boolean; overrideUsagePause?: boolean } = {},
+  opts: { peek?: boolean; overrideUsagePause?: boolean; builderProfile?: string } = {},
 ): Promise<string | null> {
   try {
     await queryUsagePause({
@@ -171,6 +171,7 @@ export async function admitInteractive(
       ...(taskId ? { taskId } : {}),
       ...(opts.peek ? { peek: true } : {}),
       ...(opts.overrideUsagePause ? { overrideUsagePause: true } : {}),
+      ...(opts.builderProfile ? { builderProfile: opts.builderProfile } : {}),
       // Only a person at a real terminal may TAKE the override (see
       // overrideEligibleActor); anything else is judged on the threshold alone.
       ...(await overrideEligibleActorOrUndefined()),

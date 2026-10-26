@@ -4,9 +4,9 @@ This page is generated from `lazy builder --help`.
 
 ```text
 Usage: lazy builder [list | attach [<id>] | stop [<id>] | end [<id>]] [--resume <id> [--import]] [--no-autonomous] [--yes]
-                    [--effort <level>] [--model <id>] [--override-usage-pause]
+                    [--effort <level>] [--model <id>] [--agent <profile>] [--override-usage-pause]
 
-Launch an interactive Claude Code session with Lazy builder instructions.
+Launch an interactive Claude Code session (or a Codex one, with --agent) with Lazy builder instructions.
 
 --override-usage-pause starts this builder session even when its credential is paused.
 
@@ -70,6 +70,11 @@ Flags:
                        pass --no-autonomous instead to run with prompts)
   --effort <level>     Claude Code reasoning effort (low, medium, high, xhigh, max)
                        Defaults to lazy.toml [builder].effort (default "high")
+  --agent <profile>    Run this builder session on an agent profile other than
+                       the builder role's ([models.roles.builder] agent) —
+                       e.g. codex-subscription for a Codex builder. Claude Code
+                       and Codex profiles only; needs the docker/podman runner
+                       for Codex. Pass it again with --resume <id>.
   --model <id>         Override the model the builder itself runs as (passed
                        straight through to Claude Code's --model; no allow-list,
                        so brand-new models work). Takes precedence over the
@@ -82,4 +87,5 @@ Examples:
   lazy builder list               # List captured conversations
   lazy builder --no-autonomous    # Run with permission prompts instead
   lazy builder --model mythos     # Run the builder on a specific model
+  lazy builder --agent codex-subscription   # Run the builder on Codex
 ```

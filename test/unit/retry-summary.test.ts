@@ -81,3 +81,10 @@ describe('formatRetrySummary', () => {
     expect(summary).toBe(`attempt 2: ${'y'.repeat(11)}…`);
   });
 });
+
+test('retry summary distinguishes scheduled backoff from a running retry', () => {
+  const status = { retryCount: 2, retry_next_at: '2026-10-24T12:00:10Z', retry_recovery_deadline: '2026-10-24T12:05:00Z' };
+  expect(formatRetrySummary(status)).toContain('next retry at 2026-10-24T12:00:10Z');
+  expect(formatRetrySummary({ ...status, retry_next_at: undefined })).toContain('waiting for model recovery');
+  expect(formatRetrySummary(status)).toContain('recovery deadline 2026-10-24T12:05:00Z');
+});

@@ -299,11 +299,9 @@ describe('lazy-agent doctor', () => {
     expect(text).toContain('task: task-uuid-1');
   });
 
-  // INVARIANT: in a member's own terminal container — no lazy MCP server, no
-  // daemon config, no lazy tool permissions, all by design — doctor says it is
-  // a member session and shows those checks as not applicable, never as
-  // failures a member would read as a broken install.
-  test('a member terminal session is named, and its absent MCP is not a failure', async () => {
+  // INVARIANT: member Pair/Chat configure tools per connection. Absent shared
+  // config is not a failed connection check, and must not claim tools are absent.
+  test('a member terminal explains its connection-specific tools', async () => {
     delete process.env.LAZY_DAEMON_CONFIG;
     await rm(join(home, '.claude.json'));
     await writeFile(join(home, '.claude', 'settings.json'), '{}\n');
@@ -314,7 +312,8 @@ describe('lazy-agent doctor', () => {
     expect(result.checks.map((c) => c.id)).toEqual(['daemon-config', 'claude-json', 'tool-permissions']);
     for (const c of result.checks) expect(c.data?.notApplicable).toBe(true);
     const text = formatAgentDoctorReport(result);
-    expect(text).toContain('member terminal session: no MCP, no daemon config by design');
+    expect(text).toContain('member terminal session: Pair and Chat supply connection-specific lazy tools');
+    expect(text).toContain('reopen that connection');
     expect(text).not.toContain('✗');
     expect(text).not.toContain('builder or project-wide mode');
   });

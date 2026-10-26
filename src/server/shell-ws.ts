@@ -34,7 +34,8 @@ import type { Runner, RunnerType } from '../runner';
 import type { ShellUnavailableCode } from './shell-ui';
 import { parseShellSessionMode, planPairOrChatExec } from './shell-pair';
 import { logger } from '../utils/logger';
-import { watchTerminalIdle, terminalExpiredMessage, type TerminalLimits, type IdleWatch } from './terminal-idle';
+import { parseShellSessionName, shellSessionCommand } from '../terminal/shell-session';
+import { attachSessionArgv, isValidSessionName } from '../sessions/tmux';
 import { createRunner } from '../runner';
 import { terminalEngineOf as engineOf } from '../runner/container-cli';
 import { taskRef } from '../task/identity';
@@ -42,6 +43,7 @@ import { ExecStream, resolveDockerSocketPath } from '../runner/docker-exec-strea
 import { OutputLog, TerminalHolds, RESUME_TOKEN_RE, TERMINAL_RESUME_GRACE_MS } from './terminal-hold';
 import type { WebSocketUpgrader, UpgradeOutcome } from './ws';
 import { decodePathSegment } from './task-urls';
+import { queueOrWriteSshInput, flushSshInput, startSshConnection, relaySshLog, relaySshOutput, finishSsh, logSshConnectionEnd, type SshConnectionData } from '../ssh/connection';
 import {
   parseShellClientMessage,
   shellServerMessage,
@@ -76,13 +78,8 @@ export interface ShellSocketData {
   env: string[];
   /** Releases the Pair/Chat lock after the socket closes. */
   onClose: (() => void) | null;
-  /**
-   * Close the terminal when idle or open too long (a member's terminal on a
-   * shared daemon — see ./terminal-idle.ts). Unset: no limit, as before.
-   */
-  limits?: TerminalLimits;
-  /** The running watch, when {@link limits} is set. */
-  idle?: IdleWatch | null;
+  /** Called only after the Engine API successfully starts the terminal exec. */
+  onStarted?: () => Promise<void>;
   /**
    * Work that runs AFTER the upgrade was answered and before the exec starts
    * — a member's own container (./session-attach-ws.ts). `status` sends a
@@ -101,6 +98,12 @@ export interface ShellSocketData {
    * preparation, which may be a minutes-long image build. Must be idempotent.
    */
   releaseNow?: (() => void) | null;
+  /**
+   * `?mode=ssh` (../ssh/connection.ts): the exec is `sshd -i` with no TTY,
+   * binary frames are SSH bytes both ways, and the connection carries its own
+   * audit.
+   */
+  ssh?: SshConnectionData;
   /**
    * Set by the route: who may reattach to this terminal after a dropped
    * connection (./terminal-hold.ts) — the route, its target and, on a shared
@@ -144,7 +147,6 @@ export const TERMINAL_ENDED_MESSAGE =
 export function endTerminal(data: ShellSocketData): void {
   if (data.ended) return;
   data.ended = true;
-  data.idle?.stop();
   data.exec?.close();
   terminalHolds.release(data.resumeToken);
   data.resumeToken = null;
@@ -432,8 +434,7 @@ export function refusal(status: number, message: string): Response {
  * attach route differ only in how they authorize and resolve the target.
  */
 /**
- * Relay a chunk of terminal OUTPUT to the browser. Output is not activity: it
- * never touches the idle watch (see the keystroke branch of the handler).
+ * Relay a chunk of terminal output to the browser.
  */
 export function relayTerminalOutput(ws: Pick<ServerWebSocket<ShellSocketData>, 'sendBinary'>, bytes: Uint8Array): void {
   // Raw terminal output rides binary frames untouched.
@@ -470,6 +471,8 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         return;
       }
       data.socketPath = socketPath;
+      const ssh = data.ssh;
+      if (ssh) startSshConnection(ssh);
       const exec = new ExecStream({
         socketPath,
         container: data.container,
@@ -478,14 +481,18 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         cols: data.cols,
         rows: data.rows,
         env: data.env,
+        ...(ssh ? { tty: false, onStderr: (bytes: Uint8Array) => relaySshLog(ws, ssh, bytes) } : {}),
         // Output goes to whichever socket the terminal is drawing to NOW —
         // after a reattach, not the one that opened it — and into the log a
-        // reattaching page catches up from.
+        // reattaching page catches up from. SSH is never resumable: its bytes
+        // go to the socket that carries the connection.
         onData: (bytes) => {
+          if (ssh) return relaySshOutput(ws, bytes);
           data.log?.append(bytes);
           if (data.ws) relayTerminalOutput(data.ws, bytes);
         },
         onExit: (code) => {
+          if (ssh) return finishSsh(ws, ssh, code);
           data.exitCode = code;
           const current = data.ws;
           // Exited while detached: kept until the page comes back to read
@@ -501,24 +508,12 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         },
       });
       data.exec = exec;
-      if (data.limits) {
-        const limits = data.limits;
-        data.idle = watchTerminalIdle(limits, (reason) => {
-          const current = data.ws;
-          if (!current) {
-            endTerminal(data);
-            return;
-          }
-          data.ending = true;
-          try {
-            current.send(shellServerMessage({ type: 'error', message: terminalExpiredMessage(reason, limits) }));
-            current.close(4000, reason === 'idle' ? 'idle' : 'max session');
-          } catch { /* already closed */ }
-        });
-      }
       try {
         await exec.start();
-        if (data.resumeOwner && !data.ended) {
+        await data.onStarted?.();
+        if (ssh) flushSshInput(ssh, exec);
+        // An SSH connection cannot be picked up again mid-protocol: never resumable.
+        if (data.resumeOwner && !data.ended && !ssh) {
           data.resumeToken = terminalHolds.register(data.resumeOwner, data, () => endTerminal(data));
         }
         const current = data.ws;
@@ -548,6 +543,15 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         }
       }
       const exec = ws.data.exec;
+      if (ws.data.ssh) {
+        // SSH: binary frames are the protocol's bytes; there is nothing to
+        // control (no PTY to resize). The client speaks FIRST (its banner),
+        // usually while the member's container is still being made, so input
+        // that arrives before sshd runs is held, never dropped.
+        if (typeof message === 'string') return;
+        queueOrWriteSshInput(ws, ws.data.ssh, exec, new Uint8Array(message));
+        return;
+      }
       if (!exec) {
         // Still preparing: keystrokes have nowhere to go, but a resize is kept
         // so the PTY opens at the size the terminal has NOW, not the one in
@@ -573,12 +577,7 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
         }
         return;
       }
-      // BINARY frame — raw keystrokes for the PTY stdin. The ONLY thing that
-      // counts as somebody using the terminal (./terminal-idle.ts): not its
-      // output — a dev server printing away with nobody at the keyboard would
-      // otherwise hold every turn off the task for the whole maximum — and
-      // not a resize, which a browser sends by itself.
-      ws.data.idle?.touch();
+      // BINARY frame — raw keystrokes for the PTY stdin.
       exec.write(new Uint8Array(message));
     },
 
@@ -611,6 +610,7 @@ export function createShellRelayHandler(): import('bun').WebSocketHandler<unknow
       }
       // Closing the exec closes the hijacked docker socket, which HUPs the
       // process inside the container — orphan reaping with no bookkeeping.
+      if (data.ssh) logSshConnectionEnd(data.ssh, data.container);
       endTerminal(data);
     },
   };
@@ -692,7 +692,38 @@ export function createShellUpgrader(deps: ShellUpgraderDeps): WebSocketUpgrader 
       const resolved = await resolveShellTarget(deps.root, task, session);
       if (!resolved.available) return refusal(409, resolved.reason);
 
-      let cmd = SHELL_CMD;
+      // `?tmux=<name>`: attach to one of the container's named tmux sessions
+      // (the Services tab's Attach / Take control) instead of a shell of one's
+      // own; `&readonly=1` watches without typing (`attach -r`). Nothing is
+      // started and no turn is waited for, as on the session attach route.
+      const tmuxName = url.searchParams.get('tmux');
+      if (tmuxName !== null) {
+        if (url.searchParams.get('mode') !== null || url.searchParams.get('session') !== null) {
+          return refusal(400, 'Attach to a tmux session (?tmux=) or open a terminal (?mode=, ?session=), not both.');
+        }
+        if (!isValidSessionName(tmuxName)) return refusal(400, `Not a session name: ${JSON.stringify(tmuxName)}.`);
+        const tmuxData: ShellSocketData = {
+          socketPath: '',
+          container: resolved.container,
+          binary: resolved.binary,
+          engineSocket: resolved.engineSocket,
+          cols,
+          rows,
+          exec: null,
+          cmd: attachSessionArgv(tmuxName, { readOnly: url.searchParams.get('readonly') === '1' }),
+          env: ['TERM=xterm-256color'],
+          onClose: null,
+        };
+        if (!server.upgrade(req, { data: tmuxData })) return refusal(426, 'Expected a WebSocket upgrade request.');
+        return 'upgraded';
+      }
+
+
+      // The Shell is the container's `shell` tmux session: a reconnect or a
+      // reload lands back in it (../terminal/shell-session.ts).
+      const sessionName = parseShellSessionName(url.searchParams.get('session'));
+      if (!sessionName) return refusal(400, 'session must be lowercase letters, digits and dashes (at most 32).');
+      let cmd = mode === 'shell' ? shellSessionCommand(sessionName) : SHELL_CMD;
       let env = ['TERM=xterm-256color'];
       let onClose: (() => void) | null = null;
       let abort: (() => void) | null = null;

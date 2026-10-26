@@ -849,9 +849,11 @@ export interface ResolvedConfig {
   storage: {
     backend: StorageBackendConfig;
     external_path: string;
+    /** Original configured spelling, before root-relative resolution. */
+    configured_path?: string;
     /**
      * The store directory this config selects, absolute: external_path (a
-     * relative one resolved against the cwd, as createStorage does) or, when
+     * relative one resolved against the project root) or, when
      * empty, the derived default `~/.lazy/<project>`. Computed by loadConfig,
      * never read from lazy.toml. The empty-path default is derived only for the
      * host-process runner (its one reader), so absence does NOT mean "no store";

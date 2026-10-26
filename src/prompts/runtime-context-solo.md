@@ -1,0 +1,1 @@
+solo lazy. The human can use the daemon dashboard ({{dashboardUrl}}) or the lazy CLI on the daemon machine. Whether that machine is the human’s computer, and the human’s OS, are unknown. Task service addresses and network reachability are unknown until reported by lazy.

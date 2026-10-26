@@ -75,8 +75,38 @@ export type CodexStep =
       /** Write `{ status, ok }` into the fake's state dir under this filename. */
       recordFile?: string;
     }
+  /**
+   * Write a native rollout under `$CODEX_HOME/sessions/YYYY/MM/DD/` the way
+   * the interactive TUI does (appending when it already exists — a resumed
+   * thread). Record shapes are the ones read off codex-cli 0.164.0 —
+   * session_meta, turn_context, response_item/message, event_msg/token_count —
+   * see test/fixtures/codex/codex-rollout-0.164.0.jsonl.
+   */
+  | { kind: 'rollout'; sessionId: string; userText: string; assistantText: string; inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; model?: string }
+  /**
+   * Act as Codex's MCP client for `[mcp_servers.<server>]` in
+   * `$CODEX_HOME/config.toml` — the file lazy writes before the launch: spawn
+   * it, initialize, list its tools and make each call in order. Writes a
+   * {@link CodexMcpCallRecord} into the state dir under `recordFile`.
+   */
+  | {
+      kind: 'mcp-call';
+      recordFile: string;
+      calls: Array<{ tool: string; arguments?: Record<string, unknown> }>;
+      server?: string;
+      timeoutMs?: number;
+    }
   /** Exit immediately with this code. */
   | { kind: 'exit'; code: number };
+
+/** What a codex `mcp-call` step writes into the fake's state dir. */
+export interface CodexMcpCallRecord {
+  argv: string[];
+  /** `$CODEX_HOME/config.toml` as read during the session. */
+  configToml: string;
+  tools: string[];
+  results: Array<{ tool: string; isError: boolean; text: string }>;
+}
 
 export interface CodexScenario {
   steps: CodexStep[];
@@ -299,10 +329,123 @@ async function runHttp(step) {
   await res.text().catch(() => '');
 }
 
+function codexHome() {
+  const home = process.env.CODEX_HOME;
+  if (!home) throw new Error(FAKE_LABEL + ': CODEX_HOME is unset');
+  return home;
+}
+
+// A native rollout, in the record shapes of codex-cli 0.164.0.
+function writeRollout(step) {
+  const now = new Date();
+  const day = now.toISOString().slice(0, 10).split('-');
+  const dir = path.join(codexHome(), 'sessions', day[0], day[1], day[2]);
+  fs.mkdirSync(dir, { recursive: true });
+  const existing = fs.readdirSync(dir).find((n) => n.endsWith('-' + step.sessionId + '.jsonl'));
+  const stamp = now.toISOString().slice(0, 19).replace(/:/g, '-');
+  const file = path.join(dir, existing || ('rollout-' + stamp + '-' + step.sessionId + '.jsonl'));
+  const ts = now.toISOString();
+  const turn = 'turn-' + Math.random().toString(16).slice(2);
+  const model = step.model || 'gpt-fake';
+  const usage = {
+    input_tokens: step.inputTokens === undefined ? 100 : step.inputTokens,
+    cached_input_tokens: step.cachedInputTokens || 0,
+    cache_write_input_tokens: 0,
+    output_tokens: step.outputTokens === undefined ? 20 : step.outputTokens,
+    reasoning_output_tokens: 0,
+  };
+  const records = [];
+  if (!existing) {
+    records.push({ timestamp: ts, type: 'session_meta', payload: { session_id: step.sessionId, id: step.sessionId, cwd: process.cwd(), cli_version: '0.164.0-fake' } });
+  }
+  records.push(
+    { timestamp: ts, type: 'turn_context', payload: { turn_id: turn, cwd: process.cwd(), model } },
+    { timestamp: ts, type: 'response_item', payload: { type: 'message', id: 'msg-u-' + turn, role: 'user', content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>' + process.cwd() + '</cwd>\n</environment_context>' }] } },
+    { timestamp: ts, type: 'response_item', payload: { type: 'message', id: 'msg-q-' + turn, role: 'user', content: [{ type: 'input_text', text: step.userText }] } },
+    { timestamp: ts, type: 'response_item', payload: { type: 'message', id: 'msg-a-' + turn, role: 'assistant', content: [{ type: 'output_text', text: step.assistantText }] } },
+    { timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: usage, last_token_usage: usage } } },
+  );
+  fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+}
+
+// Codex's MCP client, reduced to what a test needs. The server entry is read
+// out of the managed config.toml lazy rendered (its command/args lines are TOML
+// basic strings and arrays, which parse as JSON).
+async function runMcpCall(step) {
+  const { spawn } = require('node:child_process');
+  const tomlPath = path.join(codexHome(), 'config.toml');
+  const toml = fs.readFileSync(tomlPath, 'utf-8');
+  const section = '[mcp_servers.' + (step.server || 'lazy') + ']';
+  const at = toml.indexOf(section);
+  if (at === -1) throw new Error(FAKE_LABEL + ': no ' + section + ' in ' + tomlPath);
+  const body = toml.slice(at + section.length).split('\n[')[0];
+  const value = (key) => {
+    const m = body.match(new RegExp('^' + key + ' = (.*)$', 'm'));
+    if (!m) throw new Error(FAKE_LABEL + ': ' + section + ' has no ' + key);
+    return JSON.parse(m[1]);
+  };
+  const command = value('command');
+  const serverArgs = value('args');
+  const child = spawn(command, serverArgs, { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (d) => { stderr += d; });
+  let buffer = '';
+  const waiting = new Map();
+  child.stdout.on('data', (d) => {
+    buffer += d;
+    let nl;
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch (err) { continue; }
+      const done = waiting.get(msg.id);
+      if (done) { waiting.delete(msg.id); done(msg); }
+    }
+  });
+  let nextId = 0;
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = ++nextId;
+    const timer = setTimeout(
+      () => reject(new Error(FAKE_LABEL + ': MCP ' + method + ' timed out; server stderr:\n' + stderr)),
+      step.timeoutMs || 60000,
+    );
+    waiting.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  });
+  try {
+    await request('initialize', {});
+    const listed = await request('tools/list', {});
+    const tools = ((listed.result && listed.result.tools) || []).map((t) => t.name);
+    const results = [];
+    for (const call of step.calls) {
+      const res = await request('tools/call', { name: call.tool, arguments: call.arguments || {} });
+      results.push(res.error
+        ? { tool: call.tool, isError: true, text: JSON.stringify(res.error) }
+        : {
+            tool: call.tool,
+            isError: !!(res.result && res.result.isError),
+            text: ((res.result && res.result.content) || []).map((c) => c.text).join('\n'),
+          });
+    }
+    fs.writeFileSync(path.join(stateDir, step.recordFile), JSON.stringify({ argv, configToml: toml, tools, results }, null, 2));
+  } finally {
+    child.stdin.end();
+    child.kill('SIGTERM');
+  }
+}
+
 // The step kinds only codex understands. Returning false hands an unknown kind
 // back to the shared runtime, which fails loudly.
 async function runAgentStep(step) {
   switch (step.kind) {
+    case 'rollout':
+      writeRollout(step);
+      return true;
+    case 'mcp-call':
+      await runMcpCall(step);
+      return true;
     case 'respond':
       writeResponse(step);
       return true;

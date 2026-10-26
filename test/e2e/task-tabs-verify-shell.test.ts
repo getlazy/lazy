@@ -206,14 +206,14 @@ describe('tabbed task page verify + shell', () => {
     expect(after.progress).toEqual({ verified: 1, total: 2 });
   }, 90_000);
 
-  test('the Shell tab is an index that names sessions close on reload', async () => {
+  test('the Shell tab is an index that says a shell outlives its terminal', async () => {
     const taskId = await blockedTask('Shell tab index');
     const html = await (await fetch(`${base}/tasks/${taskId}/shell`)).text();
     expect(html).toContain('data-lz-tab="shell"');
     expect(html).toContain('data-lz-shell-index');
     expect(html).toContain('data-lz-shell-mode="pair"');
     expect(html).toContain('data-lz-shell-mode="chat"');
-    expect(html).toContain('Sessions close when you reload');
+    expect(html).toContain('the shell keeps running in the container');
     expect(html).toContain('does not lock the task');
     expect(html).toContain('30 seconds');
   }, 90_000);

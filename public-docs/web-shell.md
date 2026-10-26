@@ -12,13 +12,23 @@ directly, plus Pair and Chat. Verification steps mount a terminal **under the
 step**, not in this tab; the tab lists those sessions and links to them. The
 tab is hidden when the task's runner has no container.
 
-Sessions live in this browser document. Reload or leave the page and they
-close — there is no server-side registry. `lazy shell <task>` survives.
+The terminals live in this browser document, but the shell does not: on an
+image with `tmux`, a shell is the container's `shell` tmux session, which keeps
+running when you reload or leave the page. Opening a shell again — here, or
+with `lazy shell <task>`, which enters the same session — takes you back to it.
+
+Terminals have no idle or lifetime limit. In Teams, your own environment and its
+sessions stay when you close the page or disconnect, however long they are idle.
+The environment ends when you exit its last shell or explicitly end its sessions,
+when the task ends, or when you leave the team. A project restart reuses it when
+it can be recovered. The agent keeps working while your terminals are open.
 
 ## Opening a shell
 
 On the **Shell tab**, **+ New** opens a full-height terminal in the task's
-container. Bash is used when the container has it, otherwise `sh`. You land in
+container, attached to its `shell` tmux session (created the first time).
+Bash is used when the container has it, otherwise `sh`; an image without
+`tmux` gets a plain shell that ends with its terminal. You land in
 the task's working directory (its worktree), with `TERM=xterm-256color`, so
 full-screen programs like `vi`, `less` and `htop` render correctly.
 
@@ -45,12 +55,38 @@ connection reconnects to the same session by itself (see
 5 minutes, pairing ends 30 seconds later, so the task cannot stay locked
 forever. Only one Pair session per task.
 
-**Chat** opens a read-only conversation with the task's agent (`lazy chat`).
-It does not lock the task and does not change the task's agent, model, or
-effort. A working task's agent owns the session — Chat refuses then, with the
-same message as the CLI.
+In **Lazy Teams**, **Pair** opens your own conversation in your terminal
+container. Its `lazy_*` tools work on the paired task and its direct subtasks;
+writes name you, and turns you launch use your own credential. Several members
+can pair at once, alongside the task's running agent. Pairing does not lock the
+task. Closing the connection revokes that conversation's tool access; reopening
+Pair gives it a fresh connection.
 
-Both ride the same WebSocket as a plain shell, not a second exec path.
+Teams Pair and Chat run the task's own agent — Claude Code, Codex, Cursor or Pi —
+on any of their profiles, including named endpoints and tier chains. Requests
+use the task's profile and your own connections, resolved at account, team or
+project level, just like a turn you launch. If a required connection is missing,
+click the button to see which endpoint to connect under **Connections**. Pair
+resumes the agent's conversation on Claude Code, Codex and Pi; a Cursor session
+starts a new conversation.
+
+**Chat** opens a read-only conversation with read-only lazy tools. The daemon
+refuses writes even if the agent tries calling a write tool directly. Chat runs
+on Claude Code, Cursor and Pi tasks. It is not available on Codex tasks:
+Codex's read-only mode needs a sandbox that cannot run inside a task's
+container. Clicking Chat there says so; use **Ask** for a read-only question.
+
+In the **solo dashboard**, Pair takes over the task's agent session, with the
+same lock as `lazy pair`: unblock and accept refuse until it ends. A dropped
+connection releases the lock within 30 seconds. Solo Chat opens only while the
+task is paused. Neither mode changes the task's agent, model, or effort.
+
+The **Chat tab** is separate from terminal Chat: it uses read-only Ask turns
+and works on all four harnesses, including Codex. See [the Chat tab](reference/teams/task.md#chat).
+
+![Pair and the interactive Chat explanation on a Codex task in Teams](images/teams/teams-task-shell-codex.png)
+
+Both terminal modes ride the same WebSocket as a plain shell.
 
 ## Copy and paste
 
@@ -98,17 +134,20 @@ page never executes anything. When the block finishes, the shell prints
 terminal stays open and interactive for whatever you want to try next.
 
 Run is offered only for blocks that could be shell input (a `json`, `toml` or
-`ts` block has no Run), and is disabled with the same reason as the Shell tab
-when no shell can be opened. A stopped container is not one of those reasons —
+`ts` block has no Run). If no shell can be opened, clicking Run explains why
+and what to do next. A stopped container is not one of those reasons —
 Run starts it, and says so in the terminal it opens.
 
-Closing the terminal, leaving the page, or typing `exit` ends the session.
+If the connection drops, **Reconnect** attaches to the container's `shell`
+session again, with whatever was running in it (a reconnected session does not
+re-run its block). Typing `exit` ends the shell; closing the terminal or
+leaving the page only detaches from it. On an image without `tmux`, a dropped
+connection ends the shell and Reconnect opens a fresh one.
 
 ## When the connection drops
 
 A terminal whose connection drops — Wi-Fi changing, a laptop waking from sleep,
-a proxy closing a connection — is not ended. The program in it keeps running
-for **5 minutes**, and the page reconnects to it by itself: quick tries first,
+a proxy closing a connection — reconnects by itself for **5 minutes**: quick tries first,
 then every 30 seconds. The status line says **Connection lost — reconnecting…**
 while it does, and typing is paused (nothing you type in that gap is sent).
 When it is back, the output you missed is drawn once and the session carries on
@@ -117,7 +156,9 @@ where it was. Watch reconnects the same way and redraws its stream.
 It does not reconnect when the session really ended: the program exited, you
 closed the terminal or left the page, or the server refused it. Then the status
 line says what happened and **Open a new session** starts a fresh one. A
-terminal that could not reconnect within the 5 minutes has ended too.
+terminal that could not reconnect within 5 minutes releases its browser connection.
+A shell backed by tmux keeps running; open Shell again to rejoin it. On an
+image without tmux, the plain shell ends with its connection.
 
 ## Starting the container
 
@@ -144,9 +185,9 @@ pointed at another task's container: which container to enter is decided
 entirely by the daemon from the task's session, and the browser has no say in
 it. The only things the browser sends are your keystrokes and the terminal size.
 
-When you close the terminal, the shell inside the container is torn down with
-it. Reload the page and every session is gone — the Shell tab says so in one
-line. `lazy shell <task>` is the one that survives.
+When you close the terminal, the shell inside the container keeps running in
+its tmux session until you `exit` it or the container is recreated. Without
+`tmux` in the image, it is torn down with the terminal.
 
 ## Access and security
 
@@ -160,6 +201,10 @@ class.
 
 On a managed (Lazy Teams) daemon the dashboard does not exist, and the
 shell answers 404 along with the rest of it.
+
+Tools that speak SSH — VS Code Remote-SSH, JetBrains Gateway, `scp`, `ssh -L` —
+reach the same environment through `lazy shell <task> --ssh-config`; see
+[How to SSH into a task](how-to/ssh-into-a-task.md).
 
 See [Serve ports](serve-ports.md) for how the daemon binds and
 [Surface asymmetries](surface-asymmetries.md) for why there is no agent-facing

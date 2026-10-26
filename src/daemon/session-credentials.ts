@@ -45,6 +45,7 @@ import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname } from 'path';
 import { getSessionCredentialsPath } from './paths';
 import type { UserCredentialKind } from './user-credentials';
+import { memberBindingMaySpend } from './member-recovery';
 
 /**
  * Prefix that marks a token as a lazy placeholder rather than a real
@@ -245,7 +246,7 @@ export async function lookupSessionBinding(
   token: string,
 ): Promise<SessionCredentialBinding | null> {
   if (!isSessionPlaceholderToken(token)) return null;
-  const live = (b: SessionCredentialBinding) => b.token === token && b.revokedAt === null;
+  const live = (b: SessionCredentialBinding) => b.token === token && b.revokedAt === null && memberBindingMaySpend(projectRoot, b.taskId);
   const cached = cache.get(projectRoot);
   const hit = cached?.bindings.find(live);
   if (hit) return hit;
@@ -299,13 +300,14 @@ export async function setSessionBindingOrigin(projectRoot: string, taskId: strin
 /**
  * Revoke every live binding whose key starts with `prefix`. For the member
  * containers' bindings (`member-exec:`), whose only other revoke is the
- * container's removal, which a daemon restart interrupts. Returns how many.
+ * container's removal, which a daemon restart interrupts. `keep` names keys
+ * left live: those of member containers the new daemon re-adopted. Returns how many.
  */
-export async function revokeBindingsByKeyPrefix(projectRoot: string, prefix: string): Promise<number> {
+export async function revokeBindingsByKeyPrefix(projectRoot: string, prefix: string, keep: ReadonlySet<string> = new Set()): Promise<number> {
   return mutate(projectRoot, async (file) => {
     let revoked = 0;
     const bindings = prune(file.bindings).map((b) => {
-      if (!b.taskId.startsWith(prefix) || b.revokedAt !== null) return b;
+      if (!b.taskId.startsWith(prefix) || b.revokedAt !== null || keep.has(b.taskId)) return b;
       revoked += 1;
       return { ...b, revokedAt: Date.now() };
     });

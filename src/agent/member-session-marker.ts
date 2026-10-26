@@ -3,12 +3,13 @@
  *
  * The daemon writes it into the home it builds for that container
  * (src/daemon/member-container.ts); `lazy-agent doctor` reads it
- * (./doctor.ts). Such a container deliberately has no lazy MCP server, no
- * daemon config and no lazy tool permissions, and doctor must say so rather
- * than report three failures to the member reading it. It decides nothing but
+ * (./doctor.ts). Pair/Chat supply connection-specific MCP configuration on
+ * their command line, rather than a shared home entry or daemon config env
+ * variable. Doctor must explain that rather than report three failures.
+ * It decides nothing but
  * what doctor prints: it is a label, not a credential or a gate.
  */
 export const MEMBER_SESSION_MARKER = '.claude/lazy-member-session';
 
 export const MEMBER_SESSION_MARKER_TEXT =
-  "This is a member's own terminal environment: no lazy MCP server and no daemon config, by design.\n";
+  "This is a member's own terminal environment: Pair and Chat supply connection-specific lazy MCP tools.\n";

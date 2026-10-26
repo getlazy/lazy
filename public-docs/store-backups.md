@@ -18,9 +18,33 @@ does not open the store.
   [Self-hosting Lazy Teams](self-hosting-lazy-teams.md#automatic-store-backup-before-every-roll).
 
 An ordinary restart on the same version takes no backup. A fresh project with
-no store yet doesn't either. If a backup for the same upgrade already exists
-and the store has not changed since it was taken, lazy uses it instead of
-copying again.
+no store yet doesn't either. If any verified backup exists and the store has
+not changed since it was taken, lazy uses it instead of copying again, whichever
+versions took it, so switching back and forth between versions does not recopy
+the store. A backup interrupted midway cannot be resumed: the next start removes
+the half-written copy, says so, and starts the backup again.
+
+## While a backup runs
+
+The backup is your way back to the version you came from. The daemon does not
+answer until it finishes, and every surface says what is happening:
+
+- `lazy upgrade` says up front how big the store is and roughly how long the
+  backup takes, then shows its progress.
+- `lazy daemon start`, `lazy daemon start --foreground` and any command that
+  starts the daemon show how far the backup has got, for example
+  `Backing up your store before lazy 0.94.1 opens it, so you can go back to 0.93.1 if you need to: copying: 1.20 GiB of 4.20 GiB (10 of 40 files), about 40 s left`. The time
+  left covers the whole backup, including the check of the copy that follows it.
+  When it is done they say `Backup saved: <path>` with the command that restores
+  it, or `Store already backed up at <path>; nothing to copy.`
+- `lazy daemon status`, and the project's status in Lazy Teams, report the
+  daemon as starting and backing up the store, not as "not running".
+- `lazy daemon stop` says a backup is running and leaves it running. Stopping it
+  throws the backup away, and the next start begins it again, so it stops only
+  with `lazy daemon stop --yes`.
+
+The daemon runs in its own session: pressing Ctrl+C on the command that started
+it, or closing the terminal, does not stop it mid-backup.
 
 ## Where, and how many
 
@@ -35,6 +59,17 @@ Backups go in a folder **next to** the store, never inside it:
 The store is the `[storage] external_path` in `lazy.toml`, or
 `~/.lazy/<project-name>` when that is empty. lazy keeps the newest five verified
 backups. Set `[storage] backup_keep` to keep a different number.
+
+On a single-person install, set backup retention in the project root's
+`lazy.toml`:
+
+```toml
+[storage]
+backup_keep = 10
+```
+
+This keeps the newest ten verified backups for the project. Lazy Teams manages
+backup retention for its projects and keeps five.
 
 Each backup is one gzip-compressed tar archive of the whole store. The store is
 mostly text, so a backup usually takes a small fraction of the store's size.
@@ -115,6 +150,10 @@ The copy needs the store's lock, so stop the daemon first.
    not touched: the daemon says so, and you either run the same restore again
    or remove the restore marker it names to keep the store as it is.
 4. Start the daemon: `lazy daemon start`.
+
+Backups retain the store's checkout ownership. If you restore into a different
+checkout, explicitly [re-home the stopped store](store-ownership.md#moving-a-checkout)
+before starting its daemon.
 
 For a Lazy Teams project, add `--store <path>` with the project's store path on
 the host (shown as "Store (external_path)" on the project's page in god mode).

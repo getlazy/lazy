@@ -13,76 +13,88 @@ import p7 from './prompts/builder-dashboard.md' with { type: 'text' };
 import p8 from './prompts/builder-scratch-host.md' with { type: 'text' };
 import p9 from './prompts/builder-scratch-store.md' with { type: 'text' };
 import p10 from './prompts/builder-system-prompt.md' with { type: 'text' };
-import p11 from './prompts/chat-live-system-prompt.md' with { type: 'text' };
-import p12 from './prompts/chat-system-prompt.md' with { type: 'text' };
-import p13 from './prompts/chattiness.md' with { type: 'text' };
-import p14 from './prompts/cluster-constraints.md' with { type: 'text' };
-import p15 from './prompts/commit-leftovers.md' with { type: 'text' };
-import p16 from './prompts/commit-nudge.md' with { type: 'text' };
-import p17 from './prompts/conversation-ask-map.md' with { type: 'text' };
-import p18 from './prompts/conversation-ask-reduce.md' with { type: 'text' };
-import p19 from './prompts/conversation-ask-single.md' with { type: 'text' };
-import p20 from './prompts/customize-proxy-plugin-guide.md' with { type: 'text' };
-import p21 from './prompts/customize-proxy-plugin-not-run.md' with { type: 'text' };
-import p22 from './prompts/docker-agent-instructions.md' with { type: 'text' };
-import p23 from './prompts/docker-builder-runner-instructions.md' with { type: 'text' };
-import p24 from './prompts/document-constraints.md' with { type: 'text' };
-import p25 from './prompts/environment-replaced.md' with { type: 'text' };
-import p26 from './prompts/feedback-redelivery.md' with { type: 'text' };
-import p27 from './prompts/fidelity-summary.md' with { type: 'text' };
-import p28 from './prompts/fix-constraints.md' with { type: 'text' };
-import p29 from './prompts/goal-context-continue.md' with { type: 'text' };
-import p30 from './prompts/goal-context-resume.md' with { type: 'text' };
-import p31 from './prompts/goal-context-start.md' with { type: 'text' };
-import p32 from './prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
-import p33 from './prompts/lazy-md-context.md' with { type: 'text' };
-import p34 from './prompts/link-description.md' with { type: 'text' };
-import p35 from './prompts/low-high-loop-review.md' with { type: 'text' };
-import p36 from './prompts/low-high-loop-revise.md' with { type: 'text' };
-import p37 from './prompts/maintain-context.md' with { type: 'text' };
-import p38 from './prompts/maintain-followup.md' with { type: 'text' };
-import p39 from './prompts/mcp-server-instructions.md' with { type: 'text' };
-import p40 from './prompts/memory-compact-body.md' with { type: 'text' };
-import p41 from './prompts/memory-compact-generate.md' with { type: 'text' };
-import p42 from './prompts/memory-index-agent.md' with { type: 'text' };
-import p43 from './prompts/memory-index-builder.md' with { type: 'text' };
-import p44 from './prompts/memory-index-unavailable.md' with { type: 'text' };
-import p45 from './prompts/memory-size-warning.md' with { type: 'text' };
-import p46 from './prompts/merge-conflict-resolution-resume.md' with { type: 'text' };
-import p47 from './prompts/merge-conflict-resolution.md' with { type: 'text' };
-import p48 from './prompts/model-guidance.md' with { type: 'text' };
-import p49 from './prompts/pending-notes-followup.md' with { type: 'text' };
-import p50 from './prompts/permission-pushback.md' with { type: 'text' };
-import p51 from './prompts/present-regions.md' with { type: 'text' };
-import p52 from './prompts/react-context.md' with { type: 'text' };
-import p53 from './prompts/react-followup.md' with { type: 'text' };
-import p54 from './prompts/refactor-constraints.md' with { type: 'text' };
-import p55 from './prompts/rejected-protected-files.md' with { type: 'text' };
-import p56 from './prompts/remote-branch-merge-resume.md' with { type: 'text' };
-import p57 from './prompts/remote-branch-merge.md' with { type: 'text' };
-import p58 from './prompts/report-commit.md' with { type: 'text' };
-import p59 from './prompts/report-reduce.md' with { type: 'text' };
-import p60 from './prompts/report-task.md' with { type: 'text' };
-import p61 from './prompts/resume-context.md' with { type: 'text' };
-import p62 from './prompts/review-comment-ask.md' with { type: 'text' };
-import p63 from './prompts/review-comments-unblock.md' with { type: 'text' };
-import p64 from './prompts/review-prose-ask.md' with { type: 'text' };
-import p65 from './prompts/review-qa.md' with { type: 'text' };
-import p66 from './prompts/review-system-prompt.md' with { type: 'text' };
-import p67 from './prompts/review-task-ask.md' with { type: 'text' };
-import p68 from './prompts/review-turn-feature.md' with { type: 'text' };
-import p69 from './prompts/review-turn-scope.md' with { type: 'text' };
-import p70 from './prompts/review-verdict-reask.md' with { type: 'text' };
-import p71 from './prompts/rework-context.md' with { type: 'text' };
-import p72 from './prompts/setup-dockerfile.md' with { type: 'text' };
-import p73 from './prompts/system-instructions-resume.md' with { type: 'text' };
-import p74 from './prompts/system-instructions.md' with { type: 'text' };
-import p75 from './prompts/system-messages-builder.md' with { type: 'text' };
-import p76 from './prompts/task-image-not-built.md' with { type: 'text' };
-import p77 from './prompts/task-record-ask-map.md' with { type: 'text' };
-import p78 from './prompts/task-record-ask-reduce.md' with { type: 'text' };
-import p79 from './prompts/task-record-ask-single.md' with { type: 'text' };
-import p80 from './prompts/tool-instructions.md' with { type: 'text' };
+import p11 from './prompts/chat-live-any-agent-system-prompt.md' with { type: 'text' };
+import p12 from './prompts/chat-live-system-prompt.md' with { type: 'text' };
+import p13 from './prompts/chat-system-prompt.md' with { type: 'text' };
+import p14 from './prompts/chattiness.md' with { type: 'text' };
+import p15 from './prompts/cluster-constraints.md' with { type: 'text' };
+import p16 from './prompts/commit-leftovers.md' with { type: 'text' };
+import p17 from './prompts/commit-nudge.md' with { type: 'text' };
+import p18 from './prompts/conversation-ask-map.md' with { type: 'text' };
+import p19 from './prompts/conversation-ask-reduce.md' with { type: 'text' };
+import p20 from './prompts/conversation-ask-single.md' with { type: 'text' };
+import p21 from './prompts/customize-proxy-plugin-guide.md' with { type: 'text' };
+import p22 from './prompts/customize-proxy-plugin-not-run.md' with { type: 'text' };
+import p23 from './prompts/docker-agent-instructions.md' with { type: 'text' };
+import p24 from './prompts/docker-builder-runner-instructions.md' with { type: 'text' };
+import p25 from './prompts/document-constraints.md' with { type: 'text' };
+import p26 from './prompts/environment-replaced.md' with { type: 'text' };
+import p27 from './prompts/feedback-redelivery.md' with { type: 'text' };
+import p28 from './prompts/fidelity-summary.md' with { type: 'text' };
+import p29 from './prompts/fix-constraints.md' with { type: 'text' };
+import p30 from './prompts/goal-context-continue.md' with { type: 'text' };
+import p31 from './prompts/goal-context-resume.md' with { type: 'text' };
+import p32 from './prompts/goal-context-start.md' with { type: 'text' };
+import p33 from './prompts/host-process-builder-runner-instructions.md' with { type: 'text' };
+import p34 from './prompts/lazy-md-context.md' with { type: 'text' };
+import p35 from './prompts/link-description.md' with { type: 'text' };
+import p36 from './prompts/low-high-loop-review.md' with { type: 'text' };
+import p37 from './prompts/low-high-loop-revise.md' with { type: 'text' };
+import p38 from './prompts/maintain-context.md' with { type: 'text' };
+import p39 from './prompts/maintain-followup.md' with { type: 'text' };
+import p40 from './prompts/mcp-server-instructions.md' with { type: 'text' };
+import p41 from './prompts/memory-compact-body.md' with { type: 'text' };
+import p42 from './prompts/memory-compact-generate.md' with { type: 'text' };
+import p43 from './prompts/memory-index-agent.md' with { type: 'text' };
+import p44 from './prompts/memory-index-builder.md' with { type: 'text' };
+import p45 from './prompts/memory-index-unavailable.md' with { type: 'text' };
+import p46 from './prompts/memory-size-warning.md' with { type: 'text' };
+import p47 from './prompts/merge-conflict-resolution-resume.md' with { type: 'text' };
+import p48 from './prompts/merge-conflict-resolution.md' with { type: 'text' };
+import p49 from './prompts/model-guidance.md' with { type: 'text' };
+import p50 from './prompts/pending-notes-followup.md' with { type: 'text' };
+import p51 from './prompts/permission-pushback.md' with { type: 'text' };
+import p52 from './prompts/present-regions.md' with { type: 'text' };
+import p53 from './prompts/react-context.md' with { type: 'text' };
+import p54 from './prompts/react-followup.md' with { type: 'text' };
+import p55 from './prompts/refactor-constraints.md' with { type: 'text' };
+import p56 from './prompts/rejected-protected-files.md' with { type: 'text' };
+import p57 from './prompts/remote-branch-merge-resume.md' with { type: 'text' };
+import p58 from './prompts/remote-branch-merge.md' with { type: 'text' };
+import p59 from './prompts/report-commit.md' with { type: 'text' };
+import p60 from './prompts/report-reduce.md' with { type: 'text' };
+import p61 from './prompts/report-task.md' with { type: 'text' };
+import p62 from './prompts/resume-context.md' with { type: 'text' };
+import p63 from './prompts/review-comment-ask.md' with { type: 'text' };
+import p64 from './prompts/review-comments-unblock.md' with { type: 'text' };
+import p65 from './prompts/review-prose-ask.md' with { type: 'text' };
+import p66 from './prompts/review-qa.md' with { type: 'text' };
+import p67 from './prompts/review-system-prompt.md' with { type: 'text' };
+import p68 from './prompts/review-task-ask.md' with { type: 'text' };
+import p69 from './prompts/review-turn-feature.md' with { type: 'text' };
+import p70 from './prompts/review-turn-scope.md' with { type: 'text' };
+import p71 from './prompts/review-verdict-reask.md' with { type: 'text' };
+import p72 from './prompts/rework-context.md' with { type: 'text' };
+import p73 from './prompts/runtime-context-builder-container.md' with { type: 'text' };
+import p74 from './prompts/runtime-context-builder-host.md' with { type: 'text' };
+import p75 from './prompts/runtime-context-read-work-cli.md' with { type: 'text' };
+import p76 from './prompts/runtime-context-read-work-mcp.md' with { type: 'text' };
+import p77 from './prompts/runtime-context-read-work.md' with { type: 'text' };
+import p78 from './prompts/runtime-context-solo.md' with { type: 'text' };
+import p79 from './prompts/runtime-context-task-host.md' with { type: 'text' };
+import p80 from './prompts/runtime-context-task.md' with { type: 'text' };
+import p81 from './prompts/runtime-context-teams.md' with { type: 'text' };
+import p82 from './prompts/runtime-context-unknown.md' with { type: 'text' };
+import p83 from './prompts/runtime-context.md' with { type: 'text' };
+import p84 from './prompts/setup-dockerfile.md' with { type: 'text' };
+import p85 from './prompts/system-instructions-resume.md' with { type: 'text' };
+import p86 from './prompts/system-instructions.md' with { type: 'text' };
+import p87 from './prompts/system-messages-builder.md' with { type: 'text' };
+import p88 from './prompts/task-image-not-built.md' with { type: 'text' };
+import p89 from './prompts/task-record-ask-map.md' with { type: 'text' };
+import p90 from './prompts/task-record-ask-reduce.md' with { type: 'text' };
+import p91 from './prompts/task-record-ask-single.md' with { type: 'text' };
+import p92 from './prompts/tool-instructions.md' with { type: 'text' };
 
 export const PROMPT_BUNDLE: Record<string, string> = {
   "agent-profiles-section.md": p0,
@@ -96,74 +108,86 @@ export const PROMPT_BUNDLE: Record<string, string> = {
   "builder-scratch-host.md": p8,
   "builder-scratch-store.md": p9,
   "builder-system-prompt.md": p10,
-  "chat-live-system-prompt.md": p11,
-  "chat-system-prompt.md": p12,
-  "chattiness.md": p13,
-  "cluster-constraints.md": p14,
-  "commit-leftovers.md": p15,
-  "commit-nudge.md": p16,
-  "conversation-ask-map.md": p17,
-  "conversation-ask-reduce.md": p18,
-  "conversation-ask-single.md": p19,
-  "customize-proxy-plugin-guide.md": p20,
-  "customize-proxy-plugin-not-run.md": p21,
-  "docker-agent-instructions.md": p22,
-  "docker-builder-runner-instructions.md": p23,
-  "document-constraints.md": p24,
-  "environment-replaced.md": p25,
-  "feedback-redelivery.md": p26,
-  "fidelity-summary.md": p27,
-  "fix-constraints.md": p28,
-  "goal-context-continue.md": p29,
-  "goal-context-resume.md": p30,
-  "goal-context-start.md": p31,
-  "host-process-builder-runner-instructions.md": p32,
-  "lazy-md-context.md": p33,
-  "link-description.md": p34,
-  "low-high-loop-review.md": p35,
-  "low-high-loop-revise.md": p36,
-  "maintain-context.md": p37,
-  "maintain-followup.md": p38,
-  "mcp-server-instructions.md": p39,
-  "memory-compact-body.md": p40,
-  "memory-compact-generate.md": p41,
-  "memory-index-agent.md": p42,
-  "memory-index-builder.md": p43,
-  "memory-index-unavailable.md": p44,
-  "memory-size-warning.md": p45,
-  "merge-conflict-resolution-resume.md": p46,
-  "merge-conflict-resolution.md": p47,
-  "model-guidance.md": p48,
-  "pending-notes-followup.md": p49,
-  "permission-pushback.md": p50,
-  "present-regions.md": p51,
-  "react-context.md": p52,
-  "react-followup.md": p53,
-  "refactor-constraints.md": p54,
-  "rejected-protected-files.md": p55,
-  "remote-branch-merge-resume.md": p56,
-  "remote-branch-merge.md": p57,
-  "report-commit.md": p58,
-  "report-reduce.md": p59,
-  "report-task.md": p60,
-  "resume-context.md": p61,
-  "review-comment-ask.md": p62,
-  "review-comments-unblock.md": p63,
-  "review-prose-ask.md": p64,
-  "review-qa.md": p65,
-  "review-system-prompt.md": p66,
-  "review-task-ask.md": p67,
-  "review-turn-feature.md": p68,
-  "review-turn-scope.md": p69,
-  "review-verdict-reask.md": p70,
-  "rework-context.md": p71,
-  "setup-dockerfile.md": p72,
-  "system-instructions-resume.md": p73,
-  "system-instructions.md": p74,
-  "system-messages-builder.md": p75,
-  "task-image-not-built.md": p76,
-  "task-record-ask-map.md": p77,
-  "task-record-ask-reduce.md": p78,
-  "task-record-ask-single.md": p79,
-  "tool-instructions.md": p80,
+  "chat-live-any-agent-system-prompt.md": p11,
+  "chat-live-system-prompt.md": p12,
+  "chat-system-prompt.md": p13,
+  "chattiness.md": p14,
+  "cluster-constraints.md": p15,
+  "commit-leftovers.md": p16,
+  "commit-nudge.md": p17,
+  "conversation-ask-map.md": p18,
+  "conversation-ask-reduce.md": p19,
+  "conversation-ask-single.md": p20,
+  "customize-proxy-plugin-guide.md": p21,
+  "customize-proxy-plugin-not-run.md": p22,
+  "docker-agent-instructions.md": p23,
+  "docker-builder-runner-instructions.md": p24,
+  "document-constraints.md": p25,
+  "environment-replaced.md": p26,
+  "feedback-redelivery.md": p27,
+  "fidelity-summary.md": p28,
+  "fix-constraints.md": p29,
+  "goal-context-continue.md": p30,
+  "goal-context-resume.md": p31,
+  "goal-context-start.md": p32,
+  "host-process-builder-runner-instructions.md": p33,
+  "lazy-md-context.md": p34,
+  "link-description.md": p35,
+  "low-high-loop-review.md": p36,
+  "low-high-loop-revise.md": p37,
+  "maintain-context.md": p38,
+  "maintain-followup.md": p39,
+  "mcp-server-instructions.md": p40,
+  "memory-compact-body.md": p41,
+  "memory-compact-generate.md": p42,
+  "memory-index-agent.md": p43,
+  "memory-index-builder.md": p44,
+  "memory-index-unavailable.md": p45,
+  "memory-size-warning.md": p46,
+  "merge-conflict-resolution-resume.md": p47,
+  "merge-conflict-resolution.md": p48,
+  "model-guidance.md": p49,
+  "pending-notes-followup.md": p50,
+  "permission-pushback.md": p51,
+  "present-regions.md": p52,
+  "react-context.md": p53,
+  "react-followup.md": p54,
+  "refactor-constraints.md": p55,
+  "rejected-protected-files.md": p56,
+  "remote-branch-merge-resume.md": p57,
+  "remote-branch-merge.md": p58,
+  "report-commit.md": p59,
+  "report-reduce.md": p60,
+  "report-task.md": p61,
+  "resume-context.md": p62,
+  "review-comment-ask.md": p63,
+  "review-comments-unblock.md": p64,
+  "review-prose-ask.md": p65,
+  "review-qa.md": p66,
+  "review-system-prompt.md": p67,
+  "review-task-ask.md": p68,
+  "review-turn-feature.md": p69,
+  "review-turn-scope.md": p70,
+  "review-verdict-reask.md": p71,
+  "rework-context.md": p72,
+  "runtime-context-builder-container.md": p73,
+  "runtime-context-builder-host.md": p74,
+  "runtime-context-read-work-cli.md": p75,
+  "runtime-context-read-work-mcp.md": p76,
+  "runtime-context-read-work.md": p77,
+  "runtime-context-solo.md": p78,
+  "runtime-context-task-host.md": p79,
+  "runtime-context-task.md": p80,
+  "runtime-context-teams.md": p81,
+  "runtime-context-unknown.md": p82,
+  "runtime-context.md": p83,
+  "setup-dockerfile.md": p84,
+  "system-instructions-resume.md": p85,
+  "system-instructions.md": p86,
+  "system-messages-builder.md": p87,
+  "task-image-not-built.md": p88,
+  "task-record-ask-map.md": p89,
+  "task-record-ask-reduce.md": p90,
+  "task-record-ask-single.md": p91,
+  "tool-instructions.md": p92,
 };

@@ -25,6 +25,10 @@ import {
 import { MAX_TASK_CODE_LENGTH } from '../../src/task/identity';
 import { parentTaskIdOf, taskTarget } from '../../src/task-target';
 import type { RaisedItem, RaisedItemInput, Task } from '../../src/types';
+import { testStorageOptions } from '../helpers/storage';
+import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+
+isolateLazyEnv();
 
 function stubTask(id: string, overrides: Partial<Task> = {}): Task {
   return {
@@ -188,7 +192,7 @@ describe('storage promoteRaisedItem', () => {
     spawnSyncUnsupervised(['git', 'add', '.'], { cwd: testDir });
     spawnSyncUnsupervised(['git', 'commit', '-m', 'Initial'], { cwd: testDir });
 
-    storage = await createStorage(testDir, { backend: 'external' });
+    storage = await createStorage(testDir, testStorageOptions(testDir));
     parentTask = await storage.createTask('Release hub', undefined, undefined, 'release-hub');
     childTask = await storage.createTask('Child work', parentTask.id, undefined, 'child-work');
   });

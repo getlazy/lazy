@@ -43,6 +43,7 @@ export const TASK_LIVE_REGION_IDS = [
   'reviews',
   'changes',
   'commits',
+  'chat',
 ] as const;
 
 export type TaskLiveRegionId = (typeof TASK_LIVE_REGION_IDS)[number];
@@ -81,6 +82,10 @@ export const TASK_TAB_REGIONS: Readonly<Record<TaskTabId, readonly TaskLiveRegio
   raised: ['raised'],
   comments: ['comments'],
   journal: ['journal'],
+  // Its messages are asks: ask turns, and review-surface asks (whose answer
+  // can land as a review comment with no turn). The header carries the
+  // working -> blocked flip around an ask.
+  chat: ['chat', 'header'],
   // No live region: artifacts change rarely, and a reload shows them.
   artifacts: [],
   // Derived from status history (the task's and its children's) plus turns
@@ -110,6 +115,9 @@ export const TASK_TAB_POLICY: Readonly<Record<TaskTabId, TaskTabUpdatePolicy>> =
   // a half-typed comment must survive a refresh.
   comments: 'append',
   journal: 'append',
+  // A conversation with a composer at the bottom: morph keeps the half-typed
+  // message (form-value preservation) while the answer lands.
+  chat: 'morph',
   artifacts: 'morph',
   // An insight surface read on purpose, and the most expensive body on the
   // page (status history per child, plus the audit trail). Pill, not morph —
@@ -160,6 +168,13 @@ export interface TaskLiveRegionInput {
   commits: LiveRegionCommit[];
   /** Task branch HEAD sha, or null when the branch does not exist yet. */
   headSha: string | null;
+  /** The Chat's messages (src/task/chat.ts): id and person-message state. */
+  chat: LiveRegionChatMessage[];
+}
+
+export interface LiveRegionChatMessage {
+  id: string;
+  state: string | null;
 }
 
 /** `n:<id>=<status>,…` — order-independent because the caller's order is stable. */
@@ -194,6 +209,11 @@ export function buildLiveRegionKeys(
     reviews: `${reviewTurns.length}:${reviewTurns.map((t) => t.sequence).join(',')}`,
     changes: input.headSha ? input.headSha.slice(0, 12) : '',
     commits: `${input.commits.length}:${input.commits[input.commits.length - 1]?.sha.slice(0, 12) ?? ''}`,
+    // Count + last id + how many are still waiting or failed: an answer
+    // landing flips a state without adding a person message.
+    chat: `${input.chat.length}:${input.chat[input.chat.length - 1]?.id ?? ''}:` +
+      `${input.chat.filter((m) => m.state === 'pending').length}:` +
+      `${input.chat.filter((m) => m.state === 'failed').length}`,
   };
 }
 

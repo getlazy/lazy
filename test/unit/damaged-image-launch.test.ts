@@ -104,7 +104,8 @@ describe('a damaged runner image is repaired on launch', () => {
     expect(calls.filter((c) => c.startsWith('pull '))).toEqual([]);
     for (const c of calls) expect(c).not.toMatch(DESTRUCTIVE);
     // Probe, damaged; probe again after the repair — no third attempt.
-    expect(calls.filter((c) => c.startsWith('run ')).length).toBe(2);
+    // Exclude the rebuilt image's self-check, which runs when a valid installed lazy-agent binary is available.
+    expect(calls.filter((c) => c.startsWith('run ') && c.includes('--entrypoint which ')).length).toBe(2);
     const after = runnerImageStatus() as { state: string; buildId?: string | null };
     expect(after.state).toBe('ready');
     expect(after.buildId).not.toBe(ready.buildId);

@@ -1,3 +1,4 @@
+import { BUILDER_CONTAINER_PATHS } from '../runner/docker-runner';
 /**
  * Daemon-owned builder sessions — a session registry as a Storage entity, and
  * the launch that makes the container daemon-owned and DETACHED rather than
@@ -42,7 +43,7 @@ import {
   type TurnCredentialPlan,
 } from './turn-credentials';
 import { actorEmail } from '../actor-ref';
-import type { ResolvedConfig } from '../config/types';
+import type { ResolvedConfig, RoleTarget } from '../config/types';
 import type { ActorInput } from '../types';
 import { teamModeEnabled } from './user-credentials';
 import { isManagedMode } from '../config/managed';
@@ -64,6 +65,8 @@ import { customImageReady, describeRunnerImage, runnerImageStatus, syncRunnerIma
 import { loadConfig } from '../config/loader';
 import { createRunner } from '../runner';
 import { resolveRoleTarget } from '../utils/role-target';
+import { builderTargetForProfile, resolveBuilderProfileName } from '../builder/builder-profile';
+import { findBuilderCodexHome } from '../builder/codex-home';
 import { withLiveProxyTarget } from './auth-env';
 import { builderRunName } from '../builder/relaunch';
 import { BuilderSessionStateConflictError } from '../storage/interface';
@@ -152,13 +155,47 @@ async function planSessionLaunchCredential(
   projectRoot: string,
   builderId: string,
   memberEmail: string | null,
+  /** The run's own profile (BuilderSession.agentProfile); the role's when null. */
+  agentProfile: string | null,
 ): Promise<SessionLaunchPlan> {
   const config = await loadConfig(projectRoot);
-  const builderTarget = await withLiveProxyTarget(resolveRoleTarget('builder', config), config);
+  const builderTarget = await withLiveProxyTarget(sessionBuilderTarget(config, agentProfile), config);
   const credentialPlan = await teamModeEnabled(projectRoot)
     ? await planSessionCredential(projectRoot, builderId, memberEmail, builderTarget.profile, config)
     : null;
   return { builderTarget, credentialPlan };
+}
+
+/**
+ * The builder target for a run on `agentProfile` (null → the role's). A
+ * profile lazy.toml stopped defining is a 409 naming it, never a silent
+ * fallback to the role's profile — the run's conversation belongs to its own
+ * harness.
+ */
+function sessionBuilderTarget(config: ResolvedConfig, agentProfile: string | null | undefined): RoleTarget {
+  try {
+    return builderTargetForProfile(config, agentProfile ?? null);
+  } catch (err) {
+    throw new RpcError(409, err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * Validate the profile a member asked a NEW builder to run on, at the RPC
+ * boundary: unknown, or a harness that cannot run a builder, is a 400 naming
+ * why. Null when none was asked for (the role's profile).
+ */
+async function requestedAgentProfile(projectRoot: string, params: Record<string, unknown>): Promise<string | null> {
+  const raw = params.agent;
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw !== 'string') throw new RpcError(400, '`agent` must be an agent profile name.');
+  const config = await loadConfig(projectRoot);
+  try {
+    const name = resolveBuilderProfileName(config, raw);
+    return name === config.models.roles.builder.profile ? null : name;
+  } catch (err) {
+    throw new RpcError(400, err instanceof Error ? err.message : String(err));
+  }
 }
 
 /**
@@ -206,6 +243,8 @@ export async function builderSessionRefreshAuthEnv(
   projectRoot: string,
   tokenLabel: string,
   config: ResolvedConfig,
+  /** The session's own target (its token's profile); the role's when omitted. */
+  sessionTarget?: RoleTarget,
 ): Promise<Array<{ key: string; value: string }>> {
   const builderId = tokenLabel.startsWith('builder-') ? tokenLabel.slice('builder-'.length) : null;
   if (!builderId) {
@@ -219,7 +258,7 @@ export async function builderSessionRefreshAuthEnv(
       'complete — so it cannot be relaunched in place. Start the builder again.',
     );
   }
-  const roleTarget = resolveRoleTarget('builder', config);
+  const roleTarget = sessionTarget ?? resolveRoleTarget('builder', config);
   const refusal = await sideLaunchCredentialProblem(projectRoot, binding.ownerUserId, roleTarget.profile, config);
   if (refusal) throw new RpcError(400, refusal);
   const storage = await getOrCreateStorage();
@@ -403,10 +442,12 @@ async function launchDetachedContainer(opts: {
    * Builder named, then its summary, appended to the system prompt.
    */
   continuationSeed?: string | null;
+  /** The run's own profile (BuilderSession.agentProfile); the role's when null. */
+  agentProfile: string | null;
 }): Promise<{ containerName: string; resumed: string | null; runnerImage: BuilderRunnerImage | null }> {
   const { projectRoot, memberEmail, builderId, resumeSessionId, launchPlan, trace, explicitResume = false } = opts;
   const config = await loadConfig(projectRoot);
-  const runner = await createRunner(projectRoot);
+  const runner = await createRunner(projectRoot, undefined, { builderProfile: opts.agentProfile });
   if (!runner.usesSandbox() || !runner.launchBuilderDetached) {
     throw new RpcError(
       400,
@@ -424,7 +465,12 @@ async function launchDetachedContainer(opts: {
   const plan = launchPlan.credentialPlan;
 
   const daemonMcpName = `builder-${builderId}`;
-  const { configPath: daemonConfigPath } = await trace.phase('daemon MCP config', () => handleGetDaemonMcpConfig(projectRoot, { name: daemonMcpName }));
+  const { configPath: daemonConfigPath } = await trace.phase('daemon MCP config', () => handleGetDaemonMcpConfig(projectRoot, {
+    name: daemonMcpName,
+    // Recorded on the token, so the container's launch-env refresh answers
+    // for this run's profile (src/builder/builder-profile.ts).
+    profile: builderTarget.profile,
+  }));
 
   // This code runs INSIDE the daemon (a dispatchRpc handler), never as a
   // separate client process — `resolveAuthEnvFromDaemon` is for the latter and
@@ -539,7 +585,7 @@ async function launchDetachedContainer(opts: {
 async function buildSystemPrompt(projectRoot: string, runner: Awaited<ReturnType<typeof createRunner>>): Promise<string> {
   const storage = await getOrCreateStorage();
   // Always the detached launch, whose scratch is a container-only path.
-  return assembleBuilderSystemPrompt({ lazyRoot: projectRoot, runner, storage, scratchAccess: 'store' });
+  return assembleBuilderSystemPrompt({ lazyRoot: projectRoot, runner, storage, scratchAccess: 'store', scratchDir: BUILDER_CONTAINER_PATHS.scratchDir });
 }
 
 /**
@@ -946,8 +992,14 @@ export async function handleStartBuilderSession(
   if (!rejoinId) {
     // A NEW builder every time: none of the member's other sessions is touched.
     const rowId = randomUUID();
+    const agentProfile = await requestedAgentProfile(projectRoot, params);
     return runTracedStart(projectRoot, memberEmail, 'startBuilderSession', rowId,
-      (trace) => startBuilderSessionLocked(projectRoot, memberEmail, trace, { rowId }));
+      (trace) => startBuilderSessionLocked(projectRoot, memberEmail, trace, { rowId, agentProfile }));
+  }
+  // A rejoin runs on the run's own profile; asking for another is refused,
+  // not ignored — its conversation belongs to the harness that recorded it.
+  if (params.agent !== undefined && params.agent !== null && params.agent !== '') {
+    throw new RpcError(400, 'A builder run keeps the agent profile it started on; start a new builder to use another.');
   }
   const row = await ownSessionForRejoin(projectRoot, rejoinId, params);
   return runTracedStart(projectRoot, memberEmail, 'startBuilderSession', row.id,
@@ -1127,6 +1179,8 @@ async function startBuilderSessionLocked(
     rejoin?: boolean;
     resume?: ResumeRequest;
     seed?: SeedRequest;
+    /** A NEW run's profile; a rejoin always uses the row's own. */
+    agentProfile?: string | null;
   },
 ): Promise<BuilderSession> {
   const storage = await getOrCreateStorage();
@@ -1247,7 +1301,9 @@ async function startBuilderSessionLocked(
   let claimed: BuilderSession | null = null;
   let launchedContainer: string | null = null;
   try {
-    const launchPlan = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail));
+    const agentProfile = existing ? existing.agentProfile ?? null : opts.agentProfile ?? null;
+    if (agentProfile) trace.note(`agent profile ${agentProfile}`);
+    const launchPlan = await trace.phase('credential plan', () => planSessionLaunchCredential(projectRoot, builderId, memberEmail, agentProfile));
     if (existing && existing.state === 'stopped') {
       // Reached either straight from the stale branch above — where these
       // calls are idempotent no-ops — or on a row left stopped by an earlier
@@ -1315,6 +1371,7 @@ async function startBuilderSessionLocked(
         trace,
         explicitResume: resume !== null,
         continuationSeed: continuation ? continuation.continuationSeed : existing.continuationSeed ?? null,
+        agentProfile,
       });
       launchedContainer = launched.containerName;
       // A conversation that could not be resumed is forgotten, or the next
@@ -1337,6 +1394,7 @@ async function startBuilderSessionLocked(
       agentSessionId: resume?.sessionId ?? null,
       ...(seed ? { continuedFrom: seed.continuedFrom, continuationSeed: seed.seed } : {}),
       ...(resume?.continuation ? resume.continuation : {}),
+      ...(agentProfile ? { agentProfile } : {}),
       createdAt: now,
       updatedAt: now,
       endedAt: null,
@@ -1351,6 +1409,7 @@ async function startBuilderSessionLocked(
       trace,
       explicitResume: resume !== null,
       continuationSeed: seed?.seed ?? resume?.continuation?.continuationSeed ?? null,
+      agentProfile,
     });
     launchedContainer = freshLaunch.containerName;
     return await reconcileClaimedSession(projectRoot, claimed, freshLaunch.containerName, resume && freshLaunch.resumed !== resume.sessionId
@@ -1435,7 +1494,27 @@ export async function handleResumeBuilder(
   const sessionId = decision.sessionId;
 
   const homeDirAbs = resolveBuilderSessionHomeDir(projectRoot, memberEmail);
-  if (!(await holdsBuilderSessionFile(builderSessionProjectsRoot(homeDirAbs), projectRoot, sessionId, homeDirAbs))) {
+  // A conversation is continued by the harness that recorded it, so the run
+  // resumes on the profile the conversation ran on: the one recorded on a run
+  // of this member's that held it (Codex rollouts live in the member's Codex
+  // homes, Claude sessions in their projects dir — src/builder/codex-home.ts).
+  const recordedProfile = (await storage.listBuilderSessions(projectRoot))
+    .find((r) => r.memberEmail === memberEmail && r.agentSessionId !== null
+      && builder.segments.includes(r.agentSessionId) && r.agentProfile)?.agentProfile ?? null;
+  const codexHome = await findBuilderCodexHome(homeDirAbs, sessionId);
+  if (codexHome) {
+    // No recorded profile: the run was on the role's own profile, which must
+    // then still be a Codex one.
+    const config = await loadConfig(projectRoot);
+    if (sessionBuilderTarget(config, recordedProfile).harness !== 'codex') {
+      throw new RpcError(
+        409,
+        `This builder ran on Codex, and lazy has no record of which Codex profile it used, so it cannot be ` +
+        `resumed. Its transcript is still here to read; "Continue from a summary" starts a new builder from it. ` +
+        `Nothing was started.`,
+      );
+    }
+  } else if (!(await holdsBuilderSessionFile(builderSessionProjectsRoot(homeDirAbs), projectRoot, sessionId, homeDirAbs))) {
     throw new RpcError(
       409,
       `This builder's session file (${sessionId.slice(0, 8)}) is no longer on this server, so Claude Code ` +
@@ -1461,6 +1540,7 @@ export async function handleResumeBuilder(
           rowId,
           rejoin: run !== null,
           resume: { sessionId, segments: builder.segments, continuation },
+          agentProfile: recordedProfile,
         });
       });
     });
@@ -1498,6 +1578,9 @@ export async function handleContinueBuilderFromSummary(
   const memberEmail = actorEmail(params.actor as ActorInput | undefined) ?? null;
   const ref = typeof params.builderId === 'string' ? params.builderId.trim() : '';
   if (!ref) throw new RpcError(400, 'continueBuilderFromSummary: `builderId` is required');
+  // The NEW builder may run on a profile of the member's choosing — a summary
+  // is plain text, so any builder harness can continue from one.
+  const agentProfile = await requestedAgentProfile(projectRoot, params);
 
   const storage = await getOrCreateStorage();
   const { resolveBuilderTranscript } = await import('../builder/identity-transcript');
@@ -1555,6 +1638,7 @@ export async function handleContinueBuilderFromSummary(
     return startBuilderSessionLocked(projectRoot, memberEmail, trace, {
       rowId,
       seed: { seed, continuedFrom },
+      agentProfile,
     });
   });
 }

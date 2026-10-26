@@ -21,6 +21,7 @@ import { parseFlags, requireLazyRoot, refuseIfBoundClone } from '../helpers';
 import { formatDuration } from '../../utils/format';
 import { describeExpiry } from '../../utils/local-day';
 import { isTTY, promptYesNo } from '../editor';
+import { withStoreClaimPrompt } from '../store-claim';
 import {
   checkDaemonHealth,
   DAEMON_HEALTH_TIMEOUT_MS,
@@ -54,9 +55,11 @@ import { commandDaemonHealth, daemonHealthUsage } from './daemon-health';
 import { commandDaemonReload, daemonReloadUsage, formatConfigStatusOrError, readConfigStatusForDisplay } from './daemon-reload';
 import { missingCredentialNotice } from '../../daemon/credential-gate';
 import { theme } from '../../render/theme';
+import { assertManagedStartAllowed, ManagedDaemonStartRefused } from '../../daemon/managed-marker';
 
 import { formatDaemonBuiltLine } from '../../utils/build-provenance';
 import { getSourceIdentity } from '../../utils/source-id';
+import { readLiveBackupProgress, startingLine } from '../../daemon/store-backup-progress';
 
 /**
  * Compare a daemon's reported source id against this checkout's.
@@ -166,11 +169,17 @@ async function daemonStart(args: string[]): Promise<void> {
     { name: 'foreground', takesValue: false },
     { name: 'background', takesValue: false },
     { name: 'project', takesValue: true },
+    { name: 'yes', aliases: ['y'], takesValue: false },
   ], 'daemon start');
 
   const foreground = parsed.flags.get('foreground') === true;
   const projectRoot = resolveProjectRoot(parsed.flags);
+  await refuseUnmanagedStartOfManagedDaemon(projectRoot);
 
+  await withStoreClaimPrompt(projectRoot, args, () => startDaemon(projectRoot, foreground));
+}
+
+async function startDaemon(projectRoot: string, foreground: boolean): Promise<void> {
   if (foreground) {
     // Foreground mode: startDaemonServer() acquires the flock internally.
     // If lock held → throws "Already running." If not → starts. One path.
@@ -192,6 +201,14 @@ async function daemonStart(args: string[]): Promise<void> {
         console.error(`Error: ${foreignDaemonRefusal(projectRoot, foreign)}`);
         process.exit(1);
       }
+      // Another start of this project is mid-backup, holding the lock: say
+      // that, rather than the bare "already running" the lock would give.
+      const starting = await readLiveBackupProgress(projectRoot);
+      if (starting) {
+        console.error(`Error: the daemon is already ${startingLine(starting)}.`);
+        console.error('Watch it with `lazy daemon status`; it answers once the backup finishes.');
+        process.exit(1);
+      }
     }
     console.log('Starting daemon in foreground mode...');
     const { startDaemonServer } = await import('../../daemon/server');
@@ -208,14 +225,18 @@ async function daemonStart(args: string[]): Promise<void> {
     // alive). After a crash, the marker files remain but the process is dead —
     // the old check (file existence only) would say "already running" while
     // `daemon status` (which connects) said "not running".
-    if (isDaemonRunning(projectRoot)) {
-      const pid = readPid(projectRoot);
-      console.log(`Daemon is already running${pid ? ` (PID ${pid})` : ''}.`);
-      return;
+    // A start mid-backup has written its PID file but does not answer yet, so
+    // it is asked about FIRST: the liveness check alone calls it running.
+    const { waitForBackingUpDaemon } = await import('../../daemon/auto-start');
+    if (!(await waitForBackingUpDaemon(projectRoot))) {
+      if (isDaemonRunning(projectRoot)) {
+        const pid = readPid(projectRoot);
+        console.log(`Daemon is already running${pid ? ` (PID ${pid})` : ''}.`);
+        return;
+      }
+      cleanupStaleFiles(projectRoot);
+      await startDaemonBackground(projectRoot);
     }
-
-    cleanupStaleFiles(projectRoot);
-    await startDaemonBackground(projectRoot);
 
     // Report status after successful start
     const status = await checkDaemonHealth(projectRoot);
@@ -291,6 +312,30 @@ async function daemonStop(
 
   // Use unified liveness check — same as start and status.
   // After a crash, marker files may exist but the process is dead.
+  // A start mid-backup holds the lock but does not answer yet. Stopping it
+  // throws the backup away, and the next start begins it again from scratch —
+  // what turned one backup into an endless loop on 2026-10-24 — so it is said
+  // first and done only on an explicit --yes.
+  const starting = await readLiveBackupProgress(projectRoot);
+  if (starting) {
+    console.log(`Daemon is ${startingLine(starting)}.`);
+    if (!yes) {
+      console.log('Stopping it now throws the backup away; the next start begins it again from scratch.');
+      console.log('Left running. To stop it anyway: `lazy daemon stop --yes`.');
+      return false;
+    }
+    console.log('Stopping it (--yes); the backup so far is discarded.');
+    try { process.kill(starting.pid, 'SIGTERM'); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
+    }
+    for (let i = 0; i < 100 && isProcessAlive(starting.pid); i++) await new Promise(r => setTimeout(r, EXIT_POLL_MS));
+    if (isProcessAlive(starting.pid)) {
+      console.error(`Error: the starting daemon (PID ${starting.pid}) did not exit within 10 s.`);
+      return false;
+    }
+    console.log('Stopped.');
+    return true;
+  }
   if (!isDaemonRunning(projectRoot)) {
     // Clean up stale files from a previous crash so the next start works cleanly
     cleanupStaleFiles(projectRoot);
@@ -449,6 +494,7 @@ async function daemonRestart(args: string[]): Promise<void> {
     { name: 'yes', aliases: ['y'], takesValue: false },
   ], 'daemon restart');
   const projectRoot = resolveProjectRoot(parsed.flags);
+  await refuseUnmanagedStartOfManagedDaemon(projectRoot);
 
   // One line, never a refusal: the new daemon inherits THIS shell, which may
   // not carry a credential the running one had (a daemon needs none to run).
@@ -470,12 +516,13 @@ async function daemonRestart(args: string[]): Promise<void> {
   }
 
   // Rebuild each leg's args from the parsed flags instead of forwarding ours
-  // verbatim: `stop` has no --foreground/--background and `start` has no --yes,
+  // verbatim: `stop` has no --foreground/--background,
   // and parseFlags exits(1) on a flag a subcommand does not declare.
   const projectArgs = typeof parsed.flags.get('project') === 'string'
     ? ['--project', parsed.flags.get('project') as string]
     : [];
   const startArgs = [...projectArgs];
+  if (yes) startArgs.push('--yes');
   if (parsed.flags.get('foreground') === true) startArgs.push('--foreground');
   if (parsed.flags.get('background') === true) startArgs.push('--background');
 
@@ -491,9 +538,17 @@ async function daemonStatus(args: string[]): Promise<void> {
   const projectRoot = resolveProjectRoot(parsed.flags);
   const json = parsed.flags.get('json') === true;
 
+  // A start mid-backup has its PID file written and does not answer yet:
+  // asked first, or it reads as "alive but not responding".
+  const starting = await readLiveBackupProgress(projectRoot);
+
   if (json) {
     // The daemon's own answers, unformatted: liveness and address from its
     // status probe, the config section from `configStatus`.
+    if (starting) {
+      console.log(JSON.stringify({ running: false, starting: { pid: starting.pid, phase: 'store_backup', line: startingLine(starting), progress: starting } }, null, 2));
+      return;
+    }
     if (!isDaemonRunning(projectRoot)) {
       console.log(JSON.stringify({ running: false }, null, 2));
       return;
@@ -514,20 +569,31 @@ async function daemonStatus(args: string[]): Promise<void> {
   // Primary check: same isDaemonRunning() used by start/stop/ensureDaemon.
   // If the process is dead but marker files remain (crash), clean up and
   // report "not running" — don't attempt a health check that will fail.
+  if (starting) {
+    console.log(`Daemon is ${startingLine(starting)}.`);
+    console.log('It answers once the backup finishes; closing this terminal does not stop it.');
+    return;
+  }
   if (!isDaemonRunning(projectRoot)) {
     cleanupStaleFiles(projectRoot);
     console.log('Daemon is not running.');
     // Surface the last startup-error marker if present — the daemon fails hard
     // (and does not run) when the [proxy] server can't start, so this is where
     // the "why isn't the proxy up?" reason lives once the daemon is down.
-    try {
-      const marker = (await readFile(getStartupErrorPath(projectRoot), 'utf-8')).trim();
-      if (marker) {
-        console.log('');
-        console.log('Last start attempt failed with:');
-        console.log(marker.split('\n').map((l) => `  ${l}`).join('\n'));
-      }
-    } catch { /* no marker (normal) — nothing to surface */ }
+    // A cause that has since been fixed is reported as fixed, with the next
+    // step — never as the current state (src/daemon/startup-failure-status.ts).
+    const { readLastStartFailure } = await import('../../daemon/startup-failure-status');
+    const failure = await readLastStartFailure(projectRoot).catch((err) => {
+      console.error(`Warning: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
+    if (failure?.kind === 'resolved') {
+      console.log(failure.resolution);
+    } else if (failure) {
+      console.log('');
+      console.log('Last start attempt failed with:');
+      console.log(failure.message.split('\n').map((l) => `  ${l}`).join('\n'));
+    }
     return;
   }
 
@@ -704,6 +770,11 @@ async function daemonDashboardUrl(args: string[]): Promise<void> {
   ], 'daemon dashboard-url');
   const projectRoot = resolveProjectRoot(parsed.flags);
 
+  const starting = await readLiveBackupProgress(projectRoot);
+  if (starting) {
+    console.error(`Error: the daemon is ${startingLine(starting)}; it has no dashboard until that finishes.`);
+    process.exit(1);
+  }
   if (!isDaemonRunning(projectRoot)) {
     cleanupStaleFiles(projectRoot);
     console.error('Error: daemon is not running. Start it with `lazy daemon start`.');
@@ -986,6 +1057,7 @@ Start options:
   --foreground    Run in foreground (don't detach)
   --background    Run in background (default, explicit flag for auto-start)
   --project PATH  Explicit project root (default: auto-detect from cwd)
+  --yes           Suppress the ownership claim prompt; never claims a store
 
 status options:
   --json          Print the status as JSON
@@ -1024,4 +1096,24 @@ Examples:
   lazy daemon auto-budget list  # Inspect today's auto-react budget
   lazy daemon config get        # Show the builder cap + current usage
   lazy daemon config set builders 4  # Change the builder cap (ephemeral)`);
+}
+
+/**
+ * A daemon Lazy Teams manages must be started with the environment Teams
+ * starts it with — managed mode, its store and config, its credentials. A
+ * shell that lacks it (one that did not load the project's environment) would
+ * bring up an ordinary unmanaged daemon that has lost all of that, and pushes
+ * stop working with no sign why (2026-10-20). Refuse, and say where to restart
+ * it instead. A shell that DID load it (Teams' machine shell) is in managed
+ * mode and passes; the daemon then re-applies the forge token Teams last
+ * pushed (src/daemon/forge-credential.ts).
+ */
+async function refuseUnmanagedStartOfManagedDaemon(projectRoot: string): Promise<void> {
+  try {
+    await assertManagedStartAllowed(projectRoot);
+  } catch (err) {
+    if (!(err instanceof ManagedDaemonStartRefused)) throw err;
+    console.error(theme.error(`Error: ${err.message}`));
+    process.exit(1);
+  }
 }

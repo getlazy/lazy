@@ -45,6 +45,10 @@ export interface AuthEnvVar {
  * value derived from one.
  */
 export interface DaemonCredentialEntry {
+  /** Stored source overridden by the exported variable named in via. */
+  shadowed?: string;
+  /** A usable export remains present even if inspecting the store failed. */
+  shadowCheckError?: string;
   /** Credential name — a provider (`anthropic`) or a user-chosen one (`work-openai`). */
   name: string;
   /** Human-facing label: a provider's display name, or the name itself. */
@@ -54,12 +58,15 @@ export interface DaemonCredentialEntry {
   present: boolean;
   /** Where the daemon found it — its environment or the store's index — or null. */
   source: 'env' | 'store' | null;
+  /** Origin of the credential in use, including a set loaded at daemon startup. */
+  setName?: string;
   /** The env var NAME or the store backend id. Null when absent. */
   via: string | null;
   /**
    * Which FORM is in effect — `oauth` (a subscription) or `api-key` (a metered
    * key) — or null when unknowable. Known from the store's non-secret index; an
-   * env var carries a bare value that says nothing about its form. Reported
+   * exported env var carries a bare value that says nothing about its form.
+   * A set credential loaded at startup retains its hydration record's kind. Reported
    * because on a provider issuing both, this is the difference between spending
    * a subscription and spending metered credit.
    */

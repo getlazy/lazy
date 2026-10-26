@@ -179,6 +179,8 @@ export interface TakeStoreBackupOptions {
   now?: () => Date;
   /** Called as the backup progresses: at every phase change, and about once a second within one (verification and single large files included). */
   onProgress?: (progress: BackupProgress) => void;
+  /** Told the names of interrupted copies (`.partial`) this backup removed before starting over. */
+  onInterruptedDiscarded?: (names: string[]) => void;
   /** Least time between two progress calls within one phase (default 1000 ms). */
   progressIntervalMs?: number;
   /** Free bytes on the backups filesystem; injectable for tests. */
@@ -244,7 +246,8 @@ export async function takeStoreBackup(options: TakeStoreBackupOptions): Promise<
 
   const run = async (): Promise<StoreBackup> => {
     await mkdir(backupsDir, { recursive: true, mode: 0o700 });
-    await discardInterruptedCopies(backupsDir);
+    const discarded = await discardInterruptedCopies(backupsDir);
+    if (discarded.length > 0) options.onInterruptedDiscarded?.(discarded);
     const takenAt = now();
     const name = `${stamp(takenAt)}-${safeLabel(options.fromVersion)}-to-${safeLabel(options.toVersion)}`;
     const finalPath = join(backupsDir, name);
@@ -709,10 +712,14 @@ async function fsyncDir(path: string): Promise<void> {
 // A copy killed half-way leaves a `.partial` the size of the store that nothing
 // else would delete. Only one backup of a store runs at a time (the lock, or a
 // stopped writer), so any partial here is a dead one.
-async function discardInterruptedCopies(backupsDir: string): Promise<void> {
+async function discardInterruptedCopies(backupsDir: string): Promise<string[]> {
+  const discarded: string[] = [];
   for (const entry of await readdir(backupsDir)) {
-    if (entry.endsWith(PARTIAL_SUFFIX)) await rm(join(backupsDir, entry), { recursive: true, force: true });
+    if (!entry.endsWith(PARTIAL_SUFFIX)) continue;
+    await rm(join(backupsDir, entry), { recursive: true, force: true });
+    discarded.push(entry);
   }
+  return discarded;
 }
 
 // Keep copied data for at most the newest failed backup (see the header).

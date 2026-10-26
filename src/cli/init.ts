@@ -1,3 +1,5 @@
+import { setupStorageText, setupGitignoreText, setupRemoteText, LAZY_IGNORE_ENTRIES } from '../git/setup-edits';
+import { initializeManagedCheckout } from '../git/managed-setup';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { ensureLazyExcludeBestEffort } from '../git/lazy-exclude';
 import { isAbsolute, join, resolve } from 'path';
@@ -11,7 +13,7 @@ import {
 } from '../project-paths';
 import { basename } from 'path';
 import { getHome } from '../utils/home';
-import { DEFAULT_CONFIG, getDefaultConfigTemplate } from '../config/loader';
+import { DEFAULT_CONFIG, getDefaultConfigTemplate, resolveStoragePath } from '../config/loader';
 import { createStorage } from '../storage';
 import { isTTY, promptLine, promptChoice, promptYesNo } from './editor';
 import { repoHasCommits } from '../git/operations';
@@ -108,29 +110,7 @@ export function applySmolvmRunner(content: string, env: Record<string, string | 
  * Handles dotted keys like 'remote.driver' by finding the [remote] section.
  */
 function applyTomlOverrides(configPath: string, overrides: Record<string, string>): void {
-  let content = readFileSync(configPath, 'utf-8');
-
-  for (const [key, value] of Object.entries(overrides)) {
-    // Parse dotted key: "remote.driver" → section="remote", field="driver"
-    const dotIdx = key.indexOf('.');
-    if (dotIdx === -1) continue;
-
-    const section = key.substring(0, dotIdx);
-    const field = key.substring(dotIdx + 1);
-
-    // Escape regex metacharacters in section/field names to prevent injection
-    const escSection = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const escField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-    // Replace the field value in the section
-    const pattern = new RegExp(
-      `^(\\[${escSection}\\]\\s*\\n(?:.*\\n)*?${escField}\\s*=\\s*)"[^"]*"`,
-      'm',
-    );
-    content = content.replace(pattern, `$1"${value}"`);
-  }
-
-  writeFileSync(configPath, content);
+  writeFileSync(configPath, setupRemoteText(readFileSync(configPath, 'utf-8'), overrides));
 }
 
 /**
@@ -145,31 +125,7 @@ function applyTomlOverrides(configPath: string, overrides: Record<string, string
  * section.
  */
 export function setExternalStoragePath(configPath: string, externalPath: string): void {
-  const content = readFileSync(configPath, 'utf-8');
-  const quoted = JSON.stringify(externalPath);
-
-  // The [storage] section body: from its header to the next section header
-  // (or EOF). `m` so ^ matches line starts; the lookahead stops at `[next]`.
-  const sectionMatch = content.match(/^\[storage\][^\n]*\n(?:(?!^\[)[\s\S])*/m);
-  if (!sectionMatch) {
-    const sep = content.endsWith('\n') ? '' : '\n';
-    writeFileSync(
-      configPath,
-      `${content}${sep}\n[storage]\nbackend = "external"\nexternal_path = ${quoted}\n`,
-    );
-    return;
-  }
-
-  let section = sectionMatch[0];
-  section = /^external_path\s*=/m.test(section)
-    ? section.replace(/^external_path\s*=.*$/m, `external_path = ${quoted}`)
-    : section.replace(/^(\[storage\][^\n]*\n)/, `$1external_path = ${quoted}\n`);
-
-  section = /^backend\s*=/m.test(section)
-    ? section.replace(/^backend\s*=.*$/m, 'backend = "external"')
-    : section.replace(/^(\[storage\][^\n]*\n)/, '$1backend = "external"\n');
-
-  writeFileSync(configPath, content.replace(sectionMatch[0], section));
+  writeFileSync(configPath, setupStorageText(readFileSync(configPath, 'utf-8'), externalPath));
 }
 
 /**
@@ -375,77 +331,13 @@ function checkAuthSetup(): void {
  * matches whole path components, so `.lazy/` matches a directory named exactly
  * `.lazy` and never these sibling prefixes. They need their own entries.
  */
-export const LAZY_IGNORE_ENTRIES = [
-  '.env',
-  '.lazy-task-sandbox/',
-  '.lazy-lock',
-  '.lazy/',
-];
-
-/**
- * Entries written by older versions of `lazy init`, back when the in-repo
- * storage backend kept task JSON in `.lazy/tasks/` and that state was
- * deliberately committed — so only the runtime subpaths could be ignored.
- *
- * That backend is gone (`src/config/loader.ts` rejects `backend = "in-repo"`
- * and `"orphan-branch"`), so these are removed and replaced by `.lazy/`.
- */
-const LEGACY_LAZY_IGNORE_ENTRIES = [
-  '.lazy/worktrees/',
-  '.lazy/bin/',
-  '.lazy/logs/',
-  '.lazy/recovery/',
-  '.lazy/tasks/*/*.tmp.*',
-  '.lazy/tasks/*/*.backup.*',
-  '.lazy/tasks/*/protocol/',
-  '.lazy/storage.lock',
-  '.lazy/.reconcile-lock',
-  '.lazy/tmp',
-  // The in-repo plaintext approval passphrase is GONE (v0.23) — it lives
-  // hashed outside every repository now. Kept in this legacy list so init
-  // sweeps the stale line out of existing .gitignore files.
-  '.lazy/approve-passphrase',
-];
-
-/**
- * Reconcile the project's .gitignore with LAZY_IGNORE_ENTRIES.
- *
- * Idempotent: repeated runs converge on the same file. Any legacy enumerated
- * `.lazy/...` entry is dropped rather than left alongside the blanket rule, and
- * an existing blanket `.lazy/` is left in place (older versions of init actively
- * stripped it — that anti-migration is gone).
- *
- * Returns true if the file changed.
- */
+export { LAZY_IGNORE_ENTRIES } from '../git/setup-edits';
 export async function updateGitignore(targetDir: string): Promise<boolean> {
-  const gitignorePath = join(targetDir, '.gitignore');
-
-  if (!existsSync(gitignorePath)) {
-    writeFileSync(gitignorePath, LAZY_IGNORE_ENTRIES.join('\n') + '\n');
-    return true;
-  }
-
-  const before = readFileSync(gitignorePath, 'utf-8');
-
-  // Drop the legacy enumerated entries and the legacy `.workshop/` rule.
-  // Line-exact matching only: a user's own `.lazy/tasks/*/protocol/` comment or
-  // a negation (`!.lazy/keep-me`) is left untouched.
-  const kept = before.split('\n').filter(line => {
-    const trimmed = line.trim();
-    if (trimmed === LEGACY_DIR + '/') return false;
-    return !LEGACY_LAZY_IGNORE_ENTRIES.includes(trimmed);
-  });
-
-  const present = new Set(kept.map(line => line.trim()));
-  const missing = LAZY_IGNORE_ENTRIES.filter(entry => !present.has(entry));
-
-  let text = kept.join('\n');
-  if (missing.length > 0) {
-    text = text.trimEnd() + '\n' + missing.join('\n') + '\n';
-  }
-
-  if (text === before) return false;
-  writeFileSync(gitignorePath, text);
+  const path = join(targetDir, '.gitignore');
+  const before = existsSync(path) ? readFileSync(path, 'utf-8') : null;
+  const after = before === null ? LAZY_IGNORE_ENTRIES.join('\n') + '\n' : setupGitignoreText(before);
+  if (after === before) return false;
+  writeFileSync(path, after);
   return true;
 }
 
@@ -531,9 +423,12 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // short-circuit below would never catch this case.
   await refuseIfBoundClone('init', targetDir);
 
-  // Managed hosts only, and before the "already initialized" short-circuits: a
-  // repository that commits its own `.lazy` must not be able to skip the gate.
   await reportUnmanageableConfig(targetDir);
+
+  if (isManagedMode()) {
+    await initializeManagedCheckout(targetDir);
+    return;
+  }
 
   // Check for both new and legacy directories
   if (existsSync(lazyPath)) {
@@ -594,7 +489,7 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // it rather than being asked on top of it: the caller already decided.
   let storageChoice: StorageChoice = {};
   if (options.externalPath) {
-    storageChoice = { path: resolve(options.externalPath) };
+    storageChoice = { path: options.externalPath };
   } else if (isTTY() && !options.nonInteractive) {
     storageChoice = await promptStorageChoice(targetDir, gitRemote);
   }
@@ -609,15 +504,20 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     console.log(`Creating ~/.lazy/ for internal housekeeping (agent binaries, protocol state, logs).`);
   }
 
-  // Determine storage path. Always resolve the full path so it can be persisted
-  // to lazy.toml — prevents path drift when $HOME changes between sessions.
+  // Preserve the configured spelling; filesystem operations use the absolute path.
   const storagePath = storageChoice.path || join(getHome(), '.lazy', await getProjectName(targetDir, gitRemote));
-  mkdirSync(storagePath, { recursive: true });
+  const resolvedStoragePath = resolveStoragePath(targetDir, storagePath);
+  try {
+    mkdirSync(resolvedStoragePath, { recursive: true });
+  } catch (err: any) {
+    throw new Error(`Cannot create storage directory "${storagePath}" (resolved to "${resolvedStoragePath}"): ${err.message}`);
+  }
 
   // Initialize file-based storage — pass the RESOLVED path, not the user input.
   const storage = await createStorage(targetDir, {
     backend: 'external',
-    externalPath: storagePath,
+    externalPath: resolvedStoragePath,
+    configuredPath: storagePath,
   });
   await storage.close();
 
@@ -640,11 +540,12 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
   // for anyone silently.
   let runnerChoice = options.runner;
   if (!runnerChoice && isTTY() && !options.nonInteractive && !isManagedMode()) {
-    const idx = await promptChoice('Which runner should run task containers?', [
+    // smolvm-solo-guest-uid-mounts (next-release-20261021) brings smolvm back
+    // to this prompt once the hardware suite passes.
+    await promptChoice('Which runner should run task containers?', [
       'docker — Docker Desktop or a local Docker engine (default)',
-      'smolvm — a per-project smolvm microVM; needs only the docker client on this machine',
     ]);
-    runnerChoice = INIT_RUNNERS[idx] ?? 'docker';
+    runnerChoice = 'docker';
   }
   if (runnerChoice === 'smolvm') {
     const { content, missing } = applySmolvmRunner(readFileSync(configPath, 'utf-8'));
@@ -727,7 +628,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     if (createFirstTask) {
       const firstTaskStorage = await createStorage(targetDir, {
         backend: 'external',
-        externalPath: storagePath,
+        externalPath: resolvedStoragePath,
+        configuredPath: storagePath,
       });
       try {
         const task = await firstTaskStorage.createTask(
@@ -777,7 +679,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
     if (createDockerfileTask) {
       const dockerfileTaskStorage = await createStorage(targetDir, {
         backend: 'external',
-        externalPath: storagePath,
+        externalPath: resolvedStoragePath,
+        configuredPath: storagePath,
       });
       try {
         const task = await dockerfileTaskStorage.createTask(
@@ -824,7 +727,8 @@ export async function init(targetDir: string = process.cwd(), options: InitOptio
         // once for the whole block so both offers share one handle.
         const importStorage = await createStorage(targetDir, {
           backend: 'external',
-          externalPath: storagePath,
+          externalPath: resolvedStoragePath,
+          configuredPath: storagePath,
         });
         try {
           // Re-running init on a repo that already imported memory must not

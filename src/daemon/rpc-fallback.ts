@@ -85,7 +85,7 @@ import type { CredentialFailure } from '../proxy/credential-health';
 import type { IdentityAnswer } from '../identity';
 import type { CommitRepairResult, ConfirmedRepair } from './repair-commits';
 import type { BuilderSession } from '../storage/types';
-import type { AttachSessionInfo } from './session-attach';
+import type { AttachSessionInfo, SshHostKeyInfo } from './session-attach';
 import type { TaskMcpConfigResult } from './task-mcp-config';
 
 
@@ -347,6 +347,36 @@ export async function repairCommits(params: {
   const root = resolveLazyRoot();
   const { handleRepairCommits } = await import('./repair-commits');
   return handleRepairCommits(root, params as Record<string, unknown>, observers.onProgress);
+}
+
+// --- Task sessions ---
+
+/**
+ * A task's tmux sessions (`name` absent) or one session's output (`name`
+ * given), through the daemon — same daemon-first / in-process-fallback shape
+ * as `queryRegions`. Errors propagate: a container that could not be asked
+ * must never read as "nothing running".
+ */
+export async function queryTaskSessions(params: {
+  taskId: string;
+  name?: string;
+  lines?: number;
+  logBytes?: number;
+}): Promise<import('./task-sessions').TaskSessionsList | import('./task-sessions').TaskSessionRead> {
+  // Two literal calls, not one with a computed name: the bound-clone proxy's
+  // body-key guard reads each command's call site (test/helpers/cli-rpc-bodies.ts).
+  const rpc = params.name === undefined
+    ? await tryRpc<import('./task-sessions').TaskSessionsList>('taskSessions', { taskId: params.taskId })
+    : await tryRpc<import('./task-sessions').TaskSessionRead>('taskSessionOutput', {
+      taskId: params.taskId, name: params.name, lines: params.lines, logBytes: params.logBytes,
+    });
+  if (rpc) return rpc;
+
+  const root = resolveLazyRoot();
+  const sessions = await import('./task-sessions');
+  return params.name === undefined
+    ? sessions.listTaskSessions(root, params)
+    : sessions.readTaskSession(root, params);
 }
 
 // --- Review regions ---
@@ -693,6 +723,8 @@ export async function queryUsagePause(params: {
   /** `admitInteractive`: decide without taking the override (a pre-flight). */
   peek?: boolean;
   overrideUsagePause?: boolean;
+  /** `admitInteractive` for a builder on a profile other than the role's (`lazy builder --agent`). */
+  builderProfile?: string;
   /** The channel asking — only `human` may set the override; `human` or `builder` a task's allowance. */
   actor?: Actor;
   /** The pre-flight's own eligibility: `false` judges the task without the pending override. */
@@ -722,6 +754,7 @@ export async function queryUsagePause(params: {
     await admitInteractiveSession(root, storage, {
       surface: params.surface ?? 'pair', taskId: params.taskId, actor: params.actor, peek: params.peek,
       overrideUsagePause: params.overrideUsagePause,
+      builderProfile: params.builderProfile,
     });
     return describeUsagePauseState(root, storage);
   }
@@ -823,10 +856,13 @@ export async function queryDaemonMcpConfig(params: {
    * eviction path when the registry's builder cap trips (see mcp-tokens.ts).
    */
   ownerPid?: number;
+  /** The agent profile this builder session runs on, recorded on its token. */
+  profile?: string;
 }): Promise<DaemonMcpConfigResult> {
   const rpc = await tryRpc<DaemonMcpConfigResult>('getDaemonMcpConfig', {
     name: params.name,
     ownerPid: params.ownerPid,
+    ...(params.profile ? { profile: params.profile } : {}),
   });
   if (rpc) return rpc;
 
@@ -1333,6 +1369,7 @@ export async function queryRejectTask(params: {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  endMemberSessions?: boolean;
   actor?: ActorInput;
 }, progress?: ProgressSink): Promise<RejectTaskRpcResult> {
   const observers = observersOf(progress);
@@ -1340,6 +1377,7 @@ export async function queryRejectTask(params: {
     taskId: params.taskId,
     reason: params.reason,
     acceptDirtyWorktree: params.acceptDirtyWorktree,
+    endMemberSessions: optInFlag(params.endMemberSessions),
     actor: params.actor,
   }, observers);
   if (rpc) return rpc;
@@ -1362,6 +1400,7 @@ export async function queryCloseTask(params: {
   taskId: string;
   reason: string;
   acceptDirtyWorktree?: boolean;
+  endMemberSessions?: boolean;
   actor?: ActorInput;
 }, progress?: ProgressSink): Promise<CloseTaskRpcResult> {
   const observers = observersOf(progress);
@@ -1369,6 +1408,7 @@ export async function queryCloseTask(params: {
     taskId: params.taskId,
     reason: params.reason,
     acceptDirtyWorktree: params.acceptDirtyWorktree,
+    endMemberSessions: optInFlag(params.endMemberSessions),
     actor: params.actor,
   }, observers);
   if (rpc) return rpc;
@@ -1603,7 +1643,7 @@ export interface SyncTaskRpcResult {
   taskId: string;
   displayId: string;
   /** `merged` / `conflict` are the self-sync route — see src/daemon/self-sync.ts. */
-  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'held_by_member' | 'waiting_for_parent';
+  status: 'up_to_date' | 'sync_launched' | 'pending_sync' | 'merged' | 'conflict' | 'waiting_for_parent';
   message: string;
   warnings: string[];
   steps?: SelfSyncStep[];
@@ -1926,6 +1966,13 @@ export async function rpcAttachSession(id?: string): Promise<AttachSessionInfo> 
   const rpc = await tryRpc<AttachSessionInfo>('attachSession', { ...(id ? { id } : {}) });
   if (rpc) return rpc;
   throw sessionNeedsDaemon('attachSession');
+}
+
+/** The task's SSH host key for the caller — what `lazy shell --ssh-config --install` pins. */
+export async function rpcSshHostKey(id: string): Promise<SshHostKeyInfo> {
+  const rpc = await tryRpc<SshHostKeyInfo>('sshHostKey', { id });
+  if (rpc) return rpc;
+  throw sessionNeedsDaemon('sshHostKey');
 }
 
 /** End a builder session — terminal; the only way one stops for good (§5.7). */

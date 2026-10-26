@@ -352,8 +352,8 @@ describe('the launch and the sweep use this', () => {
 
   test('the supervisor wrapper leaves the read-only copies out of the adopt probe and chown', () => {
     const script = buildSupervisorWrapperScript('/p', '/w', ['/w'], ['/w/.git']);
-    expect(script).toContain('find "$p" ! -writable ! -path "/w/.git" -print -quit');
-    expect(script).toContain('sudo -n find "$p" ! -path "/w/.git" -exec chown -h');
+    expect(script).toContain('-uid 0 ! -path "/w/.git" ! -writable -print -quit');
+    expect(script).toContain('-uid 0 ! -path "/w/.git" -exec chown -h');
     expect(script).not.toContain('chown -R');
   });
 });

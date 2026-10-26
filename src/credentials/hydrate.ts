@@ -60,7 +60,7 @@ import {
   credentialSelfRefreshing,
   requiredProviders,
 } from './providers';
-import { credentialInEnv, credentialPresence, getStoredCredential } from './store';
+import { credentialInEnv, credentialPresence, getStoredCredentialForEntry } from './store';
 import { markHydratedEnvValue } from './hydrated-env';
 import type { BackendId } from './backends';
 
@@ -124,7 +124,7 @@ export async function hydrateCredentialEnv(
     const entry = await credentialPresence(projectRoot, provider);
     if (!entry) continue;
 
-    const stored = await getStoredCredential(projectRoot, provider);
+    const stored = await getStoredCredentialForEntry(projectRoot, provider, entry);
     if (!stored) continue;
 
     const envVar = envVarFor(provider, stored.kind);
@@ -150,6 +150,7 @@ export async function hydrateCredentialEnv(
       hint: entry.hint,
       kind: entry.kind,
       backend: entry.backend,
+      setName: entry.setName,
     });
     hydrated.push({ provider, envVar, backend: stored.backend });
     logger.info(

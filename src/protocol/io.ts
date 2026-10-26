@@ -13,6 +13,7 @@
  *
  * All writes use atomic temp-file-then-rename to prevent partial reads.
  */
+import { appendRuntimeContext, daemonRuntimeFacts } from '../runtime-context';
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync, chmodSync } from 'fs';
 import { join, dirname, isAbsolute, relative, resolve } from 'path';
@@ -24,10 +25,11 @@ import { PROGRESS_FILE } from './progress';
 import { mintNotesSecret } from './notes-secret';
 import { FINAL_MARKER_FILE } from './final-marker';
 import { PRESENTATION_MARKER_FILE } from './presentation-marker';
-import type { ResolvedConfig, MaintainEntry, ReactEntry } from '../config/types';
+import type { ResolvedConfig, MaintainEntry, ReactEntry, RunnerType } from '../config/types';
 import { buildAgentSandboxArgs, hostSandboxStorePath } from '../runner/host-sandbox';
 import { harnessForAgentName } from '../config/agent-profiles';
 import { logger } from '../utils/logger';
+import { getDaemonContext, hasDaemonContext } from '../daemon/context';
 
 /**
  * Allocate a fresh command correlation id.
@@ -54,8 +56,9 @@ export function newCommandId(): CommandId {
  */
 export function commonCommandFields(
   config: ResolvedConfig,
-  opts?: { command_id?: CommandId },
+  opts?: { command_id?: CommandId; runner?: RunnerType },
 ): {
+  runtime_context?: string;
   protocol_version: number;
   command_id: CommandId;
   turn_started_at: string;
@@ -72,6 +75,7 @@ export function commonCommandFields(
   react?: ReactEntry[];
 } {
   return {
+    ...(config.runner ? { runtime_context: taskRuntimeContext(opts?.runner ?? config.runner.type) } : {}),
     protocol_version: PROTOCOL_VERSION,
     command_id: opts?.command_id ?? newCommandId(),
     turn_started_at: new Date().toISOString(),
@@ -267,7 +271,13 @@ export function writeCommand(dir: string, command: Command): void {
   const withSecret = (cid && command.task_id)
     ? { ...command, notes_secret: mintNotesSecret(command.task_id, cid) }
     : command;
-  atomicWrite(commandPath(dir), JSON.stringify(withSecret, null, 2));
+  // Where this daemon's proxy listens. A task container outlives daemon
+  // restarts, and the proxy's port is OS-assigned per daemon, so every command
+  // says where it is now and the supervisor moves its env there before it
+  // starts the agent (src/supervisor/proxy-address-env.ts).
+  const proxyPort = hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
+  const stamped = proxyPort ? { ...withSecret, proxy_port: proxyPort } : withSecret;
+  atomicWrite(commandPath(dir), JSON.stringify(stamped, null, 2));
   if (cid) recordDispatchedCommand(dir, cid);
 }
 
@@ -658,4 +668,9 @@ export function removeProtocolDir(dir: string): void {
     cleanProtocol(dir);
     if (existsSync(dir)) rmdirSync(dir);
   } catch { /* best effort */ }
+}
+
+/** Deployment facts for task launches, including standalone sync commands. */
+export function taskRuntimeContext(runner: RunnerType): string {
+  return appendRuntimeContext('', { facts: daemonRuntimeFacts(), runner, audience: 'task', dashboardUrl: hasDaemonContext() ? getDaemonContext().dashboardUrl : undefined });
 }

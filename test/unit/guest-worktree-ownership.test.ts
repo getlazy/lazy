@@ -151,13 +151,81 @@ describe.skipIf(!canRun)('root daemon + uid-1000 task container share a worktree
   });
 });
 
+// INVARIANT: adopt hands back only what lazy's root-run daemon left behind
+// (uid 0). A directory a task's own service owns — Postgres's data dir, mode
+// 0700, owner postgres — keeps its owner and mode across every turn. The old
+// rule chowned -R anything the container user could not write, and on the
+// first turn after a Teams engineer moved Postgres data into the worktree
+// Postgres lost access to its own files ("could not open file
+// global/pg_filenode.map: Permission denied").
+describe.skipIf(!canRun)('a service-owned data dir in the worktree survives every turn', () => {
+  const PG_UID = 70; // postgres in the official alpine image; any non-root uid that is not ours
+  let root: string;
+  let repo: string;
+  let wt: string;
+  let pg: string;
+
+  beforeAll(async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), 'lazy-pg-own-')));
+    repo = join(root, 'repo');
+    wt = join(root, 'wt');
+    pg = join(wt, '.lazy', 'run-data', 'postgres');
+    // The root daemon clones and adds the worktree (a real one, so the
+    // supervisor's pass resolves its git dirs); Postgres, as its own uid,
+    // writes its data inside it.
+    const setup = run(['sudo', 'env', '-u', 'SUDO_UID', 'GIT_CONFIG_GLOBAL=/dev/null', 'sh', '-c',
+      `git init -q -b main '${repo}' && cd '${repo}' && ` +
+      `git -c user.email=d@x -c user.name=d commit -q --allow-empty -m init && ` +
+      `git worktree add -q '${wt}' -b task && ` +
+      `mkdir -p '${pg}/global' && echo map > '${pg}/global/pg_filenode.map' && ` +
+      `chown -R ${PG_UID}:${PG_UID} '${pg}' && chmod 700 '${pg}' && echo hi > '${wt}/README.md'`]);
+    expect(setup.err).toBe('');
+    expect(setup.code).toBe(0);
+  });
+
+  afterAll(async () => {
+    if (root) run(['sudo', 'rm', '-rf', root]);
+  });
+
+  function owners(): string {
+    return run(['sudo', 'sh', '-c', `stat -c '%u %a' '${pg}' '${pg}/global' '${pg}/global/pg_filenode.map'`]).out;
+  }
+
+  test('three turns of adopt, the supervisor pass and a root-daemon realign leave it untouched', async () => {
+    const before = owners();
+    expect(before).toBe(`${PG_UID} 700\n${PG_UID} 755\n${PG_UID} 644\n`);
+    const uid = process.getuid!();
+    const gid = process.getgid!();
+    // What the wrapper adopts: the worktree and its two git dirs.
+    const wrapperPaths = [wt, join(repo, '.git', 'worktrees', 'wt'), join(repo, '.git', 'objects')].map((x) => `'${x}'`).join(' ');
+    for (let turn = 0; turn < 3; turn++) {
+      // The PID-1 wrapper's adopt, before the supervisor starts.
+      const adopt = run(['sh', '-c', `${adoptFunction()}\nadopt ${wrapperPaths}`]);
+      expect(adopt.err).toBe('');
+      const paths = await taskWritablePaths(wt);
+      // The supervisor's pass before each command.
+      expect(await adoptBeforeCommand(wt)).toBeNull();
+      // The root daemon's realign after a tool call that wrote into the worktree.
+      const realign = run(['sudo', ...realignOwnershipArgv(paths, uid, gid, false)]);
+      expect(realign.err).toBe('');
+      expect(realign.code).toBe(0);
+      expect(owners()).toBe(before);
+    }
+    // The root-owned file lazy's daemon left IS taken back.
+    await writeFile(join(wt, 'README.md'), 'agent edit\n');
+  });
+});
+
 describe('realignment argv', () => {
   // INVARIANT: only entries NOT already owned by the target uid are chowned,
   // and symlinks themselves (-h), never their targets — a root daemon following
   // an agent-planted symlink would chown anything on the machine.
-  test('root daemon: no sudo, -h, filtered by uid', () => {
+  // Only ROOT-owned entries are taken, and a directory owned by any third
+  // user (a postgres data dir) is pruned whole — never chowned, never entered.
+  test('root daemon: no sudo, -h, root-owned only, foreign dirs pruned', () => {
     expect(realignOwnershipArgv(['/w', '/g'], 1000, 1000, false)).toEqual(
-      ['find', '/w', '/g', '!', '-uid', '1000', '-exec', 'chown', '-h', '1000:1000', '{}', '+']);
+      ['find', '/w', '/g', '(', '!', '-uid', '0', '!', '-uid', '1000', '-type', 'd', '-prune', ')',
+        '-o', '(', '-uid', '0', '-exec', 'chown', '-h', '1000:1000', '{}', '+', ')']);
   });
   test('container user: through sudo -n', () => {
     expect(realignOwnershipArgv(['/w'], 1000, 1000, true).slice(0, 3)).toEqual(['sudo', '-n', 'find']);

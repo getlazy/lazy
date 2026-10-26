@@ -13,6 +13,15 @@ describe('lazy fix', () => {
     await ctx.cleanup();
   });
 
+  // INVARIANT: Fix help describes targeted work verification. Full-suite work
+  // belongs at protected-branch acceptance, not in each debugging cycle.
+  test('help reserves the full suite for protected-branch acceptance', async () => {
+    const result = await ctx.lazy(['fix', '--help']);
+    expectSuccess(result);
+    expectOutput(result, 'Verify fix passes reproduction and targeted tests');
+    expectOutput(result, 'Run the full test suite only before acceptance into the protected branch.');
+  });
+
   test('creates a fix task with --goal flag', async () => {
     const result = await ctx.lazy(['fix', '--goal', 'Fix token refresh hanging']);
 

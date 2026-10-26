@@ -466,6 +466,19 @@ describe('lazy init --runner', () => {
   let tmpDir: string;
   afterEach(async () => { if (tmpDir) await rm(tmpDir, { recursive: true, force: true }); });
 
+  test('interactive init offers only docker', async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'lazy-init-'));
+    initGitRepo(tmpDir);
+    const result = await runLazy(tmpDir, ['init', '--skip-auth-check', '--skip-remote-check', '--skip-completion-check'], {
+      LAZY_FORCE_TTY: '1', LAZY_PROMPT_DEFAULTS: 'decline',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Which runner should run task containers?\n  1) docker — Docker Desktop or a local Docker engine (default)');
+    expect(result.stdout).not.toContain('2) smolvm');
+    expect((await loadConfig(tmpDir)).runner.type).toBe('docker');
+    expect(readFileSync(join(tmpDir, 'lazy.toml'), 'utf-8')).not.toContain('[smolvm]');
+  });
+
   // INVARIANT: smolvm is chosen only when asked for: --runner smolvm (or the
   // TTY prompt), never inferred. init writes what it can and says what is
   // still needed.

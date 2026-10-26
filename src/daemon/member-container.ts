@@ -1,3 +1,4 @@
+import { launchWithDiskSpaceRecovery } from '../docker/disk-space';
 /**
  * A member's OWN terminal container, on a shared daemon.
  *
@@ -45,11 +46,13 @@
  * in its `.gitconfig` — and anything there would run inside the member's
  * container, next to the member's credential. So the member's container gets a
  * home lazy builds for it ({@link prepareMemberHome}): lazy-written settings (no
- * hooks, no MCP servers), the UI preferences only, the git config lazy
+ * hooks, no imported MCP servers), the UI preferences only, the git config lazy
  * generated at launch, and the one conversation transcript Pair resumes —
  * data, never configuration. Pair and Chat also start Claude Code with the
  * options that ignore the worktree's own settings and any MCP server lazy did
- * not write (src/supervisor/pair.ts, MEMBER_SESSION_CLAUDE_ARGS). What is left
+ * not write (src/supervisor/pair.ts, MEMBER_SESSION_CLAUDE_ARGS). A separate
+ * read-only mount carries only this member's connection-scoped MCP configs;
+ * no task token is shared. What is left
  * is inherent, and documented: a member who RUNS the task's own scripts in
  * Shell runs code a turn may have written.
  *
@@ -71,6 +74,9 @@
  * ({@link MEMBER_CONTAINER_LABEL} plus the project label).
  */
 
+import { pinGrantsToAddresses } from '../proxy/credential-broker';
+import { allowMemberBinding, blockMemberBinding } from './member-recovery';
+import { MEMBER_MCP_MOUNT } from './member-pair-mcp';
 import { customImageNotReady, DEFAULT_RUNNER_IMAGE_PIN } from '../capture/custom-image-gate';
 import { createHash, randomBytes } from 'crypto';
 import { join, resolve } from 'path';
@@ -79,18 +85,18 @@ import { basename, dirname } from 'path';
 import { getDaemonBaseDir, projectSlug } from './paths';
 import { BUILDER_STATE_DIR_ENV, builderStateRoot } from '../builder/state-root';
 import { getHome } from '../utils/home';
-import { readRegularFileUnder, writeRegularFileUnder, FileTooLargeError } from './link-safe-files';
+import { readRegularFileUnder, writeRegularFileUnder, FileTooLargeError, LinkRefusedError } from './link-safe-files';
 import { extractClaudePreferenceSeed } from '../task/claude-home';
 import { encodeProjectPath } from '../import/claude-code-logs';
+import { sessionArea, listTranscripts, findSessionTranscript } from './member-transcripts';
 import type { Storage } from '../storage';
 import type { Task, Session } from '../types';
 import { spawn } from '../utils/spawn';
 import { logger } from '../utils/logger';
 import { loadConfig } from '../config/loader';
 import type { MountConfigEntry } from '../config/types';
-import { profileNameForAgent } from '../config/agent-profiles';
+import { profileNameForAgent, profileForAgentNameOrNull } from '../config/agent-profiles';
 import { ensureTaskWorktree } from './task-worktree';
-import { pathExists } from '../utils/fs';
 import { SANDBOX_DIR } from '../utils/sandbox';
 import { buildMemberMountArgs, turnWritableIndex, turnWritableMountStorage, type SharedStorage } from '../capture/mounts';
 import { buildGitMountArgs } from '../capture/git-mounts';
@@ -101,14 +107,34 @@ import { launchImagePin } from '../docker/worktree-image';
 import { PROJECT_LABEL } from '../runner/docker-runner';
 import type { PhaseNotify } from './progress';
 import { MEMBER_SESSION_MARKER, MEMBER_SESSION_MARKER_TEXT } from '../agent/member-session-marker';
+import { listSessionsCommand, parseSessionActivity, type SessionActivity } from '../terminal/shell-session';
 import {
   planMemberContainerCredential,
+  memberTerminalProfile,
+  memberTerminalCredentialProblem,
+  memberContainerProfileEnv,
   MEMBER_EXEC_CREDENTIAL_KEYS,
+  MEMBER_EXEC_BINDING_PREFIX,
+  memberTerminalGrantLabel,
+  releaseMemberContainerCredential,
   type MemberContainerCredential,
 } from '../server/member-exec-credential';
+import { getTaskSessionBinding, setSessionBindingOrigin } from './session-credentials';
+import { getDaemonContext, hasDaemonContext } from './context';
+import { proxyAddressEnvChanges } from '../supervisor/proxy-address-env';
+import { adoptChownShell, adoptProbeShell } from '../utils/adopt-rule';
+import { claimTaskDataDirShell, taskDataMountArgs, taskDataVolumeName } from '../runner/task-data';
 
 /** Label every member container carries; its value is the task id. */
 export const MEMBER_CONTAINER_LABEL = 'lazy.member-terminal';
+/**
+ * Whose container it is (the member's email) and which credential binding its
+ * placeholder resolves through — what a later daemon needs to re-adopt it
+ * ({@link readoptMemberContainer}). Set by the daemon at `docker run`; nothing
+ * inside the container can change a label.
+ */
+export const MEMBER_EMAIL_LABEL = 'lazy.member-email';
+export const MEMBER_BINDING_LABEL = 'lazy.member-binding';
 
 /** The Docker network every member container joins — see the header. */
 export const MEMBER_NETWORK = 'lazy-members';
@@ -258,12 +284,65 @@ export function memberContainerName(taskId: string): string {
 
 /** A running member container, and how to get rid of it. */
 export interface MemberContainer {
+  /** Finish interrupted restart recovery before terminal access. */
+  prepare?: () => Promise<void>;
+  /** Persist that a terminal exec has successfully started after recovery. */
+  attached?: () => Promise<void>;
+  /** Private daemon-owned MCP config directory, mounted read-only. */
+  mcpDirectory?: string;
   name: string;
   binary: string;
   /** Give the container user any path under the task's worktree it cannot write — run on every terminal attach, since a root daemon keeps writing there. */
   adopt?: () => Promise<void>;
   /** Remove the container (killing everything in it) and revoke its credential. */
   remove: () => Promise<void>;
+  /** The container's tmux sessions (src/terminal/shell-session.ts); throws when it cannot be asked. */
+  activity?: () => Promise<SessionActivity>;
+  /**
+   * `KEY=value` entries each terminal exec adds: the live proxy address on a
+   * re-adopted container, plus fresh profile credentials when Pair/Chat names
+   * its current profile. Existing processes keep their original environment.
+   */
+  execEnv?: (profile?: string) => Promise<string[]>;
+}
+
+/**
+ * The live proxy port, or undefined outside a daemon. The member containers'
+ * twin of the per-command `proxy_port` a task container's supervisor reads.
+ */
+function liveProxyPort(): number | undefined {
+  return hasDaemonContext() ? getDaemonContext().proxyPort : undefined;
+}
+
+/** A container's create-time env, as `docker inspect` reports it. */
+async function inspectContainerEnv(binary: string, name: string): Promise<Record<string, string>> {
+  const out = await runCaptured([binary, 'inspect', '--format', '{{json .Config.Env}}', name]);
+  if (out.exitCode !== 0) throw new Error(out.stderr.trim() || `${binary} inspect exited ${out.exitCode}`);
+  const list = JSON.parse(out.stdout.trim() || '[]') as unknown;
+  const env: Record<string, string> = {};
+  if (Array.isArray(list)) {
+    for (const e of list) {
+      if (typeof e !== 'string') continue;
+      const i = e.indexOf('=');
+      if (i > 0) env[e.slice(0, i)] = e.slice(i + 1);
+    }
+  }
+  return env;
+}
+
+/**
+ * Ask a container for its tmux sessions. Throws when the exec fails (the
+ * container is gone, or the runtime did not answer); an image without tmux,
+ * or a server with no session, answers zero sessions.
+ */
+export async function containerSessionActivity(
+  binary: string,
+  name: string,
+  run: (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }> = runCaptured,
+): Promise<SessionActivity> {
+  const out = await run([binary, 'exec', name, ...listSessionsCommand()]);
+  if (out.exitCode !== 0) throw new Error(out.stderr.trim() || `${binary} exec exited ${out.exitCode}`);
+  return parseSessionActivity(out.stdout);
 }
 
 /**
@@ -606,10 +685,16 @@ const MAX_CLAUDE_CONFIG_BYTES = 1024 * 1024;
  * (`lstat`, never a read): a link or a missing file answers false, and the
  * home's link-safe read deals with it.
  */
-export async function agentTranscriptTooLarge(worktreePath: string, sessionId: string | null | undefined): Promise<boolean> {
+export async function agentTranscriptTooLarge(
+  worktreePath: string,
+  sessionId: string | null | undefined,
+  harness = 'claude-code',
+): Promise<boolean> {
   if (!isSessionFileId(sessionId)) return false;
+  const rel = await sandboxTranscriptRel(worktreePath, harness, sessionId);
+  if (!rel) return false;
   try {
-    const st = await lstat(join(worktreePath, SANDBOX_DIR, transcriptRel(worktreePath, sessionId)));
+    const st = await lstat(join(worktreePath, SANDBOX_DIR, rel));
     return st.isFile() && st.size > MAX_TRANSCRIPT_BYTES;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') return false;
@@ -622,10 +707,38 @@ function isSessionFileId(id: string | null | undefined): id is string {
   return !!id && /^[A-Za-z0-9._-]+$/.test(id) && id !== '.' && id !== '..';
 }
 
-/** The transcript's path relative to a home (sandbox or member). */
+/** A Claude Code transcript's path relative to a home (sandbox or member). */
 function transcriptRel(worktreePath: string, sessionId: string): string {
   return join('.claude', 'projects', encodeProjectPath(worktreePath), `${sessionId}.jsonl`);
 }
+
+/**
+ * Where the task sandbox holds this harness's transcript of `sessionId`,
+ * relative to the sandbox (and so to a member home), or null when there is
+ * none — or the harness keeps none lazy can carry (Cursor, ./member-transcripts.ts).
+ */
+async function sandboxTranscriptRel(worktreePath: string, harness: string, sessionId: string): Promise<string | null> {
+  if (harness === 'claude-code') return transcriptRel(worktreePath, sessionId);
+  const area = sessionArea(harness, worktreePath);
+  if (!area) return null;
+  return findSessionTranscript(join(worktreePath, SANDBOX_DIR), area, sessionId);
+}
+
+/**
+ * The session id a member's Pair or Chat should resume, or null to start a new
+ * conversation: the agent's own session where the member's home carries it in.
+ * Codex and Pi only when the task sandbox actually holds that session's file —
+ * `codex resume` with an id it has no rollout for fails outright — and never
+ * Cursor, whose store lazy does not carry. Claude Code as before: its id.
+ */
+export async function memberResumableSessionId(worktreePath: string, harness: string, sessionId: string | null | undefined): Promise<string | null> {
+  if (!isSessionFileId(sessionId)) return null;
+  if (harness === 'claude-code') return sessionId;
+  return (await sandboxTranscriptRel(worktreePath, harness, sessionId)) ? sessionId : null;
+}
+
+/** The agent-home directories a member home carries, one per harness. */
+const MEMBER_AGENT_DIRS = ['.claude', '.codex', '.cursor', '.pi'] as const;
 
 /**
  * The git config a member's container gets: the daemon's own (the same source
@@ -661,8 +774,21 @@ export function memberHomesDir(projectRoot: string): string {
 /** Written at the top of each home (never mounted): what to hand back where. */
 const HOME_META = 'lazy-member-home.json';
 interface HomeMeta {
+  /** A runtime stop lost the shells; keep the environment until its next attach. */
+  restartAwaitingAttach?: boolean;
   worktreePath: string;
   agentSessionId: string | null;
+  /**
+   * The harness the home was built for — which session area the hand-back
+   * reads (./member-transcripts.ts). Absent on a home built before members
+   * could pair on other harnesses: Claude Code.
+   */
+  harness?: string;
+  /**
+   * The carried transcript's path relative to the home (and to the sandbox).
+   * Absent on an older home: the Claude Code path of {@link agentSessionId}.
+   */
+  agentTranscriptRel?: string | null;
   /**
    * The task sandbox's copy of that session's transcript when the home was
    * built ({@link transcriptFingerprint}; null when there was none). The
@@ -709,6 +835,8 @@ export async function prepareMemberHome(opts: {
   container: string;
   worktreePath: string;
   agentSessionId: string | null;
+  /** The task's harness: whose session the home carries. Claude Code when unset. */
+  harness?: string;
   /** Paths the member's git must treat as safe (the worktree and its git dirs). */
   safeDirectories: string[];
   /** Where a conversation that cannot be handed back is reported. */
@@ -719,12 +847,14 @@ export async function prepareMemberHome(opts: {
   const dir = join(parent, opts.container);
   await mkdir(dir, { mode: 0o700 });
   const sessionId = isSessionFileId(opts.agentSessionId) ? opts.agentSessionId : null;
+  const harness = opts.harness ?? 'claude-code';
   try {
     let transcript: Buffer | null = null;
     let transcriptTooLarge = false;
-    if (sessionId) {
+    const carriedRel = sessionId ? await sandboxTranscriptRel(opts.worktreePath, harness, sessionId) : null;
+    if (sessionId && carriedRel) {
       try {
-        transcript = await readRegularFileUnder(opts.worktreePath, join(SANDBOX_DIR, transcriptRel(opts.worktreePath, sessionId)), MAX_TRANSCRIPT_BYTES);
+        transcript = await readRegularFileUnder(opts.worktreePath, join(SANDBOX_DIR, carriedRel), MAX_TRANSCRIPT_BYTES);
       } catch (err) {
         // Too large to carry is not a reason to refuse a plain Shell, which
         // never reads it: the home starts without it, and says so.
@@ -736,6 +866,8 @@ export async function prepareMemberHome(opts: {
     const meta: HomeMeta = {
       worktreePath: opts.worktreePath,
       agentSessionId: sessionId,
+      harness,
+      agentTranscriptRel: carriedRel,
       agentTranscript: transcriptFingerprint(transcript),
       ...(transcriptTooLarge ? { agentTranscriptTooLarge: true } : {}),
     };
@@ -745,7 +877,11 @@ export async function prepareMemberHome(opts: {
     await writeRegularFileUnder(dir, join('.claude', 'settings.json'), '{}\n');
     // What `lazy-agent doctor` reads to say this is a member session.
     await writeRegularFileUnder(dir, MEMBER_SESSION_MARKER, MEMBER_SESSION_MARKER_TEXT);
+    await mkdir(join(dir, 'member-mcp'), { recursive: true, mode: 0o755 });
     await mkdir(join(dir, '.claude', 'projects', encodeProjectPath(opts.worktreePath)), { recursive: true, mode: 0o700 });
+    // Every harness's home directory, each mounted into the container: the
+    // session writes its config and conversation there, in the member's home.
+    for (const agentDir of MEMBER_AGENT_DIRS) await mkdir(join(dir, agentDir), { recursive: true, mode: 0o700 });
     // The worktree is the root every sandbox path is checked under — so the
     // sandbox directory itself cannot be a link either.
     const rawConfig = await readRegularFileUnder(opts.worktreePath, join(SANDBOX_DIR, '.claude.json'), MAX_CLAUDE_CONFIG_BYTES);
@@ -760,8 +896,8 @@ export async function prepareMemberHome(opts: {
     }
     await writeRegularFileUnder(dir, '.claude.json', JSON.stringify(extractClaudePreferenceSeed(sandboxConfig), null, 2) + '\n');
     await writeRegularFileUnder(dir, '.gitconfig', await memberGitconfig(opts.safeDirectories));
-    if (sessionId && transcript) {
-      await writeRegularFileUnder(dir, transcriptRel(opts.worktreePath, sessionId), transcript, 0o600);
+    if (carriedRel && transcript) {
+      await writeRegularFileUnder(dir, carriedRel, transcript, 0o600);
     }
     // The container user may not be the daemon's (a root daemon on Linux);
     // the container's own command takes ownership (see the argv), but the
@@ -824,19 +960,20 @@ export async function handBackMemberHome(
     if (!rawMeta) throw new Error(`${HOME_META} is missing`);
     const meta = JSON.parse(rawMeta.toString('utf-8')) as HomeMeta;
     if (typeof meta.worktreePath !== 'string') throw new Error(`${HOME_META} names no worktree`);
-    const projectsRel = join('.claude', 'projects', encodeProjectPath(meta.worktreePath));
-    let names: string[] = [];
-    try {
-      names = (await readdir(join(dir, projectsRel))).filter((f) => f.endsWith('.jsonl'));
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    }
+    const area = sessionArea(meta.harness ?? 'claude-code', meta.worktreePath);
+    const rels = area ? await listTranscripts(dir, area) : [];
+    // The transcript the home carried in — the one that may go back over the
+    // agent's own copy. An older home names none: its Claude Code path.
+    const carriedRel = meta.agentTranscriptRel !== undefined
+      ? meta.agentTranscriptRel
+      : (isSessionFileId(meta.agentSessionId) ? transcriptRel(meta.worktreePath, meta.agentSessionId) : null);
     const recovered: string[] = [];
     let diverged = false;
-    for (const name of names) {
-      const transcript = await readRegularFileUnder(dir, join(projectsRel, name), MAX_TRANSCRIPT_BYTES);
+    for (const rel of rels) {
+      const name = basename(rel);
+      const transcript = await readRegularFileUnder(dir, rel, MAX_TRANSCRIPT_BYTES);
       if (!transcript) continue;
-      if (isSessionFileId(meta.agentSessionId) && name === `${meta.agentSessionId}.jsonl`) {
+      if (carriedRel && rel === carriedRel) {
         // The member never touched it — nothing of theirs to hand back or save.
         // Writing it anyway could race a turn appending to the agent's copy:
         // a home can be handed back after the task is free again (a member
@@ -853,7 +990,7 @@ export async function handBackMemberHome(
         // the agent has run more turns on the same session. Overwriting then
         // would drop those turns from the agent's transcript — so the member's
         // copy is kept beside it instead.
-        const sandboxRel = join(SANDBOX_DIR, projectsRel, name);
+        const sandboxRel = join(SANDBOX_DIR, rel);
         let current: TranscriptFingerprint | null | 'too large';
         try {
           current = transcriptFingerprint(await readRegularFileUnder(meta.worktreePath, sandboxRel, MAX_TRANSCRIPT_BYTES));
@@ -898,7 +1035,8 @@ export async function handBackMemberHome(
       body:
         `When a member's terminal environment closed, its conversation could not be handed back to the task: ${why}\n\n` +
         `Nothing was deleted. The conversation is in ${dir} on the machine running lazy; its transcripts are ` +
-        `under .claude/projects/. Remove that directory once you have what you need.`,
+        `under its agent directory (.claude/projects/, .codex/sessions/ or .pi/agent/sessions/). Remove that ` +
+        `directory once you have what you need.`,
     }).catch((msgErr: unknown) => {
       logger.error(`Could not file a system message about the kept conversation at ${dir}: ${msgErr instanceof Error ? msgErr.message : String(msgErr)}`);
     });
@@ -968,6 +1106,14 @@ export interface MemberContainerArgsParams {
   runArgs: string[];
   /** The member's credential environment — the ONLY credential the container gets. */
   credentialEnv: Array<{ key: string; value: string }>;
+  /**
+   * The task's persistent data volume (src/runner/task-data.ts), mounted
+   * read-write so services a member starts see the same data as the turns'.
+   */
+  taskDataVolume?: string;
+  /** Recorded as labels so a later daemon can re-adopt the container; absent, it never is. */
+  memberEmail?: string;
+  bindingKey?: string;
 }
 
 /**
@@ -975,8 +1121,9 @@ export interface MemberContainerArgsParams {
  * inspectable without Docker (test/unit/member-container.test.ts): no namespace
  * shared with anything, only {@link MEMBER_NETWORK}, no mount of the protocol
  * dir, the daemon state dir or the turn-writable sandbox home, the git pointer
- * files as read-only copies, and no environment but lazy's fixed
- * `GIT_SSH_COMMAND` and the member's credential — last, so nothing before it
+ * files as read-only copies, the task's own data volume ($LAZY_TASK_DATA), and
+ * no environment but lazy's fixed `GIT_SSH_COMMAND` and `LAZY_TASK_DATA` and
+ * the member's credential — last, so nothing before it
  * can replace it. `runArgs` must already be {@link memberRunArgs}' output.
  */
 export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): string[] {
@@ -985,6 +1132,9 @@ export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): st
     '--name', p.name,
     '--label', `${PROJECT_LABEL}=${p.repoRoot}`,
     '--label', `${MEMBER_CONTAINER_LABEL}=${p.taskId}`,
+    ...(p.memberEmail && p.bindingKey
+      ? ['--label', `${MEMBER_EMAIL_LABEL}=${p.memberEmail}`, '--label', `${MEMBER_BINDING_LABEL}=${p.bindingKey}`]
+      : []),
     // A network of its own — never the task containers' default bridge.
     '--network', MEMBER_NETWORK,
     // The proxy the member's placeholder is spent through.
@@ -1000,7 +1150,15 @@ export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): st
     // sandbox home (see the header).
     '-v', `${p.homeDir}/.claude:/home/user/.claude`,
     '-v', `${p.homeDir}/.claude.json:/home/user/.claude.json`,
+    // The other harnesses' homes, for a Pair or Chat on a Codex, Cursor or Pi
+    // task: their config is written there by the session itself, for the
+    // member, and their conversation lives there (./member-transcripts.ts).
+    // A home a previous daemon built may lack them; prepareMemberHome makes them.
+    '-v', `${p.homeDir}/.codex:/home/user/.codex`,
+    '-v', `${p.homeDir}/.cursor:/home/user/.cursor`,
+    '-v', `${p.homeDir}/.pi:/home/user/.pi`,
     '-v', `${p.homeDir}/.gitconfig:/home/user/.gitconfig:ro`,
+    '-v', `${p.homeDir}/member-mcp:${MEMBER_MCP_MOUNT}:ro`,
     '-v', `${p.agentBinaryPath}:/usr/local/bin/lazy-agent:ro`,
     // NONE of the task's variables (`lazy env set`): whoever can set one
     // could otherwise make the member's shell, editor, runtime or git run
@@ -1014,6 +1172,7 @@ export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): st
     // a terminal relayed through a browser would hang on. Fixed text, never
     // a task's value.
     '-e', 'GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new',
+    ...(p.taskDataVolume ? taskDataMountArgs(p.taskDataVolume) : []),
     ...p.customMountArgs,
     ...p.runArgs,
     // LAST before the image: docker takes the last -e for a key, so nothing
@@ -1042,7 +1201,7 @@ export function buildMemberContainerDockerArgs(p: MemberContainerArgsParams): st
  * are the git pointer copies, read-only by design.
  */
 export function memberContainerCommand(adoptPaths: string[], readOnlyPaths: string[]): string {
-  return `${memberAdoptScript(adoptPaths, readOnlyPaths)}; exec sleep infinity`;
+  return `${memberAdoptScript(adoptPaths, readOnlyPaths)}; ${claimTaskDataDirShell()}; exec sleep infinity`;
 }
 
 /**
@@ -1054,12 +1213,12 @@ export function memberContainerCommand(adoptPaths: string[], readOnlyPaths: stri
  */
 export function memberAdoptScript(adoptPaths: string[], readOnlyPaths: string[]): string {
   const excl = readOnlyPaths.map((p) => `! -path "${p}"`).join(' ');
-  const targets = ['/home/user/.claude', '/home/user/.claude.json', ...adoptPaths].map((p) => `"${p}"`).join(' ');
+  const targets = ['/home/user/.claude', '/home/user/.claude.json', '/home/user/.codex', '/home/user/.cursor', '/home/user/.pi', ...adoptPaths].map((p) => `"${p}"`).join(' ');
   return (
     `for p in ${targets}; do ` +
     '[ -e "$p" ] || continue; ' +
-    `find "$p" ! -writable ${excl} -print -quit 2>/dev/null | grep -q . || continue; ` +
-    `sudo -n find "$p" ${excl} -exec chown -h "$(id -u):$(id -g)" {} + 2>/dev/null || true; ` +
+    `${adoptProbeShell('"$p"', excl)} || continue; ` +
+    `${adoptChownShell('"$p"', excl)} 2>/dev/null || true; ` +
     'done'
   );
 }
@@ -1169,6 +1328,7 @@ export async function launchMemberContainer(opts: {
   const name = memberContainerName(task.id);
   const planned = await (deps.planCredential ?? planMemberContainerCredential)({
     root: projectRoot, taskId: task.id, sessionId: session.id, memberEmail, container: name,
+    profile: await memberTerminalProfile(projectRoot, task.agent_id),
   });
   if (!planned.ok) return planned;
   const credential: MemberContainerCredential = planned.credential;
@@ -1190,6 +1350,7 @@ export async function launchMemberContainer(opts: {
       container: name,
       worktreePath,
       agentSessionId: session.agent_session_id ?? null,
+      harness: profileForAgentNameOrNull(config, task.agent_id)?.harness ?? 'claude-code',
       safeDirectories: [worktreePath, gitPaths.worktreeGitDir, gitPaths.commonDir],
       storage,
     });
@@ -1225,6 +1386,9 @@ export async function launchMemberContainer(opts: {
       customMountArgs,
       runArgs,
       credentialEnv: credential.env,
+      taskDataVolume: taskDataVolumeName(task.id),
+      memberEmail,
+      bindingKey: credential.key,
     });
     opts.notify?.(onDefaultImage ? `starting your terminal container on lazy's default image (${imageName}) — the project's own image is not ready yet` : 'starting your terminal container');
     const ran = await (deps.run ?? runDetached)(argv);
@@ -1265,6 +1429,7 @@ export async function launchMemberContainer(opts: {
     };
   }
   logger.info(`[${task.id.substring(0, 8)}] Started ${memberEmail}'s own terminal environment (${name}).`);
+  if (credential.key) allowMemberBinding(projectRoot, credential.key);
 
   let removed = false;
   return {
@@ -1272,10 +1437,18 @@ export async function launchMemberContainer(opts: {
     container: {
       name,
       binary,
+      mcpDirectory: join(home!.dir, 'member-mcp'),
+      execEnv: async (profile) => {
+        if (!profile || !credential.key) return [];
+        const env = await memberContainerProfileEnv({ root: projectRoot, taskId: task.id, memberEmail, container: name, key: credential.key, profile });
+        const original = new Map(credential.env.map(({ key, value }) => [key, value]));
+        return env.filter(entry => original.get(entry.slice(0, entry.indexOf('='))) !== entry.slice(entry.indexOf('=') + 1));
+      },
       adopt: async () => {
         const out = await (deps.run ?? runDetached)([binary, 'exec', name, 'sh', '-c', memberAdoptScript(adoptPaths, readOnlyPaths)]);
         if (out.exitCode !== 0) throw new Error(out.stderr.trim() || `${binary} exec exited ${out.exitCode}`);
       },
+      activity: () => containerSessionActivity(binary, name),
       remove: async () => {
         if (removed) return;
         try {
@@ -1295,9 +1468,7 @@ export async function launchMemberContainer(opts: {
 
 async function runDetached(argv: string[]): Promise<{ exitCode: number; stderr: string }> {
   // Bounded: an image is already resolved by now, so this is `docker run -d`.
-  const proc = spawn(argv, { stdout: 'ignore', stderr: 'pipe', timeout: 120_000 });
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-  return { exitCode: exitCode ?? 1, stderr };
+  return launchWithDiskSpaceRecovery(argv, 120_000);
 }
 
 /** The container's address on {@link MEMBER_NETWORK}, or null. */
@@ -1325,10 +1496,248 @@ export async function memberContainerRunning(binary: string, name: string): Prom
   return isContainerRunning(name, binary);
 }
 
+/** A member container a previous daemon left, as the runtime lists it. */
+export interface LeftoverMemberContainer {
+  name: string;
+  /** From {@link MEMBER_CONTAINER_LABEL}; empty when unlabelled. */
+  taskId: string;
+  /** From {@link MEMBER_EMAIL_LABEL}; null on a container made before it was recorded. */
+  email: string | null;
+  /** From {@link MEMBER_BINDING_LABEL}; null likewise. */
+  bindingKey: string | null;
+  running: boolean;
+}
+
+export interface ReadoptMemberContainerDeps {
+  binding?: typeof getTaskSessionBinding;
+  credentialProblem?: typeof memberTerminalCredentialProblem;
+  pinOrigin?: typeof setSessionBindingOrigin;
+  containerAddress?: (binary: string, name: string) => Promise<string | null>;
+  platform?: NodeJS.Platform;
+  gitPaths?: (worktreePath: string) => Promise<MemberGitLayout>;
+  run?: (argv: string[]) => Promise<{ exitCode: number; stderr: string }>;
+  remove?: (binary: string, name: string) => Promise<void>;
+  releaseCredential?: typeof releaseMemberContainerCredential;
+  handBack?: typeof handBackMemberHome;
+  /** The container's create-time env; defaults to `docker inspect`. */
+  containerEnv?: (binary: string, name: string) => Promise<Record<string, string>>;
+  /** The daemon's live proxy port; defaults to the daemon context's. */
+  proxyPort?: () => number | undefined;
+}
+
 /**
- * Remove every member container this project's previous daemon left behind.
- * Run at DAEMON STARTUP, before the reconcile loop: no member terminal survives
- * a restart (its socket dies with the process), and a leftover container would
+ * Take back a member container a previous daemon left, restarting it when
+ * stopped. Only when everything it needs is
+ * still there: its labels name the member and the credential binding (a
+ * container made by an older lazy has neither), its home is on
+ * disk, and the binding is still LIVE — its placeholder is baked into the
+ * container's environment, so it is the same binding or none. On Linux the
+ * binding is re-pinned to the container's current address before anything
+ * else. Nothing is re-minted: a container whose credential cannot be kept is
+ * not re-adopted, and the caller removes it as before.
+ *
+ * The returned container's `remove` does what a fresh one's does — container,
+ * then credential, then the home handed back.
+ */
+export async function readoptMemberContainer(opts: {
+  projectRoot: string;
+  binary: string;
+  leftover: LeftoverMemberContainer;
+  storage?: Pick<Storage, 'createSystemMessage'>;
+  profile?: string;
+  deps?: ReadoptMemberContainerDeps;
+}): Promise<{ ok: true; container: MemberContainer; email: string; bindingKey: string; grantLabel: string; waitForAttach: boolean } | { ok: false; reason: string }> {
+  const { projectRoot, binary, leftover } = opts;
+  const deps = opts.deps ?? {};
+  const { name, taskId, email, bindingKey } = leftover;
+  if (bindingKey) blockMemberBinding(projectRoot, bindingKey);
+  if (!email || !bindingKey || !taskId) return { ok: false, reason: 'it does not record whose it is (made by an older lazy)' };
+  if (!bindingKey.startsWith(`${MEMBER_EXEC_BINDING_PREFIX}${taskId}:`)) return { ok: false, reason: 'its credential label does not match its task' };
+  const homeDir = join(memberHomesDir(projectRoot), name);
+  let worktreePath: string;
+  let meta: HomeMeta;
+  try {
+    const rawMeta = await readRegularFileUnder(homeDir, HOME_META, 64 * 1024);
+    if (!rawMeta) return { ok: false, reason: 'its home is gone' };
+    meta = JSON.parse(rawMeta.toString('utf-8')) as HomeMeta;
+    if (typeof meta.worktreePath !== 'string') return { ok: false, reason: `its home's ${HOME_META} names no worktree` };
+    worktreePath = meta.worktreePath;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: false, reason: 'its home is gone' };
+    if (err instanceof LinkRefusedError) return { ok: false, reason: `its home is unsafe: ${err.message}` };
+    throw new Error(`its home cannot be read: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const exists = async (path: string) => {
+    try {
+      await lstat(path);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw new Error(`could not inspect ${path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  if (!(await exists(join(homeDir, 'member-mcp')))) return { ok: false, reason: 'it predates member pairing tools' };
+  if (!(await exists(worktreePath))) return { ok: false, reason: "the task's worktree is gone" };
+  const binding = await (deps.binding ?? getTaskSessionBinding)(projectRoot, bindingKey);
+  if (!binding || binding.revokedAt !== null) return { ok: false, reason: 'its credential was revoked' };
+  if (binding.taskId !== bindingKey || binding.ownerUserId !== email.trim().toLowerCase()) {
+    return { ok: false, reason: 'its credential binding does not match its task and member' };
+  }
+  const problem = await (deps.credentialProblem ?? memberTerminalCredentialProblem)(projectRoot, email, opts.profile);
+  if (problem) return { ok: false, reason: problem };
+  const run = deps.run ?? runDetached;
+  let restartError: string | null = null;
+  const start = async () => {
+    const started = await run([binary, 'start', name]);
+    if (started.exitCode !== 0) throw new Error(`it could not be restarted: ${started.stderr.trim() || `exit ${started.exitCode}`}`);
+  };
+  if (!leftover.running) {
+    // Persist before starting: a second restart must not mistake shells lost
+    // to a runtime stop for the member having deliberately exited them.
+    meta.restartAwaitingAttach = true;
+    await writeRegularFileUnder(homeDir, HOME_META, JSON.stringify(meta) + '\n', 0o600);
+    try {
+      await start();
+    } catch (err) {
+      restartError = err instanceof Error ? err.message : String(err);
+      logger.warn(`Keeping ${email}'s terminal environment ${name}: ${restartError}. Restart will be retried on terminal access.`);
+    }
+  }
+  const pin = async () => {
+    if ((deps.platform ?? process.platform) !== 'linux') return;
+    // The same pin a launch sets (see launchMemberContainer): an address the
+    // runtime may have changed is read again, never assumed.
+    const address = await (deps.containerAddress ?? memberContainerAddress)(binary, name);
+    if (!address) throw new Error(`it has no address on the ${MEMBER_NETWORK} network to pin its credential to`);
+    try {
+      await (deps.pinOrigin ?? setSessionBindingOrigin)(projectRoot, bindingKey, address);
+      await pinGrantsToAddresses(projectRoot, memberTerminalGrantLabel(email, name), [address]);
+    } catch (err) {
+      throw new Error(`its credential could not be pinned: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  if (!restartError) {
+    await pin();
+  }
+  // Its env was fixed when the previous daemon created it, so the proxy
+  // address in it names THAT daemon's port. Read once (credential values are
+  // not kept); every terminal exec then carries the address moved to the live
+  // port, and new tmux windows get it too.
+  let createEnv: Record<string, string>;
+  try {
+    const all = await (deps.containerEnv ?? inspectContainerEnv)(binary, name);
+    createEnv = Object.fromEntries(Object.entries(all).filter(([k]) => !MEMBER_EXEC_CREDENTIAL_KEYS.includes(k)));
+  } catch (err) {
+    throw new Error(`its environment cannot be read: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const grantLabel = memberTerminalGrantLabel(email, name);
+  const execEnv = async (profile?: string): Promise<string[]> => {
+    if (restartError) throw new Error(restartError);
+    const credentialEnv = profile
+      ? await memberContainerProfileEnv({ root: projectRoot, taskId, memberEmail: email, container: name, key: bindingKey, profile })
+      : [];
+    const changes = proxyAddressEnvChanges(createEnv, (deps.proxyPort ?? liveProxyPort)());
+    const entries = Object.entries(changes);
+    if (entries.length === 0) return credentialEnv;
+    // Best effort: new windows and panes of the member's tmux sessions read
+    // the server's global env. A program already running keeps what it had.
+    const script = entries.map(([k, v]) => `tmux set-environment -g ${k} '${v.replace(/'/g, "'\\''")}' 2>/dev/null`).join('; ') + '; true';
+    await run([binary, 'exec', name, 'sh', '-c', script]).catch((err: unknown) => {
+      logger.warn(`Could not update the proxy address in ${name}'s tmux sessions: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return [...entries.map(([k, v]) => `${k}=${v}`), ...credentialEnv];
+  };
+  let removed = false;
+  if (!restartError) allowMemberBinding(projectRoot, bindingKey);
+  return {
+    ok: true,
+    email,
+    bindingKey,
+    grantLabel,
+    waitForAttach: meta.restartAwaitingAttach === true,
+    container: {
+      name,
+      binary,
+      prepare: async () => {
+        if (!restartError) return;
+        // Startup validation cannot authorize a later retry: a member may
+        // have left or revoked their connection while the runtime was down.
+        const current = await (deps.binding ?? getTaskSessionBinding)(projectRoot, bindingKey);
+        if (!current || current.revokedAt !== null || current.taskId !== bindingKey || current.ownerUserId !== email.trim().toLowerCase()) {
+          throw new Error(`Cannot recover ${name}: its member credential binding is no longer live or does not match.`);
+        }
+        const problem = await (deps.credentialProblem ?? memberTerminalCredentialProblem)(projectRoot, email, opts.profile);
+        if (problem) throw new Error(`Cannot recover ${name}: ${problem}`);
+        await start();
+        await pin();
+        restartError = null;
+        allowMemberBinding(projectRoot, bindingKey);
+      },
+      mcpDirectory: join(homeDir, 'member-mcp'),
+      // The paths are worked out again on each attach rather than carried
+      // over: checked on the host from files, as at launch.
+      adopt: async () => {
+        const gitPaths = await (deps.gitPaths ?? ((w: string) => validateMemberGitLayout(projectRoot, w)))(worktreePath);
+        const adoptPaths = [worktreePath, gitPaths.worktreeGitDir, gitPaths.objectsDir];
+        const readOnlyPaths = gitPaths.pointerFiles.map((p) => p.target);
+        const out = await run([binary, 'exec', name, 'sh', '-c', memberAdoptScript(adoptPaths, readOnlyPaths)]);
+        if (out.exitCode !== 0) throw new Error(out.stderr.trim() || `${binary} exec exited ${out.exitCode}`);
+      },
+      attached: async () => {
+        if (!meta.restartAwaitingAttach) return;
+        const updated = { ...meta };
+        delete updated.restartAwaitingAttach;
+        await writeRegularFileUnder(homeDir, HOME_META, JSON.stringify(updated) + '\n', 0o600);
+        meta = updated;
+      },
+      activity: () => {
+        if (restartError) throw new Error(restartError);
+        return containerSessionActivity(binary, name);
+      },
+      execEnv,
+      remove: async () => {
+        if (removed) return;
+        try {
+          await (deps.remove ?? removeMemberContainer)(binary, name);
+        } finally {
+          await (deps.releaseCredential ?? releaseMemberContainerCredential)(projectRoot, bindingKey, grantLabel);
+        }
+        removed = true;
+        await (deps.handBack ?? handBackMemberHome)(projectRoot, homeDir, opts.storage);
+      },
+    },
+  };
+}
+
+/** Parse one line of the leftover listing (see {@link removeLeftoverMemberContainers}). */
+export function parseLeftoverMemberLine(line: string): LeftoverMemberContainer | null {
+  const [name, taskId, email, bindingKey, state] = line.trim().split('\t');
+  if (!name?.startsWith(MEMBER_CONTAINER_PREFIX)) return null;
+  return {
+    name,
+    taskId: taskId ?? '',
+    email: email || null,
+    bindingKey: bindingKey || null,
+    running: state === 'running',
+  };
+}
+
+/** Read-only inventory shared by startup recovery and finished-task cleanup. */
+export async function listMemberContainers(projectRoot: string, binary: string): Promise<LeftoverMemberContainer[]> {
+  const proc = spawn([binary, 'ps', '-a', '--filter', `name=^${MEMBER_CONTAINER_PREFIX}`,
+    '--filter', `label=${MEMBER_CONTAINER_LABEL}`, '--filter', `label=${PROJECT_LABEL}=${projectRoot}`,
+    '--format', `{{.Names}}\t{{.Label "${MEMBER_CONTAINER_LABEL}"}}\t{{.Label "${MEMBER_EMAIL_LABEL}"}}\t{{.Label "${MEMBER_BINDING_LABEL}"}}\t{{.State}}`],
+  { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 });
+  const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  if (code !== 0) throw new Error(`Could not list terminal environments: ${err.trim() || `exit ${code}`}`);
+  return out.split('\n').map(parseLeftoverMemberLine).filter((row): row is LeftoverMemberContainer => row !== null);
+}
+
+/**
+ * Deal with every member container this project's previous daemon left
+ * behind. Run at DAEMON STARTUP, before the reconcile loop. A container
+ * `readopt` takes back is left running (the member's sessions in it survive
+ * the restart); every other one is removed — a leftover nobody holds would
  * keep running whatever the member left in it with nobody to end it. One it
  * cannot remove is reported (with the task its label names) so the caller can
  * hold that task until it is gone.
@@ -1336,37 +1745,34 @@ export async function memberContainerRunning(binary: string, name: string): Prom
 export async function removeLeftoverMemberContainers(
   projectRoot: string,
   binary: string,
-  deps: { remove?: (binary: string, name: string) => Promise<void>; list?: () => Promise<string> } = {},
-): Promise<{ removed: number; failed: Array<{ taskId: string; name: string; error: string }> }> {
-  // No runtime installed, no containers to remove — every daemon on a host
-  // without Docker starts through here.
-  if (!deps.list && !Bun.which(binary)) return { removed: 0, failed: [] };
-  const stdout = await (deps.list ?? (async () => {
-    const proc = spawn(
-      [binary, 'ps', '-a',
-        '--filter', `name=^${MEMBER_CONTAINER_PREFIX}`,
-        '--filter', `label=${MEMBER_CONTAINER_LABEL}`,
-        '--filter', `label=${PROJECT_LABEL}=${projectRoot}`,
-        '--format', `{{.Names}}\t{{.Label "${MEMBER_CONTAINER_LABEL}"}}`],
-      { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 },
-    );
-    const [out, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
-    ]);
-    if (code !== 0) throw new Error(`could not list terminal containers: ${stderr.trim() || `exit ${code}`}`);
-    return out;
-  }))();
+  deps: {
+    remove?: (binary: string, name: string) => Promise<void>;
+    list?: () => Promise<string>;
+    /** True when the container was taken back and must be left alone. */
+    readopt?: (leftover: LeftoverMemberContainer) => Promise<boolean>;
+  } = {},
+): Promise<{ removed: number; readopted: string[]; failed: Array<{ taskId: string; name: string; error: string }> }> {
+  // A missing runtime executable is an unavailable inventory, never evidence
+  // that the previous daemon left no environments. Let spawn report it so the
+  // startup sweep preserves homes and bindings and retries recovery.
+  const leftovers = deps.list
+    ? (await deps.list()).split('\n').map(parseLeftoverMemberLine).filter((row): row is LeftoverMemberContainer => row !== null)
+    : await listMemberContainers(projectRoot, binary);
   let removed = 0;
+  const readopted: string[] = [];
   const failed: Array<{ taskId: string; name: string; error: string }> = [];
-  for (const line of stdout.split('\n')) {
-    const [name, taskId] = line.trim().split('\t');
-    if (!name?.startsWith(MEMBER_CONTAINER_PREFIX)) continue;
+  for (const leftover of leftovers) {
+    const { name, taskId } = leftover;
+    if (deps.readopt && (await deps.readopt(leftover))) {
+      readopted.push(name);
+      continue;
+    }
     try {
       await (deps.remove ?? removeMemberContainer)(binary, name);
       removed += 1;
     } catch (err) {
-      failed.push({ taskId: taskId ?? '', name, error: err instanceof Error ? err.message : String(err) });
+      failed.push({ taskId, name, error: err instanceof Error ? err.message : String(err) });
     }
   }
-  return { removed, failed };
+  return { removed, readopted, failed };
 }

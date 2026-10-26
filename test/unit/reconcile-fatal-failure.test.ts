@@ -135,6 +135,16 @@ describe('reconciler: classified agent failures', () => {
   beforeEach(async () => { env = await setupEnv(); });
   afterEach(async () => { await env.cleanup(); });
 
+  for (const failure_class of ["transient_overload", "transient_network"] as const) {
+    test(`exhausted ${failure_class} stays interrupted for automatic recovery`, async () => {
+      const { taskId, sessionId, protoDir } = await makeTask(env, "working");
+      const response: ErrorResponse = { status: "error", phase: "work", error: "temporary failure exhausted six attempts", failure_class, failure_attempts: 6 };
+      deliver(protoDir, response);
+      await handleErrorResponse(env.storage, taskId, { id: sessionId }, response, protoDir, env.lazyRoot);
+      expect((await env.storage.getTask(taskId))?.status).toBe("interrupted");
+    });
+  }
+
   test('a fatal failure blocks the task instead of interrupting it', async () => {
     const { taskId, sessionId, protoDir } = await makeTask(env, 'working');
 

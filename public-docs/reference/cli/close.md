@@ -3,7 +3,7 @@
 This page is generated from `lazy close --help`.
 
 ```text
-Usage: lazy close <task_id> [--reason "reason text"] [--yes] [--accept-dirty-worktree]
+Usage: lazy close <task_id> [--reason "reason text"] [--yes] [--accept-dirty-worktree] [--end-sessions]
 
 Close a task — stop work and mark it as abandoned.
 
@@ -16,6 +16,9 @@ Options:
   --yes, -y               Skip editor prompt (non-interactive mode)
                           Requires --reason or piped stdin
   --accept-dirty-worktree Allow closing even if worktree has uncommitted changes
+  --end-sessions          End any member's open sessions in the task's environment
+                          first (Lazy Teams); without it, the close is refused
+                          while they have sessions open
 
 Reason input priority: --reason flag > piped stdin > $EDITOR (interactive)
 

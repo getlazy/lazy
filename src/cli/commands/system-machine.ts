@@ -120,7 +120,7 @@ async function commandResetDockerStorage(args: string[]): Promise<void> {
       console.error('Error: resetting Docker storage needs --yes when there is no terminal to confirm at.');
       process.exit(1);
     }
-    console.log(theme.warning('This deletes every image, container, volume and build cache on this machine, and stops everything running in Docker.'));
+    console.log(theme.warning('This deletes every image, container, volume and build cache on this machine — including every open task’s data directory ($LAZY_TASK_DATA: its services’ databases) — and stops everything running in Docker.'));
     console.log('Builds and task starts are cold afterwards: images are pulled and layers rebuilt.');
     if (!await promptYesNo('Reset this machine\'s Docker storage?', false)) {
       console.log('Not reset.');

@@ -68,8 +68,8 @@ import {
 } from '../../upgrade/interactive-prompt';
 import { VERSION } from '../../version';
 import { backupStoreForUpgrade, SKIP_STORE_BACKUP_ENV } from '../../daemon/upgrade-store-backup';
-import { backupSizeText } from '../../storage/store-backup';
-import { backupProgressPrinter } from '../../daemon/upgrade-store-backup';
+import { backupOutcomeLine, backupProgressPrinter, describeUpcomingBackup } from '../../daemon/upgrade-store-backup';
+import { backupPurpose } from '../../daemon/store-backup-progress';
 import { missingCredentialNotice } from '../../daemon/credential-gate';
 
 interface ContainerInfo {
@@ -556,6 +556,13 @@ export async function commandUpgrade(args: string[]): Promise<void> {
 
   // Read before the daemon restarts — ensureDaemon rewrites the marker on startup.
   const previousVersion = await readPreviousDaemonVersion(root);
+  // Said up front, before anything is stopped: the backup holds the project
+  // down for as long as it takes, and a person who knows that waits for it.
+  if (previousVersion && previousVersion !== VERSION && !skipStoreBackup) {
+    console.log('Measuring the store to size the backup the new version needs...');
+    const upcoming = await describeUpcomingBackup(root).catch((err) => `Could not size the store backup in advance: ${err instanceof Error ? err.message : String(err)}`);
+    if (upcoming) console.log(upcoming);
+  }
 
   // Declared out here so the `finally` can abandon a still-running background
   // rebuild on every exit path that is not a completed upgrade.
@@ -919,7 +926,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       console.log(theme.warning('\n--skip-store-backup: the store is NOT being backed up before the new daemon opens it.'));
       process.env[SKIP_STORE_BACKUP_ENV] = '1';
     } else if (previousVersion && previousVersion !== VERSION) {
-      console.log('\nBacking up the store before the new daemon opens it...');
+      console.log(`\n${backupPurpose(previousVersion, VERSION)}...`);
       try {
         const config = await loadConfig(root);
         const outcome = await backupStoreForUpgrade({
@@ -930,8 +937,8 @@ export async function commandUpgrade(args: string[]): Promise<void> {
           reason: `lazy upgrade ${previousVersion} → ${VERSION}`,
           onProgress: backupProgressPrinter((line) => console.log(`  ${line}`)),
         });
-        if (outcome.kind === 'skipped') console.log(`  No backup needed: ${outcome.reason}`);
-        else console.log(`  ${theme.success(`${outcome.kind === 'taken' ? 'Backed up' : 'Already backed up'}: ${outcome.backup.path}`)} (${outcome.backup.file_count} files, ${backupSizeText(outcome.backup)})`);
+        const line = backupOutcomeLine(outcome, previousVersion);
+        console.log(`  ${outcome.kind === 'skipped' ? line : theme.success(line)}`);
       } catch (err) {
         console.error(`\nError: ${err instanceof Error ? err.message : String(err)}`);
         console.error('The old daemon was stopped and has NOT been restarted. Fix the cause and run `lazy upgrade` again,');

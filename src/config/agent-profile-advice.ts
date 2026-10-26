@@ -166,7 +166,7 @@ export function piUpstreamExamples(): string {
       'endpoint = "https://api.anthropic.com", credential = "anthropic", or [agents.remote-ollama-pi] harness = "pi", ' +
       'model = "…", endpoint = "http://ollama.lan:11434", credential = "none", or over the OpenAI wire when the ' +
       'endpoint is OpenAI\'s or OpenRouter\'s, e.g. [agents.openai-pi] harness = "pi", ' +
-      'model = "gpt-6-sol", endpoint = "https://api.openai.com", credential = "openai" or [agents.openrouter-pi] ' +
+      'model = "gpt-6.1-sol", endpoint = "https://api.openai.com", credential = "openai" or [agents.openrouter-pi] ' +
       'harness = "pi", model = "anthropic/claude-sonnet-4.5", endpoint = "https://openrouter.ai/api", ' +
       'credential = "openrouter". Every endpoint names the credential that pays it.'
     );
@@ -313,7 +313,7 @@ export function generatedConfigProfileExamples(): string {
       '#\n' +
       '# [agents.work-codex]\n' +
       '# harness = "codex"\n' +
-      '# model = "gpt-6-sol"'
+      '# model = "gpt-6.1-sol"'
     );
   }
   return (

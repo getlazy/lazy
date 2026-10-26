@@ -113,7 +113,7 @@ export const PI_PROVIDER_KEY: Record<PiProvider, string> = {
  * left only builtins on the wire, the denylist kept `read` plus the bridged
  * tool), and the read-only lazy_* toolset must survive an ask turn.
  */
-const PLAN_MODE_EXCLUDED_TOOLS = 'bash,edit,write,powershell';
+export const PLAN_MODE_EXCLUDED_TOOLS = 'bash,edit,write,powershell';
 
 /** Marker for lazy's own pre-flight provider refusal, matched in classifyFailure. */
 const UNSUPPORTED_PROVIDER_PREFIX = 'pi provider not supported by lazy';
@@ -373,9 +373,18 @@ export class PiActivityStream implements AgentActivityStream {
         kind: 'result',
         sessionId: this.sessionId,
         raw: JSON.stringify(buildPiResultLine(this.sessionId, summary)),
+        ...(summary.stopReason === 'error' && summary.errorMessage ? { failureMessage: summary.errorMessage } : {}),
       };
     }
 
+    // Pi 0.84.4 auto_retry_start carries the provider diagnostic, not prose.
+    if (type === 'auto_retry_start') {
+      return { kind: 'heartbeat', failureMessage: String(msg.errorMessage ?? '') };
+    }
+    const delta = msg.assistantMessageEvent as { type?: string; delta?: unknown } | undefined;
+    const modelOutput = type === 'message_update' &&
+      (delta?.type === 'text_delta' || delta?.type === 'thinking_delta') &&
+      typeof delta.delta === 'string' && delta.delta.length > 0;
     // Everything else — agent_start, turn_start/end, message lifecycle and
     // deltas, tool_execution_update, queue/compaction events — is evidence the
     // turn is advancing. pi has no heartbeat-shaped keep-alive event (its
@@ -383,7 +392,7 @@ export class PiActivityStream implements AgentActivityStream {
     // `heartbeat`. Unknown future event types count as progress for the same
     // reason ClaudeCodeActivityStream counts them: mistaking real progress for
     // silence is the expensive error.
-    return { kind: 'progress' };
+    return { kind: 'progress', ...(modelOutput ? { modelOutput: true } : {}) };
   }
 }
 

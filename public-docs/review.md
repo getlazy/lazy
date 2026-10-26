@@ -12,6 +12,19 @@ Put a task in `separate` mode — `lazy create`/`start`/`edit --review separate`
 or `[review] mode` for the whole project — and everything on this page applies
 to it.
 
+In Lazy Teams, a project admin can choose this default under **Settings →
+Configuration**:
+
+```toml
+[review]
+mode = "separate"
+gate = "always"
+auto_fix = false
+```
+
+Each completed task gets a separate reviewer, and a finding that gates
+acceptance stays with the task for you to act on.
+
 **You can run `lazy review <task>` by hand in any mode, and what it finds
 GATES.** A review you asked for is a deliberate act — nobody spends a review
 turn they did not want — so its findings above medium hold the accept whatever

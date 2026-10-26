@@ -1,12 +1,10 @@
 /**
- * INVARIANT: a fresh accept of a task a member is working in has NO effect
- * beyond the store. The member check runs at the top of the fresh-accept path,
- * before the accept check, the `[automation.pre_accept]` gate (project
- * commands run in the member's files), the branch push, PR/MR creation,
- * approveForMerge and the forge's gates — so a refused accept ran nothing on
- * the member's files and wrote nothing to the forge. Only the raised-item
- * resolutions come first: they are the human's own words, saved before
- * anything that can refuse.
+ * INVARIANT (engineer, 2026-10-21, replacing "an accept of a task a member is
+ * working in is refused before it has any effect"): a member's sessions in the
+ * task do NOT refuse its accept. The accept runs as it would with nobody
+ * inside — gate, push, MR, merge — because nothing fallible may follow the
+ * merge and the accepted transition (the accept commit point). Member sessions
+ * end afterwards, as a follow-through step (test/unit/accept-followthrough-member-inside.test.ts).
  */
 
 import { describe, test, expect, beforeEach, afterEach, afterAll } from 'bun:test';
@@ -276,20 +274,14 @@ describe('accepting a task a member is working in', () => {
   });
   afterEach(() => resetMemberTerminalsForTests());
 
-  test('is refused before the acceptance gate, the push, the MR or any forge call', async () => {
+  test('is not refused: it reaches the acceptance gate with the member inside', async () => {
     expect(claimMemberTerminal(mockTask.id, ALICE).ok).toBe(true);
     markMemberTerminalEntered(mockTask.id, ALICE);
     const err = await acceptTask('/tmp/test', { taskId: 'held-task' }).then(() => null, (e: unknown) => e);
-    expect(err).toBeInstanceOf(RealRpcError);
-    expect((err as RealRpcError).status).toBe(409);
-    expect((err as Error).message).toContain(ALICE);
-    expect(reached.filter((r) => EFFECTS.includes(r))).toEqual([]);
-    expect(mockTask.status).toBe('blocked');
+    expect(err === null || !(err as Error).message.includes(ALICE)).toBe(true);
+    expect(reached).toContain('launchAcceptanceGate');
   });
 
-  // Controls: with nobody inside, the same accept DOES reach each recorder,
-  // so the empty list above is the check's doing, not a fixture that never
-  // gets that far.
   test('with nobody inside, the accept reaches the acceptance gate', async () => {
     await acceptTask('/tmp/test', { taskId: 'held-task' }).catch(() => {});
     expect(reached).toContain('launchAcceptanceGate');

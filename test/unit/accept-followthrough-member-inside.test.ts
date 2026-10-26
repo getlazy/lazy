@@ -1,11 +1,8 @@
 /**
- * INVARIANT: a merge the forge made while a member was working in the task
- * (their task was `submitted`, then its PR merged) is committed, but the
- * task's worktree, branch, container and tokens are NOT cleaned up under them.
- * Post-accept follow-through — the one function both the remote-sync merge path
- * and the daemon's retry sweep run — leaves `cleanup` pending while a member
- * is inside, without counting it as a failure (no attempt, no backoff, no
- * system message), and runs it on the first pass after their session ends.
+ * INVARIANT: accepted tasks end their member environments before worktree
+ * cleanup. Idle sessions never expire while a task is live, so task completion
+ * must end them. A failed removal is retryable follow-through and never undoes
+ * acceptance or removes files beneath a still-running environment.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -14,7 +11,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { runAcceptFollowThrough } from '../../src/daemon/task-lifecycle';
 import { ACCEPT_FOLLOWTHROUGH_KEY, FOLLOWTHROUGH_STEPS } from '../../src/daemon/accept-intent';
-import { claimMemberTerminal, markMemberTerminalEntered, releaseMemberTerminal, resetMemberTerminalsForTests } from '../../src/server/member-terminals';
+import { claimMemberTerminal, markMemberTerminalEntered, membersInsideTask, resetMemberTerminalsForTests } from '../../src/server/member-terminals';
 import { getWorktreePath } from '../../src/task/identity';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 
@@ -45,9 +42,7 @@ function fixture() {
   const calls: string[] = [];
   const storage: any = {
     getTask: async () => task,
-    // Cleanup's first read. Answering "no session" keeps the second pass from
-    // needing a container runtime or git: what is asserted is whether cleanup
-    // RAN, and that the worktree is still there while the member is inside.
+    // No task session: exercise follow-through ordering without a runtime.
     getSessionByTaskId: async () => { calls.push('cleanup'); return null; },
     updateTaskMetadata: async (_id: string, key: string, value: string) => { task.metadata[key] = value; },
   };
@@ -60,32 +55,49 @@ function fixture() {
 }
 
 describe('post-accept follow-through while a member is inside', () => {
-  test('keeps the worktree until the member session ends, then cleans up', async () => {
+  test('ends member sessions before cleanup, without waiting for idle expiry', async () => {
+    const { task, calls, ctx } = fixture();
+    expect(claimMemberTerminal(task.id, ALICE, async () => { calls.push('vacate'); }).ok).toBe(true);
+    markMemberTerminalEntered(task.id, ALICE);
+
+    const result = await runAcceptFollowThrough(root, task.id, ctx);
+    expect(result.pending).toEqual([]);
+    expect(calls).toEqual(['vacate', 'cleanup']);
+    expect(membersInsideTask(task.id)).toEqual([]);
+    expect(task.status).toBe('complete');
+    expect(task.metadata[ACCEPT_FOLLOWTHROUGH_KEY]).toBe('');
+  });
+
+  test('retries failed member teardown without undoing acceptance or cleaning the worktree', async () => {
     const { task, calls, ctx } = fixture();
     const worktree = getWorktreePath(root, task);
     await mkdir(worktree, { recursive: true });
-    expect(claimMemberTerminal(task.id, ALICE).ok).toBe(true);
+    let failRemoval = true;
+    expect(claimMemberTerminal(task.id, ALICE, async () => {
+      calls.push('vacate');
+      if (failRemoval) throw new Error('runtime unavailable');
+    }).ok).toBe(true);
     markMemberTerminalEntered(task.id, ALICE);
 
-    for (let pass = 0; pass < 2; pass++) {
-      const held = await runAcceptFollowThrough(root, task.id, ctx);
-      expect(held.pending).toEqual(['cleanup']);
-      expect(held.waitingForMember).toBe(ALICE);
-      expect(calls).toEqual([]);
-      expect((await stat(worktree)).isDirectory()).toBe(true);
-      // Not a failure: nothing counted, nothing backed off.
-      const record = JSON.parse(task.metadata[ACCEPT_FOLLOWTHROUGH_KEY]);
-      expect(record.attempts).toBe(0);
-      expect(record.nextAttemptAt).toBeUndefined();
-      expect(record.done).not.toContain('cleanup');
-    }
+    const failed = await runAcceptFollowThrough(root, task.id, ctx);
+    expect(failed.pending).toEqual(['cleanup']);
+    expect(failed.error).toContain('runtime unavailable');
+    expect(task.status).toBe('complete');
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(call => call === 'vacate')).toBe(true);
+    expect((await stat(worktree)).isDirectory()).toBe(true);
+    const record = JSON.parse(task.metadata[ACCEPT_FOLLOWTHROUGH_KEY]);
+    expect(record.attempts).toBe(1);
+    expect(record.nextAttemptAt).toBeGreaterThan(Date.now());
+    expect(record.done).not.toContain('cleanup');
 
-    // Her session ends (the hold is freed after the vacate).
-    releaseMemberTerminal(task.id, ALICE, async () => {}, 1);
-    await new Promise((r) => setTimeout(r, 20));
-    const after = await runAcceptFollowThrough(root, task.id, ctx);
-    expect(after.pending).toEqual([]);
-    expect(calls).toEqual(['cleanup']);
+    const beforeRetry = calls.length;
+    failRemoval = false;
+    const retried = await runAcceptFollowThrough(root, task.id, ctx);
+    expect(retried.pending).toEqual([]);
+    expect(calls.slice(beforeRetry)).toEqual(['vacate', 'cleanup']);
+    expect(membersInsideTask(task.id)).toEqual([]);
+    expect(task.status).toBe('complete');
     expect(task.metadata[ACCEPT_FOLLOWTHROUGH_KEY]).toBe('');
   });
 });

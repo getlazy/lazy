@@ -1,11 +1,12 @@
 /**
- * INVARIANT: reparent and redo refuse (409, naming the member) while a member
- * is working in the task's files, and they refuse BEFORE they write anything.
- * Reparent's sync merges the new parent into those files and redo's close
- * tears them down, and both of those refuse while a member is inside — so a
- * repoint or a replacement task written ahead of that refusal was left behind:
- * a task pointing at a parent it was never synced with, or a stray duplicate
- * of the task being redone.
+ * INVARIANT: redo refuses (409, naming the member) while a member is working
+ * in the task's files, BEFORE it writes anything: its close tears those files
+ * down, so a replacement task written ahead of that refusal was left behind as
+ * a stray duplicate of the task being redone.
+ *
+ * INVARIANT (engineer, 2026-10-21, replacing "reparent refuses too"): reparent
+ * does NOT wait for a member. Its sync merges the new parent into the
+ * worktree the way a turn does, and turns never wait for a member.
  */
 
 import { describe, test, expect, afterEach, spyOn } from 'bun:test';
@@ -47,8 +48,21 @@ function aliceInside(): void {
 afterEach(() => resetMemberTerminalsForTests());
 
 describe('while a member is working in the task', () => {
+  test('reparent is not refused for the member: it goes on to repoint the task', async () => {
+    aliceInside();
+    const writes: string[] = [];
+    const spy = spyOn(rpcHandlers, 'getOrCreateStorage').mockResolvedValue(recordingStorage(writes) as never);
+    try {
+      const err = await reparentTask('/nonexistent-project', { taskId: 'held', parent: 'np' } as never).then(() => null, (e: unknown) => e);
+      // Whatever ends it in this fake store, it is not a refusal naming her.
+      expect(err === null || !(err as Error).message.includes(ALICE)).toBe(true);
+      expect(writes).toContain('updateTaskTarget');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   for (const [name, run] of [
-    ['reparent', () => reparentTask('/nonexistent-project', { taskId: 'held', parent: 'np' } as never)],
     ['redo', () => redoTask('/nonexistent-project', { taskId: 'held', reason: 'try again' } as never)],
   ] as const) {
     test(`${name} is refused with a 409 naming them, and writes nothing`, async () => {

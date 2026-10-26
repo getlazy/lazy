@@ -1,3 +1,4 @@
+import { withDiskSpaceRecovery, DiskFullError, launchWithDiskSpaceRecovery } from '../docker/disk-space';
 import { customImageNotReady } from '../capture/custom-image-gate';
 import { withLaunchInFlight } from './launch-in-flight';
 /**
@@ -50,7 +51,9 @@ import {
   removeContainer,
   resolveImageName,
   localImageExists,
+  repinLaunchGrantsToContainer,
 } from '../capture/claude';
+import { AGENT_STOP_DEFAULT_GRACE_SECONDS, KEPT_CONTAINER_LABEL, parseAgentStop, stopAgentScript, type AgentStopOutcome } from './agent-stop';
 
 import { ClaudeCodePackaging } from '../agent/claude-code-packaging';
 import { getAgentPackaging } from '../agent/registry';
@@ -66,7 +69,10 @@ import {
   writeBuilderSessionClaudeConfig,
   writeNeutralCredentialStore,
   builderSessionLaunchDir,
+  resolveBuilderSessionHomeDir,
 } from '../builder/claude-home';
+import { resolveBuilderCodexHome, CONTAINER_CODEX_HOME } from '../builder/codex-home';
+import { builderResumeIdFromArgs, assertHeadlessBuilderHarness } from '../builder/codex-args';
 import { assertDaemonMcpConfigMounted } from '../builder/mcp-config-check';
 import { assertSiblingContainerLaunchSupported } from './sibling-containers';
 import { writeMcpLaunchWrapper } from '../builder/mcp-launch-wrapper';
@@ -100,6 +106,8 @@ import { autoBuildsRootDockerfile } from '../config/managed-mode';
 import { writeToolPermissions } from '../mcp/config';
 import { READ_ONLY_TOOL_NAMES } from '../mcp/tool-access';
 import { isToolForRole } from '../mcp/tool-roles';
+import { adoptChownShell, adoptProbeShell } from '../utils/adopt-rule';
+import { TASK_DATA_LABEL, removeTaskDataVolume, taskDataVolumeName } from './task-data';
 
 // Agent packaging for tool checks. Instantiated once; stateless.
 const agentPackaging = new ClaudeCodePackaging();
@@ -657,7 +665,7 @@ export class DockerRunner implements Runner {
 
     logger.debug(`[oneshot] ${redactSecrets(args).join(' ')}`);
 
-    return execBoundedOneshot(args, {
+    return withDiskSpaceRecovery(this.binary, () => execBoundedOneshot(args, {
       timeoutMs: resolveOneshotTimeoutMs(req),
       label: `${this.binary} one-shot`,
       harness,
@@ -666,7 +674,7 @@ export class DockerRunner implements Runner {
       onTimeout: async () => {
         await removeContainer(containerName, this.binary);
       },
-    });
+    }));
   }
 
   async isRunning(runName: string): Promise<boolean> {
@@ -928,8 +936,82 @@ export class DockerRunner implements Runner {
     }
   }
 
-  async removeRun(runName: string): Promise<void> {
-    await removeContainer(runName, this.binary);
+  async stopAgentInRun(runName: string, opts?: { gracefulTimeoutSeconds?: number }): Promise<AgentStopOutcome> {
+    const grace = Math.max(0, Math.floor(opts?.gracefulTimeoutSeconds ?? AGENT_STOP_DEFAULT_GRACE_SECONDS));
+    try {
+      const proc = spawn([this.binary, 'exec', runName, 'sh', '-c', stopAgentScript(), 'lazy-agent-stop', String(grace)], {
+        stdout: 'pipe', stderr: 'pipe',
+        // The script waits out the grace itself; the CLI call must outlive it.
+        timeout: DOCKER_TIMEOUT_MS + grace * 1000,
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+      ]);
+      const outcome = parseAgentStop(exitCode, stdout);
+      if (outcome === 'failed') {
+        logger.debug(`Could not stop the agent in ${runName} (exit ${exitCode}): ${stderr.trim() || stdout.trim()}`);
+      }
+      return outcome;
+    } catch (err) {
+      logger.debug(`Could not stop the agent in ${runName}: ${err instanceof Error ? err.message : String(err)}`);
+      return 'failed';
+    }
+  }
+
+  async startStoppedRun(runName: string): Promise<boolean> {
+    const inspect = async () => {
+      const proc = spawn([this.binary, 'inspect', '--format', `{{.State.Running}} {{index .Config.Labels "${KEPT_CONTAINER_LABEL}"}}`, runName], {
+        stdout: 'pipe', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS,
+      });
+      const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      if (exitCode !== 0) return null;
+      const [running, kept] = stdout.trim().split(/\s+/);
+      return { running: running === 'true', kept: kept === '1' };
+    };
+    try {
+      const before = await inspect();
+      // No such container, or one created before containers were kept: its
+      // wrapper would exit at the next daemon restart, so it is recreated.
+      if (!before || !before.kept) return false;
+      if (!before.running) {
+        const [stderr, exitCode] = await withDiskSpaceRecovery(this.binary, async () => {
+          const proc = spawn([this.binary, 'start', runName], { stdout: 'ignore', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+          const result = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+          if (result[1] !== 0) throw new Error('Error response from daemon: ' + result[0]);
+          return result;
+        });
+        if (exitCode !== 0) {
+          logger.info(`Could not start the stopped container ${runName} again (${stderr.trim() || `exit ${exitCode}`}); it is recreated.`);
+          return false;
+        }
+      }
+      const after = await inspect();
+      if (!after?.running) return false;
+      // A started container may have a new bridge address; its grants follow.
+      if (!before.running) await repinLaunchGrantsToContainer(this.binary, runName);
+      return true;
+    } catch (err) {
+      if (err instanceof DiskFullError) throw err;
+      logger.info(`Could not start the stopped container ${runName} again: ${err instanceof Error ? err.message : String(err)}; it is recreated.`);
+      return false;
+    }
+  }
+
+  async removeRun(runName: string, options?: { strict?: boolean }): Promise<void> {
+    await removeContainer(runName, this.binary, options);
+  }
+
+  async removeTaskData(taskUuid: string): Promise<void> {
+    await removeTaskDataVolume(this.binary, taskDataVolumeName(taskUuid));
+  }
+
+  async lacksCurrentLayout(runName: string): Promise<boolean> {
+    const proc = spawn([this.binary, 'inspect', '--format', `{{index .Config.Labels "${TASK_DATA_LABEL}"}}`, runName],
+      { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    // Not inspectable (gone, engine hiccup): let the normal reuse decision answer.
+    if (code !== 0) return false;
+    return out.trim() !== '1';
   }
 
   async discoverRunningRuns(): Promise<string[]> {
@@ -1452,6 +1534,21 @@ export class DockerRunner implements Runner {
     // src/builder/scratch.ts. Never mounted into a task-agent container.
     const scratchDir = await ensureBuilderScratchDir(lazyRoot);
 
+    // A Codex builder runs in an isolated CODEX_HOME of its own (or the one that
+    // holds the conversation it resumes) — see src/builder/codex-home.ts.
+    let codexHome: string | undefined;
+    if (builderTarget.harness === 'codex') {
+      const resumeId = builderResumeIdFromArgs(claudeExtraArgs);
+      const resolved = await resolveBuilderCodexHome(resolveBuilderSessionHomeDir(lazyRoot, null), builderId, resumeId);
+      if (resumeId && !resolved.holdsResume) {
+        throw new Error(
+          `Codex conversation ${resumeId} is not in any of this project's Codex builder homes, so it cannot be resumed. ` +
+          `Find resumable sessions with: lazy builder list`,
+        );
+      }
+      codexHome = resolved.codexHome;
+    }
+
     // Build container args: launch lazy-agent in builder mode.
     const dockerArgs = buildBuilderDockerArgs({
       binary: this.binary,
@@ -1461,12 +1558,18 @@ export class DockerRunner implements Runner {
       dataDir,
       containerConfigFile,
       agentBinaryPath,
+      harness: builderTarget.harness,
+      codexHome,
       home: getHome(),
       projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
       neutralCredentialStore,
       mergedConfigFile,
       mcpWrapperPath,
-      authEnvVars,
+      // A Codex builder's supervisor asks the daemon for its launch env before
+      // its first launch (an OPENAI_API_KEY placeholder and the Codex proxy
+      // base — src/builder/codex-launch-env.ts); the answer above is Claude
+      // Code's spelling and only served as the up-front credential check.
+      authEnvVars: builderTarget.harness === 'codex' ? [] : authEnvVars,
       imageName,
       promptFile,
       daemonConfigPath: useDaemonProxy ? daemonConfigPath : undefined,
@@ -1524,6 +1627,11 @@ export class DockerRunner implements Runner {
    * but runs `claude -p` directly and returns the parsed answer.
    */
   async launchBuilderHeadless(params: LaunchBuilderHeadlessParams): Promise<LaunchBuilderHeadlessResult> {
+    return withDiskSpaceRecovery(this.binary, () => this.launchBuilderHeadlessOnce(params));
+  }
+
+  private async launchBuilderHeadlessOnce(params: LaunchBuilderHeadlessParams): Promise<LaunchBuilderHeadlessResult> {
+    assertHeadlessBuilderHarness(this.builderTarget().harness, this.builderTarget().profile);
     const {
       lazyRoot, systemPrompt, prompt, resumeSessionId, builderId, daemonConfigPath,
       projects, authEnvVars, debug,
@@ -1649,7 +1757,7 @@ export class DockerRunner implements Runner {
       const detail = stderr.trim() || stdout.trim();
       throw new Error(
         detail
-          ? `Headless builder turn failed (exit ${exitCode}): ${detail.slice(0, 500)}`
+          ? `Headless builder turn failed (exit ${exitCode}):\n${detail.slice(0, 500)}`
           : `Headless builder turn failed with exit code ${exitCode}`,
       );
     }
@@ -1836,7 +1944,7 @@ export class DockerRunner implements Runner {
     // `claude --resume <id>` exits at once ("No conversation found") when
     // <id>.jsonl is not in the dir it sees, so such a launch would be dead in
     // seconds — start a fresh conversation instead and say which was used.
-    if (resumeSessionId) {
+    if (resumeSessionId && this.builderTarget().harness !== 'codex') {
       const seen = useProjectsMount && projects ? projects.hostDir : join(homeDirAbs, '.claude', 'projects');
       if (!(await projectsDirHoldsSession(seen, lazyRoot, resumeSessionId))) {
         if (params.requireResume) {
@@ -1858,10 +1966,32 @@ export class DockerRunner implements Runner {
     }
 
     const scratchDir = await ensureBuilderScratchDir(lazyRoot);
+    const builderTarget = this.builderTarget();
+
+    // A Codex builder's conversation lives in its own CODEX_HOME under the
+    // member's home, not in the Claude projects dir checked above (which a
+    // Codex builder never writes) — so its resume is decided here instead.
+    let codexHome: string | undefined;
+    if (builderTarget.harness === 'codex') {
+      const resolved = await resolveBuilderCodexHome(homeDirAbs, builderId, params.resumeSessionId ?? null);
+      codexHome = resolved.codexHome;
+      resumeSessionId = params.resumeSessionId;
+      if (resumeSessionId && !resolved.holdsResume) {
+        if (params.requireResume) {
+          throw new BuilderResumeUnavailableError(
+            `Codex conversation ${resumeSessionId} is not in any of your Codex builder homes, so it cannot be resumed. ` +
+            `Nothing was started.`,
+          );
+        }
+        logger.warn(`Builder ${builderId}: Codex conversation ${resumeSessionId} is not in any Codex builder home; starting a fresh conversation instead.`);
+        resumeSessionId = null;
+      }
+      trace?.note(`codex home ${codexHome}; ${resumeSessionId ? `resuming conversation ${resumeSessionId}` : 'fresh conversation'}`);
+    }
+
     // The detached (Teams) builder composes its own argv, apart from `lazy builder`:
     // it too runs the builder default unless the role's profile names a model.
     const { resolveBuilderModel } = await import('../agent/agent-model');
-    const builderTarget = this.builderTarget();
     const builderModel = resolveBuilderModel(config, { harness: builderTarget.harness, model: builderTarget.model });
     const claudeExtraArgs = detachedBuilderClaudeArgs(builderModel, resumeSessionId);
 
@@ -1873,6 +2003,8 @@ export class DockerRunner implements Runner {
       dataDir,
       containerConfigFile,
       agentBinaryPath,
+      harness: builderTarget.harness,
+      codexHome,
       home: homeDirAbs,
       projectsHostDir: useProjectsMount ? projects!.hostDir : undefined,
       neutralCredentialStore,
@@ -1899,12 +2031,7 @@ export class DockerRunner implements Runner {
     // `docker run -d` prints the container id and exits immediately — the
     // container's own lifetime is what continues, not this process's.
     await phase(`${this.binary} run`, async () => {
-      const proc = spawn(dockerArgs, { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
+      const { stdout, stderr, exitCode } = await launchWithDiskSpaceRecovery(dockerArgs, DOCKER_TIMEOUT_MS, trace ? d => trace.note(d) : undefined);
       if (exitCode !== 0) {
         const detail = stderr.trim() || stdout.trim();
         if (isDamagedLayerError(detail)) {
@@ -1937,6 +2064,13 @@ export interface BuilderDockerArgsParams {
   agentBinaryPath: string;
   /** Host home dir — source of the ~/.claude mount. */
   home: string;
+  /** The builder profile's harness — `claude-code` (default) or `codex`. */
+  harness?: string;
+  /**
+   * A Codex builder's isolated CODEX_HOME on the host (src/builder/codex-home.ts),
+   * mounted at {@link CONTAINER_CODEX_HOME}. Required when harness is codex.
+   */
+  codexHome?: string;
   /** Per-builder Claude projects dir, when the write-probe cleared it. */
   projectsHostDir?: string;
   neutralCredentialStore: string;
@@ -1991,13 +2125,16 @@ export function detachedBuilderClaudeArgs(model: string, resumeSessionId?: strin
 export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[] {
   const {
     binary, builderId, lazyRoot, dataDir, scratchDir, containerConfigFile, agentBinaryPath,
-    home, projectsHostDir, neutralCredentialStore, supervisorLogFile, mergedConfigFile, authEnvVars,
+    home, harness = 'claude-code', codexHome, projectsHostDir, neutralCredentialStore, supervisorLogFile, mergedConfigFile, authEnvVars,
     mcpWrapperPath,
     imageName, promptFile, daemonConfigPath, claudeExtraArgs, debug, headlessClaudeArgs,
     detached,
   } = params;
 
   const interactive = !headlessClaudeArgs?.length;
+  if (harness === 'codex' && !codexHome) {
+    throw new Error('A Codex builder needs its own CODEX_HOME; none was resolved for this launch.');
+  }
 
   // Where each launch file appears INSIDE the container. A detached (Teams)
   // builder gets fixed paths under BUILDER_CONTAINER_DIR; the interactive and
@@ -2069,6 +2206,12 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
     // Persisted builder Claude config with MCP server entry (writable — Claude
     // Code updates it on startup and when the human answers a trust/model prompt)
     '-v', `${mergedConfigFile}:/home/user/.claude.json`,
+    // A Codex builder's own CODEX_HOME: rollouts (what it resumes from), its
+    // state, and the config.toml the supervisor rewrites before every launch.
+    // The ~/.claude mounts above stay: the supervisor reads the lazy MCP entry
+    // from the merged ~/.claude.json, so one file decides the tool channel for
+    // both harnesses.
+    ...(harness === 'codex' ? ['-v', `${codexHome}:${CONTAINER_CODEX_HOME}`, '-e', `CODEX_HOME=${CONTAINER_CODEX_HOME}`] : []),
     // MCP selfcheck wrapper — Claude Code respawns this on reconnect; must
     // verify the bind-mounted lazy-agent after every upgrade before exec.
     ...(mcpWrapperPath ? ['-v', `${mcpWrapperPath}:${at.mcpWrapperPath}:ro`] : []),
@@ -2099,6 +2242,7 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
       imageName,
       // Run the builder supervisor (not Claude directly)
       'lazy-agent', 'builder',
+      ...(harness === 'codex' ? ['--harness', 'codex'] : []),
       '--system-prompt-file', at.promptFile,
       '--worktree', lazyRoot,
       // Use container config (host.docker.internal) not the host config (127.0.0.1)
@@ -2135,6 +2279,7 @@ export function buildBuilderDockerArgs(params: BuilderDockerArgsParams): string[
       '/home/user/.claude',
       '/home/user/.claude.json',
       ...(projectsHostDir ? ['/home/user/.claude/projects'] : []),
+      ...(harness === 'codex' ? [CONTAINER_CODEX_HOME] : []),
     ];
     dockerArgs.splice(dockerArgs.indexOf(imageName) + 1, 0,
       'sh', '-c', builderAdoptScript(adoptPaths), 'lazy-builder-entry');
@@ -2219,9 +2364,9 @@ export function builderAdoptScript(paths: string[]): string {
   return [
     `for p in ${quoted}; do`,
     '[ -e "$p" ] || continue;',
-    'find "$p" ! -writable -print -quit 2>/dev/null | grep -q . || continue;',
+    `${adoptProbeShell('"$p"')} || continue;`,
     'if command -v sudo >/dev/null 2>&1; then',
-    'sudo -n chown -R "$(id -u):$(id -g)" "$p" || echo "lazy: could not take ownership of $p (a root-run daemon on Linux needs this to be writable)" >&2;',
+    `${adoptChownShell('"$p"')} || echo "lazy: could not take ownership of $p (a root-run daemon on Linux needs this to be writable)" >&2;`,
     'else',
     'echo "lazy: $p is not writable by $(id -un) and sudo is unavailable — writes there will fail" >&2;',
     'fi;',
