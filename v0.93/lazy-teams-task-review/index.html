@@ -1215,7 +1215,8 @@ an agent turn. The branch must still exist locally or on the project&#39;s remot
 <li><strong>Shell</strong> opens a new shell. Open as many as you like; each has its own
 <strong>Close</strong>.</li>
 <li><strong>Pair</strong> takes over the agent&#39;s own session, so you drive it. If your
-connection drops, pairing ends by itself within 30 seconds. Pair is not
+connection drops, the page reconnects to the same session by itself; if it
+cannot within 5 minutes, pairing ends 30 seconds later. Pair is not
 offered while the agent is mid-turn or while somebody else is already
 pairing. (Like any open terminal, it also holds the task — see
 <a href="#taking-turns-with-the-agent">Taking turns with the agent</a>.)</li>
@@ -1226,6 +1227,13 @@ while the task is waiting for you.</li>
 <li><strong>Watch</strong> shows what the agent is doing right now — its requests, what it is
 running and its own session — as it happens. It is read-only.</li>
 </ul>
+<p>If a terminal&#39;s connection drops — Wi-Fi changing, a laptop waking from sleep —
+the program in it keeps running for 5 minutes and the page reconnects to it by
+itself. The status line says <strong>Connection lost. Reconnecting…</strong> meanwhile, and
+typing is paused until it is back; the output you missed is then drawn once.
+Your builder&#39;s terminal, the Verify tab&#39;s shells and god mode&#39;s machine shell
+behave the same way. A terminal whose session really ended — the program exited,
+you closed it, or you are no longer allowed in — says so and does not retry.</p>
 <h3 id="your-own-environment"><a class="anchor" href="#your-own-environment" aria-hidden="true">#</a>Your own environment</h3>
 <p>Your terminals never run inside the agent&#39;s environment. The first one you open
 starts an environment of your own for the task: the task&#39;s image, with the

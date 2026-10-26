@@ -84,11 +84,27 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <main>
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../#explanation">Explanation</a> › <span aria-current="page">The agent container</span></nav>
 <h1 id="the-agent-container"><a class="anchor" href="#the-agent-container" aria-hidden="true">#</a>The agent container</h1>
-<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#the-default-image">The default image</a></li><li><a href="#giving-your-project-its-own-image">Giving your project its own image</a></li><li><a href="#the-headless-browser">The headless browser</a></li><li><a href="#when-the-image-is-built">When the image is built</a></li><li><a href="#resetting-a-machines-docker-storage">Resetting a machine's Docker storage</a></li><li><a href="#rebuilding">Rebuilding</a></li><li><a href="#when-an-agent-cannot-start">When an agent cannot start</a></li><li><a href="#what-the-container-can-and-cannot-change-in-git">What the container can and cannot change in git</a></li></ul></details></nav>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#a-container-lasts-across-turns">A container lasts across turns</a></li><li><a href="#the-default-image">The default image</a></li><li><a href="#giving-your-project-its-own-image">Giving your project its own image</a></li><li><a href="#the-headless-browser">The headless browser</a></li><li><a href="#when-the-image-is-built">When the image is built</a></li><li><a href="#resetting-a-machines-docker-storage">Resetting a machine's Docker storage</a></li><li><a href="#rebuilding">Rebuilding</a></li><li><a href="#when-an-agent-cannot-start">When an agent cannot start</a></li><li><a href="#what-the-container-can-and-cannot-change-in-git">What the container can and cannot change in git</a></li></ul></details></nav>
 <p>Every task&#39;s agent runs in a Docker container of its own. This page is for anyone
 whose agents need tools the default image does not have, or who is diagnosing an
 agent that cannot start: what the default image contains, how to give your
 project its own image, and when lazy rebuilds it.</p>
+<h2 id="a-container-lasts-across-turns"><a class="anchor" href="#a-container-lasts-across-turns" aria-hidden="true">#</a>A container lasts across turns</h2>
+<p>A task keeps its container between turns. A failed agent, a timeout, or Stop
+ends the turn without replacing the container. Services and files outside the
+task&#39;s checkout stay there for the next turn. This applies in Lazy Teams and
+when running lazy on your own machine.</p>
+<p>Accepting, rejecting or closing the task cleans up its container. Explicitly
+restarting the environment, changing its agent, environment variables or image,
+and daemon upgrades or restarts can also replace it. An out-of-memory kill or
+an external container stop can end it independently of lazy.</p>
+<p>Before creating a replacement, lazy records the loss in the task&#39;s journal and
+tells the next work turn. For an exited container, the record includes its exit
+code, whether Docker reported an out-of-memory kill, and when it exited, when
+those facts are available. Lazy Teams also keeps an <strong>Environment replaced</strong>
+notice on the task page after the agent has seen it.</p>
+<p>Keep data you need beyond the task in durable storage: container files outside
+the checkout do not survive environment replacement or task cleanup.</p>
 <h2 id="the-default-image"><a class="anchor" href="#the-default-image" aria-hidden="true">#</a>The default image</h2>
 <p>A project with no <code>[docker] dockerfile</code> in its <code>lazy.toml</code> and no <code>Dockerfile.lazy</code>
 at its root runs agents in lazy&#39;s default image, <code>lazy-runner</code>, which is deliberately minimal. It is Debian

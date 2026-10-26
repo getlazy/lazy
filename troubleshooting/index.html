@@ -448,7 +448,7 @@ Proxy
 </tr>
 <tr>
 <td>Storage</td>
-<td>Who holds the storage lock (the daemon itself is the only healthy answer; a dead holder, or a pid that now belongs to a different process, is called out) and whether writes are completing</td>
+<td>Who holds the storage lock (the daemon itself is the only healthy answer; a dead holder, a pid that now belongs to a different process, a lock file that is gone, and a daemon that gave up its lock while still running are each called out) and whether writes are completing</td>
 </tr>
 <tr>
 <td>Runner</td>

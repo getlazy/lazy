@@ -266,10 +266,11 @@ pi-specific to store. As with every agent, the task container only ever holds
 a per-launch placeholder; real credentials stay with the daemon and are
 attached per request at the proxy.</p>
 <h2 id="lazy-tools"><a class="anchor" href="#lazy-tools" aria-hidden="true">#</a>Lazy tools</h2>
-<p>Pi has no built-in MCP support. Lazy bridges its tool server into Pi with a
+<p>Lazy turns off Pi&#39;s own MCP client and bridges its tool server into Pi with a
 small Pi extension written into the task&#39;s sandbox home on every turn, so a Pi
 task gets the full <code>lazy_*</code> tool set (read-only on <code>lazy ask</code> turns), with the
-same per-task scoping as other agents.</p>
+same per-task scoping as other agents. MCP servers configured in Pi&#39;s own
+<code>mcp.json</code> are not connected.</p>
 <h2 id="read-only-turns"><a class="anchor" href="#read-only-turns" aria-hidden="true">#</a>Read-only turns</h2>
 <p>Pi has no plan mode and no permission prompts. On <code>lazy ask</code> (and other
 read-only turns) lazy disables Pi&#39;s write-capable built-in tools (<code>bash</code>,
@@ -299,8 +300,9 @@ harness is Pi, not only the built-in <code>pi</code> profile. See
 <p>The default <code>lazy-runner</code> image has Pi installed, alongside every other agent
 lazy can run in a container. A custom <code>Dockerfile.lazy</code> that starts
 <code>FROM lazy-runner</code> has it too. One built on another base adds Pi&#39;s install
-line itself — <code>lazy</code> prints it when the image is missing the binary. The install is pinned to a specific Pi version that lazy&#39;s
-integration was verified against.</p>
+line itself — <code>lazy</code> prints it when the image is missing the binary. The image installs Pi&#39;s latest
+release, like the other agents&#39; CLIs. Lazy needs Pi 1.0.4 or later; <code>lazy doctor</code>
+reports an older one, and a turn on it fails saying so.</p>
 
 <nav class="pager" aria-label="Previous and next"><a class="prev" href="../slack-rooms/"><span>Previous</span>Lazy Teams Slack rooms</a><a class="next" href="../troubleshooting/"><span>Next</span>Troubleshooting</a></nav>
 </main>

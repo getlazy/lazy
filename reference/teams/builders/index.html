@@ -84,39 +84,26 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <main>
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../../../#reference">Reference</a> › Lazy Teams › <span aria-current="page">Builders</span></nav>
 <h1 id="builders"><a class="anchor" href="#builders" aria-hidden="true">#</a>Builders</h1>
-<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#section-tabs">Section tabs</a></li><li><a href="#header-and-introduction">Header and introduction</a></li><li><a href="#starting-your-builder">Starting your builder</a></li><li><a href="#your-builder">Your builder</a></li><li><a href="#search-transcripts">Search transcripts</a></li><li><a href="#builders-list">Builders list</a></li><li><a href="#a-builders-page">A builder's page</a></li><li><a href="#resuming-a-builder">Resuming a builder</a></li><li><a href="#continuing-from-a-summary">Continuing from a summary</a></li></ul></details></nav>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#section-tabs">Section tabs</a></li><li><a href="#header-and-introduction">Header and introduction</a></li><li><a href="#starting-a-builder">Starting a builder</a></li><li><a href="#your-builders">Your builders</a></li><li><a href="#search-transcripts">Search transcripts</a></li><li><a href="#builders-list">Builders list</a></li><li><a href="#a-builders-page">A builder's page</a></li><li><a href="#resuming-a-builder">Resuming a builder</a></li><li><a href="#continuing-from-a-summary">Continuing from a summary</a></li></ul></details></nav>
 <p>The Builders screen lists the builder conversations for a project; you reach it from <strong>Builders</strong> in the top navigation.</p>
 <p><img src="../../../images/teams/teams-builders.png" alt="The Builders screen" loading="lazy"></p>
 <p>For what a builder is and how to use one, see <a href="../../../lazy-teams-builders/">Builders in Lazy Teams</a>.</p>
 <h2 id="section-tabs"><a class="anchor" href="#section-tabs" aria-hidden="true">#</a>Section tabs</h2>
 <p>Two tabs sit above the title: <strong>Builders</strong> (this screen) and <strong>Files</strong>, which lists the files builders left in scratch for the whole project.</p>
 <h2 id="header-and-introduction"><a class="anchor" href="#header-and-introduction" aria-hidden="true">#</a>Header and introduction</h2>
-<p>The title is <strong>Builders</strong>, with the project name above it as a link back to the project overview. A short paragraph explains that a builder runs from when it starts, or from a <code>/clear</code>, to the next <code>/clear</code>, and that you can open one to read its transcript, promote a passage into a task and see the files it left. It also says your builder runs next to the project: you can open it here, or with <code>lazy builder</code> in a clone logged in to the project.</p>
-<h2 id="starting-your-builder"><a class="anchor" href="#starting-your-builder" aria-hidden="true">#</a>Starting your builder</h2>
-<p>One button starts, reopens or resumes your builder, and its label says which:</p>
-<table>
-<thead>
-<tr>
-<th>Label</th>
-<th>Shown when</th>
-</tr>
-</thead>
-<tbody><tr>
-<td><strong>Open your builder</strong></td>
-<td>one of your builders is running</td>
-</tr>
-<tr>
-<td><strong>Resume your builder</strong></td>
-<td>none is running and one of yours is stopped</td>
-</tr>
-<tr>
-<td><strong>Start your builder</strong></td>
-<td>neither</td>
-</tr>
-</tbody></table>
+<p>The title is <strong>Builders</strong>, with the project name above it as a link back to the project overview. A short paragraph explains that a builder runs from when it starts, or from a <code>/clear</code>, to the next <code>/clear</code>, and that you can open one to read its transcript, promote a passage into a task and see the files it left. It also says your builders run next to the project, as many at once as you start: you can open one here, or with <code>lazy builder</code> in a clone logged in to the project.</p>
+<h2 id="starting-a-builder"><a class="anchor" href="#starting-a-builder" aria-hidden="true">#</a>Starting a builder</h2>
+<p><strong>Start a new builder</strong> is always there. Each press starts another builder of yours with a fresh conversation; builders you already have keep running. The project can run a limited number of builders at once across all its members; a start beyond that is refused with a message saying so. Beside the button, a count says how many of yours are running and how many are stopped.</p>
 <p>If you are not allowed to open a builder, the button is replaced by a notice that a builder runs on the account of the person using it, so it can only be opened in your own name.</p>
-<h2 id="your-builder"><a class="anchor" href="#your-builder" aria-hidden="true">#</a>Your builder</h2>
-<p>When one of your runs is not yet carried by a listed builder, a <strong>Your builder</strong> section appears above the list. Its row shows a state badge, when it started, and a note that its transcript is listed below once captured. The row links to the builder&#39;s page.</p>
+<h2 id="your-builders"><a class="anchor" href="#your-builders" aria-hidden="true">#</a>Your builders</h2>
+<p>Every builder of yours that has not ended is listed in <strong>Your builders</strong>, above the list of all builders. Each row shows:</p>
+<ul>
+<li>what it is working on: the title of the conversation it carries, or <strong>New conversation</strong> for a builder whose transcript has not been captured yet;</li>
+<li>when it started, and how it last ended if it stopped unexpectedly;</li>
+<li>a state badge (<strong>Running</strong>, <strong>Starting</strong> or <strong>Stopped — resumable</strong>);</li>
+<li><strong>Open</strong> and <strong>Stop</strong> while it runs, or <strong>Resume</strong> while it is stopped.</li>
+</ul>
+<p><strong>Open</strong> goes to the builder&#39;s terminal. <strong>Stop</strong> stops that builder only and keeps its conversation; <strong>Resume</strong> starts that same builder again. Your other builders are never touched.</p>
 <h2 id="search-transcripts"><a class="anchor" href="#search-transcripts" aria-hidden="true">#</a>Search transcripts</h2>
 <p>The <strong>Search transcripts</strong> box takes a keyword or pattern and has a <strong>Find</strong> button. With a query, the page lists <strong>Matches</strong>: each row gives the builder&#39;s title, its start time, the number of matches and an excerpt. If nothing matches you see <strong>No matching builders</strong>; clear the search to see every builder again.</p>
 <h2 id="builders-list"><a class="anchor" href="#builders-list" aria-hidden="true">#</a>Builders list</h2>
@@ -125,7 +112,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <p>Opening a builder shows:</p>
 <ul>
 <li><strong>Details</strong>: Id, Run, Started, Last activity, Branch, Messages, and Segments when the transcript was stitched from more than one.</li>
-<li><strong>Your builder</strong> (only for your own run): the run&#39;s state, <strong>Stop</strong> while it runs, <strong>Resume</strong> while it is stopped, and <strong>End</strong>, which asks for confirmation. Ending finishes the run; the transcript is kept, and you can still resume the builder later from the list. While it runs, a terminal is shown here.</li>
+<li><strong>Your builder</strong> (only for your own run of this builder): the run&#39;s state, <strong>Stop</strong> while it runs, <strong>Resume</strong> while it is stopped, and <strong>End</strong>, which asks for confirmation. Ending finishes the run; the transcript is kept, and you can still resume the builder later from the list. While it runs, a terminal is shown here.</li>
 <li><strong>Resume</strong> (your own builder, when it has no run of yours attached): resumes it, as described below.</li>
 <li><strong>Create a task from messages</strong>: select the messages you want in the transcript, then choose <strong>Create task</strong>. You can set <strong>Goal</strong>, <strong>Code</strong>, <strong>Parent task</strong> and <strong>Prompt</strong>, and <strong>Create backlog task</strong> makes a task in the backlog without starting it. Empty fields use defaults, as the hints on the page describe.</li>
 <li><strong>Transcript</strong>: the messages, paged with <strong>Earlier</strong> and <strong>Later</strong>.</li>
@@ -134,7 +121,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <h2 id="resuming-a-builder"><a class="anchor" href="#resuming-a-builder" aria-hidden="true">#</a>Resuming a builder</h2>
 <p><strong>Resume</strong> continues one of your own builders, stopped or ended, in a builder run of yours, like <code>lazy builder --resume &lt;id&gt;</code> does on the command line. It runs on your account and spends your credential. The page goes to the start page and then to the running builder.</p>
 <ul>
-<li><strong>If one of your builders is already running</strong>, Resume asks first: it stops the running builder (its conversation is kept and stays listed) and then resumes the one you picked. Two of your builders never run at once.</li>
+<li><strong>Resume opens an additional builder.</strong> Builders of yours that are already running keep running. If the builder you picked is already running in one of yours, Resume opens that one instead of starting it twice.</li>
 <li><strong>If the builder&#39;s session file is no longer on the server</strong>, Resume says so and starts nothing. The transcript can still be read on its page.</li>
 <li><strong>A teammate&#39;s builder</strong> has no Resume button: Resume carries over the whole session, including the commands it ran and their output, so it is only for the person who had the conversation. Use <strong>Continue from a summary</strong> instead.</li>
 </ul>
@@ -144,8 +131,8 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <li>The summary is made from the transcript shown on the builder&#39;s page — what each person and the builder wrote — and never from the commands the builder ran or their output.</li>
 <li>The new builder starts a fresh conversation. It is told the summary is background, and can read the original transcript if it needs more.</li>
 <li>In offline mode no model runs, so the new builder gets the last messages of the conversation instead, labelled as an excerpt.</li>
-<li><strong>If one of your builders is already running</strong>, Continue asks first and stops it (its conversation is kept), as Resume does.</li>
-<li>A continued builder&#39;s page shows <strong>Continued from</strong>, linking to the original; the original&#39;s page shows <strong>Continued as</strong>, linking back. The link appears once the new builder&#39;s run has been stopped or ended at least once.</li>
+<li><strong>Continue opens an additional builder.</strong> Builders of yours that are already running keep running.</li>
+<li>A continued builder&#39;s page shows <strong>Continued from</strong>, linking to the original; the original&#39;s page shows <strong>Continued as</strong>, linking back. The link appears once the new builder&#39;s conversation has been captured, within about half a minute of it starting.</li>
 </ul>
 
 <nav class="pager" aria-label="Previous and next"><a class="prev" href="../../../reference/teams/account-settings/"><span>Previous</span>Account settings</a><a class="next" href="../../../reference/teams/clusters/"><span>Next</span>Clusters</a></nav>

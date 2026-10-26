@@ -85,7 +85,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../../../#reference">Reference</a> › CLI › <span aria-current="page">lazy builder</span></nav>
 <h1 id="lazy-builder"><a class="anchor" href="#lazy-builder" aria-hidden="true">#</a>lazy builder</h1>
 <p>This page is generated from <code>lazy builder --help</code>.</p>
-<pre><code class="language-text">Usage: lazy builder [list | stop [&lt;id&gt;] | end [&lt;id&gt;]] [--resume &lt;id&gt; [--import]] [--no-autonomous] [--yes]
+<pre><code class="language-text">Usage: lazy builder [list | attach [&lt;id&gt;] | stop [&lt;id&gt;] | end [&lt;id&gt;]] [--resume &lt;id&gt; [--import]] [--no-autonomous] [--yes]
                     [--effort &lt;level&gt;] [--model &lt;id&gt;] [--override-usage-pause]
 
 Launch an interactive Claude Code session with Lazy builder instructions.
@@ -104,11 +104,13 @@ Subcommands:
   list, ls             List captured builder conversations
 
 In a clone logged in to Lazy Teams:
-  Your builder runs on the server; &#39;lazy builder&#39; attaches this terminal to it
-  (starting it if needed — a second run joins the same session). ctrl-] detaches
+  Your builders run on the server; &#39;lazy builder&#39; starts another one and
+  attaches this terminal to it (you may run several at once). ctrl-] detaches
   and leaves it running.
-  stop [&lt;id&gt;]          Stop it, keeping its conversation to resume
-  end [&lt;id&gt;]           End it for good
+  attach [&lt;id&gt;]        Reattach to one of yours (relaunching it if stopped)
+  stop [&lt;id&gt;]          Stop one, keeping its conversation to resume
+  end [&lt;id&gt;]           End one for good
+  With several builders, attach/stop/end name the session id.
 
 Resume options:
   --resume &lt;id&gt;        Resume a specific session by Claude session ID

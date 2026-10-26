@@ -84,7 +84,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <main>
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../#reference">Reference</a> › <span aria-current="page">Web shell</span></nav>
 <h1 id="web-shell"><a class="anchor" href="#web-shell" aria-hidden="true">#</a>Web shell</h1>
-<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#opening-a-shell">Opening a shell</a></li><li><a href="#pair-and-chat">Pair and Chat</a></li><li><a href="#copy-and-paste">Copy and paste</a></li><li><a href="#running-a-verification-step">Running a verification step</a></li><li><a href="#starting-the-container">Starting the container</a></li><li><a href="#when-a-shell-cannot-be-opened">When a shell cannot be opened</a></li><li><a href="#what-a-shell-can-reach">What a shell can reach</a></li><li><a href="#access-and-security">Access and security</a></li></ul></details></nav>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#opening-a-shell">Opening a shell</a></li><li><a href="#pair-and-chat">Pair and Chat</a></li><li><a href="#copy-and-paste">Copy and paste</a></li><li><a href="#running-a-verification-step">Running a verification step</a></li><li><a href="#when-the-connection-drops">When the connection drops</a></li><li><a href="#starting-the-container">Starting the container</a></li><li><a href="#when-a-shell-cannot-be-opened">When a shell cannot be opened</a></li><li><a href="#what-a-shell-can-reach">What a shell can reach</a></li><li><a href="#access-and-security">Access and security</a></li></ul></details></nav>
 <p>This page is for anyone reviewing tasks in the local daemon dashboard. The
 dashboard can open an interactive terminal <strong>inside a task&#39;s container</strong>,
 right from the browser. It is the same thing as running
@@ -116,8 +116,10 @@ selection (with none it stays the interrupt), <strong>Ctrl/Cmd+V</strong> or <st
 to paste, and a draggable bottom edge to change the height.</p>
 <h2 id="pair-and-chat"><a class="anchor" href="#pair-and-chat" aria-hidden="true">#</a>Pair and Chat</h2>
 <p><strong>Pair</strong> takes over the agent&#39;s session in the same terminal, with the same
-lock as <code>lazy pair</code>: unblock and accept refuse until you stop, and a dropped
-connection ends pairing within 30 seconds so the task cannot stay locked
+lock as <code>lazy pair</code>: unblock and accept refuse until you stop. A dropped
+connection reconnects to the same session by itself (see
+<a href="#when-the-connection-drops">When the connection drops</a>); if it cannot within
+5 minutes, pairing ends 30 seconds later, so the task cannot stay locked
 forever. Only one Pair session per task.</p>
 <p><strong>Chat</strong> opens a read-only conversation with the task&#39;s agent (<code>lazy chat</code>).
 It does not lock the task and does not change the task&#39;s agent, model, or
@@ -166,10 +168,19 @@ terminal stays open and interactive for whatever you want to try next.</p>
 <code>ts</code> block has no Run), and is disabled with the same reason as the Shell tab
 when no shell can be opened. A stopped container is not one of those reasons —
 Run starts it, and says so in the terminal it opens.</p>
-<p>If the connection drops, <strong>Reconnect</strong> opens a fresh shell (the previous one is
-gone; a terminal session does not survive the socket closing, and a reconnected
-session does not re-run its block). Closing the terminal, leaving the page, or
-typing <code>exit</code> ends the session.</p>
+<p>Closing the terminal, leaving the page, or typing <code>exit</code> ends the session.</p>
+<h2 id="when-the-connection-drops"><a class="anchor" href="#when-the-connection-drops" aria-hidden="true">#</a>When the connection drops</h2>
+<p>A terminal whose connection drops — Wi-Fi changing, a laptop waking from sleep,
+a proxy closing a connection — is not ended. The program in it keeps running
+for <strong>5 minutes</strong>, and the page reconnects to it by itself: quick tries first,
+then every 30 seconds. The status line says <strong>Connection lost — reconnecting…</strong>
+while it does, and typing is paused (nothing you type in that gap is sent).
+When it is back, the output you missed is drawn once and the session carries on
+where it was. Watch reconnects the same way and redraws its stream.</p>
+<p>It does not reconnect when the session really ended: the program exited, you
+closed the terminal or left the page, or the server refused it. Then the status
+line says what happened and <strong>Open a new session</strong> starts a fresh one. A
+terminal that could not reconnect within the 5 minutes has ended too.</p>
 <h2 id="starting-the-container"><a class="anchor" href="#starting-the-container" aria-hidden="true">#</a>Starting the container</h2>
 <p>The shell needs a <strong>running container</strong>, and opening one is how you ask for it:
 if the container is down, the panel starts it and shows the progress on its own
@@ -177,9 +188,8 @@ status line — pulling or building the image included — then connects. Watch,
 Pair and Chat do the same. Two panels opened together share one start; they
 never race two containers for the same task.</p>
 <p>If the start fails — Docker not running, an image that will not build — the
-panel shows the failure text and its <strong>Reconnect</strong> button becomes <strong>Start
-container</strong>, so you can retry once you have fixed the cause. That is the only
-place a Start button appears next to a terminal.</p>
+panel shows the failure text and a <strong>Start container</strong> button, so you can
+retry once you have fixed the cause. That is the only place a Start button appears next to a terminal.</p>
 <h2 id="when-a-shell-cannot-be-opened"><a class="anchor" href="#when-a-shell-cannot-be-opened" aria-hidden="true">#</a>When a shell cannot be opened</h2>
 <p>A start cannot fix a task that hasn&#39;t started, so it has no session yet; the
 page says so instead of failing silently.</p>

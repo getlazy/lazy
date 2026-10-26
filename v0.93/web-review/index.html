@@ -436,6 +436,11 @@ never a second writer). The dashboard&#39;s base URL is printed by
 <td>A line range of one file at the task&#39;s diff revisions (<code>path</code>, <code>side</code>, <code>start</code>, <code>end</code>) — what the diff&#39;s expand controls read; refuses any path that is not part of the diff</td>
 </tr>
 <tr>
+<td><code>/api/review/:task/blob</code></td>
+<td>GET</td>
+<td>The bytes of one image in the task&#39;s diff (<code>path</code>, <code>side</code> = <code>base</code> or <code>head</code>) for the before/after pictures — only files of the diff, never a symlink, at most 10 MB, served with the image&#39;s own type, <code>nosniff</code> and a sandbox CSP</td>
+</tr>
+<tr>
 <td><code>/api/review/:task/threads</code></td>
 <td>GET</td>
 <td><code>{ threads, taskThreads, pending, pendingDelivery, everQueued, everAsked, queued, state }</code> — what the island polls</td>
@@ -2069,6 +2074,25 @@ question about a diagram is asked while looking at the diagram, not after
 switching back to the fence and hunting for the right line. It opens the same
 Ask / Add comment box, anchored to the line the fence opens on, with the
 diagram&#39;s source as the quote the agent receives.</p>
+<h3 id="images-in-diffs"><a class="anchor" href="#images-in-diffs" aria-hidden="true">#</a>Images in diffs</h3>
+<p>A changed PNG, JPEG, GIF, WebP, AVIF or SVG file is shown as a picture
+instead of &quot;Binary file — not shown&quot;:</p>
+<ul>
+<li><strong>Added</strong> — the new image.</li>
+<li><strong>Deleted</strong> — the old image.</li>
+<li><strong>Changed</strong> — before and after side by side (stacked on a phone).</li>
+</ul>
+<p>Each picture is labelled with its pixel size and file size, and the file&#39;s
+header says <em>image added</em>, <em>image deleted</em> or <em>image changed</em> rather than
+<code>+0 −0</code>. An SVG also keeps its text diff below the picture. Pictures load only
+when their file is open and scrolled into view, so a diff full of screenshots
+stays fast. The same applies in Lazy Teams, on the Changes tab and the accept
+page.</p>
+<p>What is never shown as a picture: a file larger than 10 MB (&quot;Too large to
+preview&quot;), a file whose contents are not the image its name says (&quot;Binary file —
+not shown&quot;), and a symlink. Pictures come only from files this task&#39;s diff
+contains, at the same revisions the diff compares, and are drawn as plain
+images — an SVG&#39;s scripts never run.</p>
 <h3 id="threads-survive-a-re-diff-even-when-their-line-moves"><a class="anchor" href="#threads-survive-a-re-diff-even-when-their-line-moves" aria-hidden="true">#</a>Threads survive a re-diff, even when their line moves</h3>
 <p>Threads whose anchor no longer appears in the current diff (the agent edited the
 file, the hunk moved) are not dropped — they render in an <strong>orphan threads</strong>

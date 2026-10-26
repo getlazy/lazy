@@ -96,20 +96,20 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 lazy builder list
 </code></pre>
 <p>If <code>lazy upgrade</code> stops your builder to rebuild the image, it is relaunched in place afterwards with its conversation intact.</p>
-<p>In a clone logged in to Lazy Teams, <code>lazy builder</code> attaches your terminal to your builder running on the server, starting it if needed. Press ctrl-] to detach and leave it running. <code>lazy builder stop [&lt;id&gt;]</code> stops it and keeps the conversation; <code>lazy builder end [&lt;id&gt;]</code> ends the run; its conversation stays listed and can be resumed.</p>
+<p>In a clone logged in to Lazy Teams, <code>lazy builder</code> starts another builder on the server and attaches your terminal to it, as it starts another one on your own machine. Press ctrl-] to detach and leave it running; <code>lazy builder attach [&lt;id&gt;]</code> reattaches (relaunching a stopped one). <code>lazy builder stop [&lt;id&gt;]</code> stops one and keeps the conversation; <code>lazy builder end [&lt;id&gt;]</code> ends the run, and its conversation stays listed and can be resumed. With more than one builder, name the session id; lazy lists them when you leave it out.</p>
 <h3 id="dashboard"><a class="anchor" href="#dashboard" aria-hidden="true">#</a>Dashboard</h3>
 <p>The dashboard&#39;s <strong>Builders</strong> pages list and search past builder conversations and show their transcripts. You cannot start a builder from the dashboard; use <code>lazy builder</code>.</p>
 <p>Open a conversation to read its messages (#1, #2, … with who said each and when). <strong>Promote part of this conversation into a task</strong> turns an exchange into a backlog task (<strong>Create backlog task</strong>); <strong>Start here</strong> and <strong>End here</strong> on a message mark where that exchange begins and ends.</p>
 <p><img src="../../images/how-to/dashboard-builder-transcript.png" alt="A builder's transcript in the dashboard: title, start and end times, message counts, the Promote part of this conversation into a task section and four numbered messages" loading="lazy"></p>
 <h3 id="lazy-teams"><a class="anchor" href="#lazy-teams" aria-hidden="true">#</a>Lazy Teams</h3>
 <p>Open <strong>Builders</strong> in your project.</p>
-<p><img src="../../images/teams/teams-builders.png" alt="The Lazy Teams Builders page: an Open your builder button, a transcript search box and a list of builders with Running and Stopped badges" loading="lazy"></p>
+<p><img src="../../images/teams/teams-builders.png" alt="The Lazy Teams Builders page: a Start a new builder button, your two running builders each with Open and Stop, a transcript search box and a list of builders with Running and Stopped badges" loading="lazy"></p>
 <ol>
-<li>Choose <strong>Start your builder</strong>. If you already have one, the button reads <strong>Open your builder</strong> (running) or <strong>Resume your builder</strong> (stopped).</li>
+<li>Choose <strong>Start a new builder</strong>. Each press starts another one, so you can run several at once; every builder of yours is listed under <strong>Your builders</strong> with <strong>Open</strong> and <strong>Stop</strong>.</li>
 <li>Work in the terminal on the page. A builder runs on the account of the person using it, so you can only open your own.</li>
-<li><strong>Stop</strong> keeps the transcript and <strong>Resume</strong> starts it again. <strong>End</strong> finishes the run; the transcript is kept, and the builder can still be resumed from the list.</li>
-<li>Each of your own builders in the list, stopped or ended, has a <strong>Resume</strong> button that continues it in a builder of yours. See <a href="../../reference/teams/builders/#resuming-a-builder">Resuming a builder</a>.</li>
-<li>Every builder in the list, a teammate&#39;s included, has <strong>Continue</strong>, which starts a new builder of yours from a summary of it. See <a href="../../reference/teams/builders/#continuing-from-a-summary">Continuing from a summary</a>.</li>
+<li><strong>Stop</strong> keeps the transcript and <strong>Resume</strong> starts that builder again; your other builders keep running. <strong>End</strong> finishes the run; the transcript is kept, and the builder can still be resumed from the list.</li>
+<li>Each of your own builders in the list, stopped or ended, has a <strong>Resume</strong> button that continues it in an additional builder of yours. See <a href="../../reference/teams/builders/#resuming-a-builder">Resuming a builder</a>.</li>
+<li>Every builder in the list, a teammate&#39;s included, has <strong>Continue</strong>, which starts an additional builder of yours from a summary of it. See <a href="../../reference/teams/builders/#continuing-from-a-summary">Continuing from a summary</a>.</li>
 </ol>
 <p>Below, each past builder has a transcript. Tick <strong>Select message</strong> beside messages and choose <strong>Create task</strong> to start a new task from them. See <a href="../../lazy-teams-builders/">Builders in Lazy Teams</a>.</p>
 <h2 id="related"><a class="anchor" href="#related" aria-hidden="true">#</a>Related</h2>
