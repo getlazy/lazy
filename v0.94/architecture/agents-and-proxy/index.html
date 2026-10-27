@@ -88,7 +88,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <main>
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../../#architecture">Architecture</a> › <span aria-current="page">Agents, the proxy and credentials</span></nav>
 <h1 id="agents-the-proxy-and-credentials"><a class="anchor" href="#agents-the-proxy-and-credentials" aria-hidden="true">#</a>Agents, the proxy and credentials</h1>
-<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#what-the-proxy-does">What the proxy does</a></li><li><a href="#placeholder-tokens">Placeholder tokens</a></li><li><a href="#per-harness">Per harness</a></li><li><a href="#the-credential-store">The credential store</a></li><li><a href="#how-usage-limits-are-read">How usage limits are read</a></li></ul></details></nav>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#what-the-proxy-does">What the proxy does</a></li><li><a href="#placeholder-tokens">Placeholder tokens</a></li><li><a href="#per-harness">Per harness</a></li><li><a href="#the-credential-store">The credential store</a></li><li><a href="#how-usage-limits-are-read">How usage limits are read</a></li><li><a href="#when-a-model-request-fails">When a model request fails</a></li></ul></details></nav>
 <figure class="doc-diagram"><pre>sequenceDiagram
   participant A as Agent in task container
   participant P as Proxy
@@ -130,6 +130,20 @@ bind = &quot;127.0.0.1&quot;
 <h2 id="how-usage-limits-are-read"><a class="anchor" href="#how-usage-limits-are-read" aria-hidden="true">#</a>How usage limits are read</h2>
 <p>The proxy keeps only response headers that report rate limits, for example the 5-hour and 7-day windows of a Claude subscription, and the equivalents some other providers send. Anything else in a response&#39;s headers is dropped, and a value that looks like a secret is refused. The latest reading per credential is held by the daemon and survives a restart. <code>lazy stats limits</code> and <code>lazy stats budget</code> show it, and <code>[usage_pause]</code> can hold new turns past a threshold. See <a href="../../token-budgets/">Token budgets</a>. A harness whose provider sends no such headers shows no reading.</p>
 <p>More: <a href="../../explanation/daemon-and-proxy/">The daemon, the task container and the proxy</a>.</p>
+<h2 id="when-a-model-request-fails"><a class="anchor" href="#when-a-model-request-fails" aria-hidden="true">#</a>When a model request fails</h2>
+<p>Every error the proxy returns says which party failed:</p>
+<ul>
+<li><strong>The provider or the network to it.</strong> The message names the provider (Anthropic, OpenAI, Cursor, or a configured endpoint by name), its host, the agent profile and credential label, and how far the request got. For example: &quot;Anthropic (api.anthropic.com, profile <code>code-builder</code>) reset the connection 4 ms into the request&quot;.</li>
+<li><strong>lazy&#39;s own proxy.</strong> The message starts with &quot;lazy&#39;s proxy failed&quot;.</li>
+<li><strong>The provider&#39;s own error responses</strong> (5xx, 529 overloaded, 429 rate-limited) reach the agent unchanged.</li>
+</ul>
+<p>Providers close idle connections, and a request that crosses that close is reset before any answer. The proxy sends that request once more, straight away, on a fresh connection. This only happens when nothing was received yet and the request body can be sent again. The agent sees no error.</p>
+<p>To see whether a provider is having a bad hour, check provider health. It lists each provider over the last hour: how many requests, failures by kind (reset, timeout, connect, 5xx, 529, 429), and the latest failure. lazy&#39;s own refusals are not counted. You can find it in:</p>
+<ul>
+<li><code>lazy stats limits</code></li>
+<li>the dashboard&#39;s home page, below the token budget</li>
+<li>the Usage page in Lazy Teams, for project admins</li>
+</ul>
 
 <nav class="pager" aria-label="Previous and next"><a class="prev" href="../../architecture/what-runs-where/"><span>Previous</span>What runs where</a><a class="next" href="../../architecture/forges/"><span>Next</span>Forges</a></nav>
 </main>

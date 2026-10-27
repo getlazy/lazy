@@ -795,6 +795,15 @@ judgement on itself. The two cases differ by exactly one comparison
 adding a fourth review argument to <code>lazy_edit</code> means adding it to that check.</p>
 <p>Humans are unaffected: <code>lazy edit --review*</code> on any task is a person deciding
 about their own project, which is the authority this whole page is about.</p>
+<h3 id="lazy_edits-token-cap-an-agent-may-only-set-or-tighten-one"><a class="anchor" href="#lazy_edits-token-cap-an-agent-may-only-set-or-tighten-one" aria-hidden="true">#</a><code>lazy_edit</code>&#39;s token cap: an agent may only set or tighten one</h3>
+<p>A task&#39;s token cap (<code>lazy edit --token-cap</code>) bounds what it may spend. Over
+<code>lazy_edit</code>&#39;s <code>token_cap</code>, an agent may put a cap on a <strong>direct subtask</strong> that
+has none, or lower an existing one. It may never raise or clear a cap, and never
+touch its own task&#39;s cap at all. Raising or clearing a cap lifts a spend limit
+on work the agent is driving. That is a person&#39;s or the builder&#39;s decision, for
+the same reason an agent may not let a task past the usage pause.</p>
+<p>People and the builder are unaffected: they can set, raise or clear any task&#39;s
+cap from the CLI, the dashboard, Lazy Teams or the builder&#39;s tools.</p>
 <h2 id="18-turn-reports-and-file-justifications-agent-writes-human-reads"><a class="anchor" href="#18-turn-reports-and-file-justifications-agent-writes-human-reads" aria-hidden="true">#</a>18. Turn reports and file justifications: agent writes, human reads</h2>
 <p><code>lazy_report</code>, <code>lazy_justify_protected</code>, and <code>lazy_justify_maintain</code> are
 <strong>agent-only</strong> writes on the current task (same posture as <code>lazy_raise</code>). Builder mode refuses them — the builder reviews rather

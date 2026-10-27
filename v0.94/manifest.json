@@ -54,7 +54,8 @@
         "placeholder-tokens",
         "per-harness",
         "the-credential-store",
-        "how-usage-limits-are-read"
+        "how-usage-limits-are-read",
+        "when-a-model-request-fails"
       ]
     },
     {
@@ -331,6 +332,7 @@
         "review-modes",
         "what-accept-checks-first",
         "the-merge-is-the-commit-point",
+        "closing-or-rejecting",
         "in-each-surface",
         "limits"
       ]
@@ -2677,6 +2679,7 @@
         "accept---allow-queued-comments-has-no-mcp-parameter",
         "accept---allow-review-issues-is-cli-only",
         "lazy_edits-review-settings-are-refused-on-the-callers-own-task",
+        "lazy_edits-token-cap-an-agent-may-only-set-or-tighten-one",
         "18-turn-reports-and-file-justifications-agent-writes-human-reads",
         "19---allow-broken-is-cli-only",
         "20-choosing-a-subtasks-agent-is-not-gated-by-who-is-asking",

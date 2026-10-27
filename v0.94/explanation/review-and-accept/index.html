@@ -88,7 +88,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <main>
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../../#explanation">Explanation</a> › <span aria-current="page">Review and accept</span></nav>
 <h1 id="review-and-accept"><a class="anchor" href="#review-and-accept" aria-hidden="true">#</a>Review and accept</h1>
-<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#why-it-exists">Why it exists</a></li><li><a href="#review-modes">Review modes</a></li><li><a href="#what-accept-checks-first">What accept checks first</a></li><li><a href="#the-merge-is-the-commit-point">The merge is the commit point</a></li><li><a href="#in-each-surface">In each surface</a></li><li><a href="#limits">Limits</a></li></ul></details></nav>
+<nav class="toc" aria-label="On this page"><details open><summary>On this page</summary><ul><li><a href="#why-it-exists">Why it exists</a></li><li><a href="#review-modes">Review modes</a></li><li><a href="#what-accept-checks-first">What accept checks first</a></li><li><a href="#the-merge-is-the-commit-point">The merge is the commit point</a></li><li><a href="#closing-or-rejecting">Closing or rejecting</a></li><li><a href="#in-each-surface">In each surface</a></li><li><a href="#limits">Limits</a></li></ul></details></nav>
 <figure class="doc-diagram"><pre>flowchart LR
   Work[Task work] --&gt; Review[Review task diff]
   Review --&gt;|feedback| Work
@@ -149,6 +149,12 @@ decides whether a finding holds the merge.</p>
 <p>Once the merge lands, the task is accepted. Lazy records that straight away (the accept reason as a comment, the session as accepted, the task as <code>complete</code>) and nothing that can fail runs in between.</p>
 <p>Everything after that is follow-through: reparenting the task&#39;s children, fast-forwarding the target, pushing the parent branch, closing a pull request that was open for the task, tagging the accept, notifying the parent task, and cleaning up. Each step can be repeated safely. If one fails, the task stays <code>complete</code>, the steps that depend on it wait, and the daemon retries in the background. The accept command also reports what is still pending and exits non-zero, and a system message appears if it keeps failing.</p>
 <p>If the process dies mid-accept, the task is left in <code>merging</code>. The daemon does not roll it back. It checks whether the work already landed and, if not, repeats the accept from the reason and approvals you gave. After three failed automatic attempts it stops, files a system message, and hands the task back to you: re-run <code>lazy accept</code>, or reject or close it.</p>
+<h2 id="closing-or-rejecting"><a class="anchor" href="#closing-or-rejecting" aria-hidden="true">#</a>Closing or rejecting</h2>
+<p>When you close or reject a task with an unfinished merge started by lazy sync,
+lazy aborts that merge and keeps the branch at its last commit. The result
+reports how many conflicts were abandoned and which commit was kept. Ordinary
+uncommitted edits still prevent closing or rejecting unless you explicitly
+allow a dirty worktree.</p>
 <h2 id="in-each-surface"><a class="anchor" href="#in-each-surface" aria-hidden="true">#</a>In each surface</h2>
 <ul>
 <li>Daemon dashboard: the Accept button on a task&#39;s Current review tab, which shows the refusals above it. See <a href="../../web-review/">the web review surface</a>.</li>

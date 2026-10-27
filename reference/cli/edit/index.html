@@ -89,7 +89,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <nav class="crumbs" aria-label="Breadcrumbs"><a href="../../../#reference">Reference</a> › CLI › <span aria-current="page">lazy edit</span></nav>
 <h1 id="lazy-edit"><a class="anchor" href="#lazy-edit" aria-hidden="true">#</a>lazy edit</h1>
 <p>This page is generated from <code>lazy edit --help</code>.</p>
-<pre><code class="language-text">Usage: lazy edit &lt;task_id&gt; [--goal &lt;goal&gt;] [--prompt &lt;text&gt;] [--model &lt;model&gt;] [--type &lt;type&gt;] [--code &lt;code&gt;] [--parent &lt;task_id&gt;] [--runner &lt;docker|container|podman&gt;] [--effort &lt;level&gt;] [--agent &lt;profile&gt;] [--review &lt;mode&gt;] [--review-gate &lt;g&gt;] [--review-auto-fix &lt;on|off&gt;]
+<pre><code class="language-text">Usage: lazy edit &lt;task_id&gt; [--goal &lt;goal&gt;] [--prompt &lt;text&gt;] [--model &lt;model&gt;] [--type &lt;type&gt;] [--code &lt;code&gt;] [--parent &lt;task_id&gt;] [--runner &lt;docker|container|podman&gt;] [--effort &lt;level&gt;] [--agent &lt;profile&gt;] [--review &lt;mode&gt;] [--review-gate &lt;g&gt;] [--review-auto-fix &lt;on|off&gt;] [--token-cap &lt;count&gt;]
 
 Edit a task&#39;s goal, prompt, model, type, code, parent, runner, effort, agent, or review mode. Interactive if no flags provided.
 Once an agent has worked on the task, only --model, --effort, --runner, --agent and the
@@ -127,6 +127,11 @@ Options:
                      more than it is finding.
   --review-gate &lt;g&gt;  Change when a recorded review holds the merge: auto (the
                      mode decides), always, or never. Allowed any time.
+  --token-cap &lt;count&gt;
+                     The task&#39;s own token cap, e.g. 50M, 200k or 50000000; &quot;none&quot;
+                     clears it. Allowed any time. Once the task has spent that
+                     many tokens its running turn is stopped (work kept) and it
+                     does not continue until the cap is raised or cleared.
   --review-auto-fix &lt;on|off&gt;
                      Change whether a &#39;separate&#39; review that found something
                      starts a fix turn by itself. Allowed any time.

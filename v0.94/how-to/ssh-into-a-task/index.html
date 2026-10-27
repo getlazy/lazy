@@ -132,6 +132,7 @@ header.site .search li.none { padding:.4rem .6rem; color:var(--muted); font-size
 <pre><code class="language-bash">ssh -N -L 3000:web:3000 my-task.myproject.myteam.teams.example.com
 </code></pre>
 <p>Then open <code>http://localhost:3000</code>. The forward reaches the task&#39;s own service, the same one the Services tab shows, and carries any TCP traffic: a web app, a database or a debugger. A port declared without a name is reached as <code>services</code>, for example <code>ssh -N -L 5432:services:5432 …</code>. The service must be running; start it from the task&#39;s Services tab or with Start services.</p>
+<p>If lazy cannot complete a forward, a web client gets a <code>502</code> response saying why, for example that the service is not published (restart the task&#39;s environment after adding it to <code>[serve]</code>). Use the service&#39;s name, such as <code>web</code>, rather than <code>127.0.0.1</code>: in Lazy Teams the SSH connection lands next to the task, not inside it, so <code>127.0.0.1:3000</code> reaches nothing.</p>
 <p>On your own machine the services run in the task&#39;s container itself, so use <code>localhost</code>: <code>ssh -N -L 3000:localhost:3000 my-task.myproject.myteam.teams.example.com</code>.</p>
 <h2 id="copy-files-with-scp-and-sftp"><a class="anchor" href="#copy-files-with-scp-and-sftp" aria-hidden="true">#</a>Copy files with <code>scp</code> and <code>sftp</code></h2>
 <p>Paths are relative to the task&#39;s working copy:</p>

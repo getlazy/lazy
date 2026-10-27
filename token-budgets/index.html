@@ -132,7 +132,10 @@ configure <code>[usage_pause]</code> in <code>lazy.toml</code> (see <code>lazy s
 threshold_percent = 95
 </code></pre>
 <p>New turns wait when the credential&#39;s reported usage reaches 95% of a
-subscription window. Existing turns continue.</p>
+subscription window. A turn that is already running is stopped at its next model
+request, with its work kept, and resumes by itself after the reset. To bound one
+task&#39;s spend whatever the windows say, give it a token cap:
+<code>lazy edit &lt;task&gt; --token-cap 50M</code>.</p>
 <h2 id="who-sees-what"><a class="anchor" href="#who-sees-what" aria-hidden="true">#</a>Who sees what</h2>
 <p>On a single-person install you see every credential. On Lazy Teams, a member
 sees the project&#39;s shared credential and their own, never another member&#39;s. A

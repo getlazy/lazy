@@ -99,7 +99,8 @@ Arguments:
 Options:
   --reason &quot;...&quot;          Provide rejection reason inline instead of opening editor
   --yes, -y               Skip confirmation prompt
-  --accept-dirty-worktree Allow rejecting even if worktree has uncommitted changes
+  --accept-dirty-worktree Allow rejecting even if worktree has uncommitted changes;
+                          also aborts a merge left in progress (every commit is kept)
   --end-sessions          End any member&#39;s open sessions in the task&#39;s environment
                           first (Lazy Teams); without it, the reject is refused
                           while they have sessions open

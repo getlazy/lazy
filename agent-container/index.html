@@ -273,6 +273,11 @@ file to an image is one command:</p>
 <p>Chromium logs D-Bus and GPU warnings on every run in a container; they are noise,
 not failure. The exit code and a non-empty output file are the signals.</p>
 <h2 id="when-the-image-is-built"><a class="anchor" href="#when-the-image-is-built" aria-hidden="true">#</a>When the image is built</h2>
+<p>If Docker is still starting when lazy starts, lazy waits for it and builds the
+project image automatically once Docker answers. Waiting does not count as a
+failed build. Actual build failures back off before another attempt; a task
+launch retries once that backoff expires. You can still choose lazy&#39;s default
+image while the project&#39;s image is unavailable.</p>
 <p>The daemon builds your project&#39;s image <strong>when it starts</strong>, in the background —
 not inside the first task or builder launch. Everything except running an agent
 keeps working while it builds: creating tasks, reviewing, commenting, browsing.
@@ -360,16 +365,20 @@ ended with it.</li>
 <li><strong>It is created anew</strong> only when it has to be: the task&#39;s agent, environment
 variables, credential or image changed, you restart the environment
 (<code>lazy shell &lt;task&gt; --restart</code>), or the container cannot be started again.</li>
-<li><strong>A full <code>lazy upgrade</code></strong> stops and removes this project’s running task
-containers before restarting the daemon. Running services end, and packages,
-caches or other files kept only inside those containers are lost. The
-worktree, saved agent history and mounted data, including <code>$LAZY_TASK_DATA</code>,
-survive; later launches create containers on the upgraded image.</li>
+<li><strong>A full <code>lazy upgrade</code></strong> keeps this project&#39;s running task containers. It
+copies the upgraded agent into each one, and the daemon restart stops only
+the agent, so the next turn runs the upgraded lazy in the same container; a
+turn that was cut off resumes there. Services and installed tools keep
+running. The container stays on the image it was created from; the task&#39;s
+Services tab then says a newer image exists and offers <strong>Restart
+environment</strong> to move to it, and <code>lazy doctor</code> lists such tasks. A container
+created by an older lazy, which cannot take the new agent in place, is
+stopped and removed as before, and the upgrade names it.</li>
 <li><strong>It is removed</strong> when the task is accepted, rejected or closed.</li>
 </ul>
 <p><code>lazy upgrade --images</code> only refreshes the image: it stops no containers and
 does not restart the daemon. Existing containers keep their current image.
-Containers already stopped when a full upgrade runs are kept too. Restart the
+A full upgrade keeps stopped containers too. Restart the
 task’s environment with <code>lazy shell &lt;task&gt; --restart</code> to move a kept container
 to the refreshed image; this also loses its container-only files.</p>
 <h3 id="services-and-other-long-running-commands"><a class="anchor" href="#services-and-other-long-running-commands" aria-hidden="true">#</a>Services and other long-running commands</h3>

@@ -281,7 +281,9 @@ nothing.</p>
 <h2 id="the-daemon-wont-start"><a class="anchor" href="#the-daemon-wont-start" aria-hidden="true">#</a>The daemon won&#39;t start</h2>
 <p>Lazy needs its daemon: it owns task state, storage and the agent runner, and
 every CLI command is a client of it. The CLI auto-starts one when it isn&#39;t
-already running, and reports the failure rather than proceeding when it can&#39;t:</p>
+already running. Commands wait for its model proxy to be ready before proceeding,
+reporting progress when startup takes longer. If startup fails, the command reports
+the failure:</p>
 <pre><code>Error: &lt;what the daemon reported&gt;
 </code></pre>
 <p>The daemon writes the same message, with a timestamp, to its log — as the last

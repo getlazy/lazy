@@ -149,6 +149,10 @@ project its own image, and how lazy protects the worktree&#39;s git metadata.</p
 <p>Anything an agent can read it could also leak.
 That is why credentials are kept out of it.</p>
 <h2 id="the-proxy-and-credential-injection"><a class="anchor" href="#the-proxy-and-credential-injection" aria-hidden="true">#</a>The proxy and credential injection</h2>
+<p>Commands wait while the daemon’s proxy is starting. If a running daemon reports
+that its proxy is unavailable, task listings, Watch and other reads remain available.
+Run <code>lazy doctor</code> for the finding and remedy. Builder, pair, chat and task turns
+require the proxy and refuse to launch until it is available.</p>
 <p>All of an agent&#39;s model traffic goes through a proxy the daemon runs on your
 machine. The proxy is always on; the agent is always handed the proxy&#39;s address
 and never talks to the model provider directly.</p>

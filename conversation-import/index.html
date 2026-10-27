@@ -289,7 +289,8 @@ one-time, where at capture time — running forever, on every sweep tick — it
 would not be. Every rule is anchored at the very start of the conversation&#39;s
 single user message, so a real conversation that quotes a lazy prompt is never
 matched.</p>
-<p>A caveat worth knowing: because these conversations have no marker on disk,
+<p>Purged sessions stay excluded from live capture, including after a daemon restart.
+Their raw session files are left unchanged. Because they have no marker on disk,
 <code>lazy doctor --reimport-conversations</code> will re-import them if their raw JSONL is
 still present. Purge is about cleaning up the store, not about rewriting what is
 on disk.</p>

@@ -390,8 +390,14 @@ an operator must set up — see
 <a href="../self-hosting-lazy-teams/#reaching-a-tasks-running-services">Reaching a task&#39;s running services</a>.
 Declaring services, and previewing a task&#39;s files, is covered in
 <a href="../serve-ports/#under-lazy-teams">Reaching a task&#39;s dev server</a>.</p>
-<p>Where a declared port is not being served at all, the card says exactly that and
-stops — it does not guess at a cause, because it was not told one.</p>
+<p>Where the task&#39;s environment does not publish a declared port (ports are fixed
+when the environment is created), the card says so, and the <strong>Services</strong> tab
+offers <strong>Restart environment</strong>: it recreates the environment so every declared
+port is published. Running services stop and the task&#39;s files are kept; run
+services again afterwards. If the restart cannot happen right now (for example
+during a turn), the tab says why. Where a declared port is not being served for
+any other reason, the card says exactly that and stops — it does not guess at a
+cause, because it was not told one.</p>
 <p>The card also shows the project&#39;s <strong>Start services</strong> command — the one command
 that brings the project&#39;s services up in a task&#39;s environment. It is one command for the
 whole project, saved by the project&#39;s daemon; lazy does not edit your <code>lazy.toml</code> for it.
