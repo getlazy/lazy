@@ -20,7 +20,7 @@ import { open, stat } from 'fs/promises';
 import { getLogPath } from './paths';
 import { RpcError } from './rpc-error';
 import { getOrCreateStorage } from './rpc-handlers';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { launchWarmupStatus } from './launch-warmup';
 import { builderSupervisorLogHostPath } from '../builder/supervisor-log-path';
 import { builderSessionLaunchDir, resolveBuilderSessionHomeDir } from '../builder/claude-home';
@@ -49,7 +49,7 @@ export async function handleBuilderRunReport(projectRoot: string, params: Record
 
 async function describeContainer(projectRoot: string, run: { containerName: string | null; builderId: string; memberEmail: string | null }) {
   try {
-    const runner = await createRunner(projectRoot);
+    const runner = await createInspectionRunner(projectRoot);
     const name = run.containerName!;
     const running = await runner.isRunning(name).catch(() => null);
     const evidence = runner.describeExitedRun

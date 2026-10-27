@@ -60,7 +60,7 @@ describe('MCP token revocation on session end', () => {
     const tokenB = await mintMcpToken(ctx.root, { kind: 'task', taskId: bId }, `lazy-${bShort}`);
     expect(tokenA).not.toBe(tokenB);
 
-    expectSuccess(await ctx.lazy(['close', aShort, '--reason', 'done', '--yes']));
+    expectSuccess(await ctx.lazyMocked(['close', aShort, '--reason', 'done', '--yes'], MOCK_CLAUDE_SUCCESS));
 
     // The CLI subprocess rewrote the registry on disk; drop our cached copy.
     clearMcpTokenCache();

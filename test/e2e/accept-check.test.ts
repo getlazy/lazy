@@ -352,7 +352,7 @@ describe('lazy accept — reverted protected files', () => {
     expect(diff.stdout).not.toContain('mocks.spec.ts');
 
     // Accept says it anyway, BEFORE the merge, and still accepts.
-    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    const accepted = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accepted);
     const combined = accepted.stdout + accepted.stderr;
     expect(combined).toContain('protected file');
@@ -393,7 +393,7 @@ describe('lazy accept — reverted protected files', () => {
     // standing final is present. Daemonless suite, storage-level seed.
     await seedFinal(ctx, taskId);
 
-    const accepted = await ctx.lazy(['accept', taskId, '--approve-file', 'mocks.spec.ts', '--yes']);
+    const accepted = await ctx.lazyMocked(['accept', taskId, '--approve-file', 'mocks.spec.ts', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accepted);
     const combined = accepted.stdout + accepted.stderr;
     expect(combined).toContain('Approved 1 protected file change(s)');
@@ -413,7 +413,7 @@ describe('lazy accept — reverted protected files', () => {
     expect(ctx.git('-C', worktreePath, 'add', 'feature.txt').exitCode).toBe(0);
     expect(ctx.git('-C', worktreePath, 'commit', '-m', 'Add feature').exitCode).toBe(0);
 
-    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    const accepted = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accepted);
     expect(accepted.stdout + accepted.stderr).not.toContain('reverted during this task');
   });

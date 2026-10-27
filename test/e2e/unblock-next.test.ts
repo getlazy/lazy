@@ -96,7 +96,7 @@ describe('lazy unblock', () => {
   /** Accept an already-started task — with the fixture final the gate needs. */
   async function acceptForList(taskId: string): Promise<void> {
     seedFinal(ctx, taskId);
-    expectSuccess(await ctx.lazy(['accept', taskId]));
+    expectSuccess(await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS));
   }
 
   test('shows usage when no task ID provided', async () => {
@@ -170,7 +170,7 @@ describe('lazy unblock', () => {
     expectOutput(blockedResult, 'Reject blocked');
 
     // Reject the task
-    const rejectResult = await ctx.lazy(['reject', taskId, '--yes', '--reason', 'Not needed']);
+    const rejectResult = await ctx.lazyMocked(['reject', taskId, '--yes', '--reason', 'Not needed'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(rejectResult);
 
     // Now it should NOT appear in blocked
@@ -189,7 +189,7 @@ describe('lazy unblock', () => {
     expectOutput(activeResult, 'Reject active');
 
     // Reject the task
-    const rejectResult = await ctx.lazy(['reject', taskId, '--yes', '--reason', 'Bad approach']);
+    const rejectResult = await ctx.lazyMocked(['reject', taskId, '--yes', '--reason', 'Bad approach'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(rejectResult);
 
     // Now it should NOT appear in active

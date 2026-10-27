@@ -8,7 +8,7 @@ import {
   type ForwardChannel,
   type ForwardSpec,
 } from '../../serve/forward';
-import type { Runner } from '../../runner/types';
+import type { InspectionRunner } from '../../runner';
 import type { Task } from '../../types';
 
 /** What the tunnel inside the container is: STDIO ↔ a loopback TCP connection. */
@@ -54,8 +54,8 @@ export async function commandForward(args: string[]): Promise<void> {
     const task = await resolveTaskOrExit(storage, taskId);
     const session = await storage.getSessionByTaskId(task.id);
 
-    const { createRunner } = await import('../../runner');
-    const runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
+    const { createInspectionRunner } = await import('../../runner');
+    const runner = await createInspectionRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
     const containerName = session?.container_name ?? runner.runNameForTask(taskRef(task));
 
     if (!(await runner.isRunning(containerName))) {
@@ -101,7 +101,7 @@ export async function commandForward(args: string[]): Promise<void> {
 }
 
 /** One host connection's byte pipe into the container. */
-function openTunnel(runner: Runner, containerName: string, containerPort: number): ForwardChannel {
+function openTunnel(runner: InspectionRunner, containerName: string, containerPort: number): ForwardChannel {
   const stream = runner.openRunStream(containerName, socatArgv(containerPort));
   if (!stream) {
     // Unreachable in practice — the runner was checked before any listener was
@@ -118,7 +118,7 @@ function openTunnel(runner: Runner, containerName: string, containerPort: number
  * project's own Dockerfile. Finding out per-connection, as a stream that closes
  * instantly, would be a mystery; finding out up front is one line and a fix.
  */
-async function requireSocat(runner: Runner, containerName: string, task: Task): Promise<void> {
+async function requireSocat(runner: InspectionRunner, containerName: string, task: Task): Promise<void> {
   const code = await runner.execInRun(
     containerName,
     ['sh', '-c', 'command -v socat >/dev/null 2>&1'],

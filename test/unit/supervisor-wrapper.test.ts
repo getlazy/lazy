@@ -23,6 +23,7 @@ import { join } from 'path';
 import { spawn } from '../../src/utils/spawn';
 import { buildSupervisorWrapperScript } from '../../src/capture/claude';
 import { AGENT_RESTART_MARKER, SUPERVISOR_PID_FILE } from '../../src/runner/agent-stop';
+import { UPGRADED_AGENT_PATH } from '../../src/runner/agent-swap';
 import { STOP_TASK_AGENT_SCRIPT } from '../../src/runner/stop-task-agent';
 
 describe('supervisor wrapper (between-turn behavior)', () => {
@@ -237,7 +238,8 @@ describe('supervisor wrapper (daemon-requested agent restart)', () => {
     await chmod(join(bin, 'lazy-agent'), 0o755);
     const script = buildSupervisorWrapperScript(join(root, 'proto'), root)
       .replaceAll(AGENT_RESTART_MARKER, join(root, 'restart-marker'))
-      .replaceAll(SUPERVISOR_PID_FILE, join(root, 'supervisor.pid'));
+      .replaceAll(SUPERVISOR_PID_FILE, join(root, 'supervisor.pid'))
+      .replaceAll(UPGRADED_AGENT_PATH, join(root, 'upgraded-agent'));
     const proc = spawn(['sh', '-c', script], {
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdout: 'pipe', stderr: 'pipe', timeout: 30_000,
     });
@@ -264,6 +266,24 @@ describe('supervisor wrapper (daemon-requested agent restart)', () => {
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 
+
+  // INVARIANT: once `lazy upgrade` copied a new agent binary into a kept
+  // container, every supervisor the wrapper starts — the one after the daemon's
+  // restart stop included — runs that copy, never the mounted old binary.
+  test('after the restart marker the wrapper runs the upgraded agent binary', async () => {
+    await writeFile(join(root, 'upgraded-agent'), [
+      '#!/bin/sh',
+      'if [ "$1" = supervisor-exit ]; then exit 0; fi',
+      `echo new >> "${root}/new-runs"`,
+      'kill -TERM "$PPID"; exit 0',
+    ].join('\n'));
+    await chmod(join(root, 'upgraded-agent'), 0o755);
+    const result = await run(`echo $$ > "${root}/restart-marker"; exit 143`);
+    expect(result.code).toBe(0);
+    // The copy exists before the first supervisor here, so the mounted binary never runs.
+    expect(result.invocations).toBe(0);
+    expect((await readFile(join(root, 'new-runs'), 'utf-8')).trim()).toBe('new');
+  });
   test('the wrapper records the running supervisor\'s pid for the agent stop', async () => {
     const result = await run(`cat "${root}/supervisor.pid" > "${root}/seen-pid"; echo $$ > "${root}/own-pid"; stop`);
     expect(result.code).toBe(0);

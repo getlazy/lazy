@@ -73,6 +73,14 @@ Everything after that is follow-through: reparenting the task's children, fast-f
 
 If the process dies mid-accept, the task is left in `merging`. The daemon does not roll it back. It checks whether the work already landed and, if not, repeats the accept from the reason and approvals you gave. After three failed automatic attempts it stops, files a system message, and hands the task back to you: re-run `lazy accept`, or reject or close it.
 
+## Closing or rejecting
+
+When you close or reject a task with an unfinished merge started by lazy sync,
+lazy aborts that merge and keeps the branch at its last commit. The result
+reports how many conflicts were abandoned and which commit was kept. Ordinary
+uncommitted edits still prevent closing or rejecting unless you explicitly
+allow a dirty worktree.
+
 ## In each surface
 
 - Daemon dashboard: the Accept button on a task's Current review tab, which shows the refusals above it. See [the web review surface](../web-review.md).

@@ -1014,6 +1014,26 @@ export class DockerRunner implements Runner {
     return out.trim() !== '1';
   }
 
+  async runsOutdatedImage(runName: string, expectedImage: string): Promise<boolean> {
+    // The image the container was created from (by ID) against the image the
+    // task's next launch resolves to NOW — a new major.minor tag, a changed
+    // Dockerfile's new repository, or the same tag moved by a rebuild. A
+    // `lazy upgrade` keeps running containers, so they differ until the
+    // environment is restarted.
+    const inspect = async (args: string[]): Promise<string | null> => {
+      const proc = spawn([this.binary, ...args], { stdout: 'pipe', stderr: 'pipe', timeout: DOCKER_TIMEOUT_MS });
+      const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      return code === 0 ? out.trim() : null;
+    };
+    const imageId = await inspect(['inspect', '--format', '{{.Image}}', runName]);
+    // Not inspectable (gone, engine hiccup): nothing to say about it.
+    if (!imageId) return false;
+    const current = await inspect(['image', 'inspect', expectedImage, '--format', '{{.Id}}']);
+    // Not built yet: there is no newer image to restart onto.
+    if (!current) return false;
+    return current !== imageId;
+  }
+
   async discoverRunningRuns(): Promise<string[]> {
     try {
       // Query container names and their project labels in one call.

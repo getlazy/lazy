@@ -45,6 +45,8 @@ function storageOf(t: Task, withSession = false): Storage {
       if (prop === 'resolveTask') return async () => ({ task: t });
       if (prop === 'getSessionByTaskId') return async () => session;
       if (prop === 'listTaskCodes') return async () => [{ id: t.id, code: t.code }];
+      // Storage.getToolStats answers null for a task with no proxy traffic.
+      if (prop === 'getToolStats') return async () => null;
       return async () => [];
     },
   }) as unknown as Storage;

@@ -56,7 +56,10 @@ describe('lazy web submit and submitted filter', () => {
     const landing = await (await fetch(`${base}/tasks/${id}`)).text();
     expect(landing).toContain('data-lz-action-open="submit"');
     expect(landing).toContain('Local driver has no remote');
-    expect(landing).not.toMatch(/disabled[^>]*Submit|Submit[^>]*disabled/);
+    // Markup only: inline scripts mention both words (a comment about a Close
+    // button, a `retrySubmit` variable) without disabling anything.
+    const markup = landing.replace(/<script\b[\s\S]*?<\/script>/g, "");
+    expect(markup).not.toMatch(/disabled[^>]*Submit|Submit[^>]*disabled/);
 
     const review = await (await fetch(`${base}/tasks/${id}/review`)).text();
     expect(review).toContain('data-lz-action-open="submit"');

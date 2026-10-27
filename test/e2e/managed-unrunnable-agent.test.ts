@@ -46,6 +46,9 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
+import { withPresentedToken } from '../helpers/fixtures';
+import { DaemonClient } from '../../src/daemon/client';
+import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 
 /** The built-in `pi` profile's upstream — see HARNESS_DEFAULT_ENDPOINT. */
 const BUILTIN_PI_UPSTREAM = 'http://localhost:11434';
@@ -70,6 +73,10 @@ async function ollamaIsRunning(): Promise<boolean> {
 describe('creating a task on an agent a managed installation cannot run', () => {
   let ctx: TestContext;
   let managedStore: string;
+  // On a managed host a human action is refused on the control-plane token,
+  // which names no person: the creates here are a member's, on their own token.
+  let memberToken: string;
+  const asMember = (args: string[]) => withPresentedToken(ctx, memberToken, () => ctx.lazy(args));
 
   // Whether THIS test's premise holds, re-asked per test rather than kept as
   // suite state. The first version of this file set a `skipped` flag in
@@ -85,6 +92,13 @@ describe('creating a task on an agent a managed installation cannot run', () => 
       withDaemon: true,
       daemonEnv: { LAZY_MANAGED: '1', LAZY_MANAGED_STORAGE_PATH: managedStore },
     });
+    const target = getDaemonTcpTarget(ctx.root);
+    const shared = readToken(ctx.root);
+    if (!target || !shared) throw new Error('test daemon did not record a TCP target and token');
+    const minted = (await DaemonClient.fromTarget(target, shared).rpc('mintActorToken', ctx.root, {
+      kind: 'user', email: 'member@example.com', name: 'Member',
+    })) as { token: string };
+    memberToken = minted.token;
   });
 
   // UNCONDITIONAL. Every path above creates the context, so every path must
@@ -118,7 +132,7 @@ describe('creating a task on an agent a managed installation cannot run', () => 
     const before = await ctx.lazy(['list', '--all']);
     expectSuccess(before);
 
-    const result = await ctx.lazy(['create', '--agent', 'pi', '--goal', 'Run something on pi']);
+    const result = await asMember(['create', '--agent', 'pi', '--goal', 'Run something on pi']);
 
     expect(result.exitCode).not.toBe(0);
     const said = `${result.stdout}${result.stderr}`;
@@ -146,7 +160,7 @@ describe('creating a task on an agent a managed installation cannot run', () => 
   // down alongside the refusal above would have turned off the only guard
   // against the worse bug on exactly the machines most likely to hit it.
   test('still creates a task on an agent the installation does run', async () => {
-    const result = await ctx.lazy(['create', '--agent', 'claude-code', '--goal', 'Ordinary work']);
+    const result = await asMember(['create', '--agent', 'claude-code', '--goal', 'Ordinary work']);
 
     expectSuccess(result);
     const after = await ctx.lazy(['list', '--all']);

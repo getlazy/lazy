@@ -35,6 +35,34 @@ fake() {
 #!/usr/bin/env bash
 name="$1"
 { printf '%s' "\${name}"; for a in "\$@"; do printf ' %s' "\$a"; done; echo; } >> "${LOG}"
+case "\${name} \$*" in
+  ssh*"cat /srv/lazy-teams/secrets/deploy.env"*) cat "\${FAKE_DEPLOY_ENV}"; exit 0 ;;
+  ssh*"docker inspect"*"lazy_teams-ngrok"*) [ -n "\${FAKE_BOX_NGROK_ENV:-}" ] && cat "\${FAKE_BOX_NGROK_ENV}"; exit 0 ;;
+  ssh*"cat /srv/lazy-teams/ngrok/ngrok.yml") [ -n "\${FAKE_BOX_NGROK_YML:-}" ] && cat "\${FAKE_BOX_NGROK_YML}"; exit 0 ;;
+  ssh*"cat /srv/lazy-teams/secrets/cli-jwt.pem"*) printf '%s\n' "-----BEGIN PRIVATE KEY-----" "private-key-body-0123456789abcdef" "-----END PRIVATE KEY-----"; exit 0 ;;
+esac
+if [ "\${name}" = kamal ]; then
+  echo "\${LAZY_TEAMS_BOX_USER:-unset}" >> "${LOG}.users"
+  for v in AR_ENCRYPTION_PRIMARY_KEY AR_ENCRYPTION_DETERMINISTIC_KEY TRUSTED_PROXY_SECRET UNRELATED_BOX_KEY; do
+    printf '%s=%s\n' "\${v}" "\${!v-<unset>}" >> "${LOG}.kamal-env"
+  done
+fi
+# Check while the deploy process is still running, before its EXIT cleanup.
+if [ -n "\${FAKE_DEPLOY_TMP:-}" ]; then
+  echo checked >> "${LOG}.memory-checks"
+  for secret in "\${SECRET_KEY_BASE:-}" "\${TRUSTED_PROXY_SECRET:-}" "\${CLI_JWT_PRIVATE_KEY:-}"; do
+    [ -n "\${secret}" ] || continue
+    if grep -rlF -- "\${secret}" "\${FAKE_DEPLOY_TMP}" >/dev/null; then
+      echo "secret persisted locally" >> "${LOG}.persisted"
+    fi
+  done
+fi
+# This file represents the remote ngrok destination, outside deploy scratch.
+case "\${name} \$*" in
+  ssh*"cat > /srv/lazy-teams/ngrok/ngrok.yml.part"*)
+    case "\$*" in *"\${FAKE_FAIL_ON:-@@never@@}"*) echo "fake upload failure"; exit 7 ;; esac
+    cat > "${WORK}/shipped-ngrok.yml"; exit 0 ;;
+esac
 # A box whose fleet is a copy of FAKE_BOX_FLEET answers the fingerprint script.
 if [ "\${name}" = ssh ] && [ -n "\${FAKE_BOX_FLEET:-}" ]; then
   case "\$*" in *"bash -s"*) cd "\${FAKE_BOX_FLEET}" && exec bash -s ;; esac
@@ -49,6 +77,7 @@ var="FAKE_\$(echo "\${name}" | tr 'a-z-' 'A-Z_')_OUT"
 if [ "\${name}" = rsync ]; then
   for a in "\$@"; do case "\$a" in --chmod*) echo "rsync: \$a: invalid argument"; exit 1 ;; esac; done
   for a in "\$@"; do case "\$a" in /*/ngrok.yml) cp "\$a" "${WORK}/shipped-ngrok.yml" ;; esac; done
+  for a in "\$@"; do case "\$a" in /*/ship/deploy.env) cp "\$a" "${WORK}/shipped-deploy.env" ;; esac; done
   for a in "\$@"; do case "\$a" in /*/ship/*) echo "\$(basename "\$a") \$(stat -c %a "\$a" 2>/dev/null || stat -f %Lp "\$a")" >> "${LOG}.modes" ;; esac; done
 fi
 case "\${name} \$*" in
@@ -123,6 +152,12 @@ if (cd "${HERE}/.." && command -v bundle >/dev/null && bundle exec kamal version
     LAZY_TEAMS_SERVICES_HOST=r.getlazy.dev LAZY_TEAMS_BUILD_TAG=abc bin/kamal config -d hetzner 2>&1)"
   printf '%s\n' "${kamal_out}" | grep -q '^:accessories:' && printf '%s\n' "${kamal_out}" | grep -q '^  ngrok:' &&
     ok "kamal config -d hetzner loads, ngrok an accessory" || bad "kamal config -d hetzner: $(printf '%s\n' "${kamal_out}" | tail -3)"
+  # INVARIANT: Kamal and direct SSH use the same requested account; an update
+  # must not switch to root after preflight succeeded as another user.
+  ssh_user="$(cd "${HERE}/.." && LAZY_TEAMS_BOX_HOST=192.0.2.1 LAZY_TEAMS_BOX_USER=deployer \
+    LAZY_TEAMS_APP_HOST=teams.example.com LAZY_TEAMS_SERVICES_HOST=example.com LAZY_TEAMS_BUILD_TAG=abc \
+    bundle exec ruby -rkamal -e 'config = Kamal::Configuration.create_from(config_file: Pathname.new("config/deploy.yml"), destination: "hetzner"); puts config.ssh.user')"
+  [ "${ssh_user}" = deployer ] && ok "real Kamal configuration uses the requested SSH user" || bad "Kamal SSH user: ${ssh_user}"
   # INVARIANT: smolvm's registry and machine disks are host binds. In the
   # container they go with it on every deploy, and with them every worktree.
   printf '%s\n' "${kamal_out}" | grep -q '/srv/lazy-teams/home/local:/home/rails/.local' &&
@@ -171,6 +206,24 @@ echo "adopted stores go into the fleet layout"
 FAKE_ADOPTED='[{"id":4,"fleet_project_id":"p4","store_path":"/Users/me/adopted"}]' run --only copy
 grep -q "^rsync -a --delete /Users/me/adopted/ root@box.test:/srv/lazy-teams/fleet/projects/p4/store/" "${LOG}" && ok "adopted store copied to projects/<id>/store" || bad "adopted: $(grep ^rsync "${LOG}")"
 
+echo "the box's deploy.env carries what deploy needs"
+mkdir -p "${WORK}/ngrok-home/.config/ngrok"
+printf 'version: 2\nauthtoken: ngk-0123456789abcdef\n' > "${WORK}/ngrok-home/.config/ngrok/ngrok.yml"
+{ grep -v '^TEAMS_JWKS_URL=' "${ENV_FILE}"; echo "NGROK_AUTHTOKEN="; } > "${WORK}/mac/deploy-nokeys.env"
+: > "${LOG}"; rm -f "${WORK}/shipped-deploy.env" "${LOG}.modes"
+PATH="${WORK}/bin:${PATH}" HOME="${WORK}/ngrok-home" NGROK_AUTHTOKEN= \
+  LAZY_MOVE_CARRY_DIR="${WORK}/carry" LAZY_MOVE_KAMAL="${WORK}/bin/kamal" LAZY_MOVE_NATIVE_RAILS="${WORK}/bin/native-rails" \
+  "${SCRIPT}" root@box.test --env-file "${WORK}/mac/deploy-nokeys.env" --jwks-url https://keys.example.com/jwks.json \
+  --report "${WORK}/report.md" --only copy > "${WORK}/out" 2>&1; rc=$?
+[ "${rc}" -eq 0 ] && grep -qxF "NGROK_AUTHTOKEN='ngk-0123456789abcdef'" "${WORK}/shipped-deploy.env" &&
+  grep -qxF "TEAMS_JWKS_URL='https://keys.example.com/jwks.json'" "${WORK}/shipped-deploy.env" &&
+  [ "$(grep -c '^TEAMS_ALLOWED_EMAILS=' "${WORK}/shipped-deploy.env")" = 1 ] &&
+  grep -qx "deploy.env 600" "${LOG}.modes" &&
+  ok "a token from the ngrok config and a flag-given JWKS URL ship in deploy.env, mode 600" || bad "shipped env: rc=${rc} $(tail -5 "${WORK}/out")"
+grep -q "added NGROK_AUTHTOKEN" "${WORK}/out" && ok "the added key is named" || bad "not named"
+secrets_absent "staged deploy.env"
+grep -q "NGROK_AUTHTOKEN=." "${WORK}/mac/deploy-nokeys.env" && bad "the Mac env file was modified" || ok "the Mac env file is untouched"
+
 echo "final copy asks before stopping anything"
 echo "no" | run --only copy --final; rc=$?
 [ "${rc}" -ne 0 ] && ! grep -q "export_clones\|^rsync" "${LOG}" && ok "unconfirmed: nothing exported or copied" || bad "final unconfirmed"
@@ -214,7 +267,10 @@ FAKE_CURL_CODE="200 " run --only verify; rc=$?
 echo "ngrok config is rendered with the secret, but never shown"
 FAKE_FAIL_ON="grep -qx lazy_teams-ngrok" run --only ngrok; rc=$?
 [ "${rc}" -eq 0 ] && ok "ngrok step passes" || bad "ngrok rc=${rc}: $(tail -5 "${WORK}/out")"
-grep -q "^rsync -a .*/ship/ngrok.yml root@box.test:/srv/lazy-teams/ngrok/ngrok.yml" "${LOG}" && grep -qx "ngrok.yml 600" "${LOG}.modes" && ok "ngrok.yml shipped mode 600" || bad "ngrok rsync"
+grep -q "cat > /srv/lazy-teams/ngrok/ngrok.yml.part" "${LOG}" &&
+  grep -q "chmod 600 /srv/lazy-teams/ngrok/ngrok.yml.part" "${LOG}" &&
+  grep -q "mv /srv/lazy-teams/ngrok/ngrok.yml.part /srv/lazy-teams/ngrok/ngrok.yml" "${LOG}" &&
+  ok "ngrok.yml streamed to a mode 600 file and atomically installed on the box" || bad "ngrok stream"
 # INVARIANT: one wildcard endpoint serves Teams and every service, and every
 # rule is scoped by host — Teams' rules to Teams' name, the services' (every
 # path signs in) to every other name. An unscoped rule would apply Teams'
@@ -251,6 +307,7 @@ echo "build"
 # it 600 as root, and smolvm (as rails) loads it into every new machine; a
 # root-only tar fails every project's first start and stalls the fleet roll.
 run --only build; rc=$?
+# shellcheck disable=SC2016 # literal remote-shell variables
 grep -q 'chmod 644 "$tar" "$tar.source-id"' "${LOG}" && ok "the daemon image tar is made readable, built now or before" || bad "build: rc=${rc} $(grep -c chmod "${LOG}") $(tail -3 "${WORK}/out")"
 
 echo "masking"
@@ -258,20 +315,151 @@ FAKE_KAMAL_OUT="echo leak ${SKB}" run --only deploy
 grep -q '\*\*\*' "${WORK}/report.md" && ok "a secret in remote output is masked" || bad "mask"
 secrets_absent "deploy"
 
-echo "teams:deploy (package.json)"
-# INVARIANT: `bun run teams:deploy <box>` ships a new version to a box that
-# already IS the install: it never copies from the Mac (that would overwrite
-# the box's live databases and stores with the Mac's stale ones) and never
-# settles (which holds every project stopped). Run here exactly as package.json
-# spells it.
-deploy_steps="$(sed -n 's/.*"teams:deploy": *"lazy-teams\/bin\/move-install --only \([a-z,]*\)".*/\1/p' "${HERE}/../../package.json")"
-[ -n "${deploy_steps}" ] && ok "package.json has teams:deploy (${deploy_steps})" || bad "no teams:deploy script in package.json"
-run --only "${deploy_steps}"; rc=$?
-[ "${rc}" -eq 0 ] && ok "teams:deploy runs through" || bad "teams:deploy: rc=${rc} $(tail -3 "${WORK}/out")"
-grep -q "^kamal deploy --skip-push" "${LOG}" && ok "teams:deploy deploys" || bad "teams:deploy did not deploy"
-grep -qE "^sqlite3 .*\.backup|^rsync .*/fleet/|hold_projects|import_clones" "${LOG}" &&
-  bad "teams:deploy copied or settled: $(grep -E 'backup|/fleet/|hold_projects|import_clones' "${LOG}" | head -2)" ||
-  ok "teams:deploy copies nothing from the Mac and holds no project"
+echo "deploy updates only the existing box"
+# INVARIANT: updates never load migration operations or depend on the retired
+# workstation install. Only the one-time move may copy or settle data.
+deploy_run() {
+  : > "${LOG}"; : > "${LOG}.stdin"; : > "${LOG}.persisted"; : > "${LOG}.memory-checks"; : > "${LOG}.users"
+  mkdir -p "${WORK}/deploy-tmp"
+  TMPDIR="${WORK}/deploy-tmp" FAKE_DEPLOY_TMP="${WORK}/deploy-tmp" \
+  PATH="${WORK}/bin:${PATH}" HOME="${WORK}/empty-home" FAKE_DEPLOY_ENV="${WORK}/box.env" \
+    LAZY_MOVE_KAMAL="${WORK}/bin/kamal" \
+    "${HERE}/../bin/deploy" "${DEPLOY_TEST_TARGET:-root@box.test}" --report "${WORK}/report.md" "$@" > "${WORK}/out" 2>&1
+}
+cp "${ENV_FILE}" "${WORK}/box.env"
+echo NGROK_AUTHTOKEN=ngk-0123456789abcdef >> "${WORK}/box.env"
+mkdir -p "${WORK}/empty-home"
+mv "${WORK}/mac" "${WORK}/retired-mac"
+deploy_run; rc=$?
+[ "${rc}" -eq 0 ] && ok "deploy works with no Mac env file" || bad "deploy rc=${rc}: $(tail -8 "${WORK}/out")"
+steps="$(sed -n 's/^| \([a-z]*\) | PASS |.*/\1/p' "${WORK}/report.md" | tr '\n' ' ')"
+[ "${steps}" = "preflight build deploy ngrok " ] && ok "exactly four update steps" || bad "steps: ${steps}"
+grep -q '^kamal deploy --skip-push' "${LOG}" && ok "update deploys" || bad "no deploy"
+grep -qE '^sqlite3|--delete|lazy:move:|native-rails|kamal app stop' "${LOG}" && bad "update ran migration operations" || ok "no migration operations"
+grep -q 'cat /srv/lazy-teams/secrets/deploy.env' "${LOG}" && grep -q 'cat /srv/lazy-teams/secrets/cli-jwt.pem' "${LOG}" &&
+  ok "settings and signing key read from the box" || bad "box secrets not read"
+secrets_absent "box deploy"
+# INVARIANT: fetched secrets stay in memory; scanning before EXIT must find
+# none in deployment scratch, including rendered policies and upload staging.
+[ -s "${LOG}.memory-checks" ] && [ ! -s "${LOG}.persisted" ] &&
+  ok "no local secret files while deployment is running" || bad "secrets persisted locally"
+FAKE_FAIL_ON="cat > /srv/lazy-teams/ngrok/ngrok.yml.part" deploy_run; rc=$?
+[ "${rc}" -ne 0 ] && [ ! -s "${LOG}.persisted" ] &&
+  ! grep -q "^kamal accessory" "${LOG}" &&
+  ok "failed streaming upload leaves no local secret and does not restart ngrok" || bad "failed upload"
+FAKE_KAMAL_OUT="leak ${SKB} private-key-body-0123456789abcdef" deploy_run
+secrets_absent "leaky command"
+grep -q 'private-key-body-0123456789abcdef' "${WORK}/out" "${WORK}/report.md" && bad "signing key leaked" || ok "signing key masked"
+FAKE_FAIL_ON='test -d /srv/lazy-teams/storage' deploy_run; rc=$?
+[ "${rc}" -ne 0 ] && ! grep -q '^kamal deploy\|docker build' "${LOG}" && ok "missing install refuses before building" || bad "missing install"
+FAKE_FAIL_ON='test -d /srv/lazy-teams/storage' deploy_run --dry-run; rc=$?
+[ "${rc}" -ne 0 ] && grep -q "move-install for the first move" "${WORK}/out" && ok "dry-run refuses a missing install with the move command" || bad "dry-run missing install"
+deploy_run --dry-run; rc=$?
+[ "${rc}" -eq 0 ] && ! grep -q "^kamal deploy" "${LOG}" && ok "dry-run never deploys" || bad "dry-run updated the box"
+cp "${WORK}/box.env" "${WORK}/box.env.full"
+grep -v AR_ENCRYPTION_PRIMARY_KEY "${WORK}/box.env.full" > "${WORK}/box.env"
+AR_ENCRYPTION_PRIMARY_KEY=stale-workstation-value deploy_run; rc=$?
+[ "${rc}" -ne 0 ] && grep -q "have no AR_ENCRYPTION_PRIMARY_KEY" "${WORK}/out" && ok "missing box secret cannot inherit a workstation value" || bad "inherited secret"
+cp "${WORK}/box.env.full" "${WORK}/box.env"
+deploy_run --only copy >/dev/null; rc=$?
+[ "${rc}" -eq 2 ] && ok "migration step selection unavailable" || bad "deploy accepted --only"
+deploy_run --env-file "${WORK}/box.env"; rc=$?
+[ "${rc}" -eq 0 ] && ! grep -q 'cat /srv/lazy-teams/secrets/deploy.env' "${LOG}" && ok "explicit env override" || bad "env override"
+# INVARIANT: the box's deploy.env is DATA, never shell. It comes from the server and
+# deploy runs on the engineer's workstation, so a command substitution in a value must
+# not run there, and only the named deployment keys are exported to Kamal. A taken
+# value whose shell meaning differs from its literal text is refused, not reinterpreted.
+MARK="${WORK}/env-executed"; rm -f "${MARK}" "${MARK}-bt"
+{
+  grep -vE '^(AR_ENCRYPTION_PRIMARY_KEY|AR_ENCRYPTION_DETERMINISTIC_KEY|TRUSTED_PROXY_SECRET)=' "${WORK}/box.env.full"
+  echo "# a comment"
+  echo ""
+  echo "export AR_ENCRYPTION_PRIMARY_KEY='sq \$(touch ${MARK}) value'"
+  echo "AR_ENCRYPTION_DETERMINISTIC_KEY=\"dq-plain-value\""
+  echo "TRUSTED_PROXY_SECRET=plain=with=equals"
+  echo "UNRELATED_BOX_KEY=\$(touch ${MARK})"
+} > "${WORK}/box.env"
+: > "${LOG}.kamal-env"
+deploy_run; rc=$?
+[ "${rc}" -eq 0 ] && [ ! -e "${MARK}" ] &&
+  ok "deploy.env values are never executed" || bad "deploy.env executed: rc=${rc} $(ls "${WORK}" | grep env-executed) $(tail -3 "${WORK}/out")"
+grep -qxF "AR_ENCRYPTION_PRIMARY_KEY=sq \$(touch ${MARK}) value" "${LOG}.kamal-env" &&
+  grep -qxF "AR_ENCRYPTION_DETERMINISTIC_KEY=dq-plain-value" "${LOG}.kamal-env" &&
+  grep -qxF "TRUSTED_PROXY_SECRET=plain=with=equals" "${LOG}.kamal-env" &&
+  ok "quoted, export-prefixed and = values reach kamal exactly" || bad "values: $(sort -u "${LOG}.kamal-env")"
+grep -q "^UNRELATED_BOX_KEY=" "${LOG}.kamal-env" && ! grep -qvxF "UNRELATED_BOX_KEY=<unset>" <(grep "^UNRELATED_BOX_KEY=" "${LOG}.kamal-env") &&
+  ok "unrelated deploy.env keys are not exported to kamal" || bad "unrelated key: $(grep UNRELATED "${LOG}.kamal-env" | sort -u)"
+refused_case() {
+  local label="$1" line="$2"
+  rm -f "${MARK}-bt"
+  { grep -v '^AR_ENCRYPTION_DETERMINISTIC_KEY=' "${WORK}/box.env.full"; printf '%s\n' "${line}"; } > "${WORK}/box.env"
+  deploy_run; rc=$?
+  [ "${rc}" -ne 0 ] && [ ! -e "${MARK}-bt" ] && grep -q "AR_ENCRYPTION_DETERMINISTIC_KEY has a value" "${WORK}/out" &&
+    grep -q "single quotes" "${WORK}/out" && ! grep -q '^kamal deploy\|docker build' "${LOG}" &&
+    ! grep -qF "ard-0123456789abcdef" "${WORK}/out" &&
+    ok "${label}: refused and not executed" || bad "${label}: rc=${rc} $(tail -3 "${WORK}/out")"
+}
+refused_case "double-quoted backtick" "AR_ENCRYPTION_DETERMINISTIC_KEY=\"dq \`touch ${MARK}-bt\` value\""
+refused_case "inline comment" "AR_ENCRYPTION_DETERMINISTIC_KEY=ard-0123456789abcdef  # note"
+refused_case "trailing whitespace" "AR_ENCRYPTION_DETERMINISTIC_KEY=ard-0123456789abcdef "
+refused_case "unquoted & or ;" "AR_ENCRYPTION_DETERMINISTIC_KEY=ard-0123&456;789"
+# A server moved before deploy.env carried every key: refuse once, naming each.
+grep -vE '^(NGROK_AUTHTOKEN|TEAMS_ALLOWED_EMAILS)=' "${WORK}/box.env.full" > "${WORK}/box.env"
+deploy_run; rc=$?
+[ "${rc}" -ne 0 ] && grep -q "have no NGROK_AUTHTOKEN TEAMS_ALLOWED_EMAILS" "${WORK}/out" &&
+  grep -q "/srv/lazy-teams/secrets/deploy.env on the server" "${WORK}/out" &&
+  ! grep -q '^kamal deploy\|docker build' "${LOG}" &&
+  ok "a box deploy.env without NGROK_AUTHTOKEN refuses at preflight, naming every missing key" || bad "missing keys: rc=${rc} $(tail -3 "${WORK}/out")"
+# INVARIANT: a box moved by the OLD move-install (deploy.env = the Mac's copy,
+# without the token, allowlist or key endpoint) deploys with no hand edit: the
+# values are read, in memory, from where that move put them — the ngrok
+# accessory's env and the rendered ngrok config — and never shown.
+grep -vE '^(NGROK_AUTHTOKEN|TEAMS_ALLOWED_EMAILS|TEAMS_JWKS_URL)=' "${WORK}/box.env.full" > "${WORK}/box.env"
+printf '%s\n' PATH=/bin NGROK_AUTHTOKEN=ngk-0123456789abcdef > "${WORK}/box-ngrok.env"
+cat > "${WORK}/box-ngrok.yml" <<'YML'
+version: 3
+endpoints:
+  - name: lazy-teams
+    url: https://*.getlazy.dev
+    traffic_policy:
+      on_http_request:
+        - expressions: ["req.host == \"teams.r.getlazy.dev\""]
+          actions:
+            - type: jwt-validation
+              config:
+                jws:
+                  keys:
+                    sources:
+                      additional_jkus: ["https://keys.example.com/.well-known/lazy-cli-jwks.json"]
+        - expressions: ["(req.host == \"teams.r.getlazy.dev\") && (!(actions.ngrok.oauth.identity.email in ['me@example.com', 'you@example.com']))"]
+          actions: [{ type: deny, config: { status_code: 403 } }]
+        - actions:
+            - type: add-headers
+              config: { headers: { X-Lazy-Proxy-Secret: "tps-0123456789abcdef" } }
+YML
+FAKE_BOX_NGROK_ENV="${WORK}/box-ngrok.env" FAKE_BOX_NGROK_YML="${WORK}/box-ngrok.yml" deploy_run; rc=$?
+[ "${rc}" -eq 0 ] && grep -q '^kamal deploy --skip-push' "${LOG}" &&
+  grep -q "no NGROK_AUTHTOKEN; using the one the box's ngrok accessory runs with" "${WORK}/out" &&
+  grep -q "no TEAMS_ALLOWED_EMAILS; using the allowlist" "${WORK}/out" &&
+  grep -q "no TEAMS_JWKS_URL; using the key endpoint" "${WORK}/out" &&
+  grep -q "EMAILS=me@example.com,you@example.com JWKS_URL=https://keys.example.com/.well-known/lazy-cli-jwks.json bin/rails teams:proxy_policy" "${LOG}" &&
+  ok "an old-move box deploys with the token, allowlist and key endpoint read from the box" || bad "old-move box: rc=${rc} $(tail -5 "${WORK}/out")"
+secrets_absent "old-move box"
+[ ! -s "${LOG}.persisted" ] && ok "old-move box: no local secret files" || bad "old-move box persisted secrets"
+cp "${WORK}/box.env.full" "${WORK}/box.env"
+DEPLOY_TEST_TARGET=deployer@box.test deploy_run; rc=$?
+[ "${rc}" -eq 0 ] && grep -q "^ssh -o BatchMode=yes deployer@box.test" "${LOG}" &&
+  grep -qx deployer "${LOG}.users" && ! grep -qvx deployer "${LOG}.users" &&
+  ok "non-root target is used by direct SSH and every Kamal invocation" || bad "non-root target"
+grep -q '"teams:deploy": "lazy-teams/bin/deploy"' "${HERE}/../../package.json" && ok "package runs deploy" || bad "package command"
+mv "${WORK}/retired-mac" "${WORK}/mac"
+# INVARIANT: bin/deploy never evals (deploy.env is data, see above), and
+# deploy's scripts run on macOS's bash 3.2, whose `.` loads nothing from a
+# pipe and whose here-strings write a temp file (secrets on disk). No bash 3.2
+# here to run them, so this is a static guard.
+grep -nE '(^|[^<])(\.|source) <\(|<<<' "${HERE}/../bin/deploy" "${HERE}/install-common.sh" >/dev/null &&
+  bad "bash 3.2: deploy scripts use . <(, source <( or <<<" || ok "bash 3.2: no sourcing a pipe or here-strings"
+grep -nwE "eval" "${HERE}/../bin/deploy" >/dev/null && bad "bin/deploy uses eval" || ok "bin/deploy never evals"
 
 echo "reset"
 echo "nope" | run --reset; rc=$?

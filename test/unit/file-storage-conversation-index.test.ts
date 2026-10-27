@@ -86,6 +86,27 @@ describe('FileStorage conversation listing index', () => {
     return JSON.parse(readFileSync(indexPath(), 'utf-8'));
   }
 
+  // INVARIANT: purge and live capture saves serialize, so a queued capture
+  // cannot resurrect a deleted conversation; the exclusion survives reopening.
+  test('purge excludes queued capture saves and persists across storage instances', async () => {
+    const conv = makeConversation({});
+    await storage.saveConversation(conv);
+    const purge = storage.deleteConversation(conv.sessionId, { preventCapture: true });
+    const capture = storage.saveConversation(conv, { skipPurged: true });
+    expect(await purge).toBe(true);
+    await capture;
+    expect(await storage.loadConversation(conv.sessionId)).toBeNull();
+    await storage.close();
+    storage = new FileStorage(root, { basePath: base });
+    await storage.initialize();
+    expect(await storage.isConversationPurged(conv.sessionId)).toBe(true);
+    await storage.saveConversation(conv, { skipPurged: true });
+    expect(await storage.loadConversation(conv.sessionId)).toBeNull();
+    // Explicit recovery remains available, as the purge command documents.
+    await storage.saveConversation(conv);
+    expect(await storage.loadConversation(conv.sessionId)).not.toBeNull();
+  });
+
   test('an empty store lists nothing and does not create an index file', async () => {
     expect(await storage.listConversationSummaries()).toEqual([]);
     expect(existsSync(indexPath())).toBe(false);

@@ -1,8 +1,11 @@
+import { queryTaskShow } from '../../daemon/rpc-fallback';
 import { requireActorIdentity } from '../identity-preflight';
 import { existsSync } from 'fs';
 import { displayId, displayIdFor, getWorktreePath } from '../../task/identity';
 import { requireLazyRoot, requireStorage, parseFlags, resolveTaskOrExit } from '../helpers';
 import { openEditor, removeRecoveryFile, requireTTY, readStdinIfPiped } from '../editor';
+import { isTTY, promptYesNo } from '../editor';
+import { inspectWorktreeMerge, unprovenMergeRefusalMessage } from '../../task/unfinished-sync';
 import { hasUncommittedChanges } from '../../git/operations';
 import { isTerminalStatus } from '../../types';
 import { queryCloseTask } from '../../daemon/rpc-fallback';
@@ -61,7 +64,7 @@ export async function commandClose(args: string[]): Promise<void> {
 
   const skipEditor = parsed.flags.get('yes') === true;
   const argReason = parsed.flags.get('reason') as string | undefined;
-  const acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
+  let acceptDirtyWorktree = parsed.flags.get('accept-dirty-worktree') === true;
   const endMemberSessions = parsed.flags.get('end-sessions') === true;
 
   // INVARIANT: Pre-flight checks before editor — the user should never type
@@ -88,7 +91,19 @@ export async function commandClose(args: string[]): Promise<void> {
       }
 
       const worktreePath = getWorktreePath(root, task);
-      if (!acceptDirtyWorktree && existsSync(worktreePath) && await hasUncommittedChanges(worktreePath)) {
+      const dirty = !acceptDirtyWorktree && existsSync(worktreePath) && await hasUncommittedChanges(worktreePath);
+      const shown = dirty ? await queryTaskShow(task.id) : null;
+      const abandonableSync = shown && !shown.ambiguous && shown.data.abandonableSyncMerge;
+      const merge = dirty && !abandonableSync ? await inspectWorktreeMerge(worktreePath) : null;
+      if (merge) {
+        // A merge lazy cannot prove is its own sync: show it, and abort it
+        // only on this person's explicit yes (default no). Never git by hand.
+        console.error(unprovenMergeRefusalMessage(displayId(task), 'close', merge, { prompting: !skipEditor && isTTY(), working: task.status === 'working' }));
+        if (skipEditor || !isTTY() || !await promptYesNo('Abort the merge, discard anything else uncommitted (every commit is kept) and close the task?', false)) {
+          process.exit(1);
+        }
+        acceptDirtyWorktree = true;
+      } else if (dirty && !abandonableSync) {
         console.error('Error: Task has uncommitted changes!');
         console.error('Commit or stash your changes before closing.');
         console.error('Options:');
@@ -186,7 +201,8 @@ Options:
                           If not provided, $EDITOR will be opened to enter the reason
   --yes, -y               Skip editor prompt (non-interactive mode)
                           Requires --reason or piped stdin
-  --accept-dirty-worktree Allow closing even if worktree has uncommitted changes
+  --accept-dirty-worktree Allow closing even if worktree has uncommitted changes;
+                          also aborts a merge left in progress (every commit is kept)
   --end-sessions          End any member's open sessions in the task's environment
                           first (Lazy Teams); without it, the close is refused
                           while they have sessions open

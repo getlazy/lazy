@@ -16,6 +16,17 @@ import { DaemonClient } from '../../src/daemon/client';
 import { signInToDashboard, type DashboardFetch } from '../helpers/dashboard-session';
 import { reviewDraftKey } from '../../src/review/draft-key';
 
+/**
+ * The feedback draft box's contents. Once delivered, the same words appear on
+ * the page as the human turn they became (a person's feedback stays visible),
+ * so "the draft is gone" is a claim about this box, not the whole page.
+ */
+function feedbackBox(html: string): string {
+  const box = /<textarea[^>]*data-rv-draft="feedback"[^>]*>([\s\S]*?)<\/textarea>/.exec(html);
+  if (!box) throw new Error('review page has no feedback draft box');
+  return box[1]!;
+}
+
 describe('a review in progress is persisted per task', () => {
   let ctx: TestContext;
   let base: string;
@@ -167,7 +178,7 @@ describe('a review in progress is persisted per task', () => {
     expect(posted.status).toBe(303);
 
     const html = await (await fetch(`${base}/tasks/${taskId}/review`)).text();
-    expect(html).not.toContain('ship it, but rename the flag');
+    expect(feedbackBox(html)).not.toContain('ship it, but rename the flag');
   });
 
   // INVARIANT: clearing a delivered draft is the DAEMON's job, not the review
@@ -189,7 +200,7 @@ describe('a review in progress is persisted per task', () => {
     expect(unblocked.exitCode).toBe(0);
 
     const html = await (await fetch(`${base}/tasks/${taskId}/review`)).text();
-    expect(html).not.toContain('typed in the browser');
+    expect(feedbackBox(html)).not.toContain('typed in the browser');
   });
 
   // Two halves of the same rule: a review that ENDED drops its draft, and a

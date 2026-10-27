@@ -15,6 +15,8 @@
 import { escapeHtml } from './escape';
 import { describeNoReading, describeOverage, describeReadingsStoreError, describeUsagePause } from '../usage-pause/policy';
 import type { UsagePauseState } from '../daemon/usage-pause';
+import type { TaskSpendView } from '../task/show-data';
+import { describeTokenCapSpend } from '../usage-pause/running-stop';
 import type { TaskUsagePauseView } from './task-actions';
 import { timestampHtml } from './timestamps';
 
@@ -69,6 +71,27 @@ export function taskUsagePauseHtml(taskId: string, view: TaskUsagePauseView | nu
 }
 
 /** Empty when there is nothing to say — pausing off, or armed with readings, nothing paused and no overage status reported. */
+/**
+ * The task page's spend line: why lazy stopped its running turn (usage window
+ * or token cap) and what happens next, and its spend against its token cap.
+ * Nothing at all for a task with no cap and no stop.
+ */
+export function taskSpendHtml(task: { id: string; status: string }, spend: TaskSpendView | undefined): string {
+  if (!spend) return '';
+  const edit = `<a href="/tasks/${encodeURIComponent(task.id)}/edit">Raise the token cap</a>`;
+  const parts: string[] = [];
+  if (spend.stopLine) {
+    const next = task.status === 'interrupted'
+      ? 'Its running turn was stopped and its work is kept. It resumes by itself after the reset.'
+      : `Its running turn was stopped and its work is kept. It does not continue until the cap is raised. ${edit}, then unblock it.`;
+    parts.push(`<div class="rv-warn" id="task-spend-stop"><span class="tag tag-warning">${task.status === 'interrupted' ? 'paused for usage' : 'token cap'}</span> ${escapeHtml(spend.stopLine)}. ${next}</div>`);
+  }
+  if (spend.cap !== null) {
+    parts.push(`<div class="rv-note" id="task-token-cap"><span class="tag">token cap</span> ${escapeHtml(describeTokenCapSpend(spend.tokens, spend.cap))}.</div>`);
+  }
+  return parts.join('');
+}
+
 export function usagePauseBannerHtml(state: UsagePauseState | null, now: number = Date.now()): string {
   if (!state) return '';
   const lines: string[] = [];
@@ -112,6 +135,12 @@ export function usagePauseBannerHtml(state: UsagePauseState | null, now: number 
       `<li><span class="tag tag-warning">held</span> <a href="/tasks/${encodeURIComponent(h.taskId)}">${escapeHtml(h.task)}</a> — ${escapeHtml(h.hold.held)} waits.${button}</li>`,
     );
   }
+  for (const x of state.stopped ?? []) {
+    pauseState = true;
+    lines.push(
+      `<li><span class="tag tag-warning">${x.kind === 'cap' ? 'token cap' : 'paused for usage'}</span> <a href="/tasks/${encodeURIComponent(x.taskId)}">${escapeHtml(x.task)}</a> — ${escapeHtml(x.line)}.</li>`,
+    );
+  }
   for (const p of state.pausedTasks ?? []) {
     pauseState = true;
     lines.push(
@@ -132,7 +161,7 @@ export function usagePauseBannerHtml(state: UsagePauseState | null, now: number 
     <div class="detail-section" id="usage-pause-status">
       <h2>${pauseState ? 'Usage pause' : 'Usage'}</h2>
       <ul class="usage-pause-lines">${lines.join('')}</ul>
-      <p class="text-muted">${pauseState ? `Turns already running continue.${escapeHtml(held)} ` : 'Nothing is paused. '}Full diagnosis: <code>lazy doctor</code>.</p>
+      <p class="text-muted">${pauseState ? `A running turn stops once its credential crosses the threshold, its work kept.${escapeHtml(held)} ` : 'Nothing is paused. '}Full diagnosis: <code>lazy doctor</code>.</p>
     </div>
   `;
 }

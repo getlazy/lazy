@@ -26,7 +26,13 @@ describe('lazy.toml [chattiness]', () => {
   async function appendToml(snippet: string): Promise<void> {
     const tomlPath = join(ctx.root, 'lazy.toml');
     const existing = await readFile(tomlPath, 'utf-8');
-    await writeFile(tomlPath, existing + '\n' + snippet + '\n');
+    // `lazy init` already writes a [chattiness] table, and a second one is a
+    // TOML redefinition error: put the keys into the existing table instead
+    // (AGENTS.md — edit the key, never append the section).
+    const [header, ...keys] = snippet.split('\n');
+    const updated = existing.replace(new RegExp(`^${header!.replace(/[[\]]/g, '\\$&')}\\n`, 'm'), `${header}\n${keys.join('\n')}\n`);
+    if (updated === existing) throw new Error(`lazy.toml has no ${header} section to edit`);
+    await writeFile(tomlPath, updated);
   }
 
   // INVARIANT: No [chattiness] section → config loads fine (unchanged behavior).

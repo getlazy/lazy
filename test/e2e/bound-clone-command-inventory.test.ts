@@ -122,6 +122,7 @@ const TOP_ARGS: Record<string, string[]> = {
   diff: [STARTED],
   regions: [STARTED],
   status: [TASK],
+  sessions: [TASK],
   shell: [TASK],
   dashboard: [],
   playground: ['status'],
@@ -210,6 +211,8 @@ const SUB_ARGS: Record<string, string[]> = {
   'system guest-init-script': ['--id'],
   // Machine-local and project-free: prints the pinned builder image and builds nothing.
   'system smolvm-build-image': ['--print-builder-image'],
+  // A release base nothing serves: the probe reaches the real install path without downloading 43 MiB.
+  'system smolvm-install': ['--release-base', 'http://127.0.0.1:9'],
   'system repair-commits': ['--all'],
   'system store-check': ['/nonexistent-store'],
   'system store-backup': ['--store', '/nonexistent-store'],
@@ -278,6 +281,7 @@ const EXPECTED: Record<string, Expectation> = {
   'diff': W,
   'regions': W,
   'status': W,
+  'sessions': W,
   'shell': F,
   'dashboard': R,
   'playground': W,
@@ -335,6 +339,8 @@ const EXPECTED: Record<string, Expectation> = {
   'system source-id': W,
   'system guest-init-script': W,
   'system smolvm-build-image': W,
+  'system smolvm-install': F, // nothing serves the probe's release base — domain answer
+  'system store-rehome': F, // needs --from naming the previous checkout; the error says so — domain answer
   'system repair-commits': R,
   'system store-check': F,
   'system store-backup': F,

@@ -49,6 +49,7 @@ import type { PhaseNotify } from '../../src/daemon/progress';
 import { looksLikeTaskBranch } from '../../src/git/branch-prefix';
 import { createHash } from 'crypto';
 
+export { ContainerEngineUnavailableError } from '../../src/docker/engine-unavailable';
 export { IMAGE_TAG, IMAGE_MAX_AGE_DAYS, IMAGE_MAX_AGE_MS };
 const MOCK_IMAGE_REF = `${IMAGE_NAME}:${IMAGE_TAG}`;
 

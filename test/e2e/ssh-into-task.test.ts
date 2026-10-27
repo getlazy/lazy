@@ -145,7 +145,8 @@ describe.skipIf(sshdSuiteSkipped('ssh-into-task'))('SSH into a task on a shared 
     const before = await readFile(configPath, 'utf-8');
     const patched = before.replace('type = "dangerously-host-process-without-any-isolation"', 'type = "docker"');
     if (patched === before) throw new Error('could not set [runner] type = "docker" in the generated lazy.toml');
-    await writeFile(configPath, `${patched}\n[serve.services]\nweb = ${servicePort}\n`);
+    // `api` is declared but never published: the container "predates" it.
+    await writeFile(configPath, `${patched}\n[serve.services]\nweb = ${servicePort}\napi = ${servicePort + 1}\n`);
 
     await docker.seedImage(`lazy-runner:${IMAGE_TAG}`, {
       dockerfileHash: await calculateImageInputsHash(ctx.root),
@@ -281,11 +282,40 @@ describe.skipIf(sshdSuiteSkipped('ssh-into-task'))('SSH into a task on a shared 
     await fwd.exited;
     expect(body).toBe('hello from the task service');
     expect(await readFile(join(workDir, 'container', 'hosts'), 'utf-8'))
-      .toContain('127.0.1.1 services web lazy-ssh-services');
+      .toContain('127.0.1.1 services web api lazy-ssh-services');
     // Reaching the service never started (or recreated) the task's container.
     expect((await docker.invocations()).filter((l) => /^(run|start|create)\b/.test(l) && l.includes(taskContainer))).toEqual([]);
   }, 180_000);
 
+
+  // INVARIANT: a forward lazy refuses tells an HTTP client why, in words.
+  // Before, the refusal died in the forwarder and curl showed only "Empty
+  // reply from server" (seen on a Teams install whose task container predated
+  // the [serve] declaration).
+  test('a forward to a declared but unpublished service answers 502 naming the reason', async () => {
+    const alice = (await rpc(sharedToken, 'mintActorToken', { kind: 'user', email: ALICE_EMAIL }) as { token: string }).token;
+    const { opts, env } = await sshOptions(alice, keysHeader([publicKey]));
+    const localPort = 40000 + Math.floor(Math.random() * 20000);
+    const fwd = Bun.spawn(['ssh', ...opts, '-N', '-L', `${localPort}:127.0.1.1:${servicePort + 1}`, `${loginName()}@${ALIAS}`], {
+      env: { ...process.env, ...env }, stdout: 'pipe', stderr: 'pipe',
+    });
+    let res: { status: number; body: string } | null = null;
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline && !res) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${localPort}/`);
+        res = { status: r.status, body: await r.text() };
+      } catch {
+        // The forward (or the forwarder behind it) is not up yet.
+        await Bun.sleep(250);
+      }
+    }
+    fwd.kill();
+    await fwd.exited;
+    expect(res?.status).toBe(502);
+    expect(res?.body).toContain('service api');
+    expect(res?.body).toContain('is not published');
+  }, 180_000);
   // INVARIANT: only a key the member registered logs in. A key Teams does not
   // hold for her — another person's, or one she never registered — is refused
   // by sshd, and the connection never reaches a shell.

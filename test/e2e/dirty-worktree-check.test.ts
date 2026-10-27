@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { seedFinal } from '../helpers/final';
 import { worktreePathFor } from '../helpers/storage';
 
@@ -41,7 +41,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     writeFileSync(worktreeFile, 'uncommitted content\n');
 
     // 3. Try to accept — should fail because worktree is dirty
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult, 1);
     expectError(acceptResult, 'uncommitted changes');
     expectError(acceptResult, 'Commit or stash changes before running accept');
@@ -61,7 +61,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     writeFileSync(join(worktreePath, 'docs-note.md'), 'the doc nobody committed\n');
     writeFileSync(join(worktreePath, 'second.txt'), 'and another\n');
 
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult, 1);
     expectError(acceptResult, 'docs-note.md');
     expectError(acceptResult, 'second.txt');
@@ -86,7 +86,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     writeFileSync(join(sub, 'HEAD'), 'ref: refs/heads/main\n');
     writeFileSync(join(sub, 'config'), '[core]\n\tbare = false\n\tfsmonitor = /tmp/payload.sh\n');
 
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult, 1);
     expectError(acceptResult, 'core.fsmonitor');
     expectError(acceptResult, 'lazy doctor --repair-git-pointers');
@@ -103,7 +103,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     seedFinal(ctx, taskId);
 
     // 2. Worktree should be clean — accept should succeed
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted');
   });
@@ -122,7 +122,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     // Hidden from the dirty gate, as a task hiding it would.
     appendFileSync(join(ctx.root, '.git', 'info', 'exclude'), '\nsub/\n');
 
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult, 1);
     expectError(acceptResult, 'nested git repositories');
     expectError(acceptResult, 'sub/.git');
@@ -142,7 +142,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     writeFileSync(join(pluginsDir, '.git', 'config'), '[core]\n\tbare = false\n');
     seedFinal(ctx, taskId);
 
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult);
     expectError(acceptResult, '.lazy-task-sandbox/.codex/.tmp/plugins/.git');
     expectError(acceptResult, 'lazy doctor --repair-git-pointers');
@@ -167,7 +167,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     writeFileSync(worktreeFile, 'uncommitted content\n');
 
     // 3. Try to close — should fail because worktree is dirty
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Test close', '--yes']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--reason', 'Test close', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(closeResult, 1);
     expectError(closeResult, 'uncommitted changes');
     expectError(closeResult, 'Commit or stash your changes');
@@ -182,7 +182,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     await startAndReconcile(ctx, taskId);
 
     // 2. Worktree should be clean — close should succeed
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Test close', '--yes']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--reason', 'Test close', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
     // `close` prints "closed"; the resulting status is 'abandoned'.
     expectOutput(closeResult, 'closed');
@@ -194,7 +194,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     const taskId = await createTask(ctx, 'Close test without session', 'Some work');
 
     // 2. Close should succeed (no worktree to check)
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Not started']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--reason', 'Not started'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
     // `close` prints "closed"; the resulting status is 'abandoned'.
     expectOutput(closeResult, 'closed');
@@ -220,7 +220,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     expect(gitAdd.exitCode).toBe(0);
 
     // 3. Try to accept — should fail (staged changes are uncommitted)
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult, 1);
     expectError(acceptResult, 'uncommitted changes');
   });
@@ -249,7 +249,7 @@ describe('dirty worktree check — hard gate for accept/close', () => {
     writeFileSync(lockFile, 'pairing-lock');
 
     // 4. Try to accept — should fail with uncommitted changes error, not pairing error
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(acceptResult, 1);
     expectError(acceptResult, 'uncommitted changes');
   });

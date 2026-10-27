@@ -73,6 +73,8 @@ ssh -N -L 3000:web:3000 my-task.myproject.myteam.teams.example.com
 
 Then open `http://localhost:3000`. The forward reaches the task's own service, the same one the Services tab shows, and carries any TCP traffic: a web app, a database or a debugger. A port declared without a name is reached as `services`, for example `ssh -N -L 5432:services:5432 …`. The service must be running; start it from the task's Services tab or with Start services.
 
+If lazy cannot complete a forward, a web client gets a `502` response saying why, for example that the service is not published (restart the task's environment after adding it to `[serve]`). Use the service's name, such as `web`, rather than `127.0.0.1`: in Lazy Teams the SSH connection lands next to the task, not inside it, so `127.0.0.1:3000` reaches nothing.
+
 On your own machine the services run in the task's container itself, so use `localhost`: `ssh -N -L 3000:localhost:3000 my-task.myproject.myteam.teams.example.com`.
 
 ## Copy files with `scp` and `sftp`

@@ -14,7 +14,7 @@ import { theme } from '../../render/theme';
 import { loadConfig } from '../../config/loader';
 import { parentTaskIdOf } from '../../task-target';
 import { checkLock } from '../../utils/lock';
-import { createRunner } from '../../runner';
+import { createInspectionRunner } from '../../runner';
 import { renderWorkingStatus } from '../../utils/working-substate';
 import { computeTaskWorkingSubstate } from '../../utils/working-run';
 import { loadTaskProtectionStatus, protectionSummary, protectionAdvice } from '../../protection/status';
@@ -58,7 +58,7 @@ export async function commandStatus(args: string[]): Promise<void> {
     if (task.status === 'working' && sess) {
       try {
         // The reconciler's own liveness question — see src/utils/working-run.ts.
-        const substate = await computeTaskWorkingSubstate(root, task, sess, await createRunner(root));
+        const substate = await computeTaskWorkingSubstate(root, task, sess, await createInspectionRunner(root));
         statusText = renderWorkingStatus(substate);
       } catch (err) {
         logger.debug(`Task ${shortId(task.id)}: could not derive working substate: ${err instanceof Error ? err.message : err}`);

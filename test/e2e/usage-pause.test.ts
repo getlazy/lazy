@@ -9,7 +9,10 @@
  * the proxy actually captured — nothing is seeded by hand.
  *
  * Covered:
- *   - a turn already running when the reading crosses the threshold finishes;
+ *   - the request that brings back a reading past the threshold is not itself
+ *     refused (the reading is unknown until its response) — a turn whose last
+ *     request it was finishes. Stopping a running turn at its NEXT request is
+ *     usage-pause-running-turn.test.ts;
  *   - an explicit start/unblock above the threshold is refused, saying why;
  *   - the one-shot override lets exactly one PAUSED turn start, then reverts —
  *     and a launch it changes nothing for (an agent with no usage signal, an
@@ -150,9 +153,11 @@ describe('usage pause', () => {
     const taskId = await createTask(ctx, 'Usage pause task', 'Do work');
     await ctx.setClaudeScenario(proxiedTurn('pause-1'));
 
-    // No reading yet, so the first turn starts. During it the upstream reports
-    // 97% — past the threshold. INVARIANT: a turn already running is never
-    // stopped by the pause; the gate only runs at launch.
+    // No reading yet, so the first turn starts. Its one request brings back
+    // 97% — past the threshold. The pause judges each request on the reading it
+    // already has, so that request is served and the turn finishes. (Since
+    // 2026-10-24 a turn that makes a FURTHER request is stopped there — see
+    // usage-pause-running-turn.test.ts; the old "never stopped" rule is retired.)
     utilization = '0.97';
     expectSuccess(await ctx.lazy(['start', taskId, '--yes']));
     expectSuccess(await ctx.lazy(['wait', taskId]));

@@ -87,6 +87,13 @@ describe('daemon actor tokens', () => {
       LAZY_MANAGED: '1',
       LAZY_MANAGED_STORAGE_PATH: storageDirFor(ctx.root),
     });
+    // A restart may bind a different port of the window, so read the address
+    // again, as the other suites that restart do. (A 401 here was seen once,
+    // only while a second full e2e run shared the per-worker port windows; it
+    // was not reproduced on its own.)
+    const restarted = getDaemonTcpTarget(ctx.root);
+    if (!restarted) throw new Error('restarted test daemon did not record a TCP target');
+    target = restarted;
     managed = true;
   }
 

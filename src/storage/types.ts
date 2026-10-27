@@ -816,6 +816,23 @@ export interface ProxyEnforcementAudit {
  * model + backend, role, token usage, request shape, and extracted
  * tool_use/tool_result contents.
  */
+/** Why an upstream fetch threw — see `ProxyAuditRecord.failure`. */
+export interface ProxyUpstreamFailure {
+  kind: 'reset' | 'timeout' | 'refused' | 'dns' | 'tls' | 'other';
+  /** The error's own code (ECONNRESET, ENOTFOUND, …) when it had one. */
+  code: string | null;
+  /** Ms into the final attempt when it failed — a few ms means a dead pooled socket. */
+  afterMs: number;
+  /** The provider as a person names it (Anthropic, OpenAI, Cursor, endpoint <name>, or the host). */
+  provider: string;
+  /** True when lazy replayed once on a fresh connection and that failed too. */
+  replayed: boolean;
+  /** Ms since the proxy last sent a request to this upstream (idle pooled-connection hint). */
+  idleMs?: number | null;
+  /** True when the failure came after the response had started (headers or body bytes received). */
+  midResponse?: boolean;
+}
+
 export interface ProxyAuditRecord {
   /** Stable unique id for this record. */
   id: string;
@@ -915,6 +932,21 @@ export interface ProxyAuditRecord {
   stopReason: string | null;
   /** Upstream/proxy error message if the forward failed. */
   error: string | null;
+  /**
+   * Structured cause when the upstream fetch THREW (no response at all): what
+   * kind of failure, which provider, and how far in. Absent on answered
+   * requests, on lazy's own refusals, and on records that predate it. Read by
+   * the provider-health summary (src/proxy/provider-health.ts).
+   */
+  failure?: ProxyUpstreamFailure | null;
+  /**
+   * A pre-response connection reset lazy replayed SUCCESSFULLY on a fresh
+   * connection — invisible to the client, recorded so the idle-connection race
+   * stays observable. Absent when no replay happened.
+   */
+  replayedReset?: { code: string | null; afterMs: number; idleMs: number | null } | null;
+  /** Configured endpoint name the request was routed through, when it had one. */
+  endpointName?: string | null;
   /**
    * Milliseconds from request start (`ts`) to the upstream's response HEADERS
    * (time to first byte). The name is historical — records written before the

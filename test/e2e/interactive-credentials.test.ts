@@ -1,9 +1,11 @@
 import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { join, dirname } from 'path';
-import { mkdir, writeFile, readFile, chmod } from 'fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, chmod, rm } from 'fs/promises';
+import { tmpdir } from 'os';
 import { mkdirSync, writeFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
+import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
 import { expectSuccess } from '../helpers/assertions';
 import { createTask } from '../helpers/fixtures';
 import { findFullTaskId, setTaskStatus, taskFilePath, worktreePathFor } from '../helpers/storage';
@@ -89,7 +91,12 @@ async function readClaudeEnv(binDir: string): Promise<Record<string, string>> {
  *    shape check — `looksLikeLazyPlaceholder` alone would pass on any string a
  *    test happened to prefix correctly.
  */
-async function expectDaemonMintedPlaceholder(root: string, value: string): Promise<void> {
+async function expectDaemonMintedPlaceholder(
+  root: string,
+  value: string,
+  /** The task a task-mode pairing is FOR (its grant names it); omitted for a host session. */
+  forTask?: string,
+): Promise<void> {
   expect(value).not.toBe('');                      // a credential was handed over at all
   expect(value).not.toBe(DAEMON_RAW_CREDENTIAL);   // ...but not the raw one
   expect(looksLikeLazyPlaceholder(value)).toBe(true);
@@ -98,8 +105,14 @@ async function expectDaemonMintedPlaceholder(root: string, value: string): Promi
   expect(grant, `no grant registered for the placeholder handed to claude`).not.toBeNull();
   // pair and chat are interactive BUILDER sessions (see resolveInteractiveLaunch).
   expect(grant!.role).toBe('builder');
-  expect(grant!.taskId).toBeNull();
-  expect(grant!.label).toStartWith('host-builder:');
+  if (forTask) {
+    // A task's pairing runs in its container, on a grant minted for that task.
+    expect(grant!.taskId).toBe(forTask);
+    expect(grant!.label).toBe(`pair:${forTask}`);
+  } else {
+    expect(grant!.taskId).toBeNull();
+    expect(grant!.label).toStartWith('host-builder:');
+  }
   // The placeholder occupies the SAME env var the real credential would have,
   // so the client picks the same auth wire shape it always did.
   expect(grant!.envKey).toBe('ANTHROPIC_API_KEY');
@@ -146,16 +159,21 @@ function createSessionManually(ctx: TestContext, shortId: string): void {
 describe('interactive launch credentials come from the daemon', () => {
   let ctx: TestContext;
   let binDir: string;
+  let docker: FakeDocker;
   /** Env for a client invocation whose shell exports NO Anthropic credential. */
   let credentiallessShell: Record<string, string>;
 
   beforeEach(async () => {
     // A real daemon is the point: it holds the credential the client must use.
-    ctx = await setupTestLazy({ withDaemon: true });
+    // A task's pairing session runs INSIDE its container, so a fake `docker`
+    // (on the daemon's PATH and the client's) stands in for the runtime and
+    // records the `exec` that carries the session's credential.
+    docker = await installFakeDocker(await mkdtemp(join(tmpdir(), 'lazy-pair-cred-docker-')));
+    ctx = await setupTestLazy({ withDaemon: true, daemonEnv: { PATH: `${docker.binDir}:${process.env.PATH}` } });
     binDir = join(ctx.root, '.fake-bin');
     await installFakeClaude(binDir);
     credentiallessShell = {
-      PATH: `${binDir}:${process.env.PATH}`,
+      PATH: `${docker.binDir}:${binDir}:${process.env.PATH}`,
       CLAUDE_CODE_OAUTH_TOKEN: '',
       ANTHROPIC_API_KEY: '',
     };
@@ -163,6 +181,8 @@ describe('interactive launch credentials come from the daemon', () => {
 
   afterEach(async () => {
     await ctx.cleanup();
+    await rm(docker.stateDir, { recursive: true, force: true });
+    await rm(docker.binDir, { recursive: true, force: true });
   });
 
   test('lazy pair on a task passes the daemon credential to Claude Code', async () => {
@@ -172,12 +192,17 @@ describe('interactive launch credentials come from the daemon', () => {
     const result = await ctx.lazy(['pair', taskId, '--no-summary'], { env: credentiallessShell });
     expectSuccess(result);
 
-    const env = await readClaudeEnv(binDir);
-    await expectDaemonMintedPlaceholder(ctx.root, env.ANTHROPIC_API_KEY);
+    // The session is the container's Claude Code, launched by `docker exec`;
+    // the credential is whatever that exec hands it.
+    const execs = await docker.execs();
+    expect(execs.length).toBe(1);
+    const key = /-e ANTHROPIC_API_KEY=(\S+)/.exec(execs[0]!)?.[1] ?? '';
+    await expectDaemonMintedPlaceholder(ctx.root, key, findFullTaskId(ctx.root, taskId));
   });
 
   test('branchless lazy pair passes the daemon credential to Claude Code', async () => {
-    const result = await ctx.lazy(['pair'], { env: credentiallessShell });
+    // Branchless pairing runs on the host, which is opt-in (--host).
+    const result = await ctx.lazy(['pair', '--host'], { env: credentiallessShell });
     expectSuccess(result);
 
     const env = await readClaudeEnv(binDir);

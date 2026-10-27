@@ -29,6 +29,13 @@ import { validateCode, displayId, taskRef } from '../task/identity';
 import { taskBranchFor } from '../git/branch-prefix';
 import { logger } from '../utils/logger';
 import { RpcError } from './rpc-error';
+import { TOKEN_CAP_KEY, TOKEN_CAP_STOPPED_KEY, describeTokenCapSpend, formatTokenCount, parseTokenCap } from '../usage-pause/running-stop';
+import { taskTokenSpend } from './token-cap';
+
+function parsedCapOrNull(v: string | number | undefined): number | null {
+  if (v === undefined) return null;
+  try { return parseTokenCap(v); } catch { return null; /* validated before any write; describeEdit only labels */ }
+}
 import {
   parseReviewMode, parseReviewGate, parseReviewToggle, reviewOverrideMetadata, reviewOverridesApplied,
   REVIEW_MODE_INPUTS, REVIEW_GATE_INPUTS, REVIEW_TOGGLE_INPUTS,
@@ -52,6 +59,12 @@ export interface EditTaskInput {
   reviewAutoFix?: string;
   /** Omit = no change; null or '' = clear runner override */
   runner?: string | null;
+  /**
+   * The task's own token cap: a count (`50M`, `200k`, `50000000`) or a
+   * number. Omit = no change; null, '' or `none` = clear. Editable at any time,
+   * mid-turn included — the running-turn stop reads it on the next request.
+   */
+  tokenCap?: string | number | null;
   /**
    * WHO is making this edit. Recorded as a journal entry on the task (see
    * {@link recordEditInJournal}) — the Task record itself carries no actor, so
@@ -98,6 +111,8 @@ function describeEdit(input: EditTaskInput, field: string): string {
     case 'review': return `review mode → ${input.review}`;
     case 'reviewGate': return `review gate → ${input.reviewGate}`;
     case 'reviewAutoFix': return `review auto-fix → ${input.reviewAutoFix}`;
+    case 'tokenCap': return input.tokenCap === null || input.tokenCap === '' || parsedCapOrNull(input.tokenCap) === null
+      ? 'token cap cleared' : `token cap → ${formatTokenCount(parsedCapOrNull(input.tokenCap)!)}`;
     case 'runner': return cleared(input.runner) ? 'runner override cleared' : `runner → ${input.runner}`;
     case 'code': return cleared(input.code) ? 'code cleared' : `code → ${input.code}`;
     case 'parent': return cleared(input.parent) ? 'parent cleared (integrates into main)' : `parent → ${input.parent}`;
@@ -216,6 +231,7 @@ export async function editTask(
     input.effort !== undefined ||
     input.runner !== undefined ||
     input.agent !== undefined ||
+    input.tokenCap !== undefined ||
     input.review !== undefined || input.reviewGate !== undefined || input.reviewAutoFix !== undefined;
 
   const isMidFlightSafeEdit = (hasMidFlightEdit || isCosmeticRename) && !hasLockedFieldEdit;
@@ -255,6 +271,14 @@ export async function editTask(
   // non-CLI surface — RPC, MCP, the web edit form — funnels through here.
   if (input.goal !== undefined && !input.goal.trim()) {
     throw new RpcError(400, 'goal cannot be empty');
+  }
+  let tokenCap: number | null = null;
+  if (input.tokenCap !== undefined && input.tokenCap !== null) {
+    try {
+      tokenCap = parseTokenCap(input.tokenCap);
+    } catch (err) {
+      throw new RpcError(400, err instanceof Error ? err.message : String(err));
+    }
   }
   if (input.effort !== undefined && !VALID_EFFORT_LEVELS.includes(input.effort as EffortLevel)) {
     throw new RpcError(400, `Invalid effort '${input.effort}'. Must be one of: ${VALID_EFFORT_LEVELS.join(', ')}`);
@@ -381,6 +405,20 @@ export async function editTask(
   if (input.effort !== undefined && !effortHandledByAgentSwitch) {
     await pinChosenEffort(storage, task.id, input.effort);
     changes.push('effort');
+  }
+
+  if (input.tokenCap !== undefined) {
+    await storage.updateTaskMetadata(task.id, TOKEN_CAP_KEY, tokenCap === null ? '' : String(tokenCap));
+    // A changed cap retires the "stopped at its token cap" record: it described
+    // the old cap, and every surface would keep saying "raise the cap" after a
+    // person raised it. A new cap that is still reached stops the next turn anew.
+    await storage.updateTaskMetadata(task.id, TOKEN_CAP_STOPPED_KEY, '');
+    changes.push('tokenCap');
+    const spent = await taskTokenSpend(storage, task.id);
+    announcements.push(tokenCap === null
+      ? `Cleared the token cap of ${displayId(task)} (${formatTokenCount(spent)} spent so far).`
+      : `Token cap of ${displayId(task)}: ${describeTokenCapSpend(spent, tokenCap)}.` +
+        (spent >= tokenCap ? ' It is already reached: its running turn stops on its next model request, and it will not start again until the cap is raised.' : ''));
   }
 
   if (input.type !== undefined) {

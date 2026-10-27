@@ -1,3 +1,5 @@
+import { ContainerEngineUnavailableError } from '../docker/engine-unavailable';
+export { ContainerEngineUnavailableError };
 import { withDiskSpaceRecovery, currentDiskSpaceManager, isEngineDiskFull, launchWithDiskSpaceRecovery } from '../docker/disk-space';
 import { requireLaunchModel } from '../agent/launch-model';
 import { agentBinaryMountSources } from '../vm/smolvm-engines';
@@ -37,6 +39,7 @@ import { sessionCredentialEnvFor } from '../daemon/turn-credentials';
 import { recordContainerCredentialLaunch } from '../daemon/container-credential-launch';
 import { isSessionPlaceholderToken, lookupSessionBinding, setSessionBindingOrigin } from '../daemon/session-credentials';
 import { AGENT_RESTART_MARKER, KEPT_CONTAINER_LABEL, SUPERVISOR_PID_FILE } from '../runner/agent-stop';
+import { AGENT_SWAP_LABEL, UPGRADED_AGENT_PATH } from '../runner/agent-swap';
 import { PROXY_BASE_ENV } from '../supervisor/proxy-address-env';
 import { isBuildProgressLine, splitLines, formatDuration, buildTimeoutMessage } from './docker-build-output';
 import { buildTaskGitMounts } from './git-mounts';
@@ -222,8 +225,15 @@ const _packaging = new ClaudeCodePackaging();
 export async function checkDocker(binary: string = 'docker'): Promise<void> {
   logger.debug(`Checking ${binary}...`);
 
-  const answers = async () =>
-    (await spawn([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }).exited) === 0;
+  const answers = async () => {
+    try {
+      return (await spawn([binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: DOCKER_TIMEOUT_MS }).exited) === 0;
+    } catch (err) {
+      throw new ContainerEngineUnavailableError(
+        `Could not check ${binary}: ${err instanceof Error ? err.message : String(err)}`, { cause: err },
+      );
+    }
+  };
   if (!(await answers())) {
     // A Teams machine's dockerd is the project's own: it did not need
     // installing, it stopped. Try once to bring it back, then name that.
@@ -233,15 +243,15 @@ export async function checkDocker(binary: string = 'docker'): Promise<void> {
         logger.debug(`${binary} is running again ✓`);
         return;
       }
-      throw new Error(managedDockerDownMessage(report));
+      throw new ContainerEngineUnavailableError(managedDockerDownMessage(report));
     }
-    if (isManagedMode()) throw new Error(managedDockerDownMessage(null));
+    if (isManagedMode()) throw new ContainerEngineUnavailableError(managedDockerDownMessage(null));
 
     const name = binary.charAt(0).toUpperCase() + binary.slice(1);
     const installUrl = binary === 'podman'
       ? 'https://podman.io/docs/installation'
       : `https://docs.${binary}.com/get-${binary}/`;
-    throw new Error(`${name} is not installed or not running. Install ${name}: ${installUrl}`);
+    throw new ContainerEngineUnavailableError(`${name} is not installed or not running. Install ${name}: ${installUrl}`);
   }
 
   logger.debug(`${binary} is running ✓`);
@@ -3394,6 +3404,24 @@ export async function removeContainer(containerName: string, binary: string = 'd
     if (exitCode !== 0) {
       if (options?.strict) {
         if (/no such (?:object|container)/i.test(stderr)) return;
+        if (/removal of container\b[^\r\n]*\bis already in progress\b/i.test(stderr)) {
+          // Accept marks the task complete before cleanup, so the terminal-run
+          // sweep can already be removing it. Keep mounted files until Docker
+          // positively confirms that removal finished.
+          const deadline = Date.now() + DOCKER_TIMEOUT_MS;
+          while (Date.now() < deadline) {
+            const probe = spawn([binary, 'inspect', containerName], {
+              stdout: 'ignore', stderr: 'pipe', timeout: Math.max(1, deadline - Date.now()),
+            });
+            const [probeError, probeExit] = await Promise.all([new Response(probe.stderr).text(), probe.exited]);
+            if (probeExit !== 0) {
+              if (/no such (?:object|container)/i.test(probeError)) return;
+              throw new Error(`${binary} could not verify removal of ${containerName}: ${probeError.trim() || `exit ${probeExit}`}`);
+            }
+            await Bun.sleep(100);
+          }
+          throw new Error(`${binary} removal of ${containerName} did not finish within ${DOCKER_TIMEOUT_MS / 1000}s; cleanup will retry.`);
+        }
         throw new Error(`${binary} could not remove ${containerName}: ${stderr.trim() || `exit ${exitCode}`}`);
       }
       logger.warn(`Failed to remove container ${containerName} (exit ${exitCode}): ${stderr.trim()}`);
@@ -3692,7 +3720,11 @@ export function buildSupervisorWrapperScript(
     '  done',
     `  rm -f "${protocolDir}/agent-stop-ack"`,
     ...(adoptArgs ? [`  adopt ${adoptArgs}`] : []),
-    `  lazy-agent --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" &`,
+    '  # A `lazy upgrade` that kept this container copied the new agent binary in',
+    '  # (src/runner/agent-swap.ts); every supervisor from then on runs that copy.',
+    `  agent=lazy-agent; [ -x ${UPGRADED_AGENT_PATH} ] && agent=${UPGRADED_AGENT_PATH}`,
+    `  if [ "$agent" = lazy-agent ]; then lazy-agent --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" &`,
+    `  else "$agent" --one-shot --protocol-dir "${protocolDir}" --worktree "${worktreePath}" & fi`,
     '  child_pid=$!',
     `  echo $child_pid > ${SUPERVISOR_PID_FILE}`,
     `  echo "$child_pid" > "${protocolDir}/supervisor.pid"`,
@@ -3706,7 +3738,7 @@ export function buildSupervisorWrapperScript(
     '  # EVERY exit, so a later crash is a crash.',
     `  restart=0; [ "$(cat ${AGENT_RESTART_MARKER} 2>/dev/null)" = "$sup_pid" ] && restart=1; rm -f ${AGENT_RESTART_MARKER} ${SUPERVISOR_PID_FILE}`,
     '  if [ $restart = 1 ]; then backoff=1; continue; fi',
-    `  lazy-agent supervisor-exit --protocol-dir "${protocolDir}" --pid "$sup_pid" --exit-code "$rc"`,
+    `  "$agent" supervisor-exit --protocol-dir "${protocolDir}" --pid "$sup_pid" --exit-code "$rc"`,
     '  # A turn owns the agent, never the environment (including stop / 42).',
     '  # A broken binary must not spin hot or take services down with it.',
     '  if [ $rc -ne 0 ] && [ $rc -ne 42 ]; then',
@@ -3799,6 +3831,9 @@ export function buildSupervisorDockerArgs(params: SupervisorDockerArgsParams): s
     // again in place (src/runner/agent-stop.ts, src/runner/start-or-recreate.ts).
     // A container without the label predates both and is recreated instead.
     '--label', `${KEPT_CONTAINER_LABEL}=1`,
+    // Its wrapper runs an agent binary a `lazy upgrade` copies in, so upgrade
+    // keeps it running; one without the label is replaced (src/runner/agent-swap.ts).
+    '--label', `${AGENT_SWAP_LABEL}=1`,
     // Created with $LAZY_TASK_DATA and the root-only adopt rule. A kept
     // container without it is kept until a person requests a restart.
     ...(taskData ? ['--label', `${TASK_DATA_LABEL}=1`] : []),

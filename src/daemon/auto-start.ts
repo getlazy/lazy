@@ -14,7 +14,7 @@ import { mkdirSync, openSync, closeSync } from 'fs';
 import { readFile, stat, unlink } from 'fs/promises';
 import { dirname } from 'path';
 import { spawn } from '../utils/spawn';
-import { waitForDaemon, cleanupStaleFiles, isDaemonRunning, isProcessAlive, getLogPath, getStartupErrorPath } from './index';
+import { waitForDaemon, cleanupStaleFiles, isDaemonRunning, readPid, readDaemonLockPid, isProcessAlive, getLogPath, getStartupErrorPath } from './index';
 import { getLazyCommand } from '../utils/cli-path';
 import { findForeignDaemon, foreignDaemonRefusal, type ForeignDaemon } from './foreign-daemon';
 import { assertManagedStartAllowed } from './managed-marker';
@@ -166,8 +166,13 @@ export async function startDaemonBackground(
   if (
     outcome === 'exited' &&
     !(await readStartupErrorMarker(startupErrorPath)) &&
-    (await waitForDaemon(projectRoot, 5000))
-  ) return;
+    isDaemonRunning(projectRoot)
+  ) {
+    // The winning start may still be binding its proxy. Join exactly the same
+    // bounded, progress-reporting wait as a command finding it already alive.
+    await waitForLaunchReadyDaemon(projectRoot);
+    return;
+  }
 
   // Either the child exited early, or the readiness poll timed out while
   // the child is still alive but not responding. In both cases, check for
@@ -290,7 +295,8 @@ async function readStartupErrorMarker(markerPath: string, newerThanMs = 0): Prom
  * Ensure the daemon is running for the given project. Called before command dispatch.
  *
  * Fast-checks the daemon state files — if they show a live daemon, it is
- * ready. If not, spawns a daemon and polls its /daemon/status endpoint.
+ * alive; launch readiness also waits for its proxy. If not, spawns a daemon
+ * and polls its /daemon/status endpoint.
  * Singleton enforcement is in startDaemonServer() (flock), not here.
  *
  * @param command - The CLI command being run (to check skip list)
@@ -313,6 +319,7 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
   // After a crash, the marker files remain but the process is dead —
   // the PID check catches this (the old check only tested file existence).
   if (isDaemonRunning(projectRoot)) {
+    await waitForLaunchReadyDaemon(projectRoot);
     return true;
   }
 
@@ -324,6 +331,7 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
     const previous = process.env.LAZY_DAEMON_BASE_DIR;
     process.env.LAZY_DAEMON_BASE_DIR = foreign.baseDir;
     if (isDaemonRunning(projectRoot)) {
+      await waitForLaunchReadyDaemon(projectRoot);
       console.error(`Using the running daemon (PID ${foreign.pid}) from ${foreign.baseDir}.`);
       return true;
     }
@@ -331,7 +339,10 @@ export async function ensureDaemon(command: string | undefined, projectRoot: str
     else process.env.LAZY_DAEMON_BASE_DIR = previous;
   }
   // The scan may have waited out a sibling CLI's daemon starting in OUR dir.
-  if (!foreign && isDaemonRunning(projectRoot)) return true;
+  if (!foreign && isDaemonRunning(projectRoot)) {
+    await waitForLaunchReadyDaemon(projectRoot);
+    return true;
+  }
 
   // Daemon is dead or never started. Clean up stale files (PID, legacy socket)
   // left behind by a crash, then start a fresh daemon.
@@ -362,4 +373,18 @@ export async function waitForBackingUpDaemon(projectRoot: string): Promise<boole
   if (outcome === 'ready') return true;
   const marker = await readStartupErrorMarker(getStartupErrorPath(projectRoot), waitStarted);
   throw new Error(marker ?? `The daemon (PID ${progress.pid}) stopped while backing up the store and did not start.\nCheck logs: ${getLogPath(projectRoot)}`);
+}
+
+/** A live process may still be between the RPC bind and the proxy bind. */
+async function waitForLaunchReadyDaemon(projectRoot: string): Promise<void> {
+  if (await waitForDaemon(projectRoot, 100)) return;
+  // Announce the wait when joining it. The CLI's own startup time can consume
+  // most of a short proxy delay before the five-second slow-start notice.
+  console.error('Daemon is still starting; waiting for startup to finish...');
+  // The lock owner's record survives deletion of lazy.pid and is written by
+  // the process that won the singleton lock. Legacy/test daemons use lazy.pid.
+  const pid = readDaemonLockPid(projectRoot) ?? readPid(projectRoot);
+  if (pid && await waitForStartingDaemon(projectRoot, pid) === 'ready') return;
+  const marker = await readStartupErrorMarker(getStartupErrorPath(projectRoot));
+  throw new Error(marker ?? `Daemon is still starting and did not make its proxy ready within the startup timeout.\nCheck logs: ${getLogPath(projectRoot)}`);
 }

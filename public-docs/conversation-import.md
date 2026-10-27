@@ -249,7 +249,8 @@ would not be. Every rule is anchored at the very start of the conversation's
 single user message, so a real conversation that quotes a lazy prompt is never
 matched.
 
-A caveat worth knowing: because these conversations have no marker on disk,
+Purged sessions stay excluded from live capture, including after a daemon restart.
+Their raw session files are left unchanged. Because they have no marker on disk,
 `lazy doctor --reimport-conversations` will re-import them if their raw JSONL is
 still present. Purge is about cleaning up the store, not about rewriting what is
 on disk.

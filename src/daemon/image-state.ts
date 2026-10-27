@@ -28,7 +28,7 @@
  * own buttons and still cannot disagree about which apply.
  */
 import { adoptionBuildStatus, adoptionJobStatus, refAdoptionView, type AdoptionBuildState } from './image-adoption';
-import { runnerImageStatus, runnerImageJob, defaultImageRebuildJob, type RunnerImageState } from './runner-image';
+import { describeRunnerImage, runnerImageStatus, runnerImageJob, defaultImageRebuildJob, type RunnerImageState } from './runner-image';
 import type { ImageBuildJob } from './image-build-job';
 import { logger } from '../utils/logger';
 import { autoBuildsRootDockerfile } from '../config/managed-mode';
@@ -360,7 +360,7 @@ export async function projectImageState(
       image: imageRef(project),
       phase: project.state,
       currentImageInUse: project.state === 'building' && project.replacing === true,
-      reason: project.state === 'building' ? project.reason : null,
+      reason: project.state === 'building' ? project.reason : project.waitingForEngine ? describeRunnerImage(project) : null,
       build: summarize(jobFor(pJob, project.buildId)),
     };
   }

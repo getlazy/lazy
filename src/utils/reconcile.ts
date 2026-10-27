@@ -31,7 +31,7 @@ import {
   removeProtocolDir, listSupersededResponses, consumeSupersededResponse,
 } from '../protocol';
 import type { CommandId, CompletedResponse, ErrorResponse, WorktreeRecovery, AgentHandoffEntry, SupervisedKind, FinalDeclaration } from '../protocol';
-import { completedResponses, responseCommandId, answersLatestCommand, readDispatchedCommandId, supersedeResponse } from '../protocol';
+import { completedResponses, responseCommandId, answersLatestCommand, readDispatchedCommandId, dispatchedByPreviousDaemon, supersedeResponse } from '../protocol';
 import { hasUncommittedChanges, getUncommittedDiff, getCurrentSha, getAcceptTagCommit, resolveRemoteDefaultBranch } from '../git/operations';
 import { parentTaskIdOf } from '../task-target';
 import { recordSessionCommits, scanSessionCommits } from '../task/session-commits';
@@ -55,6 +55,7 @@ import { taskBranchFor, DEFAULT_BRANCH_PREFIX, looksLikeTaskBranch } from '../gi
 import { autoResumeTask, exitCodeToReason, MAX_CONSECUTIVE_INTERRUPTIONS } from './auto-resume';
 import { shouldAutoReact, recordAutoReact } from '../daemon/auto-react-budget';
 import { isUserStopped } from '../task/user-stop';
+import { isSpendStopResponse } from '../usage-pause/running-stop';
 import { releaseTurnCredential } from '../daemon/turn-credentials';
 import { createAgentTurn, createRecoveredAgentTurn, personForCurrentTurn, turnChannelActor } from '../daemon/turn-owner';
 import { systemActor } from '../identity/system-identity';
@@ -915,6 +916,20 @@ async function reconcileTaskInner(storage: Storage, taskId: string, lazyRoot: st
     await recordRecreation(storage, task.id, 'the previous environment disappeared; exit code, OOM status and exit time are unavailable');
   }
 
+  // INVARIANT: a turn launched by a PREVIOUS daemon process and found dead now
+  // was killed by lazy's own restart, upgrade or shutdown — not finished. It is
+  // interrupted the way the restart reaper interrupts one (honest reason, no
+  // circuit-breaker charge, auto-resume), never "recovered" to `blocked`
+  // because it had already committed. This catches the runs the reaper's
+  // pre-listen snapshot missed because they were already dead: the old daemon
+  // killed hard before its shutdown sweep ran, or a sweep that stopped a run
+  // without recording its interrupt (ownership unresolved, or killed before the
+  // interrupt loop, which runs only after every stop finishes).
+  if (dispatchedByPreviousDaemon(protoDir)) {
+    logger.info(`Task ${taskShortId}: turn was launched by a previous daemon and its run is gone — interrupting for resume, not recovering as finished`);
+    if (await interruptForDaemonRestart(storage, taskId, lazyRoot)) return;
+  }
+
   // The run is not alive and there is no response. Before declaring the turn
   // interrupted, check whether the agent actually finished: a stranded completion
   // (supervisor died at finalize) leaves real committed work on the branch with no
@@ -1469,6 +1484,15 @@ async function recoverStrandedCompletion(
   // cluster. Fall through to interrupted/auto-resume, like any other killed task.
   if (isClusterTask(task)) {
     logger.debug(`Task ${taskShortId}: cluster task — stranded-completion recovery does not apply, falling through to interrupted.`);
+    return false;
+  }
+
+  // INVARIANT: a turn whose daemon went away under it is never a stranded
+  // completion — the daemon's restart killed it, so its commits say nothing
+  // about whether the agent finished. See the dispatching-daemon record in
+  // src/protocol/io.ts. Falls through to interrupted/auto-resume.
+  if (dispatchedByPreviousDaemon(protoDir)) {
+    logger.debug(`Task ${taskShortId}: turn launched by a previous daemon — stranded-completion recovery does not apply, falling through to interrupted.`);
     return false;
   }
 
@@ -3084,6 +3108,14 @@ async function sweepInterruptedResponses(storage: Storage, lazyRoot: string): Pr
       const response = readResponse(protoDir);
       if (!response) continue;
 
+      // A usage stop's own error response: the stop already parked and
+      // recorded everything (src/daemon/running-turn-stop.ts).
+      if (isSpendStopResponse(task, response, responseCommandId(response))) {
+        logger.debug(`Task ${taskShortId}: stopped for usage, dropping the stop's own error response`);
+        consumeResponse(protoDir);
+        continue;
+      }
+
       if (response.status === 'completed') {
         logger.debug(`Task ${taskShortId}: found stale completed response for interrupted task, processing`);
         // handleCompletedResponses transitions the task to 'blocked' (turn done),
@@ -3190,6 +3222,12 @@ async function sweepPausedResponses(storage: Storage, lazyRoot: string): Promise
       // stop as a crash. Everything it carries is already recorded; drop it.
       if (response.status === 'error' && isUserStopped(session)) {
         logger.debug(`Task ${taskShortId}: user-stopped, dropping the stop's own error response`);
+        consumeResponse(protoDir);
+        continue;
+      }
+      // Same for a turn lazy stopped for spend (src/daemon/running-turn-stop.ts).
+      if (isSpendStopResponse(current, response, responseCommandId(response))) {
+        logger.debug(`Task ${taskShortId}: stopped for spend, dropping the stop's own error response`);
         consumeResponse(protoDir);
         continue;
       }

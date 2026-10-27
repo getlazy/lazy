@@ -122,7 +122,8 @@ describe('Turns tab order', () => {
     }
     expect(id).not.toBe('');
 
-    const html = await (await fetch(`${base}/tasks/${id}/turns`)).text();
+    // The chunk rule belongs to the chunks view; the tab opens on Conversation.
+    const html = await (await fetch(`${base}/tasks/${id}/turns?view=chunks`)).text();
     expect(html).toContain('A chunk is what happened since you last acted');
     const seqs = [...html.matchAll(/>Turn #(\d+)<\/a>/g)].map((m) => Number(m[1]));
     expect(seqs.length).toBeGreaterThanOrEqual(2);

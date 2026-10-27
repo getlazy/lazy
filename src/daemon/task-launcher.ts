@@ -643,7 +643,7 @@ async function launchTaskRun(
   // launches it by itself once the window resets (see `holdAgentStart`).
   const verdictTask = params.agentId ? { ...t, agent_id: params.agentId } : t;
   try {
-    await assertTurnStartAllowed(projectRoot, {
+    await assertTurnStartAllowed(projectRoot, { storage,
       task: verdictTask, config, actor, verb: 'start', peek: true,
       overrideEligible: params.usagePauseOverrideEligible === true,
     });
@@ -739,7 +739,7 @@ async function launchTaskRun(
   // runner preflight, so it is not spent on a start that fails there. An agent's
   // start that a reading arriving since the peek now pauses is held like above.
   try {
-    await assertTurnStartAllowed(projectRoot, {
+    await assertTurnStartAllowed(projectRoot, { storage,
       task: t, config, actor, verb: 'start',
       overrideEligible: params.usagePauseOverrideEligible === true,
     });

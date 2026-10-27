@@ -73,6 +73,8 @@ export interface AgentUpstreamRoute {
   wire: AgentWire;
   /** Set on a TIERED profile: `upstream` is tier 0, and the proxy picks per request. */
   tiers?: TierRoute[];
+  /** The configured endpoint's name, when the profile names one — how failures are attributed. */
+  endpointName?: string;
 }
 
 /** True when this profile needs its own route rather than the primary upstream. */
@@ -129,7 +131,7 @@ export function agentUpstreamMap(config: ResolvedConfig): Record<string, AgentUp
   const map: Record<string, AgentUpstreamRoute> = {};
   for (const entry of resolveAgentUpstreams(config)) {
     if (entry.tier !== undefined && entry.tier > 0) continue;
-    map[entry.profile] = { upstream: entry.upstream, wire: entry.wire };
+    map[entry.profile] = { upstream: entry.upstream, wire: entry.wire, ...(entry.endpointName ? { endpointName: entry.endpointName } : {}) };
   }
   for (const profile of agentProfilesFor(config).values()) {
     if (!profile.tiers || !map[profile.name]) continue;

@@ -30,6 +30,8 @@ export interface TaskEditInput {
   model?: string;
   effort?: string;
   agent?: string;
+  /** The task's own token cap (`50M`), or null to clear it. */
+  tokenCap?: string | null;
 }
 
 /** Deliberately loose, so daemon result shapes stay out of src/server. */
@@ -89,6 +91,16 @@ export interface TaskUsagePauseView {
   allowed: { setBy: string | null; setAt: number } | null;
 }
 
+/** Close/reject options a person confirmed in the dialog. */
+export interface TaskEndOptions {
+  /**
+   * The person confirmed discarding what is uncommitted in the worktree,
+   * including aborting a merge left in progress (every commit is kept) —
+   * the daemon's `acceptDirtyWorktree`.
+   */
+  acceptDirtyWorktree?: boolean;
+}
+
 export interface TaskActions {
   /**
    * Apply the edit through the daemon's one implementation, which enforces the
@@ -116,9 +128,9 @@ export interface TaskActions {
   /** Halt a running task without auto-resume. Reason is required. */
   stopTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
   /** Close (abandon) the task. Reason is required. */
-  closeTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
+  closeTask(taskId: string, reason: string, onProgress?: ProgressEmitter, options?: TaskEndOptions): Promise<TaskLifecycleResult>;
   /** Reject the task's work and end its session. Reason is required. */
-  rejectTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult>;
+  rejectTask(taskId: string, reason: string, onProgress?: ProgressEmitter, options?: TaskEndOptions): Promise<TaskLifecycleResult>;
   /** Relaunch a blocked/interrupted task with no new feedback. Returns once launched. */
   resumeTask(taskId: string, onProgress?: ProgressEmitter, options?: TaskLaunchOptions): Promise<TaskLifecycleResult>;
 

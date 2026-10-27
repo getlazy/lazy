@@ -13,7 +13,7 @@ import type { RunnerType } from '../config/types';
 import { DockerRunner } from './docker-runner';
 
 /** The client a container runner drives. Throws for a runner that has no containers. */
-export function containerCliOf(runner: Runner): string {
+export function containerCliOf(runner: Pick<Runner, 'type'>): string {
   if (runner instanceof DockerRunner) return runner.containerCli;
   throw new Error(`The ${runner.type} runner has no containers, so there is no container client to drive.`);
 }
@@ -36,8 +36,8 @@ export function terminalEngineOf(runner: Pick<Runner, 'type'>): { binary: string
 /** For a caller holding only a runner TYPE (a session's, a task's). */
 export async function containerCliForType(projectRoot: string, type: RunnerType | string): Promise<string> {
   if (type === 'smolvm') {
-    const { createRunner } = await import('./index');
-    return containerCliOf(await createRunner(projectRoot, 'smolvm'));
+    const { createInspectionRunner } = await import('./index');
+    return containerCliOf(await createInspectionRunner(projectRoot, 'smolvm'));
   }
   return type === 'podman' ? 'podman' : 'docker';
 }

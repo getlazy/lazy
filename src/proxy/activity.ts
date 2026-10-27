@@ -157,6 +157,13 @@ export const PATH_REFUSED_PREFIX = 'path refused';
 export const TIERS_FULL_PREFIX = 'every tier full';
 
 /**
+ * The prefix on the audit error of a request refused because lazy is stopping
+ * the task's running turn for spend — its credential crossed [usage_pause], or
+ * the task reached its token cap (src/daemon/running-turn-stop.ts).
+ */
+export const RUNNING_STOP_PREFIX = 'turn stopped for spend';
+
+/**
  * The prefix on the audit error of a tiered request a tier REFUSED for
  * capacity (a 429) and the proxy retried on the next tier.
  */
@@ -169,6 +176,16 @@ export const TIER_REFUSED_PREFIX = 'tier refused';
  * nothing says the credential is broken, and readers of that prefix say so.
  */
 export const CREDENTIAL_UNAVAILABLE_PREFIX = 'credential unavailable';
+
+/**
+ * Audit-error prefixes of answers LAZY gave without the provider deciding
+ * anything — its own refusals. Provider health never counts them
+ * (src/proxy/provider-health.ts). `TIER_REFUSED_PREFIX` is deliberately absent:
+ * that one records a real upstream capacity refusal.
+ */
+export const LAZY_REFUSAL_PREFIXES: readonly string[] = [
+  CREDENTIAL_REFUSED_PREFIX, CREDENTIAL_UNAVAILABLE_PREFIX, PATH_REFUSED_PREFIX, TIERS_FULL_PREFIX,
+];
 
 /**
  * The path as a watcher should see it: query string removed.

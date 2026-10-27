@@ -85,6 +85,8 @@ test('doctor lists old Services environments with no session and skips absent on
     const binary = join(root, 'vm-docker');
     await writeFile(binary, `#!/bin/sh
 case "$*" in
+  # The liveness probe: neither environment is running (no IDs, exit 0).
+  "ps "*) exit 0 ;;
   *lazy-${taskRef(old)}) echo '<no value>' ;;
   *lazy-${taskRef(absent)}) echo 'Error: No such container' >&2; exit 1 ;;
   *) echo "Unexpected engine call: $*" >&2; exit 1 ;;

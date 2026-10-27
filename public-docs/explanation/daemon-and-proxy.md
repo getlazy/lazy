@@ -81,6 +81,11 @@ That is why credentials are kept out of it.
 
 ## The proxy and credential injection
 
+Commands wait while the daemon’s proxy is starting. If a running daemon reports
+that its proxy is unavailable, task listings, Watch and other reads remain available.
+Run `lazy doctor` for the finding and remedy. Builder, pair, chat and task turns
+require the proxy and refuse to launch until it is available.
+
 All of an agent's model traffic goes through a proxy the daemon runs on your
 machine. The proxy is always on; the agent is always handed the proxy's address
 and never talks to the model provider directly.

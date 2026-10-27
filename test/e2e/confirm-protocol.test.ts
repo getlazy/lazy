@@ -555,7 +555,7 @@ describe('MCP confirmation protocol', () => {
     const toolsResponse = responses.find(r => r.id === 2);
     const result = toolsResponse!.result as { tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }> };
 
-    const confirmedTools = ['lazy_close', 'lazy_accept', 'lazy_redo', 'lazy_reopen', 'lazy_create'];
+    const confirmedTools = ['lazy_close', 'lazy_accept', 'lazy_reopen', 'lazy_create'];
 
     for (const toolName of confirmedTools) {
       const tool = result.tools.find(t => t.name === toolName);
@@ -563,12 +563,38 @@ describe('MCP confirmation protocol', () => {
       expect(tool!.inputSchema.properties).toHaveProperty('confirmation_code');
     }
 
-    // Verify tools that should NOT have confirmation_code
-    const unconfirmedTools = ['lazy_start', 'lazy_unblock', 'lazy_commit', 'lazy_search', 'lazy_show'];
+    // lazy_redo is builder-only (it parents the replacement outside an agent's
+    // subtree), so an agent session never lists it; its schema is read from a
+    // BUILDER session (no --task-id), where it is offered.
+    const builderSession = new McpSession(ctx.root, null, ctx.root);
+    try {
+      await builderSession.initialize();
+      const builderTools = (await builderSession.request('tools/list')).result as typeof result;
+      const redo = builderTools.tools.find(t => t.name === 'lazy_redo');
+      expect(redo).toBeDefined();
+      expect(redo!.inputSchema.properties).toHaveProperty('confirmation_code');
+    } finally {
+      await builderSession.close();
+    }
+
+    // INVARIANT: tools that never confirm carry no confirmation_code. An
+    // ordinary call must never be made to look like it needs a second step.
+    const unconfirmedTools = ['lazy_commit', 'lazy_search', 'lazy_show'];
     for (const toolName of unconfirmedTools) {
       const tool = result.tools.find(t => t.name === toolName);
       expect(tool).toBeDefined();
       expect(tool!.inputSchema.properties).not.toHaveProperty('confirmation_code');
+    }
+
+    // INVARIANT: start and unblock take a confirmation_code for ONE thing only —
+    // launching on lazy's default runner image while the project's own image is
+    // not ready (shipped in v0.91). An ordinary start/unblock still needs none;
+    // the argument is described as the runner-image refusal's code, nothing more.
+    for (const toolName of ['lazy_start', 'lazy_unblock']) {
+      const tool = result.tools.find(t => t.name === toolName);
+      expect(tool).toBeDefined();
+      const code = tool!.inputSchema.properties?.confirmation_code as { description?: string } | undefined;
+      expect(code?.description).toBe('Code from a runner-image refusal.');
     }
   });
 

@@ -13,7 +13,7 @@ import { join } from 'path';
 import { taskRef } from './identity';
 import type { Task, Session, Storage } from '../storage';
 import { protocolDir as getProtocolDir, readStatus } from '../protocol';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { parentTaskIdOf } from '../task-target';
 import type { WorkingSubstate } from '../utils/working-substate';
 import { taskTurnFailure, type TaskTurnFailure } from './turn-failure';
@@ -70,7 +70,7 @@ export async function buildTaskTree(
   lazyRoot: string,
   opts: { hiddenDescendants?: Map<string, number> } = {},
 ): Promise<TaskWithSession[]> {
-  const runner = await createRunner(lazyRoot);
+  const runner = await createInspectionRunner(lazyRoot);
   const taskMap = new Map<string, TaskWithSession>();
 
   // Protection facts resolved ONCE for the whole listing: one config read, one

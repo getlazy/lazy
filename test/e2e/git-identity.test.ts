@@ -16,7 +16,8 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { writeFile, chmod, mkdtemp } from 'fs/promises';
+import { writeFile, chmod, mkdtemp, rm } from 'fs/promises';
+import { getManagedDaemonMarkerPath } from '../../src/daemon/paths';
 import { existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -303,6 +304,10 @@ describe('git identity (single-person install)', () => {
       kind: 'user', email: 'ada@example.com', name: 'Ada',
     }) as { token: string };
 
+    // "Elsewhere": the managed daemon left its marker, which (rightly) refuses
+    // an unmanaged start in the same daemon directory. Removing it stands for
+    // presenting the token to a different, never-managed install.
+    await rm(getManagedDaemonMarkerPath(ctx.root), { force: true });
     await ctx.restartDaemon();
 
     const refused = await rpcStatus(minted.token, 'list');

@@ -198,7 +198,7 @@ async function commandDoctorPurgeHousekeeping(opts: { yes: boolean }): Promise<v
     const errors: { sessionId: string; error: Error }[] = [];
     for (const { conversation } of matches) {
       try {
-        if (await storage.deleteConversation(conversation.sessionId)) {
+        if (await storage.deleteConversation(conversation.sessionId, { preventCapture: true })) {
           deleted++;
         } else {
           // Idempotent re-run, or something else purged it concurrently.

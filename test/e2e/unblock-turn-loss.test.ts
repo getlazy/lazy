@@ -130,8 +130,18 @@ describe('an unblocked turn is never lost', () => {
     expectSuccess(await ctx.lazy(['unblock', taskId, '--message', 'Next instructions.']));
     await waitForStatus(ctx.root, taskId, ['blocked'], 120_000);
 
-    const recorded = (await agentTurns(ctx.root, taskId)).map(t => String(t.content));
-    expect(recorded.some(c => c.includes('The turn that used to vanish'))).toBe(true);
+    // Within one reconcile tick the working-task sweep parks the NEW turn
+    // (`blocked`) and only then does the superseded-response sweep record the
+    // displaced one, so `blocked` can be seen a moment before the record lands
+    // (it did, under parallel load). The rule is that it IS recorded — wait for it.
+    const vanished = (c: string) => c.includes('The turn that used to vanish');
+    let recorded: string[] = [];
+    for (const deadline = Date.now() + 30_000; Date.now() < deadline;) {
+      recorded = (await agentTurns(ctx.root, taskId)).map(t => String(t.content));
+      if (recorded.some(vanished)) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    expect(recorded.some(vanished)).toBe(true);
 
     // And nothing is left lying around: once recorded, the displaced file is
     // consumed, so it cannot be recorded a second time on a later tick.

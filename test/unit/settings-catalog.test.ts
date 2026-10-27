@@ -89,7 +89,8 @@ describe('describeConfigChange', () => {
 
   test('the usage-pause timing names held starts and running turns', () => {
     const [change] = describeConfigChange('[usage_pause]\nthreshold_percent = 95\n', '')!;
-    expect(change!.effectText).toMatch(/never stopped/);
+    // Since 2026-10-24 the threshold covers running turns too (stopped, work kept).
+    expect(change!.effectText).toMatch(/running turn, which is stopped/);
     expect(change!.effectText).toMatch(/within about a minute/);
   });
 

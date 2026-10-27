@@ -1,3 +1,4 @@
+import { unfinishedSyncMerge, type UnfinishedSyncMerge } from './unfinished-sync';
 /**
  * Everything `lazy show` needs about one task, loaded once.
  *
@@ -10,7 +11,7 @@
 import { withPromotedTaskCodes } from './show-sections';
 import { join } from 'path';
 import { protocolDir as getProtocolDir, readStatus } from '../protocol';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import type { WorkingSubstate } from '../utils/working-substate';
 import { taskTurnFailure, type TaskTurnFailure } from './turn-failure';
 import { computeTaskWorkingSubstate } from '../utils/working-run';
@@ -27,6 +28,8 @@ import { pathExists } from '../utils/fs';
 import { getTaskServeState, type TaskServeState } from '../serve/discovery';
 import { primeDashboardAuthority } from '../serve/authority';
 import type { Storage } from '../storage/interface';
+import { taskTokenSpend } from '../daemon/token-cap';
+import { runningStopLine, tokenCapOf } from '../usage-pause/running-stop';
 import { getAutoReactSummary, type AutoReactTrigger } from '../daemon/auto-react-budget';
 import { logger } from '../utils/logger';
 import { mapLimit, STORE_SCAN_CONCURRENCY } from '../utils/map-limit';
@@ -43,8 +46,24 @@ import {
  * Pre-loaded data for building task show output.
  * Passed to buildTaskShowLines to avoid duplicating data loading.
  */
+/**
+ * What the task has spent against its own token cap, and why lazy stopped its
+ * running turn if it did (src/usage-pause/running-stop.ts). One answer for
+ * `lazy show`, the task page and Lazy Teams.
+ */
+export interface TaskSpendView {
+  /** Tokens the proxy has seen this task spend. */
+  tokens: number;
+  /** The task's token cap, or null when it has none. */
+  cap: number | null;
+  /** "Paused for usage: …" / "Stopped at its token cap (…)", while the task rests where that stop left it. */
+  stopLine: string | null;
+}
+
 export interface TaskShowData {
   task: Task;
+  /** Spend against the token cap, and a running-turn stop. Absent from an older daemon. */
+  spend?: TaskSpendView;
   session: Session | null;
   turns: Turn[];
   commits: Commit[];
@@ -104,6 +123,7 @@ export interface TaskShowData {
    * later with the wrong reason. Null when there is no worktree to read.
    */
   mergeState: WorktreeMergeState | null;
+  abandonableSyncMerge: UnfinishedSyncMerge | null;
   /** Declared [serve] ports and where they are reachable. Null when not resolvable. */
   serveState: TaskServeState | null;
   /**
@@ -187,7 +207,7 @@ export async function loadTaskShowData(
     if (root) {
       try {
         // The reconciler's own liveness question — see src/utils/working-run.ts.
-        workingSubstate = await computeTaskWorkingSubstate(root, task, sess, await createRunner(root));
+        workingSubstate = await computeTaskWorkingSubstate(root, task, sess, await createInspectionRunner(root));
       } catch (err) {
         logger.debug(`Task ${shortId(task.id)}: could not derive working substate: ${err instanceof Error ? err.message : err}`);
       }
@@ -198,10 +218,14 @@ export async function loadTaskShowData(
   // is two cheap git calls and it is the ONLY thing that makes a stranded merge
   // visible before accept trips over it (fix-sync-silent-conflict).
   let mergeState: WorktreeMergeState | null = null;
+  let abandonableSyncMerge: UnfinishedSyncMerge | null = null;
   if (root && !TERMINAL_STATUSES.has(task.status)) {
     try {
       const wt = getWorktreePathForRef(root, taskRef(task));
-      if (await pathExists(wt)) mergeState = await readWorktreeMergeState(wt);
+      if (await pathExists(wt)) {
+        mergeState = await readWorktreeMergeState(wt);
+        if (mergeState.mergeInProgress) abandonableSyncMerge = await unfinishedSyncMerge(storage, task, wt, root);
+      }
     } catch (err) {
       logger.debug(`Task ${shortId(task.id)}: could not read worktree merge state: ${err instanceof Error ? err.message : err}`);
     }
@@ -310,5 +334,11 @@ export async function loadTaskShowData(
     }
   }
 
-  return { task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, turnFailure: taskTurnFailure(task, sess), mergeState, serveState, protection, autoResumeQueue, modelsDefault };
+  const spend: TaskSpendView = {
+    tokens: await taskTokenSpend(storage, task.id),
+    cap: tokenCapOf(task),
+    stopLine: runningStopLine(task),
+  };
+
+  return { spend, task, session: sess, turns, commits, comments, journal, raisedItems, turnReport, fileDecisions, artifacts, statusHistory, tagHistory, children, childSessions, parent, retryStatus, orphanStatus, autoReactStatus, supervisorStatus, workingSubstate, turnFailure: taskTurnFailure(task, sess), mergeState, abandonableSyncMerge, serveState, protection, autoResumeQueue, modelsDefault };
 }

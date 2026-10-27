@@ -196,7 +196,7 @@ describe('lazy accept revert task (continuation)', () => {
     seedFinal(ctx, 'revert-orig-work');
 
     // Accept the revert task (--yes will auto-create continuation)
-    const acceptResult = await ctx.lazy(['accept', 'revert-orig-work', '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', 'revert-orig-work', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
     expectOutput(acceptResult, 'Original work');
@@ -211,7 +211,7 @@ describe('lazy accept revert task (continuation)', () => {
 
     await startAndReconcile(ctx, 'revert-cont-test');
     seedFinal(ctx, 'revert-cont-test');
-    await ctx.lazy(['accept', 'revert-cont-test', '--yes']);
+    await ctx.lazyMocked(['accept', 'revert-cont-test', '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // Show the continuation task
     const showResult = await ctx.lazy(['show', 'cont-test-v2', '--full']);
@@ -232,7 +232,7 @@ describe('lazy accept revert task (continuation)', () => {
     await ctx.lazy(['revert', taskId, '--reason', 'V2 exists test']);
     await startAndReconcile(ctx, 'revert-ver-test');
     seedFinal(ctx, 'revert-ver-test');
-    const acceptResult = await ctx.lazy(['accept', 'revert-ver-test', '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', 'revert-ver-test', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'ver-test-v3');
   });

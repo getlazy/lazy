@@ -250,6 +250,7 @@ import { unresolvedCredentialFailures, type CredentialFailure } from '../proxy/c
 import { credentialUsageKey, currentCredentialFailures, failurePredatesCredential } from './current-credential-failures';
 import { memberEndpointUsageKey } from '../proxy/usage-limits';
 import { daemonUsageLimits, type UsageLimitReading } from '../proxy/usage-limits';
+import { daemonProviderHealthWith, type ProviderHealth } from '../proxy/provider-health';
 import { seedUsageReadings } from './usage-readings';
 import {
   rejectionAgainstCurrentCredential,
@@ -282,7 +283,7 @@ import { redactSecretValuesDeep } from '../utils/redact';
 import { acknowledgePendingNotes, claimPendingNotesForRunningTurn, requireSupervisorCredential, type PendingNotesAnswer } from './turn-comments';
 import { VERSION } from '../version';
 import { groupScratchBySession, scratchEntry, searchScratch, scratchPathsMentionedIn } from '../builder/scratch-view';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import {
   countActiveBuilders,
   effectiveBuilderLimit,
@@ -386,6 +387,15 @@ let daemonStorageInit: Promise<Storage> | null = null;
 let daemonProjectRoot: string | null = null;
 
 /**
+ * Bumped by every closeAllStorage(). An open that started before a close must
+ * never publish its handle afterwards: a caller left over from a stopped daemon
+ * (a background job still finishing) would otherwise install the OLD project's
+ * store, and a daemon started next in the same process would serve it —
+ * answering "Task not found" for tasks that are on disk under its own root.
+ */
+let storageGeneration = 0;
+
+/**
  * Since when this daemon has been unable to open its store, and why — null
  * while it has it (or has not tried yet).
  *
@@ -409,6 +419,19 @@ export function storeAvailability(): { since: number; error: string; restartFixe
  * Must be called once during daemon startup before any RPC handlers run.
  */
 export function initDaemonStorage(projectRoot: string): void {
+  // A store held for ANOTHER root was left by a previous daemon in this process
+  // (a straggler of a stopped daemon may reopen its root after closeAllStorage).
+  // Drop it, or this daemon would serve that project's store as its own.
+  if (daemonProjectRoot !== null && daemonProjectRoot !== projectRoot && (daemonStorage || daemonStorageInit)) {
+    storageGeneration++;
+    const stale = daemonOwnedStorage;
+    const staleRoot = daemonProjectRoot;
+    daemonStorage = null;
+    daemonOwnedStorage = null;
+    daemonStorageInit = null;
+    storeOpening = null;
+    stale?.close().catch((err) => logger.warn(`Could not close the store left open for ${staleRoot}: ${err instanceof Error ? err.message : err}`));
+  }
   daemonProjectRoot = projectRoot;
 }
 
@@ -444,7 +467,9 @@ export async function getOrCreateStorage(): Promise<Storage> {
   // let two racing callers both pass `!daemonStorage` and each create their own.
   if (!daemonStorageInit) {
     const root = daemonProjectRoot;
+    const generation = storageGeneration;
     const stage = (name: string) => {
+      if (generation !== storageGeneration) return;
       storeOpening = { stage: name, startedAt: storeOpening?.startedAt ?? Date.now() };
     };
     // Set when the open failed for a reason a restart does not remove (a live
@@ -466,7 +491,7 @@ export async function getOrCreateStorage(): Promise<Storage> {
         // Acquire storage lock once and hold forever. The daemon is the sole writer
         // (CLI uses RemoteStorage, agents run in containers with their own data dir).
         // All FileStorage.withLock() calls become re-entrant within this process.
-        storeLockPath = (storage as unknown as { lock?: { path?: string } }).lock?.path ?? null;
+        if (generation === storageGeneration) storeLockPath = (storage as unknown as { lock?: { path?: string } }).lock?.path ?? null;
         stage('acquiring the storage lock');
         await (storage as any).lock?.acquireForLife?.();
         // A local operator may have re-homed the store after initialize's
@@ -488,6 +513,10 @@ export async function getOrCreateStorage(): Promise<Storage> {
           await assertNoRestoreInProgress(await resolveStorePath(root));
         }
         throw err;
+      }
+      if (generation !== storageGeneration) {
+        await storage.close();
+        throw new Error(`Daemon storage for ${root} was closed while it was opening; not publishing it.`);
       }
       // Wrap AFTER the lock acquire (which reaches past the Storage interface
       // for `.lock`) so the tap never sits between a caller and lock state.
@@ -516,6 +545,8 @@ export async function getOrCreateStorage(): Promise<Storage> {
       // one caller an untapped Storage and drop its events on the floor.
       return tapped;
     })().catch((err) => {
+      // A superseded open must not touch the state of the one that replaced it.
+      if (generation !== storageGeneration) throw err;
       // Clear the memo so a later caller (e.g. the next reconcile tick, once a
       // contending lock holder releases) can retry — but surface THIS failure.
       daemonStorageInit = null;
@@ -601,6 +632,7 @@ async function awaitStoreOpen(init: Promise<Storage>): Promise<Storage> {
  * Close the long-lived Storage instance. Called on daemon shutdown.
  */
 export async function closeAllStorage(): Promise<void> {
+  storageGeneration++;
   if (daemonStorage) {
     logger.debug('Closing daemon storage...');
     const { listImageBuildJobs } = await import('./image-build-job');
@@ -1248,7 +1280,7 @@ export async function handleActive(projectRoot: string, params: Record<string, u
 function builderRunDiscoverer(projectRoot: string): () => Promise<string[]> {
   return async () => {
     try {
-      const runner = await createRunner(projectRoot);
+      const runner = await createInspectionRunner(projectRoot);
       return await runner.discoverProjectBuilderRuns(projectRoot);
     } catch (err) {
       logger.debug(`Concurrency: could not count builder containers: ${err instanceof Error ? err.message : err}`);
@@ -1791,6 +1823,7 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
     // list is explicit, so an omission silently restores the old lie that a
     // stranded task is just `blocked` (fix-sync-silent-conflict).
     mergeState: data.mergeState,
+    abandonableSyncMerge: data.abandonableSyncMerge,
     // Same rule as mergeState: protection only reaches the CLI if it is
     // serialized here, and omitting it silently restores the old behavior
     // where a gate was invisible until accept refused.
@@ -1844,6 +1877,9 @@ async function handleShowUnredacted(projectRoot: string, params: Record<string, 
     // daemon-backed `lazy show` if this field is omitted here, even though
     // loadTaskShowData computed it correctly.
     autoResumeQueue: data.autoResumeQueue,
+    // Spend against the task's token cap and any running-turn stop — the same
+    // rule as autoResumeQueue: omitted here, it vanishes from remote clients.
+    spend: data.spend,
     // [[automation.maintain]] globs for review presentation (docs-first ordering
     // on remote clients). Instructions are supervisor-only; patterns are enough
     // for the maintained-files residual bucket.
@@ -3472,6 +3508,8 @@ export async function handleEditTask(projectRoot: string, params: Record<string,
       reviewGate: optionalString(params, 'reviewGate'),
       reviewAutoFix: optionalString(params, 'reviewAutoFix'),
       runner: params.runner === null || typeof params.runner === 'string' ? (params.runner as string | null) : undefined,
+      tokenCap: params.tokenCap === null || typeof params.tokenCap === 'string' || typeof params.tokenCap === 'number'
+        ? (params.tokenCap as string | number | null) : undefined,
       // An edit is attributed like every other human act on a task. This
       // handler read no actor at all until `teams-identity-is-the-token`, so a
       // per-user token on an `editTask` call bought nothing: the change to a
@@ -3770,7 +3808,7 @@ export async function handleSmolvmServiceBindings(projectRoot: string, params: R
   if (!(await runsOnSmolvm(projectRoot, runName, deps))) {
     throw new RpcError(400, `${runName} does not run on the smolvm runner; its service ports are published on this machine directly.`);
   }
-  const runner = await createRunner(projectRoot, 'smolvm');
+  const runner = await createInspectionRunner(projectRoot, 'smolvm');
   return { bindings: await runner.getRunPortBindings(runName) };
 }
 
@@ -4938,7 +4976,7 @@ export async function handleMintDashboardTicket(projectRoot: string) {
 export async function handleUsageLimits(
   projectRoot: string,
   caller?: ActorIdentity,
-): Promise<{ readings: UsageLimitReading[]; credentialHealth: CredentialFailure[] }> {
+): Promise<{ readings: UsageLimitReading[]; credentialHealth: CredentialFailure[]; providerHealth: ProviderHealth[] }> {
   // Every member's readings (user ids, tasks, utilization) — control-plane
   // only, like listUserCredentials. The in-process fallback passes no caller.
   if (caller) requireControlActor(caller, 'usageLimits');
@@ -4949,7 +4987,8 @@ export async function handleUsageLimits(
   const records = await readAuditRecords(join(projectRoot, config.data.path), { limit: USER_AUTH_VERDICT_RECORDS });
   // Same staleness rule as listUserCredentials (./current-credential-failures).
   const credentialHealth = await currentCredentialFailures(projectRoot, records);
-  return { readings: daemonUsageLimits.readings(), credentialHealth };
+  // "Is it the provider or is it us?" — per provider over the last hour.
+  return { readings: daemonUsageLimits.readings(), credentialHealth, providerHealth: daemonProviderHealthWith(records) };
 }
 
 
@@ -5047,7 +5086,8 @@ export async function handleTokenBudget(projectRoot: string, caller?: ActorIdent
  *    pair` (`surface: 'pair'`, on `taskId`'s credential, or the builder role's
  *    when there is no task) or `lazy chat` (`surface: 'chat'`, which runs on the
  *    builder role). Judged once, like a start; a relaunch of the same session
- *    after a daemon restart is not judged again, as a running turn never is.
+ *    after a daemon restart is not judged again (a running WORK turn, unlike a
+ *    session, is judged on every request: src/daemon/running-turn-stop.ts).
  *
  * Both admissions are judged on the `actor` the client names — only a `human`
  * one may use the override, and none at all never does.
@@ -6693,7 +6733,8 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   // CLI, importers — inherits it without having to remember. See
   // saveConversationWithoutRegression for why a prefix write is always wrong.
   saveConversation: async (s, a) => {
-    await saveConversationWithoutRegression(s, a.conversation as any);
+    const outcome = await saveConversationWithoutRegression(s, a.conversation as any, a.options as { skipPurged?: boolean } | undefined);
+    if (outcome === 'skipped-purged') return outcome;
   },
   loadConversation: (s, a) => s.loadConversation(a.sessionId as string),
   listConversations: (s) => s.listConversations(),
@@ -6701,7 +6742,8 @@ export const STORAGE_METHODS: Record<string, (storage: Storage, args: Record<str
   listBuilders: (s) => s.listBuilders(),
   getBuilder: (s, a) => s.getBuilder(a.idOrSegmentId as string),
   isConversationImported: (s, a) => s.isConversationImported(a.sessionId as string),
-  deleteConversation: (s, a) => s.deleteConversation(a.sessionId as string),
+  isConversationPurged: (s, a) => s.isConversationPurged(a.sessionId as string),
+  deleteConversation: (s, a) => s.deleteConversation(a.sessionId as string, a.options as { preventCapture?: boolean } | undefined),
 
   // Agent session logs (raw Claude Code JSONL)
   saveAgentSessionLog: (s, a) => s.saveAgentSessionLog(a.taskId as string, a.sessionId as string, a.content as string),

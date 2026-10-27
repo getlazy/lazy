@@ -12,7 +12,7 @@
 
 import { describe, test, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError, extractTaskId } from '../helpers/assertions';
@@ -40,7 +40,13 @@ describe('lazy start (offline / force-local)', () => {
    * bug this exercises (start attempting a remote fetch it cannot satisfy).
    */
   async function childWithLocalOnlyParent(): Promise<string> {
-    writeFileSync(join(ctx.root, 'lazy.toml'), '[remote]\ndriver = "github"\n');
+    // Edit the key init wrote, never overwrite the file: a stub would drop the
+    // store's external_path and the commands below would see another store.
+    const tomlPath = join(ctx.root, 'lazy.toml');
+    const toml = readFileSync(tomlPath, 'utf-8');
+    const withGithub = toml.replace(/^driver = "local"$/m, 'driver = "github"');
+    if (withGithub === toml) throw new Error('lazy.toml has no driver = "local" to switch');
+    writeFileSync(tomlPath, withGithub);
     const bareRepo = mkdtempSync(join(tmpdir(), 'lazy-e2e-bare-'));
     Bun.spawnSync(['git', 'init', '--bare', bareRepo]);
     ctx.git('remote', 'add', 'origin', bareRepo);
@@ -71,15 +77,33 @@ describe('lazy start (offline / force-local)', () => {
     expectOutput(result, 'local parent branch');
   });
 
-  // INVARIANT: Online, a genuinely-missing remote parent ref must fail hard with
-  // an actionable error (per AGENTS.md "fail hard on remote failures — no silent
-  // fallbacks"), pointing the user at --force-local. Start must NOT silently
-  // branch from a stale local ref just because the fetch failed.
-  test('online: missing remote parent ref fails actionably without --force-local', async () => {
+  // INVARIANT: Online, a parent TASK branch that is not on origin yet is
+  // ordinary (since 2026-10-14): a parent's agent commits can never be pushed by
+  // it, and accept merges into the parent locally anyway, so start branches from
+  // the local parent branch and SAYS so. Not a silent fallback: the warning
+  // names the branch and the remote.
+  test('online: a parent task branch not on origin yet starts from the local branch, with a warning', async () => {
     const childId = await childWithLocalOnlyParent();
-    await ctx.lazy(['system', 'online']); // fetch will be attempted and fail
+    await ctx.lazy(['system', 'online']);
 
     const result = await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS);
+
+    expectSuccess(result);
+    expectOutput(result, 'does not exist on origin yet; used the local branch');
+  }, 20000);
+
+  // INVARIANT: Online, a missing NAMED parent branch (not a lazy task branch)
+  // still fails hard with an actionable error pointing at --force-local (AGENTS.md
+  // "fail hard on remote failures — no silent fallbacks"): start must not quietly
+  // branch from a local ref nobody pushed.
+  test('online: a missing named parent branch fails actionably without --force-local', async () => {
+    await childWithLocalOnlyParent(); // github driver + origin with only main
+    ctx.git('branch', 'release-x', 'main'); // local only, never pushed
+    await ctx.lazy(['system', 'online']);
+    const created = await ctx.lazy(['create', '--goal', 'On release-x', '--prompt', 'Work', '--parent', 'release-x']);
+    expectSuccess(created);
+
+    const result = await ctx.lazyMocked(['start', extractTaskId(created.stdout), '--yes'], MOCK_CLAUDE_SUCCESS);
 
     expectFailure(result);
     expectError(result, '--force-local');
@@ -89,12 +113,19 @@ describe('lazy start (offline / force-local)', () => {
   // ref genuinely cannot be fetched, start falls back to the parent's local HEAD
   // instead of aborting. Exposed on the CLI (--force-local) and the MCP
   // lazy_start tool (force_local).
+  // Exercised on a NAMED parent branch, the case where start without the flag
+  // still fails — on a task branch it would succeed anyway and prove nothing.
   test('online: --force-local starts from local HEAD when remote parent ref is missing', async () => {
-    const childId = await childWithLocalOnlyParent();
+    await childWithLocalOnlyParent(); // github driver + origin with only main
+    ctx.git('branch', 'release-x', 'main'); // local only, never pushed
     await ctx.lazy(['system', 'online']);
+    const created = await ctx.lazy(['create', '--goal', 'On release-x', '--prompt', 'Work', '--parent', 'release-x']);
+    expectSuccess(created);
+    const childId = extractTaskId(created.stdout);
 
+    expectFailure(await ctx.lazyMocked(['start', childId, '--yes'], MOCK_CLAUDE_SUCCESS));
     const result = await ctx.lazyMocked(['start', childId, '--yes', '--force-local'], MOCK_CLAUDE_SUCCESS);
 
     expectSuccess(result);
-  }, 20000); // fetch is still attempted (retries) before falling back to local HEAD
+  }, 40000); // fetch is attempted (retries) on both starts
 });

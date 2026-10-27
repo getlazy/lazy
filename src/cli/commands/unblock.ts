@@ -2,7 +2,7 @@ import { join } from 'path';
 import { shortId, displayId, taskRef, getWorktreePathForRef, getBranchNameFromId } from '../../task/identity';
 import { existsSync, readFileSync } from 'fs';
 import { requireLazyRoot, requireStorage, parseFlags, validateModel, validateAgentProfileOrExit, resolveTaskOrExit, rejectIfPairing } from '../helpers';
-import { createRunner } from '../../runner';
+import { createInspectionRunner } from '../../runner';
 import { getCommitsBehindCount, getCurrentBranch, getRemoteDefaultBranch } from '../../git/operations';
 import { runGit } from '../../utils/git';
 import { isTTY, promptChoice, promptYesNo, readStdinIfPiped } from '../editor';
@@ -444,7 +444,7 @@ export async function commandUnblock(args: string[]): Promise<void> {
         const storage2 = await requireStorage();
         try {
           const { followContainer } = await import('./shared');
-          const runner = await (await import('../../runner')).createRunner(root);
+          const runner = await (await import('../../runner')).createInspectionRunner(root);
           const protoDir = (await import('../../protocol')).protocolDir(task.id);
           const exitCode = await followContainer(rpcResult.containerName, storage2, root, rpcResult.worktreePath, protoDir, runner);
           await storage2.close();

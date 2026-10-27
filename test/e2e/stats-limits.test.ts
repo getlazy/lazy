@@ -116,4 +116,26 @@ describe('lazy stats limits', () => {
     expect(byName(r.windows, 'codex-secondary')).toMatchObject({ usedPercent: 74, resetSince: null });
     expect(byName(r.storedWindows, 'codex-primary').usedPercent).toBe(100);
   });
+
+  // INVARIANT: "is it the provider or is it us?" is answered by looking — the
+  // CLI and its --json both carry per-provider failures over the last hour.
+  test('shows model provider health for the last hour', async () => {
+    const now = Date.now();
+    const reset = JSON.parse(line(10, now - 3000, undefined, undefined));
+    reset.status = null;
+    reset.error = 'Anthropic (api.anthropic.com) reset the connection 2ms into the request (ECONNRESET), before sending any response';
+    reset.failure = { kind: 'reset', code: 'ECONNRESET', afterMs: 2, provider: 'Anthropic', replayed: true };
+    await seed([line(11, now - 4000, undefined, undefined), JSON.stringify(reset), line(12, now - 2000, undefined, undefined, 529)]);
+
+    const result = await ctx.lazy(['stats', 'limits']);
+    expectSuccess(result);
+    expect(result.stdout).toContain('Model providers, last hour');
+    expect(result.stdout).toContain('Anthropic (api.anthropic.com)  3 requests');
+    expect(result.stdout).toContain('1 reset, 1 529 overloaded');
+
+    const json = await ctx.lazy(['stats', 'limits', '--json']);
+    expectSuccess(json);
+    const row = JSON.parse(json.stdout).providerHealth[0];
+    expect(row).toMatchObject({ provider: 'Anthropic', requests: 3, failures: { reset: 1, overloaded: 1 } });
+  });
 });

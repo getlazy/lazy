@@ -25,7 +25,7 @@ For a server **without** KVM, see [Deploying Lazy Teams on DigitalOcean with Kam
 |---|---|---|
 | `storage` | the Lazy Teams SQLite databases | yes |
 | `fleet` | the fleet root: project stores, hosted repositories, per-project secrets | yes |
-| `secrets` | the install's env file (`SECRET_KEY_BASE`, `AR_ENCRYPTION_*`, `TRUSTED_PROXY_SECRET`) and the CLI signing key | yes — without it nothing stored can be decrypted |
+| `secrets` | the install's env file (`SECRET_KEY_BASE`, `AR_ENCRYPTION_*`, `TRUSTED_PROXY_SECRET`, plus `NGROK_AUTHTOKEN`, `TEAMS_ALLOWED_EMAILS` and `TEAMS_JWKS_URL`, which deploying a new version needs) and the CLI signing key | yes — without it nothing stored can be decrypted |
 | `home/local`, `home/cache` | the app user's `~/.local` and `~/.cache`, which hold the microVM manager's machine list, and each project machine's disk: its clone, every task's worktree and uncommitted changes, each agent's conversation | `home/local/share/smolvm` and `home/cache/smolvm/vms`, yes, with the projects stopped; the rest is rebuilt |
 | `ngrok` | the rendered ngrok configuration | can be re-rendered |
 | `images`, `registry`, `build` | built images and build contexts | no, rebuilt from the checkout |
@@ -63,13 +63,15 @@ The ngrok authtoken is read from `NGROK_AUTHTOKEN`, or from your workstation's n
 
 ### Deploying a new version
 
-Once the server is your install, ship a new version from a checkout of the commit you want:
+Use `move-install` only for the one-time move. Once the server is your install, ship every new version from a checkout of the commit you want:
 
 ```bash
 bun run teams:deploy root@your-server
 ```
 
-It runs the `preflight`, `build`, `deploy` and `ngrok` steps: it builds both images from the checked-out commit on the server, replaces the app (database migrations run as the new version starts), and refreshes ngrok's configuration from the new version's policy. It never copies anything from your workstation and never holds projects stopped. Project daemons move onto the new lazy by themselves, one by one. The secrets still come from your workstation's env file, so keep it. A deploy restarts ngrok, so the install is unreachable for a few seconds.
+This runs `lazy-teams/bin/deploy root@your-server`. It refuses a server with no existing install, pointing to `move-install` for the first move. Add `--domain example.com` for your services domain, or `--app-host` for a different Teams name. An explicit `--env-file /path/to/deploy.env` uses local deployment settings instead; the signing key still comes from the server. `--dry-run` checks the install and reads settings, then prints the update commands. Reports go under `~/lazy-deploy-reports/` by default (`--report` overrides this).
+
+It runs the `preflight`, `build`, `deploy` and `ngrok` steps: it builds both images from the checked-out commit on the server, replaces the app (database migrations run as the new version starts), and refreshes ngrok's configuration from the new version's policy. It never copies anything from your workstation and never holds projects stopped. Project daemons move onto the new lazy by themselves, one by one. The deployment settings and CLI signing key are read over SSH from `/srv/lazy-teams/secrets/deploy.env` and `cli-jwt.pem` on the server. The env file must include `NGROK_AUTHTOKEN`, `TEAMS_ALLOWED_EMAILS`, and `TEAMS_JWKS_URL` as well as the install's encryption and proxy secrets; a move writes all of them. On a server moved earlier whose env file lacks them, deploy reads them from where that move left them — the ngrok token from the running ngrok container, the allowed emails and JWKS URL from `/srv/lazy-teams/ngrok/ngrok.yml` — and says so without showing them. If a value is in neither place, deploy stops before building and names each missing key: add a `KEY=value` line for each to `/srv/lazy-teams/secrets/deploy.env` on the server once (keep it mode 600), or pass the emails and JWKS URL as `--emails` and `--jwks-url`. Deploy reads that file as plain `KEY=VALUE` lines and never runs it as a script: blank lines and `#` comment lines are skipped, an optional `export ` prefix is allowed, and keys other than those it needs are ignored. Write each value plain or in single quotes; a value whose meaning in a shell would differ from its text (spaces, a trailing `# comment`, `$`, backticks, backslashes, `;`, `&`, `|`, `<`, `>`, parentheses, a leading `~`, or double quotes around `$`, backticks or backslashes) is refused with the key named. No native install or workstation env file is needed; secrets are held only in the deployment process, never saved locally or printed. A deploy restarts ngrok, so the install is unreachable for a few seconds.
 
 ### Starting over on the server
 

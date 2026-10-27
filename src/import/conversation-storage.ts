@@ -86,7 +86,7 @@ export function isStrictPrefixConversation(
 }
 
 /** What a no-regression save actually did, so callers can report it. */
-export type ConversationSaveOutcome = 'saved' | 'skipped-regression';
+export type ConversationSaveOutcome = 'saved' | 'skipped-regression' | 'skipped-purged';
 
 /**
  * Persist a captured conversation, refusing to replace a strictly LONGER stored
@@ -107,6 +107,7 @@ export type ConversationSaveOutcome = 'saved' | 'skipped-regression';
 export async function saveConversationWithoutRegression(
   storage: Storage,
   conversation: StoredConversation,
+  options?: { skipPurged?: boolean },
 ): Promise<ConversationSaveOutcome> {
   const existing = await storage.loadConversation(conversation.sessionId);
   conversation = { ...conversation, memberEmail: existing?.memberEmail ?? conversation.memberEmail ?? null };
@@ -120,6 +121,6 @@ export async function saveConversationWithoutRegression(
     );
     return 'skipped-regression';
   }
-  await storage.saveConversation(conversation);
-  return 'saved';
+  const outcome = await storage.saveConversation(conversation, options);
+  return outcome === 'skipped-purged' ? outcome : 'saved';
 }

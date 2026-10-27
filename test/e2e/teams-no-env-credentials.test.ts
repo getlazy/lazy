@@ -82,6 +82,11 @@ named_endpoint = "acme"
     if (!t || !tok) throw new Error('test daemon did not record a TCP target and token');
     target = t;
     sharedToken = tok;
+    // The owner's save: a managed load honours the control plane's
+    // [agents]/[endpoints] only once they are applied, so without it the
+    // custom endpoint this suite is about does not exist.
+    expect(await rpc(sharedToken, 'applyProjectConfig', { toml: config, origin: 'control-plane' }))
+      .toMatchObject({ applied: true });
   });
 
   afterEach(async () => {
@@ -120,8 +125,9 @@ named_endpoint = "acme"
     expect((await ctx.codexInvocations()).filter((i) => i.argv.includes('exec'))).toHaveLength(0);
 
     // Connecting her own makes it connected — the env var never did.
+    // Carrying the endpoint she was SHOWN — her consent covers that scope, path included.
     await rpc(sharedToken, 'putEndpointCredential', {
-      userId: ALICE_EMAIL, endpointId: 'acme', origin: gatewayOrigin, kind: 'api-key', token: 'alice-own-acme',
+      userId: ALICE_EMAIL, endpointId: 'acme', origin: state.endpoints.find((e) => e.endpointId === 'acme')!.scope, kind: 'api-key', token: 'alice-own-acme',
     });
     const after = (await rpc(alice.token, 'endpointCredentials')) as EndpointCredentialsResult;
     expect(after.endpoints.find((e) => e.endpointId === 'acme')?.yours?.state).toBe('connected');

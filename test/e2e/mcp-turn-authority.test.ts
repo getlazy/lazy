@@ -125,9 +125,15 @@ describe('MCP authority is bound to the live turn', () => {
     return extractTaskId(made.stdout);
   }
 
+  // Counts the entries written through the task's MCP token. The daemon writes
+  // its own `system` notices to the same journal (e.g. "Container replaced
+  // before this turn" when a launch finds the environment gone), and those say
+  // nothing about whether the token's write was accepted.
   function journalCount(shortId: string): number {
     const file = taskFilePath(ctx.root, shortId, 'journal.json');
-    return existsSync(file) ? JSON.parse(readFileSync(file, 'utf-8')).journal.length : 0;
+    if (!existsSync(file)) return 0;
+    const entries: Array<{ actor?: unknown }> = JSON.parse(readFileSync(file, 'utf-8')).journal;
+    return entries.filter((e) => e.actor !== 'system').length;
   }
 
   function childIdFrom(body: string): string {

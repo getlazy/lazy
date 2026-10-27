@@ -6,6 +6,7 @@
  */
 
 import { parseReviewFlags, REVIEW_FLAGS, REVIEW_FLAGS_USAGE } from '../review-flags';
+import { getActor } from '../../constants';
 import { TeamsCommandRefusedError } from '../../daemon/client';
 import { existsSync } from 'fs';
 import { shortId, displayId, displayIdFor, getWorktreePath } from '../../task/identity';
@@ -322,11 +323,13 @@ export async function commandStart(args: string[]): Promise<void> {
         effortOverride,
         reviewOverrides,
         runnerOverride,
-        // The CLI IS the human channel, and the daemon requires the actor to be
-        // named rather than defaulted: the turn this writes decides whether the
-        // task's work is written for a person. (A user-kind caller's `userId`
-        // is pinned over this by the daemon, never taken from here.)
-        actor: 'human',
+        // The CLI's channel — human unless a wrapper set LAZY_ACTOR=builder,
+        // exactly as every other CLI write names it — and the daemon requires
+        // the actor to be named rather than defaulted: the turn this writes
+        // decides whether the task's work is written for a person. (A
+        // user-kind caller's `userId` is pinned over this by the daemon,
+        // never taken from here.)
+        actor: getActor(),
         ...overrideEligibility,
         ...(parsed.flags.get('override-usage-pause') === true ? { usagePausePastOnce: true as const } : {}),
         traceparent: currentTraceparent() ?? undefined,

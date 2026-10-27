@@ -108,7 +108,8 @@ import {
 import { liveKeysToken } from './task-live-regions';
 import { domMorphScript } from './dom-morph';
 import { timestampHtml } from './timestamps';
-import { taskUsagePauseHtml } from './usage-pause-banner';
+import { taskUsagePauseHtml, taskSpendHtml } from './usage-pause-banner';
+import type { TaskSpendView } from '../task/show-data';
 import { taskRunnerImageHtml, runnerImageSyncCheckboxHtml } from './runner-image-banner';
 import type { TaskUsagePauseView } from './task-actions';
 import { revertedProtectedFiles } from '../protection/reverted-files';
@@ -242,6 +243,8 @@ export interface TaskPageInput {
    * launch dialogs' "let this turn through" box). Absent/null draws nothing.
    */
   usagePause?: TaskUsagePauseView | null;
+  /** Spend against the task's token cap, and a running-turn stop (src/task/show-data.ts). */
+  spend?: TaskSpendView;
   /** Shared linkify tables (task codes; symbols merge in on Changes). */
   markdown?: RenderMarkdownOptions;
   /** Direct `/raised/:id` load — render the Raised tab with this dialog open. */
@@ -570,6 +573,7 @@ function landingHeaderHtml(input: TaskPageInput): string {
     <div class="lz-landing-header">
       ${flash}
       ${taskUsagePauseHtml(task.id, input.usagePause)}
+      ${taskSpendHtml(task, input.spend)}
       ${taskRunnerImageHtml(task, `/tasks/${encodeURIComponent(task.id)}`)}
       ${turnFailureHtml(task, session)}
       <h1>Task ${escapeHtml(taskDisplayId)}</h1>

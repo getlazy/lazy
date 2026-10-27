@@ -34,8 +34,8 @@ import {
   describeWorktreeAddFailure,
 } from '../../git/operations';
 import { runGit } from '../../utils/git';
-import { createRunner } from '../../runner';
-import type { Runner } from '../../runner';
+import { createInspectionRunner } from '../../runner';
+import type { InspectionRunner } from '../../runner';
 
 // ── types ────────────────────────────────────────────────────────────────
 
@@ -440,13 +440,12 @@ async function runContainerDoctor(
     return null;
   };
 
-  let runner: Runner;
+  let runner: InspectionRunner;
   try {
-    runner = await createRunner(root);
+    runner = await createInspectionRunner(root);
   } catch (err) {
-    // A daemon that is down (or that lost its proxy) is exactly what this
-    // looks like. It is a real thing to report, but it is not a verdict on the
-    // container — and it must not abort the task checks that already ran.
+    // A broken runner configuration is a finding, not a verdict on the
+    // container. Keep the task checks that already ran available.
     return skip(err instanceof Error ? err.message : String(err));
   }
 

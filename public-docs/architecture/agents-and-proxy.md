@@ -59,3 +59,19 @@ Real credentials live with the daemon, not in any project file. `lazy auth set` 
 The proxy keeps only response headers that report rate limits, for example the 5-hour and 7-day windows of a Claude subscription, and the equivalents some other providers send. Anything else in a response's headers is dropped, and a value that looks like a secret is refused. The latest reading per credential is held by the daemon and survives a restart. `lazy stats limits` and `lazy stats budget` show it, and `[usage_pause]` can hold new turns past a threshold. See [Token budgets](../token-budgets.md). A harness whose provider sends no such headers shows no reading.
 
 More: [The daemon, the task container and the proxy](../explanation/daemon-and-proxy.md).
+
+## When a model request fails
+
+Every error the proxy returns says which party failed:
+
+- **The provider or the network to it.** The message names the provider (Anthropic, OpenAI, Cursor, or a configured endpoint by name), its host, the agent profile and credential label, and how far the request got. For example: "Anthropic (api.anthropic.com, profile `code-builder`) reset the connection 4 ms into the request".
+- **lazy's own proxy.** The message starts with "lazy's proxy failed".
+- **The provider's own error responses** (5xx, 529 overloaded, 429 rate-limited) reach the agent unchanged.
+
+Providers close idle connections, and a request that crosses that close is reset before any answer. The proxy sends that request once more, straight away, on a fresh connection. This only happens when nothing was received yet and the request body can be sent again. The agent sees no error.
+
+To see whether a provider is having a bad hour, check provider health. It lists each provider over the last hour: how many requests, failures by kind (reset, timeout, connect, 5xx, 529, 429), and the latest failure. lazy's own refusals are not counted. You can find it in:
+
+- `lazy stats limits`
+- the dashboard's home page, below the token budget
+- the Usage page in Lazy Teams, for project admins

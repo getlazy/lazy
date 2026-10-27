@@ -73,6 +73,7 @@ const EXPECTED: Record<string, Outcome> = {
   lazy_active: 'answers',
   lazy_diff: 'answers',
   lazy_regions: 'answers',
+  lazy_sessions: 'answers',
   lazy_wait: 'answers',
   lazy_status: 'answers',
   lazy_memory_recall: 'answers',

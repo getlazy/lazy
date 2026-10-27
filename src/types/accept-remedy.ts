@@ -37,6 +37,7 @@ export type AcceptRefusalReason =
   | 'task-branch-origin-unreachable'
   | 'merge-conflict'
   | 'mid-merge'
+  | 'unproven-merge'
   | 'dirty-worktree'
   | 'tampered-git-dir'
   | 'nested-git-repository'
@@ -76,7 +77,7 @@ const REASONS: ReadonlySet<string> = new Set<AcceptRefusalReason>([
   'approval-required', 'approval-invalid', 'pending-violations', 'open-raised-items',
   'review-issues-unaddressed', 'queued-comments-undelivered',
   'resurrection',
-  'lfs-raw-blob', 'check-failed', 'out-of-sync', 'task-branch-behind-origin', 'task-branch-origin-unreachable', 'merge-conflict', 'mid-merge', 'dirty-worktree', 'tampered-git-dir', 'nested-git-repository',
+  'lfs-raw-blob', 'check-failed', 'out-of-sync', 'task-branch-behind-origin', 'task-branch-origin-unreachable', 'merge-conflict', 'mid-merge', 'unproven-merge', 'dirty-worktree', 'tampered-git-dir', 'nested-git-repository',
   'no-session', 'interrupted', 'working', 'parent-active', 'no-commits',
   'already-accepted', 'forge-approval-required', 'mr-closed', 'review-base-mismatch',
 ]);

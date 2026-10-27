@@ -4,20 +4,21 @@
  * ready, launches either run on lazy's default image because somebody chose
  * that, or are refused (src/daemon/runner-image-choice.ts).
  */
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtemp, writeFile, rm, realpath, readFile } from 'fs/promises';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mkdtemp, writeFile, rm, realpath, readFile, mkdir } from 'fs/promises';
 import { writeAdoptedImage, hashDockerfileContent } from '../../src/daemon/adopted-image';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { pinDaemonBaseDir } from '../helpers/daemon-base-dir';
 import { pinConfig } from '../helpers/pin-config';
 import { installFakeDocker, type FakeDocker } from '../helpers/fake-docker';
-import { ensureImage, resetUpgradeImageBuild, IMAGE_TAG } from '../../src/capture/claude';
+import { ensureImage, resolveImageRepository, resetUpgradeImageBuild, IMAGE_TAG } from '../../src/capture/claude';
 import { RunnerImageNotReadyError, DEFAULT_RUNNER_IMAGE_PIN } from '../../src/capture/custom-image-gate';
 import {
   startRunnerImageBoot, runnerImageStatus, resetRunnerImageForTests, retryRunnerImageBuild, syncRunnerImageTarget,
-  type RunnerImageState,
+  cancelRunnerImageBuild, describeRunnerImage, type RunnerImageState,
 } from '../../src/daemon/runner-image';
+import { projectImageState } from '../../src/daemon/image-state';
 import {
   confirmRunnerImageForLaunch, taskRunnerImageView, useCustomRunnerImage, runnerImageHold,
   builderRunnerImageBanner, classifyLaunchImage, mustRecreateForRunnerImage, RUNNER_IMAGE_NOT_READY_MARKER, RUNNER_IMAGE_LAST_META_KEY,
@@ -65,6 +66,85 @@ describe('the custom runner image is built at daemon boot', () => {
   });
 
   const boot = () => startRunnerImageBoot(root, { isContainerRunner: async () => ({ binary: docker.binPath }) });
+
+  // INVARIANT: Docker startup is waiting, not a failed build. Readiness probes
+  // recover automatically without spending the OOM build-attempt budget.
+  test('boot waits for Docker to answer then builds without Retry', async () => {
+    await writeFile(join(docker.stateDir, 'info-failures-left'), '2');
+    await boot();
+    await until(() => (runnerImageStatus() as { waitingForEngine?: boolean }).waitingForEngine === true, 3_000);
+    expect((await docker.builds()).length).toBe(0);
+    await expect(readFile(join(root, '.lazy', 'runner-image-attempt.json'))).rejects.toThrow();
+    await until(() => runnerImageStatus().state === 'ready');
+    expect(await ensureImage(docker.binPath)).toMatch(/^lazy-custom-/);
+  }, 30_000);
+
+  // INVARIANT: an engine disappearing between readiness and ensureImage is
+  // still waiting, not a failed build; only real builds spend the OOM budget.
+  test('Docker can answer once then disappear before the build and recover', async () => {
+    await writeFile(join(docker.stateDir, 'info-answer-once'), '1');
+    await boot();
+    await until(() => (runnerImageStatus() as { waitingForEngine?: boolean }).waitingForEngine === true, 3_000);
+    expect((await docker.builds()).length).toBe(0);
+    await expect(readFile(join(root, '.lazy', 'runner-image-attempt.json'))).rejects.toThrow();
+    await rm(join(docker.stateDir, 'info-answer-once'));
+    await until(() => runnerImageStatus().state === 'ready');
+    expect(await ensureImage(docker.binPath)).toMatch(/^lazy-custom-/);
+  }, 30_000);
+
+  // INVARIANT: readiness retries must preserve earlier real failures. Removing
+  // those would reset the cross-restart protection against OOM build loops.
+  test('a pre-build Docker disappearance preserves earlier failed attempts', async () => {
+    const { repository } = await resolveImageRepository(root);
+    const record = { imageName: repository + ':' + IMAGE_TAG, failures: 1,
+      lastAttemptAt: new Date(Date.now() - 120_000).toISOString(), inProgress: false, error: 'earlier build ran out of memory' };
+    await mkdir(join(root, '.lazy'), { recursive: true });
+    await writeFile(join(root, '.lazy', 'runner-image-attempt.json'), JSON.stringify(record));
+    await writeFile(join(docker.stateDir, 'info-answer-once'), '1');
+    await boot();
+    await until(() => (runnerImageStatus() as { waitingForEngine?: boolean }).waitingForEngine === true, 3_000);
+    expect(JSON.parse(await readFile(join(root, '.lazy', 'runner-image-attempt.json'), 'utf8'))).toEqual(record);
+    expect((await docker.builds()).length).toBe(0);
+    await rm(join(docker.stateDir, 'info-answer-once'));
+    await until(() => runnerImageStatus().state === 'ready');
+  }, 30_000);
+
+  // INVARIANT: waiting is visible on every surface and Cancel prevents a
+  // later Docker startup from launching work nobody still wants.
+  test('waiting explains Docker readiness and can be cancelled', async () => {
+    await docker.failInfo();
+    await boot();
+    await until(() => (runnerImageStatus() as { waitingForEngine?: boolean }).waitingForEngine === true);
+    expect(describeRunnerImage()).toContain('as soon as it answers');
+    const view = await projectImageState(root, { adoptionView: null });
+    expect(view.state).toBe('building');
+    if (view.state === 'building') expect(view.reason).toBe(describeRunnerImage());
+    cancelRunnerImageBuild();
+    await rm(join(docker.stateDir, 'fail-info'));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect(runnerImageStatus().state).toBe('failed');
+    expect((await docker.builds()).length).toBe(0);
+  });
+
+  // INVARIANT: an expired failure is retried before a launch reads readiness;
+  // a live daemon must not retain yesterday's Docker-startup refusal forever.
+  test('a launch retries an expired failure without an explicit Retry', async () => {
+    await docker.failBuilds();
+    await boot();
+    await until(() => runnerImageStatus().state === 'failed');
+    const status = runnerImageStatus() as Extract<RunnerImageState, { state: 'failed' }>;
+    const now = Date.now.bind(Date);
+    const clock = spyOn(Date, 'now').mockImplementation(() => now() + 120_000);
+    try {
+      await rm(join(docker.stateDir, 'fail-build'));
+      await syncRunnerImageTarget();
+      expect(runnerImageStatus().state).toBe('checking');
+      await until(() => runnerImageStatus().state === 'ready');
+      expect(await ensureImage(docker.binPath)).toBe(status.imageName);
+    } finally {
+      clock.mockRestore();
+    }
+  }, 30_000);
 
   // INVARIANT: while the boot build runs, a launch that wants the custom image
   // is refused and starts NO build of its own — the 25-minute build behind a

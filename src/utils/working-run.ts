@@ -38,8 +38,8 @@
  * never one it is (rightly) still waiting for.
  */
 
-import type { Runner, RunInfo, RunnerType } from '../runner/types';
-import { createRunner } from '../runner';
+import type { RunInfo, RunnerType } from '../runner/types';
+import { createInspectionRunner, type InspectionRunner } from '../runner';
 import type { InFlightTurn, Session, Task } from '../types';
 import type { Storage } from '../storage/interface';
 import { isInFlightLive } from '../daemon/in-flight-turn';
@@ -50,7 +50,7 @@ import { launchInFlight } from '../runner/launch-in-flight';
 
 export interface WorkingRun {
   /** The runner that owns the run — the one to probe, stop and remove it on. */
-  runner: Runner;
+  runner: InspectionRunner;
   /** The run's name on that runner (container name or pid-file name). */
   runName: string;
   /** The mailbox that run reads its command from and writes its status to. */
@@ -61,12 +61,12 @@ export interface WorkingRun {
 
 /**
  * Builds the runner for a type other than the default one. A seam only:
- * production always uses `createRunner`; a test passes fakes to prove WHICH
+ * production always uses `createInspectionRunner`; a test passes fakes to prove WHICH
  * runner a resolution probes.
  */
-export type RunnerFactory = (type: RunnerType) => Promise<Runner>;
+export type RunnerFactory = (type: RunnerType) => Promise<InspectionRunner>;
 
-const runnerFactory = (lazyRoot: string): RunnerFactory => (type) => createRunner(lazyRoot, type);
+const runnerFactory = (lazyRoot: string): RunnerFactory => (type) => createInspectionRunner(lazyRoot, type);
 
 /**
  * The WORK run of a task: the session's own runner (falling back to
@@ -78,7 +78,7 @@ export async function resolveWorkRun(
   lazyRoot: string,
   task: Task,
   session: Pick<Session, 'container_name' | 'runner_type'>,
-  defaultRunner: Runner,
+  defaultRunner: InspectionRunner,
   runnerOf: RunnerFactory = runnerFactory(lazyRoot),
 ): Promise<WorkingRun> {
   const runner = session.runner_type && session.runner_type !== defaultRunner.type
@@ -104,7 +104,7 @@ export async function resolveWorkingRun(
   lazyRoot: string,
   task: Task,
   session: Pick<Session, 'container_name' | 'runner_type'>,
-  defaultRunner: Runner,
+  defaultRunner: InspectionRunner,
   runnerOf: RunnerFactory = runnerFactory(lazyRoot),
 ): Promise<WorkingRun> {
   const claim = task.in_flight_turn ?? null;
@@ -136,7 +136,7 @@ export async function computeTaskWorkingSubstate(
   lazyRoot: string,
   task: Task,
   session: Pick<Session, 'container_name' | 'runner_type'>,
-  defaultRunner: Runner,
+  defaultRunner: InspectionRunner,
 ): Promise<WorkingSubstate | null> {
   return (await probeWorkingRun(lazyRoot, task, session, defaultRunner)).substate;
 }
@@ -176,7 +176,7 @@ export async function probeWorkingRun(
   lazyRoot: string,
   task: Task,
   session: Pick<Session, 'container_name' | 'runner_type'>,
-  defaultRunner: Runner,
+  defaultRunner: InspectionRunner,
   runnerOf?: RunnerFactory,
 ): Promise<WorkingRunProbe> {
   const run = await resolveWorkingRun(lazyRoot, task, session, defaultRunner, runnerOf);
@@ -221,7 +221,7 @@ export async function readTaskWorkingSubstate(
   lazyRoot: string,
   storage: Storage,
   taskId: string,
-  defaultRunner: Runner,
+  defaultRunner: InspectionRunner,
 ): Promise<WorkingSubstate | null> {
   const task = await storage.getTask(taskId);
   if (!task || task.status !== 'working') return null;

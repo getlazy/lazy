@@ -16,7 +16,7 @@ import { confirmDefaultRunnerImage } from '../runner-image-confirm';
 import { getBranchNameFromId, displayId } from '../../task/identity';
 import { existsSync } from 'fs';
 import { getBranchCommitMessages, getCurrentSha, getNewCommits, getRemoteDefaultBranch, getDiffStat } from '../../git/operations';
-import { createRunner } from '../../runner';
+import { createInspectionRunner } from '../../runner';
 import { hasResponse, readCommand, protocolDir as getProtocolDir } from '../../protocol';
 import type { StartCommand, UnblockCommand } from '../../protocol';
 
@@ -170,7 +170,7 @@ export async function followContainer(
   lazyRoot: string,
   worktreePath: string,
   protocolDir?: string,
-  existingRunner?: import('../../runner').Runner,
+  existingRunner?: import('../../runner').InspectionRunner,
 ): Promise<number> {
   logger.debug(`Following container ${containerName}...`);
 
@@ -188,7 +188,7 @@ export async function followContainer(
 
   // The runner is authoritative for where the agent writes its session logs,
   // so resolve it before starting the activity monitor.
-  const runner = existingRunner ?? await createRunner(lazyRoot);
+  const runner = existingRunner ?? await createInspectionRunner(lazyRoot);
 
   // Start activity monitor for Claude Code JSONL session logs
   const taskId = taskIdFromContainer(containerName);
@@ -658,7 +658,7 @@ export async function runFeedbackFlow(
       } else if (follow) {
         const storage2 = await requireStorage();
         try {
-          const runner = await createRunner(root);
+          const runner = await createInspectionRunner(root);
           const protoDir = getProtocolDir(task!.id);
           const exitCode = await followContainer(rpcResult.containerName, storage2, root, rpcResult.worktreePath, protoDir, runner);
           await storage2.close();

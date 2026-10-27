@@ -14,7 +14,7 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { worktreePathFor, readTurns, writeTurns } from '../helpers/storage';
 import { seedFinal } from '../helpers/final';
 
@@ -62,7 +62,7 @@ describe('lazy accept over a content-less turn', () => {
     // Sanity: the defect is really in the store (not silently defaulted on read).
     expect(readTurns(ctx.root, taskId).some(t => !('content' in t))).toBe(true);
 
-    const accept = await ctx.lazy(['accept', taskId, '--yes']);
+    const accept = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accept);
     expectOutput(accept, 'accepted');
 

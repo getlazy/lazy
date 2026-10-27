@@ -7,6 +7,7 @@
  * only its reader. Read-only, like every `stats` subcommand.
  */
 import { parseFlags } from '../helpers';
+import { describeFailureCounts, totalFailures, type ProviderHealth } from '../../proxy/provider-health';
 import { queryTokenBudget, queryUsageLimits, queryUsagePause } from '../../daemon/rpc-fallback';
 import { attachBudget } from '../../usage-pause/budget-view';
 import { describeNoReading, type UsagePauseCoverage } from '../../daemon/usage-pause';
@@ -85,7 +86,7 @@ export async function commandLimits(args: string[]): Promise<void> {
     ],
     'stats limits',
   );
-  const { readings, credentialHealth } = await queryUsageLimits();
+  const { readings, credentialHealth, providerHealth } = await queryUsageLimits();
   // Which of them [usage_pause] is holding, and which it is armed for but
   // cannot act on — the daemon's answer, so these lines and the launch gate
   // cannot disagree.
@@ -96,7 +97,7 @@ export async function commandLimits(args: string[]): Promise<void> {
     // refusal while the saved readings cannot be read.
     let view;
     try {
-      view = projectUsageLimits(readings, pause, Date.now(), credentialHealth);
+      view = projectUsageLimits(readings, pause, Date.now(), credentialHealth, providerHealth);
     } catch (err) {
       if (!(err instanceof UsageLimitsUnreadableError)) throw err;
       console.error(`Error: ${err.message}`);
@@ -116,6 +117,8 @@ export async function commandLimits(args: string[]): Promise<void> {
     console.log(`  since ${new Date(f.failedAt).toISOString()}${f.profile ? ` · agent profile ${f.profile}` : ''}`);
     if (f.error) console.log(`  ${dim(f.error)}`);
   }
+  // "Is it the provider or is it us?" — answered by looking.
+  for (const line of renderProviderHealth(providerHealth, now)) console.log(line);
   // Armed credentials with no reading at all have no reading to hang the
   // warning on, so they are listed on their own.
   const unread = (coverage ?? []).filter(
@@ -142,6 +145,26 @@ export async function commandLimits(args: string[]): Promise<void> {
   }
 }
 
+/**
+ * Provider health over the last hour, one line per provider/host, plus the
+ * latest failure's text when there was one. Empty when nothing was proxied.
+ */
+export function renderProviderHealth(health: readonly ProviderHealth[], now: number): string[] {
+  if (health.length === 0) return [];
+  const lines = [theme.label('Model providers, last hour')];
+  for (const h of health) {
+    const failed = totalFailures(h);
+    const counts = failed ? theme.warning(describeFailureCounts(h)) : dim('no failures');
+    lines.push(`  ${h.provider} (${h.host})  ${h.requests} request${h.requests === 1 ? '' : 's'} · ${counts}`);
+    if (h.lastFailureAt !== null) {
+      const ago = Math.max(0, Math.round((now - h.lastFailureAt) / 60_000));
+      lines.push(`    last failure ${ago} min ago: ${dim(h.lastFailure ?? '')}`);
+    }
+  }
+  lines.push('');
+  return lines;
+}
+
 export function limitsUsage(): void {
   console.log(`Usage: lazy stats limits [--json]
 
@@ -154,8 +177,14 @@ one it is armed for but cannot read a subscription window from is marked
 ARMED, NO READING; a window that has reset since its reading is shown as
 "reset at <time>" with its old percentage only as history.
 
+"Model providers, last hour" lists each provider or endpoint the proxy
+forwarded to (Anthropic, OpenAI, Cursor, a configured endpoint) with its
+request count, failures by kind (connection reset, timeout, connect, 5xx,
+529 overloaded, 429 rate-limited) and the latest failure — so "is it the
+provider or is it lazy?" is answered by looking.
+
 Options:
-  --json   Machine-readable: { scope, readings, pause, budget } — every reading with
+  --json   Machine-readable: { scope, readings, pause, providerHealth, budget } — every reading with
            its raw headers, windows, overage status and pause verdict, plus
            the [usage_pause] thresholds, override, held tasks and coverage
            (which credentials it is armed for with no reading). Refuses, naming

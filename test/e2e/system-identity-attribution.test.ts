@@ -30,6 +30,7 @@ import { SERVICE_CREDENTIAL_USER_ID } from '../../src/daemon/user-credentials';
 import { NO_SERVICE_CREDENTIAL_MARKER } from '../../src/daemon/turn-credentials';
 import { getLogPath } from '../../src/daemon/paths';
 import { readFile } from 'fs/promises';
+import { rmSync } from 'fs';
 
 interface AttributedRow {
   content?: string;
@@ -186,7 +187,13 @@ describe('a turn nobody asked for in managed mode', () => {
     session.container_name = 'lazy-container-that-is-gone';
     writeSessionJson(ctx.root, taskId, session);
     setTaskStatus(ctx.root, taskId, 'working');
-    consumeResponse(getProtocolDir(findFullTaskId(ctx.root, taskId)));
+    const mailbox = getProtocolDir(findFullTaskId(ctx.root, taskId));
+    consumeResponse(mailbox);
+    // The turn was dispatched by the daemon that ran BEFORE the managed
+    // restart, and a turn whose dispatching daemon is gone is read as killed by
+    // that restart (interrupted, no crash row) — not as the crash this fixture
+    // stages. Without the dispatch record the reconciler sees a crash.
+    rmSync(`${mailbox}.dispatched-by`, { force: true });
   }
 
   // INVARIANT: in Teams the system identity is the SERVICE CREDENTIAL'S OWNER —
@@ -204,6 +211,12 @@ describe('a turn nobody asked for in managed mode', () => {
       token: 'oat-service-secret',
       label: 'service (ops@example.com)',
       ownerEmail: 'ops@example.com',
+    });
+    // An automated turn runs on the service holder's own connection for the
+    // agent's endpoint, so the holder needs one.
+    await rpc('putEndpointCredential', {
+      userId: 'ops@example.com', endpointId: 'builtin:anthropic',
+      origin: 'https://api.anthropic.com', kind: 'oauth', token: 'oat-service-secret',
     });
 
     crashMidTurn(taskId);

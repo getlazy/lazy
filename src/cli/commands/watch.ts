@@ -32,7 +32,7 @@ import { theme, dim } from '../../render/theme';
 import { findLatestSessionFile, watchSessionReplayStart, watchEntryBelongsToTurn } from '../../agent/session-discovery';
 import { WatchTurnTracker } from '../../agent/watch-turns';
 import { renderEntry, type RawLogEntry } from '../../render/watch-renderer';
-import { createRunner } from '../../runner';
+import { createInspectionRunner } from '../../runner';
 import type { FollowHandle } from '../../runner/types';
 import { protocolDir as getProtocolDir, readStatus } from '../../protocol';
 import { renderStatusHeader } from '../../render/status-header';
@@ -186,7 +186,7 @@ async function doWatch(
   // The runner is the source of truth for where the agent writes its session
   // JSONL, so we create it up front (construction is cheap and doesn't touch
   // Docker) and ask it for the project dir to tail.
-  const runner = await createRunner(root);
+  const runner = await createInspectionRunner(root);
   const projectDir = runner.agentSessionProjectDir(worktreePath);
   const turns = new WatchTurnTracker(storage, task.id, (line) => process.stdout.write(dim(line) + '\n'));
   try { await turns.refresh(); } catch { console.log(dim('(recent turns unavailable)')); }

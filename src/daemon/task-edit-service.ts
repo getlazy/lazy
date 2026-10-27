@@ -55,6 +55,7 @@ import type {
   TaskSubmitPreflight,
   TaskSubmitResult,
   TaskReparentTargets,
+  TaskEndOptions,
 } from '../server/task-actions';
 
 export function createTaskEditActions(projectRoot: string): TaskActions {
@@ -97,13 +98,13 @@ export function createTaskEditActions(projectRoot: string): TaskActions {
       return {};
     },
 
-    async closeTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult> {
-      const result = await daemonCloseTask(projectRoot, { taskId, reason, actor: 'human', onProgress });
+    async closeTask(taskId: string, reason: string, onProgress?: ProgressEmitter, options?: TaskEndOptions): Promise<TaskLifecycleResult> {
+      const result = await daemonCloseTask(projectRoot, { taskId, reason, actor: 'human', acceptDirtyWorktree: options?.acceptDirtyWorktree, onProgress });
       return { warnings: result.warnings };
     },
 
-    async rejectTask(taskId: string, reason: string, onProgress?: ProgressEmitter): Promise<TaskLifecycleResult> {
-      const result = await daemonRejectTask(projectRoot, { taskId, reason, actor: 'human', onProgress });
+    async rejectTask(taskId: string, reason: string, onProgress?: ProgressEmitter, options?: TaskEndOptions): Promise<TaskLifecycleResult> {
+      const result = await daemonRejectTask(projectRoot, { taskId, reason, actor: 'human', acceptDirtyWorktree: options?.acceptDirtyWorktree, onProgress });
       return { warnings: result.warnings };
     },
 

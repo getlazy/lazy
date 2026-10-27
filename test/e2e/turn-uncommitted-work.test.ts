@@ -121,7 +121,7 @@ describe('a turn that ends with uncommitted work', () => {
   test('accept refuses, naming the file the turn left behind', async () => {
     const taskId = await runTurnLeaving('public-docs/troubleshooting.md');
 
-    const accept = await ctx.lazy(['accept', taskId]);
+    const accept = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectFailure(accept, 1);
     expectError(accept, 'public-docs/troubleshooting.md');
     expectError(accept, 'None of it is on the branch');
@@ -232,7 +232,7 @@ describe('a turn that ends with uncommitted work', () => {
       expect(workTurn!.uncommitted).toBeUndefined();
 
       // And it is on the branch now, which is the whole difference.
-      const accept = await ctx.lazy(['accept', taskId]);
+      const accept = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
       expectSuccess(accept);
     });
   });

@@ -3,7 +3,7 @@ import { rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { worktreePathFor } from '../helpers/storage';
 import { seedFinal } from '../helpers/final';
 
@@ -66,7 +66,7 @@ describe('lazy status', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Completed task test');
 
     // Accept the task to move it to 'complete' status
-    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Remove the worktree directory to simulate cleanup
@@ -130,7 +130,7 @@ describe('lazy status', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Abandoned task test');
 
     // Reject the task to move it to 'abandoned' status
-    const rejectResult = await ctx.lazy(['reject', taskId, '--reason', 'Test rejection', '--yes']);
+    const rejectResult = await ctx.lazyMocked(['reject', taskId, '--reason', 'Test rejection', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(rejectResult);
 
     // Remove the worktree directory
@@ -153,7 +153,7 @@ describe('lazy status', () => {
     const taskId = await createTask(ctx, 'Closed task test', 'Test prompt');
 
     // Close the task directly (without starting)
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'Test closure']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--reason', 'Test closure'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
 
     // Since task was never started, there's no worktree to remove,

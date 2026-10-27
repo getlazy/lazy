@@ -116,7 +116,7 @@ describe('tabbed task page prose', () => {
       'create', '--goal', 'Wiring target', '--code', 'fix-docs-release-wiring',
     ]);
     expectSuccess(target);
-    const targetId = extractTaskId(target.stdout);
+    expect(extractTaskId(target.stdout)).toBeTruthy();
 
     const taskId = await createTask(ctx, 'Raised dialog', 'Do work');
     const fullId = findFullTaskId(ctx.root, taskId);
@@ -149,7 +149,8 @@ describe('tabbed task page prose', () => {
     expect(html).toContain('data-lz-current-tab="raised"');
     expect(html).toContain('lz-raised-dialog');
     expect(html).toContain('name="raised_action');
-    expect(html).toContain(`href="/tasks/${findFullTaskId(ctx.root, targetId)}"`);
+    // Task links address a task by its code when it has one.
+    expect(html).toContain(`href="/tasks/fix-docs-release-wiring"`);
     expect(html).toContain('lz-task-link');
 
     const fragment = await fetch(`${base}/raised/${itemId}?fragment=1`);

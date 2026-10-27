@@ -124,6 +124,25 @@ export async function createRunner(
   overrideType?: RunnerType,
   opts: CreateRunnerOptions = {},
 ): Promise<Runner> {
+  return createConfiguredRunner(lazyRoot, overrideType, opts, true);
+}
+
+/** Inspection never needs model traffic or a proxy address. Launches use createRunner. */
+export type InspectionRunner = Omit<Runner,
+  'launchSupervisor' | 'runOneshot' | 'runClaudeSync' |
+  'launchBuilderInteractive' | 'launchBuilderHeadless' | 'launchBuilderDetached'
+>;
+
+export async function createInspectionRunner(lazyRoot: string, overrideType?: RunnerType): Promise<InspectionRunner> {
+  return createConfiguredRunner(lazyRoot, overrideType, {}, false);
+}
+
+async function createConfiguredRunner(
+  lazyRoot: string,
+  overrideType: RunnerType | undefined,
+  opts: CreateRunnerOptions,
+  forLaunch: boolean,
+): Promise<Runner> {
   const config = await loadConfig(lazyRoot);
   const runnerType = overrideType ?? config.runner.type;
 
@@ -159,7 +178,8 @@ export async function createRunner(
   // Wire the per-role model targets into runners so they can inject the right
   // backend env vars and preflight reachability per role (builder vs agent).
   // Route proxyable roles through the (default-on) local audit/policy proxy.
-  const roleTargets = await withProxyTargets(configuredRoles(config, opts), config);
+  const roles = configuredRoles(config, opts);
+  const roleTargets = forLaunch ? await withProxyTargets(roles, config) : roles;
 
   switch (runnerType) {
     case 'docker': {

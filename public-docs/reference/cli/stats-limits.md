@@ -14,8 +14,14 @@ one it is armed for but cannot read a subscription window from is marked
 ARMED, NO READING; a window that has reset since its reading is shown as
 "reset at <time>" with its old percentage only as history.
 
+"Model providers, last hour" lists each provider or endpoint the proxy
+forwarded to (Anthropic, OpenAI, Cursor, a configured endpoint) with its
+request count, failures by kind (connection reset, timeout, connect, 5xx,
+529 overloaded, 429 rate-limited) and the latest failure — so "is it the
+provider or is it lazy?" is answered by looking.
+
 Options:
-  --json   Machine-readable: { scope, readings, pause, budget } — every reading with
+  --json   Machine-readable: { scope, readings, pause, providerHealth, budget } — every reading with
            its raw headers, windows, overage status and pause verdict, plus
            the [usage_pause] thresholds, override, held tasks and coverage
            (which credentials it is armed for with no reading). Refuses, naming

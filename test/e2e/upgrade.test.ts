@@ -486,6 +486,78 @@ describe('lazy upgrade', () => {
     expectError(result, '--timeout expects a whole number of seconds');
   });
 
+  // INVARIANT: a full upgrade keeps this project's running task containers. Their
+  // installed tools and running services are the person's; only the agent is
+  // restarted (by the daemon restart) — on the NEW agent binary, copied into the
+  // container — and the container moves to the new image only when a person
+  // restarts its environment.
+  test('a full upgrade keeps running task containers and updates their agent', async () => {
+    const taskId = await createTask(ctx, 'Keep my environment');
+    const docker = await installFakeDocker(await mkdtemp(join(tmpdir(), 'lazy-upgrade-keep-')));
+    const name = `lazy-${taskId.slice(0, 8)}`;
+    await docker.seedContainer(name, { state: 'running' });
+    await writeFile(join(docker.stateDir, `kept-${name}`), '');
+
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { PATH: `${docker.binDir}:${process.env.PATH ?? ''}` },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, '1 task container(s) stay running');
+    expectOutput(result, `updated ${name}`);
+    expectOutputExcludes(result, 'Stopping 1 task container');
+    const calls = await docker.invocations();
+    expect(calls.some(c => c.startsWith('stop') || c.startsWith('kill') || c.startsWith('rm '))).toBe(false);
+    expect(calls.some(c => c.startsWith('cp ') && c.includes(`${name}:/tmp/lazy-agent-upgraded.new`))).toBe(true);
+    expect(calls.some(c => c.startsWith(`exec ${name} sh -c chmod 755 /tmp/lazy-agent-upgraded.new`))).toBe(true);
+    expect(await docker.containers()).toContain(name);
+    expectOutput(result, 'restart one');
+  });
+
+  // INVARIANT: a container whose wrapper cannot run a copied-in agent is stopped
+  // and removed, never kept on the old supervisor — after a protocol change that
+  // supervisor refuses every command.
+  test('a full upgrade replaces a container created before the agent swap', async () => {
+    const taskId = await createTask(ctx, 'Old environment');
+    const docker = await installFakeDocker(await mkdtemp(join(tmpdir(), 'lazy-upgrade-old-')));
+    const name = `lazy-${taskId.slice(0, 8)}`;
+    await docker.seedContainer(name, { state: 'running' });
+
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { PATH: `${docker.binDir}:${process.env.PATH ?? ''}` },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'Stopping 1 task container(s)');
+    expectOutput(result, 'cannot update its agent in place');
+    expect(await docker.invocations()).toContain(`kill ${name}`);
+  });
+
+  // INVARIANT: with leaked pre-v0.20 MCP configs, task containers are still
+  // stopped and removed BEFORE the shared daemon token is rotated — an
+  // in-container holder of that token could not re-read it.
+  test('leaked MCP configs still stop task containers before the token rotation', async () => {
+    const { legacyMcpConfigDir } = await import('../../src/upgrade/legacy-mcp-purge');
+    const taskId = await createTask(ctx, 'Holds the shared token');
+    const docker = await installFakeDocker(await mkdtemp(join(tmpdir(), 'lazy-upgrade-legacy-')));
+    const name = `lazy-${taskId.slice(0, 8)}`;
+    await docker.seedContainer(name, { state: 'running' });
+    await writeFile(join(docker.stateDir, `kept-${name}`), '');
+    await mkdir(legacyMcpConfigDir(ctx.root), { recursive: true });
+    await writeFile(join(legacyMcpConfigDir(ctx.root), 'daemon-mcp-old.json'), '{}');
+
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { PATH: `${docker.binDir}:${process.env.PATH ?? ''}` },
+    });
+
+    expectSuccess(result);
+    const out = result.stdout;
+    expect(out).toContain('the shared daemon token is about to be rotated');
+    expect(out.indexOf('Stopping 1 task container(s)')).toBeGreaterThan(-1);
+    expect(out.indexOf('Stopping 1 task container(s)')).toBeLessThan(out.indexOf('Rotated the shared daemon token'));
+    expect(await docker.invocations()).toContain(`kill ${name}`);
+  });
+
   test('upgrade with interrupted task auto-resumes it', async () => {
     // Create and start a task (mock makes it go through start → working → blocked via reconciliation)
     const taskId = await createTask(ctx, 'Auto-resume test', 'Do the work');
@@ -552,5 +624,44 @@ describe('lazy upgrade --images with a failing docker build', () => {
     expect(calls.some(c => c.startsWith('build'))).toBe(true);
     expect(calls.some(c => c.startsWith('rmi'))).toBe(false);
     expect(calls.some(c => c.startsWith('image inspect') && c.includes(ref))).toBe(true);
+  }, 120_000);
+});
+
+describe('lazy upgrade with a running daemon and a kept task container', () => {
+  let ctx: TestContext;
+  let savedPath: string | undefined;
+
+  afterEach(async () => {
+    await ctx.cleanup();
+    process.env.PATH = savedPath;
+  });
+
+  // INVARIANT: the daemon restart a full upgrade performs stops only the AGENT
+  // in a kept task container (an in-place exec), never the container itself —
+  // the wrapper then starts a fresh supervisor that reconnects to the new daemon.
+  test('the old daemon stops only the agent, and nothing removes the container', async () => {
+    const docker = await installFakeDocker(await mkdtemp(join(tmpdir(), 'lazy-upgrade-daemon-')));
+    savedPath = process.env.PATH;
+    // The daemon the harness starts inherits this PATH, so it drives the fake too.
+    process.env.PATH = `${docker.binDir}:${savedPath ?? ''}`;
+    ctx = await setupTestLazy({ withDaemon: true });
+    const taskId = await createTask(ctx, 'Keep my services');
+    const name = `lazy-${taskId.slice(0, 8)}`;
+    await docker.seedContainer(name, { state: 'running', project: ctx.root });
+    // A current wrapper's agent stop answers `stopped` (src/runner/agent-stop.ts).
+    await writeFile(join(docker.stateDir, 'exec-hook'), 'case "$*" in *lazy-agent-stop*) echo stopped ;; esac\n');
+    await writeFile(join(docker.stateDir, `kept-${name}`), '');
+
+    const result = await ctx.lazyMocked(['upgrade', '--force'], MOCK_CLAUDE_SUCCESS, {
+      env: { PATH: process.env.PATH ?? '' },
+    });
+
+    expectSuccess(result);
+    expectOutput(result, 'Restarting daemon');
+    const calls = await docker.invocations();
+    // The in-container agent stop (its script spans lines in the log; this is its first).
+    expect(calls.some(c => c.startsWith(`exec ${name} sh -c m=/tmp/lazy-agent-restart`))).toBe(true);
+    expect(calls.some(c => c === `kill ${name}` || c.startsWith(`stop ${name}`) || c.startsWith('rm '))).toBe(false);
+    expect(await docker.containers()).toContain(name);
   }, 120_000);
 });

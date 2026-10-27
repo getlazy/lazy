@@ -352,6 +352,8 @@ export interface StreamTiming {
   endedAt: number;
   /** True only when the upstream stream ran to its end; false on client cancel or a read error. */
   completed: boolean;
+  /** The upstream read error that broke the stream, when it broke (never set on a client cancel). */
+  error?: unknown;
 }
 
 /**
@@ -405,11 +407,13 @@ export function teeUsageStream(
   const scanner = new UsageScanner(isStream, wire);
   const reader = body.getReader();
   let finished = false;
-  const finish = (completed = false) => {
+  const finish = (completed = false, error?: unknown) => {
     if (finished) return;
     finished = true;
     const endedAt = now();
-    onDone(scanner.result(endedAt), { firstContentAt: scanner.firstContentAt, endedAt, completed });
+    onDone(scanner.result(endedAt), {
+      firstContentAt: scanner.firstContentAt, endedAt, completed, ...(error !== undefined ? { error } : {}),
+    });
   };
 
   return new ReadableStream<Uint8Array>({
@@ -429,7 +433,7 @@ export function teeUsageStream(
         // see the failure, not a silently truncated body) and still close out the
         // audit record with whatever usage we managed to observe.
         controller.error(err);
-        finish();
+        finish(false, err);
       }
     },
     cancel(reason) {

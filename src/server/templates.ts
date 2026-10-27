@@ -1726,6 +1726,8 @@ export interface TaskEditDraft {
   model: string;
   effort: string;
   agent: string;
+  /** The token cap as typed (`50M`), or '' for none. */
+  tokenCap: string;
 }
 
 /**
@@ -1938,6 +1940,11 @@ export function taskEditHtml(
       ${agentNoticeHtml(options.agentsNotice)}
       ${agentDescriptionsHtml(options.agents)}
       ${AGENT_PICKER_HINT}
+
+      <h2>Spend</h2>
+      <label class="edit-label" for="edit-token-cap">Token cap</label>
+      <input class="input" type="text" id="edit-token-cap" name="token_cap" value="${escapeHtml(draft.tokenCap)}" placeholder="(none) — e.g. 50M">
+      <p class="text-muted">Once the task has spent this many tokens, lazy stops its running turn (the work is kept) and it waits until the cap is raised. Leave empty for no cap. Changeable at any time.</p>
 
       <div class="action-links">
         <button type="submit" class="btn btn-primary">Save changes</button>

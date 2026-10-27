@@ -78,7 +78,13 @@ describe('terminal lifecycle releases session-credential binding', () => {
     clearUserCredentialCache();
     clearSessionCredentialCache();
     await rpc('putUserCredential', { userId: 'u-bind', kind: 'oauth', token: 'oat-bind' });
-    await rpc('putUserCredential', { userId: SERVICE_CREDENTIAL_USER_ID, kind: 'oauth', token: 'oat-svc' });
+    // Per-user billing with nobody asking (no user token on a laptop): the turn
+    // spends the service holder's own connection for the agent's endpoint.
+    await rpc('putUserCredential', { userId: SERVICE_CREDENTIAL_USER_ID, kind: 'oauth', token: 'oat-svc', ownerEmail: 'svc@example.com' });
+    await rpc('putEndpointCredential', {
+      userId: 'svc@example.com', endpointId: 'builtin:anthropic',
+      origin: 'https://api.anthropic.com', kind: 'oauth', token: 'oat-svc',
+    });
   });
 
   afterEach(async () => {

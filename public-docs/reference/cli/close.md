@@ -15,7 +15,8 @@ Options:
                           If not provided, $EDITOR will be opened to enter the reason
   --yes, -y               Skip editor prompt (non-interactive mode)
                           Requires --reason or piped stdin
-  --accept-dirty-worktree Allow closing even if worktree has uncommitted changes
+  --accept-dirty-worktree Allow closing even if worktree has uncommitted changes;
+                          also aborts a merge left in progress (every commit is kept)
   --end-sessions          End any member's open sessions in the task's environment
                           first (Lazy Teams); without it, the close is refused
                           while they have sessions open

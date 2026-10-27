@@ -2064,10 +2064,31 @@ minute and are not overage.
   first wait of a pause is announced in `lazy messages`. A review that is
   waiting is recorded on the task as not run yet, so `lazy accept` holds the
   unreviewed work meanwhile.
-- **A turn already running** — crossing the launch threshold does not kill its
-  process. Further launches it requests still face admission checks. A tiered
-  profile can switch providers or refuse further model requests when all its
-  tiers are full; see [tiered profiles](#tiered-profiles--use-a-tier-until-it-says-no).
+- **A turn already running** — is stopped too. Once its credential crosses
+  the threshold, lazy refuses the turn's next model request and stops the
+  agent. Its commits, files and environment are all kept, and nothing is
+  reverted. The task shows "Paused for usage: <window> at <reading>, resumes
+  <time>" in `lazy show`, on its page and in Lazy Teams, and `lazy doctor`
+  lists it. It resumes by itself once the window resets. To let it continue
+  now, use `lazy resume <task> --override-usage-pause` or the task's "Let its
+  next turn through" button. The turn that lets through runs to its end. This
+  works the same for every agent whose usage lazy can read (Claude Code and
+  Codex). A tiered profile pauses only when all its tiers are full; see
+  [tiered profiles](#tiered-profiles--use-a-tier-until-it-says-no).
+
+**A task's own token cap.** A task can carry its own limit on the tokens it may
+spend: `lazy edit <task> --token-cap 50M` (`200k` and `50000000` also work,
+and `none` clears it). You can also set it in the **Token cap** field of the
+task's edit page on the dashboard or in Lazy Teams. Once the task has spent that
+many tokens, its running turn is stopped in the same way, but the task waits
+for you instead of resuming by itself: it shows "Stopped at its token cap (50M
+of 50M)", and starting, unblocking, resuming or syncing it with a conflict is
+refused until you raise or clear the cap. To run just one more turn without
+changing the cap, use `--override-usage-pause` or the task's "Let its next turn
+through" button: that turn runs to its end. An agent can put a cap on its own
+subtasks or lower one, but only a person or the builder can raise or clear a cap. Its spend against the cap is shown in `lazy show` and on its
+page. The cap counts every model request lazy saw the task make, and it
+works with or without `[usage_pause]`.
 
 A reading is only as fresh as the last request. Once a window's reset time
 has passed, the reading no longer pauses anything. If the provider gave no

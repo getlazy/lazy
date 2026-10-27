@@ -45,6 +45,7 @@ function makeStorageStub(preloaded: string[] = []) {
     saved,
     importedChecks: 0,
     saveCalls: [] as string[],
+    async isConversationPurged(): Promise<boolean> { return false; },
     async isConversationImported(sessionId: string): Promise<boolean> {
       stub.importedChecks++;
       return saved.has(sessionId);
@@ -138,6 +139,35 @@ describe('capture sweep', () => {
 
     expect(result.captured).toEqual(['a1111111-0000-0000-0000-000000000001']);
     expect(storage.saved.get('a1111111-0000-0000-0000-000000000001')!.stats.messageCount).toBe(4);
+  });
+
+  // INVARIANT: a purge winning between the initial check and save is a skip,
+  // never a persisted capture or a transcript regression.
+  test('does not report a capture when a purge wins after the initial check', async () => {
+    const sessionId = 'a1111111-0000-0000-0000-000000000002';
+    await seedShared(sessionId, 2);
+    let purged = false;
+    let saveAttempted = false;
+    const storage = {
+      async isConversationPurged() { return purged; },
+      async isConversationImported() {
+        // The purge lands after the sweep's first purge check, before its save.
+        purged = true;
+        return false;
+      },
+      async loadConversation() { return null; },
+      async saveConversation(_conv: StoredConversation, options?: { skipPurged?: boolean }) {
+        saveAttempted = true;
+        expect(options?.skipPurged).toBe(true);
+        if (purged && options?.skipPurged) return 'skipped-purged' as const;
+        throw new Error('capture tried to save a purged session');
+      },
+    } as unknown as Storage;
+    const result = await sweepConversations({ ...opts(), storage, cursor: createSweepCursor() });
+    expect(saveAttempted).toBe(true);
+    expect(result.captured).toEqual([]);
+    expect(result.skippedRegressions).toEqual([]);
+    expect(result.errors).toEqual([]);
   });
 
   test('also covers the builder isolation dirs (backstop for in-container capture)', async () => {

@@ -1035,6 +1035,10 @@ export interface SupervisorStatus {
   pre_turn_sha?: string;
   /** SHA of HEAD after sync-with-remote phase completed (merged origin/<branch>) */
   post_remote_sync_sha?: string;
+  /** Exact endpoints of the merge a sync is about to start (abandon provenance). */
+  sync_command_id?: CommandId;
+  sync_merge_sha?: string;
+  sync_merge_start_sha?: string;
   /** SHA of HEAD after pre-turn sync-with-upstream phase completed */
   post_merge_sha?: string;
   /**

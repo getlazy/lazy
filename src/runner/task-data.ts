@@ -93,3 +93,6 @@ export async function measureTaskDataBytes(binary: string, runName: string): Pro
 
 /** Shared diagnosis for Services and doctor; an upgrade never replaces this environment. */
 export const OLD_TASK_ENVIRONMENT_NOTICE = "This environment was created before lazy kept a data directory and left services' files alone. Restart the environment to get both. A restart loses anything installed outside the worktree and what running services hold in memory.";
+
+/** Shown for a kept environment still on the image it was created from, after `lazy upgrade` built a newer one. */
+export const OUTDATED_IMAGE_ENVIRONMENT_NOTICE = "This environment still runs on the image it was created from; lazy has built a newer one since. Restart the environment to get the new image. A restart loses anything installed outside the worktree and what running services hold in memory.";

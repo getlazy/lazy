@@ -24,6 +24,8 @@ import { branchTarget } from '../../src/task-target';
 import { elevatedTag, resetElevatedGitChannel } from '../../src/supervisor/elevated-git';
 import { testStorageOptions } from '../helpers/storage';
 import { isolateLazyEnv } from '../helpers/isolated-lazy-env';
+import { protocolDir, writeStatus } from '../../src/protocol';
+import { unfinishedSyncMerge, UNFINISHED_SYNC_MERGE_KEY } from '../../src/task/unfinished-sync';
 
 isolateLazyEnv();
 
@@ -96,6 +98,45 @@ describe('lazy_internal_git', () => {
     const log = git(worktree, 'log', '--oneline');
     expect(log).toContain('Merge main');
     expect(log).toContain('upstream commit');
+  });
+
+  // INVARIANT: every supervisor sync merge replaces the preceding step's
+  // provenance, so abandoning step two preserves the committed first step.
+  test('records both conflicted supervisor steps under the same sync command', async () => {
+    const dir = protocolDir(ctx.taskId!);
+    await mkdir(dir, { recursive: true });
+    await writeFile(`${dir}.dispatched-command`, 'two-step-sync');
+    writeStatus(dir, { pid: process.pid, task_id: ctx.taskId!, command_type: 'sync',
+      sync_command_id: 'two-step-sync', phase: 'merge_and_fix',
+      started_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    try {
+      const handler = createInternalGitHandler(ctx);
+      await writeFile(join(worktree, 'upstream.txt'), 'task version\n');
+      git(worktree, 'add', 'upstream.txt');
+      git(worktree, 'commit', '-m', 'Task conflict');
+      const first = await handler({ op: 'merge', target: 'main', message: 'First sync step' }) as any;
+      expect(first.exit_code).not.toBe(0);
+      const firstMarker = await storage.getTaskMetadata(ctx.taskId!, UNFINISHED_SYNC_MERGE_KEY);
+      expect(JSON.parse(firstMarker!).head).toBe(git(worktree, 'rev-parse', 'HEAD'));
+      await writeFile(join(worktree, 'upstream.txt'), 'resolved first step\n');
+      git(worktree, 'add', 'upstream.txt');
+      git(worktree, 'commit', '-m', 'Resolve first sync step');
+      const resolvedHead = git(worktree, 'rev-parse', 'HEAD');
+      await writeFile(join(repo, 'upstream.txt'), 'second upstream conflict\n');
+      git(repo, 'add', 'upstream.txt');
+      git(repo, 'commit', '-m', 'Next upstream step');
+      const second = await handler({ op: 'merge', target: 'main', message: 'Second sync step' }) as any;
+      expect(second.exit_code).not.toBe(0);
+      const marker = JSON.parse((await storage.getTaskMetadata(ctx.taskId!, UNFINISHED_SYNC_MERGE_KEY))!);
+      expect(marker.head).toBe(resolvedHead);
+      expect(marker.mergeHead).toBe(git(repo, 'rev-parse', 'HEAD'));
+      expect(marker.commandId).toBe('two-step-sync');
+      const task = (await storage.getTask(ctx.taskId!))!;
+      expect((await unfinishedSyncMerge(storage, task, worktree))?.head).toBe(resolvedHead);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await rm(`${dir}.dispatched-command`, { force: true });
+    }
   });
 
   test('refuses a sibling task branch', async () => {

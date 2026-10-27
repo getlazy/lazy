@@ -13,9 +13,11 @@
 
 import { describe, test, expect, afterEach } from 'bun:test';
 import { join, resolve } from 'path';
-import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { getDaemonDir } from '../../src/daemon/paths';
+import { killDaemonsForRoot } from '../helpers/daemon-registry';
 
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 
@@ -82,6 +84,16 @@ describe('lazy init — inherit Claude Code history', () => {
   let homeDir: string;
 
   afterEach(async () => {
+    // `lazy init` and the commands after it auto-start a daemon for tmpDir
+    // (these runs are not under the harness, so nothing else reaps it). Left
+    // running, each one outlived the suite and squatted the shared daemon port
+    // window for every later file in the run.
+    if (tmpDir) {
+      // The daemon keys on the realpath (macOS tmpdir is a symlink).
+      const root = await realpath(tmpDir);
+      killDaemonsForRoot(root);
+      await rm(getDaemonDir(root), { recursive: true, force: true });
+    }
     if (tmpDir) await rm(tmpDir, { recursive: true, force: true });
     if (homeDir) await rm(homeDir, { recursive: true, force: true });
   });

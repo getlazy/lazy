@@ -548,9 +548,9 @@ async function livenessFor(
  */
 async function defaultCrashedProbe(projectRoot: string): Promise<CrashedProbe | null> {
   try {
-    const { createRunner } = await import('../runner');
+    const { createInspectionRunner } = await import('../runner');
     const { taskRef } = await import('../task/identity');
-    const runner = await createRunner(projectRoot);
+    const runner = await createInspectionRunner(projectRoot);
     return async (task, session) => {
       const name = session.container_name ?? runner.runNameForTask(taskRef(task));
       const info = await runner.getRunInfo(name);
@@ -564,9 +564,9 @@ async function defaultCrashedProbe(projectRoot: string): Promise<CrashedProbe | 
 
 async function defaultProbe(projectRoot: string): Promise<WorkingProbe | null> {
   try {
-    const { createRunner } = await import('../runner');
+    const { createInspectionRunner } = await import('../runner');
     const { probeWorkingRun } = await import('../utils/working-run');
-    const runner = await createRunner(projectRoot);
+    const runner = await createInspectionRunner(projectRoot);
     return async (task, session) => {
       const probed = await probeWorkingRun(projectRoot, task, session, runner);
       return probed.substate;

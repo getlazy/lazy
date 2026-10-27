@@ -42,7 +42,7 @@ import type { BuilderSession, CommitRun } from '../storage/types';
 import { RUN_ATTACH_PREFIX, runContainerName } from '../run/identity';
 import type { Session, Task, ActorInput } from '../types';
 import type { Runner, RunnerType } from '../runner';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { execContainerName } from '../server/shell-ws';
 import { assertSessionRowActionable, multiMemberDaemon, probeBuilderRun, settleDeadBuilderSessions } from './builder-sessions';
 import { RpcError } from './rpc-error';
@@ -135,7 +135,7 @@ export async function resolveSessionAttachTarget(
   opts: ResolveSessionAttachOptions,
 ): Promise<SessionAttachResolution> {
   const { projectRoot, storage, sessionId, callerEmail, multiMember } = opts;
-  const runnerFor = opts.runnerFor ?? ((type) => createRunner(projectRoot, type));
+  const runnerFor = opts.runnerFor ?? ((type) => createInspectionRunner(projectRoot, type));
 
   if (sessionId.startsWith(RUN_ATTACH_PREFIX)) {
     const run = await storage.getCommitRun(sessionId.slice(RUN_ATTACH_PREFIX.length));
@@ -285,7 +285,7 @@ export async function confirmAttachTargetRunning(
   const runnerType = target.kind === 'task'
     ? target.session.runner_type ?? target.task.runner_type ?? undefined
     : undefined;
-  const runner = await createRunner(projectRoot, runnerType);
+  const runner = await createInspectionRunner(projectRoot, runnerType);
   if (target.kind === 'builder') {
     // Three-way: a runtime that did not answer is not a dead builder, and the
     // refusal must say which it was — the two used to read identically.

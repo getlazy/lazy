@@ -224,9 +224,9 @@ describe('lazy search', () => {
       await createTask(ctx, 'finished_scope_marker backlog task');
 
       await startAndAccept(ctx, acceptedId);
-      expectSuccess(await ctx.lazy(['close', closedId, '--reason', 'No longer needed', '--yes']));
+      expectSuccess(await ctx.lazyMocked(['close', closedId, '--reason', 'No longer needed', '--yes'], MOCK_CLAUDE_SUCCESS));
       await startAndReconcile(ctx, rejectedId);
-      expectSuccess(await ctx.lazy(['reject', rejectedId, '--reason', 'Wrong approach', '--yes']));
+      expectSuccess(await ctx.lazyMocked(['reject', rejectedId, '--reason', 'Wrong approach', '--yes'], MOCK_CLAUDE_SUCCESS));
 
       const result = await ctx.lazy(['search', 'in:finished finished_scope_marker', '--group']);
       expectSuccess(result);

@@ -134,7 +134,9 @@ describe('shared daemon token rotation', () => {
     expect((await mcp(agentToken)).status).toBe(200);
     // A task token on its own surface is likewise untouched (403 here would be
     // an identity mismatch, 401 a dead token — neither may happen).
-    const taskResp = await fetch(`http://127.0.0.1:${daemon.webPort}/mcp/${taskId}/lazy_status`, {
+    // A read that needs no worktree: this task was never started, and lazy_status
+    // answers "the bound worktree no longer exists" for one (a 500 unrelated to auth).
+    const taskResp = await fetch(`http://127.0.0.1:${daemon.webPort}/mcp/${taskId}/lazy_list`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

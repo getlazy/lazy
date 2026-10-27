@@ -30,6 +30,7 @@ import { buildAgentSandboxArgs, hostSandboxStorePath } from '../runner/host-sand
 import { harnessForAgentName } from '../config/agent-profiles';
 import { logger } from '../utils/logger';
 import { getDaemonContext, hasDaemonContext } from '../daemon/context';
+import { CLAIMING_PROCESS_ID } from '../daemon/in-flight-turn';
 
 /**
  * Allocate a fresh command correlation id.
@@ -279,6 +280,7 @@ export function writeCommand(dir: string, command: Command): void {
   const stamped = proxyPort ? { ...withSecret, proxy_port: proxyPort } : withSecret;
   atomicWrite(commandPath(dir), JSON.stringify(stamped, null, 2));
   if (cid) recordDispatchedCommand(dir, cid);
+  if (hasDaemonContext()) recordDispatchingProcess(dir);
 }
 
 /**
@@ -356,7 +358,64 @@ function recordDispatchedCommand(dir: string, commandId: CommandId): void {
   }
 }
 
+/**
+ * Which daemon PROCESS dispatched the mailbox's latest command — the same
+ * per-process identity ask/review claims carry (`CLAIMING_PROCESS_ID`). A
+ * sibling of the mailbox for the same reason as the command record.
+ *
+ * It answers one question: did the daemon reading this launch the turn, or did
+ * a daemon restart (or upgrade) happen while the turn ran? A turn whose daemon
+ * went away was killed by lazy, so its commits are never evidence that the
+ * agent finished (see `recoverStrandedCompletion`).
+ */
+function dispatchingProcessPath(dir: string): string {
+  return `${dir}.dispatched-by`;
+}
+
+function recordDispatchingProcess(dir: string): void {
+  try {
+    atomicWrite(dispatchingProcessPath(dir), CLAIMING_PROCESS_ID);
+  } catch (err) {
+    // Without it, a turn killed by a restart can be read as a finished one —
+    // the behaviour before the record existed. Said loudly.
+    logger.warn(
+      `Protocol ${dir}: could not record which daemon dispatched the command ` +
+      `(${err instanceof Error ? err.message : String(err)}).`,
+    );
+  }
+}
+
+/**
+ * True when the mailbox's latest command was dispatched by a DIFFERENT daemon
+ * process than this one — the daemon restarted since the turn launched. False
+ * when it was this process, and when nothing is recorded (a command written
+ * outside a daemon, or before the record existed): only positive evidence.
+ */
+export function dispatchedByPreviousDaemon(dir: string): boolean {
+  const p = dispatchingProcessPath(dir);
+  try {
+    if (!existsSync(p)) return false;
+    const id = readFileSync(p, 'utf-8').trim();
+    return id !== '' && id !== CLAIMING_PROCESS_ID;
+  } catch (err) {
+    logger.warn(
+      `Protocol ${dir}: could not read which daemon dispatched the command ` +
+      `(${err instanceof Error ? err.message : String(err)}).`,
+    );
+    return false;
+  }
+}
+
 function clearDispatchedCommand(dir: string): void {
+  const by = dispatchingProcessPath(dir);
+  try {
+    if (existsSync(by)) unlinkSync(by);
+  } catch (err) {
+    logger.warn(
+      `Protocol ${dir}: could not clear the dispatching-daemon record ` +
+      `(${err instanceof Error ? err.message : String(err)}).`,
+    );
+  }
   const p = dispatchedCommandPath(dir);
   try {
     if (existsSync(p)) unlinkSync(p);

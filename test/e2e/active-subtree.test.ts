@@ -12,7 +12,7 @@ import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { resolve } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError, extractTaskId } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 
@@ -124,7 +124,7 @@ describe('lazy active <task_id> (subtree filter)', () => {
     await startAndReconcile(ctx, leafId);
 
     // Close the middle task — it becomes terminal and drops out of `active`.
-    const closed = await ctx.lazy(['close', midId, '--reason', 'not needed', '--yes']);
+    const closed = await ctx.lazyMocked(['close', midId, '--reason', 'not needed', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closed);
 
     const result = await ctx.lazy(['active', 'deep-root']);

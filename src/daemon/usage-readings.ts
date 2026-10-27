@@ -22,6 +22,7 @@
  */
 
 import { join } from 'path';
+import { daemonProviderHealth } from '../proxy/provider-health';
 import type { ResolvedConfig } from '../config/types';
 import type { StoredUsageLimitReading } from '../storage/types';
 import { UsageLimitReadingsUnreadableError } from '../storage/usage-limit-readings';
@@ -232,6 +233,8 @@ export async function seedUsageReadings(projectRoot: string, config: ResolvedCon
       const spentBefore = daemonUsageLimits.spentCredentials();
       daemonUsageLimits.quietly(() => {
         for (const r of records) {
+          // The provider-health hour survives a restart from the same records.
+          daemonProviderHealth.observe(r);
           // Member+endpoint keys were introduced with durable readings. A deleted
           // reading means the connection changed, not that an audit copy should
           // restore the previous account's quota. Legacy keys keep their fold.

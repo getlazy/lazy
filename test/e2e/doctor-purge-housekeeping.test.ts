@@ -11,12 +11,16 @@
  * (RemoteStorage.deleteConversation), which is how a real purge persists.
  */
 
-import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { describe, test, beforeEach, afterEach, expect } from 'bun:test';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, expectOutputExcludes } from '../helpers/assertions';
 import { encodeProjectPath } from '../../src/import/claude-code-logs';
+import { sweepConversations, createSweepCursor } from '../../src/import/capture-sweep';
+import { RemoteStorage } from '../../src/storage/remote-storage';
+import { DaemonClient } from '../../src/daemon/client';
+import { getDaemonTcpTarget, readToken } from '../../src/daemon/lifecycle';
 import fidelityPrompt from '../../src/prompts/fidelity-summary.md' with { type: 'text' };
 
 /**
@@ -143,6 +147,47 @@ describe('lazy doctor --purge-housekeeping-conversations', () => {
     const again = await ctx.lazy(['doctor', '--purge-housekeeping-conversations', '--yes']);
     expectSuccess(again);
     expectOutput(again, 'No machine-generated housekeeping conversations found');
+  });
+
+  // INVARIANT: a fresh capture cursor after a purge must not resurrect history.
+  // Raw pre-marker JSONL remains on disk across daemon restarts.
+  test('a capture tick after purge and restart leaves housekeeping deleted', async () => {
+    expectSuccess(await ctx.lazy(['doctor', '--purge-housekeeping-conversations', '--yes']));
+    await ctx.restartDaemon();
+    const target = getDaemonTcpTarget(ctx.root);
+    const token = readToken(ctx.root);
+    if (!target || !token) throw new Error('test daemon has no TCP target or token');
+    const storage = new RemoteStorage(DaemonClient.fromTarget(target, token), ctx.root, '');
+    const cursor = createSweepCursor();
+    const tick = () => sweepConversations({
+      lazyRoot: ctx.root, dataDirAbs: join(ctx.root, '.lazy'),
+      homeDirAbs: join(ctx.root, 'unused-home'), storage, cursor,
+    });
+    expect(await storage.isConversationPurged(HOUSEKEEPING_ID)).toBe(true);
+    const first = await tick();
+    expect(first.scanned).toBe(3);
+    expect(first.errors).toEqual([]);
+    expect(first.captured).not.toContain(HOUSEKEEPING_ID);
+    expect(await storage.loadConversation(HOUSEKEEPING_ID)).toBeNull();
+    // A file that changes after the first tick must remain excluded too.
+    await seedSession(ctx.root, HOUSEKEEPING_ID, [
+      { user: preMarkerFidelityPrompt('Changed after purge'), assistant: 'A longer summary of the work.' },
+    ]);
+    expect((await tick()).errors).toEqual([]);
+    expect(await storage.loadConversation(HOUSEKEEPING_ID)).toBeNull();
+    expect(await storage.loadConversation(REAL_ID)).not.toBeNull();
+  });
+
+  test('a guarded save through the daemon reports a purged session as skipped', async () => {
+    const target = getDaemonTcpTarget(ctx.root);
+    const token = readToken(ctx.root);
+    if (!target || !token) throw new Error('test daemon has no TCP target or token');
+    const storage = new RemoteStorage(DaemonClient.fromTarget(target, token), ctx.root, '');
+    const conversation = await storage.loadConversation(HOUSEKEEPING_ID);
+    if (!conversation) throw new Error('seeded housekeeping conversation is missing');
+    expectSuccess(await ctx.lazy(['doctor', '--purge-housekeeping-conversations', '--yes']));
+    expect(await storage.saveConversation(conversation, { skipPurged: true })).toBe('skipped-purged');
+    expect(await storage.loadConversation(HOUSEKEEPING_ID)).toBeNull();
   });
 
   // The purge classifies stored content; re-import classifies on-disk markers.

@@ -61,7 +61,7 @@ describe('lazy accept idempotent transitions', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Idempotent accept test');
 
     // First accept
-    const firstAccept = await ctx.lazy(['accept', taskId, '--yes']);
+    const firstAccept = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(firstAccept);
     expectOutput(firstAccept, 'accepted');
 
@@ -74,7 +74,7 @@ describe('lazy accept idempotent transitions', () => {
     // accepted worktree/branch are gone by now, so this also pins the check
     // ORDER: the outcome check must beat worktree recovery, or the user gets an
     // unrelated "branch not found on remote" after three fetch retries.
-    const secondAccept = await ctx.lazy(['accept', taskId, '--yes']);
+    const secondAccept = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(secondAccept);
     expectError(secondAccept, 'was already accepted');
     expectError(secondAccept, `lazy reopen ${taskId}`);
@@ -89,7 +89,7 @@ describe('lazy accept idempotent transitions', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Idempotent reject test');
 
     // First reject
-    const firstReject = await ctx.lazy(['reject', taskId, '--reason', 'First rejection', '--yes']);
+    const firstReject = await ctx.lazyMocked(['reject', taskId, '--reason', 'First rejection', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(firstReject);
 
     // Verify task is abandoned
@@ -98,7 +98,7 @@ describe('lazy accept idempotent transitions', () => {
     expectOutput(showAfterFirst, 'abandoned');
 
     // Second reject (should be idempotent - no error)
-    const secondReject = await ctx.lazy(['reject', taskId, '--reason', 'Second rejection', '--yes']);
+    const secondReject = await ctx.lazyMocked(['reject', taskId, '--reason', 'Second rejection', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(secondReject);
 
     // Verify task is still abandoned
@@ -112,8 +112,8 @@ describe('lazy accept idempotent transitions', () => {
   test('reject cannot replace a close verdict on an abandoned task', async () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Close then stale reject');
 
-    expectSuccess(await ctx.lazy(['close', taskId, '--reason', 'No longer wanted']));
-    const reject = await ctx.lazy(['reject', taskId, '--reason', 'Stale browser verdict', '--yes']);
+    expectSuccess(await ctx.lazyMocked(['close', taskId, '--reason', 'No longer wanted'], MOCK_CLAUDE_SUCCESS));
+    const reject = await ctx.lazyMocked(['reject', taskId, '--reason', 'Stale browser verdict', '--yes'], MOCK_CLAUDE_SUCCESS);
 
     expectFailure(reject);
     expectError(reject, 'already abandoned');
@@ -128,7 +128,7 @@ describe('lazy accept idempotent transitions', () => {
     const taskId = await createTask(ctx, 'Double close test');
 
     // First close
-    const firstClose = await ctx.lazy(['close', taskId, '--reason', 'First close']);
+    const firstClose = await ctx.lazyMocked(['close', taskId, '--reason', 'First close'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(firstClose);
 
     // Verify task is abandoned
@@ -137,7 +137,7 @@ describe('lazy accept idempotent transitions', () => {
     expectOutput(showAfterFirst, 'abandoned');
 
     // Second close should fail (already abandoned)
-    const secondClose = await ctx.lazy(['close', taskId, '--reason', 'Second close']);
+    const secondClose = await ctx.lazyMocked(['close', taskId, '--reason', 'Second close'], MOCK_CLAUDE_SUCCESS);
     expectFailure(secondClose);
     expectError(secondClose, 'already abandoned');
   });
@@ -146,7 +146,7 @@ describe('lazy accept idempotent transitions', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Terminal transition test');
 
     // Accept the task (sets to complete)
-    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Verify task is complete
@@ -156,7 +156,7 @@ describe('lazy accept idempotent transitions', () => {
 
     // Try to reject it (complete → abandoned should fail). The gate is the
     // session outcome, so the error names it: the session ended as 'accepted'.
-    const rejectResult = await ctx.lazy(['reject', taskId, '--reason', 'Trying to reject', '--yes']);
+    const rejectResult = await ctx.lazyMocked(['reject', taskId, '--reason', 'Trying to reject', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(rejectResult);
     expectError(rejectResult, 'Session already ended (accepted)');
   });
@@ -165,7 +165,7 @@ describe('lazy accept idempotent transitions', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Reopen and accept test');
 
     // Accept the task
-    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Reopen the task. Reopening a *complete* task demands a reason (it undoes
@@ -189,13 +189,13 @@ describe('lazy accept idempotent transitions', () => {
     // The reopen reason is human feedback no prompt has carried, so accept
     // refuses on it — and on it alone: the first accept's own [Accepted]
     // record is not feedback and must not count.
-    const gated = await ctx.lazy(['accept', taskId, '--yes']);
+    const gated = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expect(gated.exitCode).not.toBe(0);
     expect(gated.stdout + gated.stderr).toContain('1 queued comment ');
 
     // Here the human did the follow-up work themselves, so the reason needs no
     // agent turn: accept again, saying so (not terminal anymore).
-    const secondAccept = await ctx.lazy(['accept', taskId, '--yes', '--allow-queued-comments']);
+    const secondAccept = await ctx.lazyMocked(['accept', taskId, '--yes', '--allow-queued-comments'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(secondAccept);
 
     // Verify task is complete again
@@ -216,7 +216,7 @@ describe('lazy accept idempotent transitions', () => {
     expectSuccess(reparent);
     setTaskStatus(ctx.root, taskId, 'blocked');
 
-    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    const accepted = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accepted);
   });
 });

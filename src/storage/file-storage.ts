@@ -174,6 +174,7 @@ import type { BuilderSummary } from './types';
 import { lineageFromMessages, type SegmentLineage } from '../builder/identity';
 import { summarizeBuilders, findBuilder } from '../builder/identity-view';
 import { isTerminalStatus, isBlockedStatus, raisedStatusForAction, LEGACY_CLUSTER_TASK_TYPE } from '../types';
+import { ACCEPT_IN_FLIGHT_KEY } from '../task/accept-in-flight';
 import { emptyReviewDraft, MAX_LINE_DRAFTS, MAX_VIEWED_FILES } from '../review-draft';
 import { normalizeTagOrThrow } from '../utils/tags';
 import { targetFromLegacy, parentTaskIdOf } from '../task-target';
@@ -1614,11 +1615,9 @@ export class FileStorage implements Storage {
     const candidateSessions = await mapLimit(candidates, STORE_SCAN_CONCURRENCY, (t) => this.getSessionByTaskId(t.id));
     for (const [i, task] of candidates.entries()) {
       const session = candidateSessions[i];
-      if (session?.ended_at && session.outcome) {
+      if (session?.ended_at && session.outcome && !task.metadata?.[ACCEPT_IN_FLIGHT_KEY]) {
         const newStatus = session.outcome === 'accepted' ? 'complete' : 'abandoned';
         const now = Date.now();
-        task.status = newStatus;
-        task.completed_at = task.completed_at ?? session.ended_at;
         // Persist the fix (best-effort, self-healing) — lock only for the
         // write. Re-read task.json INSIDE the lock and apply just the two
         // healed fields: `task` was loaded before this await-heavy sweep, and
@@ -1629,12 +1628,26 @@ export class FileStorage implements Storage {
           await this.lock.withLock(async () => {
             const current = await this.readTask(join(this.taskDir(task.id), 'task.json'));
             if (!current) return;
+            // Decide again on the fresh read: `task` is a snapshot from before
+            // the sweep's awaits. An accept that landed meanwhile has already
+            // written its own attributed `complete` (healing again would record
+            // a second, unattributed one), and an accept still in flight owns
+            // the transition — its stranded-merge resume finishes a dead one.
+            // A declined heal reports what is on disk, never the heal it skipped.
+            if (isTerminalStatus(current.status) || current.status === 'working' || current.metadata?.[ACCEPT_IN_FLIGHT_KEY]) {
+              Object.assign(task, current);
+              return;
+            }
             current.status = newStatus;
             current.completed_at = current.completed_at ?? session.ended_at;
             const changelog = await this.readAndAppendStatusChange(task.id, newStatus, now);
             await this.atomicWriteTask(task.id, { 'task.json': current, 'status-changelog.json': changelog });
+            task.status = newStatus;
+            task.completed_at = current.completed_at;
           });
         } catch {
+          task.status = newStatus;
+          task.completed_at = task.completed_at ?? session.ended_at;
           // In-memory fix still applies for this query
         }
       }
@@ -5234,13 +5247,16 @@ export class FileStorage implements Storage {
     return join(this.basePath, CONVERSATION_INDEX_FILENAME);
   }
 
-  async saveConversation(conversation: StoredConversation): Promise<void> {
-    await mkdir(this.conversationsPath, { recursive: true });
-    const path = join(this.conversationsPath, `${conversation.sessionId}.json`);
-    await this.writeJson(path, conversation);
-    // Transcript is durable before the index is touched. A failed index update
-    // is recovered on the next listConversationSummaries rebuild.
-    await this.upsertConversationIndexEntry(conversation, path);
+  async saveConversation(conversation: StoredConversation, options?: { skipPurged?: boolean }): Promise<void | 'skipped-purged'> {
+    return this.lock.withLock(async () => {
+      if (options?.skipPurged && await this.isConversationPurged(conversation.sessionId)) return 'skipped-purged' as const;
+      await mkdir(this.conversationsPath, { recursive: true });
+      const path = join(this.conversationsPath, `${conversation.sessionId}.json`);
+      await this.writeJson(path, conversation);
+      // Transcript is durable before the index is touched. A failed index update
+      // is recovered on the next listConversationSummaries rebuild.
+      await this.upsertConversationIndexEntry(conversation, path);
+    });
   }
 
   async loadConversation(sessionId: string): Promise<StoredConversation | null> {
@@ -5314,22 +5330,40 @@ export class FileStorage implements Storage {
     }
   }
 
-  async deleteConversation(sessionId: string): Promise<boolean> {
-    await this.guardUnlockedWrite();
+  async isConversationPurged(sessionId: string): Promise<boolean> {
     try {
-      await unlink(join(this.conversationsPath, `${sessionId}.json`));
+      await stat(join(this.basePath, 'purged-conversations', sessionId + '.json'));
+      return true;
     } catch (err) {
-      // ENOENT is the idempotent case: nothing there, nothing deleted. Any
-      // other failure (permissions, I/O) is a real problem the caller must see
-      // — silently reporting "deleted" would let a purge claim success while
-      // the store is untouched.
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-      throw new Error(
-        `Failed to delete conversation ${sessionId} from ${this.conversationsPath}: ${(err as Error).message}`,
-      );
+      throw new Error('Failed to check purge record for conversation ' + sessionId + ': ' + (err as Error).message);
     }
-    await this.removeConversationIndexEntry(sessionId);
-    return true;
+  }
+
+  async deleteConversation(sessionId: string, options?: { preventCapture?: boolean }): Promise<boolean> {
+    return this.lock.withLock(async () => {
+      // Record intent before deletion, serialized with capture saves. A capture
+      // already parsing this session must not resurrect it after the unlink.
+      if (options?.preventCapture) {
+        const dir = join(this.basePath, 'purged-conversations');
+        await mkdir(dir, { recursive: true });
+        await this.writeJson(join(dir, sessionId + '.json'), { sessionId });
+      }
+      try {
+        await unlink(join(this.conversationsPath, `${sessionId}.json`));
+      } catch (err) {
+        // ENOENT is the idempotent case: nothing there, nothing deleted. Any
+        // other failure (permissions, I/O) is a real problem the caller must see
+        // — silently reporting "deleted" would let a purge claim success while
+        // the store is untouched.
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+        throw new Error(
+          `Failed to delete conversation ${sessionId} from ${this.conversationsPath}: ${(err as Error).message}`,
+        );
+      }
+      await this.removeConversationIndexEntry(sessionId);
+      return true;
+    });
   }
 
   private async listConversationTranscriptFiles(): Promise<ConversationTranscriptFile[]> {

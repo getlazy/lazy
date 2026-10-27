@@ -788,7 +788,9 @@ export interface LazyConfig {
    * credential: human starts/unblocks/resumes are refused with the reading,
    * and the daemon's own launches (auto-resume, auto-delivery, cluster
    * restarts) wait and go ahead by themselves once the window resets. A turn
-   * already running is never stopped. Off unless `threshold_percent` is set.
+   * already running is stopped at its next model request, work kept, and
+   * resumes after the reset (src/daemon/running-turn-stop.ts). Off unless
+   * `threshold_percent` is set.
    */
   usage_pause?: {
     /** Percent (1–100) of a usage window past which new turns wait. 0 / absent = off. */

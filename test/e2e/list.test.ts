@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectOutputExcludes, expectError } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { seedFinal } from '../helpers/final';
 
 describe('lazy list', () => {
@@ -141,7 +141,7 @@ describe('lazy list', () => {
     expectOutput(result, 'Task to accept');
 
     // Accept the task
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Now it should NOT appear in active
@@ -161,7 +161,7 @@ describe('lazy list', () => {
     expectOutput(result, 'Task to reject');
 
     // Reject the task with required --yes and --reason flags
-    const rejectResult = await ctx.lazy(['reject', taskId, '--yes', '--reason', 'Testing rejection']);
+    const rejectResult = await ctx.lazyMocked(['reject', taskId, '--yes', '--reason', 'Testing rejection'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(rejectResult);
 
     // Now it should NOT appear in active
@@ -181,7 +181,7 @@ describe('lazy list', () => {
     expectOutput(result, 'Task to close');
 
     // Close the task
-    await ctx.lazy(['close', taskId, '--reason', 'Not needed']);
+    await ctx.lazyMocked(['close', taskId, '--reason', 'Not needed'], MOCK_CLAUDE_SUCCESS);
 
     // Now it should NOT appear in active
     result = await ctx.lazy(['active']);
@@ -212,7 +212,7 @@ describe('lazy list', () => {
     expectOutput(result, 'Task for blocked accept test');
 
     // Accept the task
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Now it should NOT appear in blocked
@@ -231,7 +231,7 @@ describe('lazy list', () => {
     expectOutput(result, 'Task for blocked reject test');
 
     // Reject the task
-    const rejectResult = await ctx.lazy(['reject', taskId, '--yes', '--reason', 'Bad approach']);
+    const rejectResult = await ctx.lazyMocked(['reject', taskId, '--yes', '--reason', 'Bad approach'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(rejectResult);
 
     // Now it should NOT appear in blocked
@@ -322,7 +322,7 @@ describe('lazy list', () => {
     expectOutput(result, 'Task for list accept test');
 
     // Accept the task
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Now it should NOT appear in list (default excludes terminal)
@@ -394,7 +394,7 @@ describe('lazy list', () => {
     await startAndReconcile(ctx, 'child-all');
     // Fixture setup, not the subject (see test/helpers/final.ts).
     seedFinal(ctx, 'child-all');
-    await ctx.lazy(['accept', 'child-all']);
+    await ctx.lazyMocked(['accept', 'child-all'], MOCK_CLAUDE_SUCCESS);
 
     // Without --all, accepted child should not appear even when filtering by parent
     let result = await ctx.lazy(['list', parentId.substring(0, 8)]);

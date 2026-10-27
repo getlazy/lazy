@@ -58,7 +58,10 @@ threshold_percent = 95
 ```
 
 New turns wait when the credential's reported usage reaches 95% of a
-subscription window. Existing turns continue.
+subscription window. A turn that is already running is stopped at its next model
+request, with its work kept, and resumes by itself after the reset. To bound one
+task's spend whatever the windows say, give it a token cap:
+`lazy edit <task> --token-cap 50M`.
 
 ## Who sees what
 

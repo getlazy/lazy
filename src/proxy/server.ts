@@ -82,7 +82,7 @@ import { credentialValuesIn, upstreamErrorExcerpt } from './upstream-error';
 import { forwardableBody } from '../utils/forward-body';
 import {
   activityPath, closeEventFromRecord, proxyActivity,
-  CREDENTIAL_REFUSED_PREFIX, CREDENTIAL_UNAVAILABLE_PREFIX, PATH_REFUSED_PREFIX, TIERS_FULL_PREFIX, TIER_REFUSED_PREFIX, type ProxyActivityBus,
+  CREDENTIAL_REFUSED_PREFIX, CREDENTIAL_UNAVAILABLE_PREFIX, PATH_REFUSED_PREFIX, TIERS_FULL_PREFIX, RUNNING_STOP_PREFIX, TIER_REFUSED_PREFIX, type ProxyActivityBus,
 } from './activity';
 import {
   decideProxyPath,
@@ -100,6 +100,15 @@ import {
   isUpstreamTimeout,
   upstreamFetchOptions,
 } from './upstream-timeout';
+import {
+  LAZY_PROXY_FAILED_PREFIX,
+  describeAttributedFailure,
+  describeParty,
+  fetchReplayingStaleConnection,
+  upstreamHost,
+} from './upstream-failure';
+import type { ProxyUpstreamFailure } from '../storage/types';
+import { daemonProviderHealth, type ProviderHealthTracker } from './provider-health';
 import { extractOpenAIRequest } from './openai-extractor';
 import { routeForProfile, type AgentUpstreamRoute } from './agent-upstreams';
 import {
@@ -694,6 +703,8 @@ async function forwardCursor(
     auditQueue: AuditQueue;
     activity: ProxyActivityBus;
     upstreamTimeoutSeconds: number;
+    /** Ms since the proxy last sent to this upstream (and marks it sent now). */
+    idleSince: (upstream: string) => number | null;
     config?: ResolvedConfig;
   },
 ): Promise<Response> {
@@ -841,8 +852,18 @@ async function forwardCursor(
   }
 
   let upstreamResp: Response;
+  const idleMs = ctx.idleSince(cursorUpstream);
+  const cursorParty = {
+    upstream: cursorUpstream,
+    endpoint: null,
+    profile: caller?.grant.profile ?? null,
+    credential: cursorCredentialLabel,
+  };
+  let replayedReset: { code: string | null; afterMs: number; idleMs: number | null } | null = null;
   try {
-    upstreamResp = await fetch(target, {
+    // Replayable only when the body is a buffered value: a streamed client
+    // body has been consumed by the first attempt (src/proxy/upstream-failure.ts).
+    upstreamResp = await fetchReplayingStaleConnection((fresh) => fetch(target, {
       method: req.method,
       headers: fwdHeaders,
       body: bodyOverride !== null ? bodyOverride : hasBody ? forwardableBody(req.body) : undefined,
@@ -853,21 +874,38 @@ async function forwardCursor(
       // lazy's own ceiling instead of Bun's hidden one — same rule on every
       // route, so no upstream can be reaped at a number nobody chose.
       ...upstreamFetchOptions(ctx.upstreamTimeoutSeconds, req.signal),
-    } as RequestInit);
+      ...(fresh ? { keepalive: false } : {}),
+    } as RequestInit), {
+      replayable: bodyOverride !== null || !hasBody,
+      signal: req.signal,
+      onReplay: ({ code, afterMs }) => logger.warn(
+        `[proxy] seq=${ctx.seq} ${describeParty(cursorParty)} reset the connection ${afterMs}ms in ` +
+        `(${code ?? 'no code'}, idle ${idleMs ?? '?'}ms before); replaying once on a fresh connection`,
+      ),
+      onReplayed: ({ code, afterMs }) => { replayedReset = { code, afterMs, idleMs }; },
+    });
   } catch (err) {
-    const message = req.signal.aborted
-      ? CLIENT_ABORT_MESSAGE
-      : describeUpstreamFailure(err, cursorUpstream, ctx.upstreamTimeoutSeconds);
-    ctx.auditQueue.enqueue({ ...base, status: null, error: message, durationMs: Date.now() - ctx.startMs });
-    logger.warn(`[proxy] seq=${ctx.seq} cursor upstream ${cursorUpstream} unreachable: ${message}`);
+    let message = CLIENT_ABORT_MESSAGE;
+    let failure: ProxyUpstreamFailure | null = null;
+    if (!req.signal.aborted) {
+      const described = describeAttributedFailure(err, cursorParty, ctx.upstreamTimeoutSeconds, Date.now() - ctx.startMs);
+      message = described.message;
+      failure = { ...described.failure, idleMs };
+    }
+    ctx.auditQueue.enqueue({ ...base, status: null, error: message, failure, durationMs: Date.now() - ctx.startMs });
+    logger.warn(`[proxy] seq=${ctx.seq} ${message}`);
     return new Response(
       JSON.stringify({ type: 'error', error: { type: 'proxy_error', message } }),
       { status: 502, headers: { 'content-type': 'application/json' } },
     );
   }
 
+  if (upstreamResp.status === 429 || upstreamResp.status >= 500) {
+    logger.warn(`[proxy] seq=${ctx.seq} ${describeParty(cursorParty)} answered HTTP ${upstreamResp.status}`);
+  }
   const cursorRecord: ProxyAuditRecord = {
     ...base,
+    ...(replayedReset ? { replayedReset } : {}),
     status: upstreamResp.status,
     usageLimitHeaders: captureUsageLimitHeaders(upstreamResp.headers),
     credential: usageLimitCredentialKey({
@@ -905,7 +943,17 @@ async function forwardCursor(
   // the key exchange's access/refresh tokens are swapped for grant-bound
   // placeholders before the body leaves the proxy.
   if (caller && upstreamResp.ok && upstreamResp.body != null && !isStreamingContentType(upstreamResp.headers.get('content-type'))) {
-    return cursorTokenResponse(upstreamResp, respHeaders, caller, credentials, ctx, cursorSourceDigest);
+    return cursorTokenResponse(upstreamResp, respHeaders, caller, credentials, ctx, cursorSourceDigest, (err) => {
+      // The record for this request is already queued; the answer still names who failed.
+      const message = req.signal.aborted
+        ? CLIENT_ABORT_MESSAGE
+        : describeAttributedFailure(err, cursorParty, ctx.upstreamTimeoutSeconds, Date.now() - ctx.startMs, 'mid-response').message;
+      logger.warn(`[proxy] seq=${ctx.seq} ${message}`);
+      return new Response(
+        JSON.stringify({ type: 'error', error: { type: 'proxy_error', message } }),
+        { status: 502, headers: { 'content-type': 'application/json' } },
+      );
+    });
   }
 
   return new Response(upstreamResp.body, {
@@ -952,12 +1000,19 @@ async function cursorTokenResponse(
   credentials: ProxyCredentialDeps | null,
   ctx: { seq: number },
   sourceDigest: string | null,
+  /** The upstream broke while its body was being read: the answer to send instead. */
+  onBodyError: (err: unknown) => Response,
 ): Promise<Response> {
   // Buffered as BYTES: unary Connect replies (`application/proto`) are binary,
   // and decoding them as text replaced invalid UTF-8 with U+FFFD — a corrupted
   // reply that broke Cursor launches. Only a valid-UTF-8 JSON object carrying
   // a token field is ever rebuilt; everything else goes out byte-for-byte.
-  const bytes = new Uint8Array(await upstreamResp.arrayBuffer());
+  let bytes: Uint8Array<ArrayBuffer>;
+  try {
+    bytes = new Uint8Array(await upstreamResp.arrayBuffer());
+  } catch (err) {
+    return onBodyError(err);
+  }
   const passThrough = () => new Response(bytes, {
     status: upstreamResp.status, statusText: upstreamResp.statusText, headers: respHeaders,
   });
@@ -1027,6 +1082,8 @@ export function createProxyServer(
     // Latest usage-limit reading per credential. Defaults to the daemon-wide
     // tracker the `usageLimits` RPC reads; injectable for tests.
     usageLimits?: UsageLimitTracker;
+    /** Provider-health window (tests pass their own; default is the daemon's). */
+    providerHealth?: ProviderHealthTracker;
     // Called once per tier SWITCH of a tiered profile (src/proxy/tier-select.ts),
     // never per request; the daemon records it durably on the task.
     onTierSwitch?: (event: TierSwitchEvent) => void;
@@ -1036,6 +1093,9 @@ export function createProxyServer(
     // Has this task's tiered session already been served by more than one
     // provider (durably, across daemon restarts)? See src/proxy/tier-history.ts.
     historyCrossed?: (taskId: string) => Promise<boolean>;
+    // Should this task's running turn be stopped for spend? Non-null refuses
+    // the request with the message; the daemon stops the turn itself.
+    runningTurnStop?: (taskId: string) => Promise<{ message: string } | null>;
     // Refresh saved readings before tier choice; existing tracker readings
     // remain usable if a refresh fails.
     prepareTierChoice?: () => Promise<void>;
@@ -1075,10 +1135,13 @@ export function createProxyServer(
   const toolStats = options?.toolStats ?? null;
   const turnLatency = options?.turnLatency ?? null;
   const usageLimits = options?.usageLimits ?? daemonUsageLimits;
+  const providerHealth = options?.providerHealth ?? daemonProviderHealth;
   const auditQueue = new AuditQueue(auditSink, (record) => {
     activity.publish(closeEventFromRecord(record));
     // Pure in-memory map write; cannot fail on I/O.
     usageLimits.observe(record);
+    // Same: in-memory window of provider outcomes (src/proxy/provider-health.ts).
+    providerHealth.observe(record);
     // Folded at the queue for the same reason the activity tap is: every
     // record that reaches the trail reaches the durable tool stats too, by
     // construction, so a future audit site cannot forget it. `observe` returns
@@ -1107,6 +1170,17 @@ export function createProxyServer(
     }
   });
   let seq = 0;
+  // Upstream origin → when the proxy last started a request to it. Audited on a
+  // thrown fetch as `failure.idleMs`: a reset a few ms in after a long idle is
+  // the stale-pooled-connection signature (src/proxy/upstream-failure.ts).
+  const lastSentAt = new Map<string, number>();
+  const idleSince = (upstream: string): number | null => {
+    const key = upstreamHost(upstream);
+    const now = Date.now();
+    const before = lastSentAt.get(key);
+    lastSentAt.set(key, now);
+    return before === undefined ? null : now - before;
+  };
   // Per task+profile: the tier the last request used, and which upstream
   // origins have served its session (two or more = its history crossed
   // providers; see src/proxy/tier-history.ts). In memory: a daemon restart
@@ -1237,6 +1311,7 @@ export function createProxyServer(
           auditQueue,
           activity,
           upstreamTimeoutSeconds,
+          idleSince,
           config: requestConfig,
         });
       }
@@ -1320,6 +1395,30 @@ export function createProxyServer(
         );
       }
       let callerRoute = caller ? routeForProfile(requestRoutes, caller.grant) : undefined;
+      // A task's running work turn past [usage_pause] or its own token cap is
+      // being stopped (src/daemon/running-turn-stop.ts): its requests are
+      // refused from here on, and the daemon stops the agent behind this one.
+      if (caller?.grant.taskId && caller.grant.role !== 'builder' && options?.runningTurnStop) {
+        let stop: { message: string } | null = null;
+        try {
+          stop = await options.runningTurnStop(caller.grant.taskId);
+        } catch (err) {
+          logger.warn(`[proxy] seq=${currentSeq} running-turn check failed for task ${caller.grant.taskId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        if (stop) {
+          return refuse(
+            { id, seq: currentSeq, startMs, auditQueue }, req,
+            {
+              path, upstream, backend: 'proxy', role, taskId,
+              reason: stop.message,
+              message: stop.message,
+              status: 429,
+              errorPrefix: RUNNING_STOP_PREFIX,
+              body: allTiersFullBody(callerRoute?.wire === 'openai' ? 'openai' : 'anthropic'),
+            },
+          );
+        }
+      }
       // --- Tiered profile: pick this request's tier (src/proxy/tier-select.ts) ---
       // The grant names the TIERED profile; which endpoint and model serve this
       // request is decided here, per request, from the live usage readings. The
@@ -1499,6 +1598,9 @@ export function createProxyServer(
         ? req.clone()
         : null;
       const routedUpstream = callerRoute?.upstream;
+      // The configured endpoint this request goes through, by name — on every
+      // record, success or failure, so provider health groups them as one.
+      const routeEndpoint: string | null = tierChoice?.tier.endpoint ?? callerRoute?.endpointName ?? null;
       // Which wire format this request's traffic speaks — picks the allowlist
       // tier, the request extractor, and the usage scanner. The Anthropic
       // extractor must never see OpenAI-wire traffic, and vice versa.
@@ -1831,9 +1933,21 @@ export function createProxyServer(
         return entry.headers;
       };
 
+      // Who a target is, for every message that names the party that failed.
+      const partyFor = (target: ProxyFallbackTarget) => ({
+        upstream: target.upstream,
+        endpoint: routeEndpoint,
+        profile: credentialProfile ?? caller?.grant.profile ?? null,
+        credential: chain.find((c) => c.target === target)?.label ?? null,
+      });
+      // The idle gap before each attempt, kept for the failure audit.
+      let lastIdleMs: number | null = null;
       const doFetch = (target: ProxyFallbackTarget): Promise<Response> => {
         const body = bodyForTarget(bodyText, parsedBody, target.model);
-        return fetch(target.upstream + path, {
+        lastIdleMs = idleSince(target.upstream);
+        // The body is a buffered string, so a reset before any response can be
+        // replayed once on a fresh connection (src/proxy/upstream-failure.ts).
+        return fetchReplayingStaleConnection((fresh) => fetch(target.upstream + path, {
           method: req.method,
           headers: headersFor(target),
           body: body.length ? body : undefined,
@@ -1841,7 +1955,33 @@ export function createProxyServer(
           // Without this a local model that is merely slow to produce its first
           // byte is aborted mid-prefill and reported as an unreachable upstream.
           ...upstreamFetchOptions(upstreamTimeoutSeconds, req.signal),
-        } as RequestInit);
+          // The replay must not pick the pool's stale socket again.
+          ...(fresh ? { keepalive: false } : {}),
+        } as RequestInit), {
+          replayable: true,
+          signal: req.signal,
+          onReplay: ({ code, afterMs }) => logger.warn(
+            `[proxy] seq=${currentSeq} ${describeParty(partyFor(target))} ` +
+            `reset the connection ${afterMs}ms in (${code ?? 'no code'}, idle ${lastIdleMs ?? '?'}ms before); ` +
+            `replaying once on a fresh connection`,
+          ),
+          onReplayed: ({ code, afterMs }) => { replayedReset = { code, afterMs, idleMs: lastIdleMs }; },
+        });
+      };
+      // Set when a pre-response reset was replayed and the replay answered.
+      let replayedReset: { code: string | null; afterMs: number; idleMs: number | null } | null = null;
+      // Fields every record from here on carries about where it went.
+      const routeFields = (): Partial<ProxyAuditRecord> => ({
+        ...(routeEndpoint ? { endpointName: routeEndpoint } : {}),
+        ...(replayedReset ? { replayedReset } : {}),
+      });
+      let forwardFailure: ProxyUpstreamFailure | null = null;
+      const describeThrown = (err: unknown, target: ProxyFallbackTarget): string => {
+        const { message, failure } = describeAttributedFailure(
+          err, partyFor(target), upstreamTimeoutSeconds, Date.now() - startMs,
+        );
+        forwardFailure = { ...failure, idleMs: lastIdleMs };
+        return message;
       };
 
       let upstreamResp: Response | null = null;
@@ -1890,10 +2030,11 @@ export function createProxyServer(
           if (req.signal.aborted) {
             // Client is gone: not an upstream failure, so never fail over.
             forwardError = CLIENT_ABORT_MESSAGE;
+            forwardFailure = null;
             if (firstTrigger === null) firstTrigger = 'client_abort';
             break;
           }
-          forwardError = describeUpstreamFailure(err, target.upstream, upstreamTimeoutSeconds);
+          forwardError = describeThrown(err, target);
           if (firstTrigger === null) firstTrigger = isUpstreamTimeout(err) ? 'timeout' : 'unreachable';
           if (!isLast) {
             logger.warn(
@@ -1939,10 +2080,11 @@ export function createProxyServer(
                 if (req.signal.aborted) {
                   // Client is gone: not an upstream failure, so never fail over.
                   forwardError = CLIENT_ABORT_MESSAGE;
+                  forwardFailure = null;
                   if (firstTrigger === null) firstTrigger = 'client_abort';
                   break;
                 }
-                forwardError = describeUpstreamFailure(err, target.upstream, upstreamTimeoutSeconds);
+                forwardError = describeThrown(err, target);
                 if (firstTrigger === null) firstTrigger = isUpstreamTimeout(err) ? 'timeout' : 'unreachable';
                 if (!isLast) {
                   logger.warn(
@@ -2021,6 +2163,7 @@ export function createProxyServer(
         commitTierSwitch?.();
         recordTierServed();
         const durationMs = Date.now() - startMs;
+        if (forwardFailure) logger.warn(`[proxy] seq=${currentSeq} ${forwardError}`);
         auditQueue.enqueue({
           id,
           seq: currentSeq,
@@ -2046,6 +2189,8 @@ export function createProxyServer(
           usage: null,
           stopReason: null,
           error: forwardError,
+          failure: forwardFailure,
+          ...routeFields(),
           durationMs,
           reroute,
           enforcement: null,
@@ -2064,6 +2209,42 @@ export function createProxyServer(
       // anything below reads (or buffers) the body.
       const headersAt = Date.now();
       const status = upstreamResp.status;
+      // The provider's own error answer passes through unchanged; lazy's log
+      // names who gave it.
+      if (status === 429 || status >= 500) {
+        logger.warn(`[proxy] seq=${currentSeq} ${describeParty(partyFor(finalTarget))} answered HTTP ${status}`);
+      }
+      // The upstream broke AFTER its response started: never replayed (it may
+      // have acted), audited with who failed, and answered with that message.
+      const failMidResponse = (err: unknown, partial: ProxyAuditRecord): Response => {
+        let message = CLIENT_ABORT_MESSAGE;
+        let failure: ProxyUpstreamFailure | null = null;
+        if (!req.signal.aborted) {
+          const d = describeAttributedFailure(
+            err, partyFor(finalTarget), upstreamTimeoutSeconds, Date.now() - startMs, 'mid-response',
+          );
+          message = d.message;
+          failure = d.failure;
+          logger.warn(`[proxy] seq=${currentSeq} ${message}`);
+        }
+        auditQueue.enqueue({ ...partial, error: message, failure });
+        return new Response(
+          JSON.stringify({ type: 'error', error: { type: 'proxy_error', message } }),
+          { status: 502, headers: { 'content-type': 'application/json' } },
+        );
+      };
+      const partialRecord = (): ProxyAuditRecord => ({
+        id, seq: currentSeq, ts: startMs, role, taskId, userId,
+        ...(credentialProfile ? { credentialProfile } : {}),
+        ...(tierChoice ? { servedByEndpoint: tierChoice.tier.endpoint, tierIndex: tierChoice.tier.index, tierProfile: caller?.grant.profile ?? null } : {}),
+        ...routeFields(),
+        backend: 'proxy', upstream: finalTarget.upstream,
+        method: req.method, path, endpoint: extracted.endpoint, model: extracted.model,
+        tier: extracted.tier, stream: extracted.stream, requestShape: extracted.requestShape,
+        toolUses: extracted.toolUses, toolResults: extracted.toolResults,
+        status, usage: null, stopReason: null, error: null, durationMs: headersAt - startMs,
+        reroute: null, enforcement: null,
+      });
 
       // Usage-limit signal: read off the response HEADERS, which arrive before
       // any body — so streamed and error (429) responses carry it alike.
@@ -2173,7 +2354,12 @@ export function createProxyServer(
         // Read incrementally rather than with text(): the client gets nothing
         // until the whole body is in (enforcement must see every tool_use), but
         // the record still says when the first content token ARRIVED.
-        const timedBody = await readBodyTimed(upstreamResp.body!, isStream, wire);
+        let timedBody: Awaited<ReturnType<typeof readBodyTimed>>;
+        try {
+          timedBody = await readBodyTimed(upstreamResp.body!, isStream, wire);
+        } catch (err) {
+          return failMidResponse(err, { ...partialRecord(), reroute });
+        }
         const respText = timedBody.text;
 
         let enforced: ReturnType<typeof enforceResponseBody>;
@@ -2218,6 +2404,7 @@ export function createProxyServer(
           ttftMs: timedBody.firstContentAt === null ? null : timedBody.firstContentAt - startMs,
           ttltMs: timedBody.endedAt - startMs,
           reroute, enforcement, usageLimitHeaders, credential: credentialKey,
+          ...routeFields(),
         });
 
         return new Response(enforced.bodyText, {
@@ -2261,6 +2448,7 @@ export function createProxyServer(
         enforcement: null,
         usageLimitHeaders,
         credential: credentialKey,
+        ...routeFields(),
       };
 
       // Only a successful inference response carries token usage —
@@ -2286,7 +2474,12 @@ export function createProxyServer(
           upstreamResp.body != null &&
           !(upstreamResp.headers.get('content-type') ?? '').includes('text/event-stream')
         ) {
-          const body = await upstreamResp.text();
+          let body: string;
+          try {
+            body = await upstreamResp.text();
+          } catch (err) {
+            return failMidResponse(err, record);
+          }
           const refusal = codexRefusalHeaders(body, startMs);
           const withError = { ...record, error: upstreamErrorExcerpt(body, credentialValuesIn(headersFor(finalTarget))) };
           auditQueue.enqueue(refusal ? { ...withError, usageLimitHeaders: { ...usageLimitHeaders, ...refusal } } : withError);
@@ -2307,7 +2500,12 @@ export function createProxyServer(
         ) {
           // Forward the upstream's BYTES, and decode only a copy for the
           // excerpt: text() would replace invalid UTF-8 in what the client gets.
-          const body = await upstreamResp.arrayBuffer();
+          let body: ArrayBuffer;
+          try {
+            body = await upstreamResp.arrayBuffer();
+          } catch (err) {
+            return failMidResponse(err, record);
+          }
           const excerpt = upstreamErrorExcerpt(
             new TextDecoder().decode(body),
             credentialValuesIn(headersFor(finalTarget)),
@@ -2340,8 +2538,19 @@ export function createProxyServer(
       // observe from the audit tap carries the same ts and changes nothing.
       usageLimits.observe(record);
       const teed = teeUsageStream(upstreamResp.body!, respIsStream, (usage, timing) => {
+        // A stream the UPSTREAM broke (not a client cancel) is a provider
+        // failure mid-response: say who, so it is never mistaken for a cancel.
+        let broke: { error: string; failure: ProxyUpstreamFailure } | null = null;
+        if (timing.error !== undefined && !req.signal.aborted) {
+          const d = describeAttributedFailure(
+            timing.error, partyFor(finalTarget), upstreamTimeoutSeconds, timing.endedAt - startMs, 'mid-response',
+          );
+          logger.warn(`[proxy] seq=${currentSeq} ${d.message}`);
+          broke = { error: d.message, failure: d.failure };
+        }
         auditQueue.enqueue({
           ...record,
+          ...(broke ?? {}),
           usage,
           ttftMs: timing.firstContentAt === null ? null : timing.firstContentAt - startMs,
           // A cancelled or broken stream has no "last token": recording its abort
@@ -2388,7 +2597,7 @@ export function createProxyServer(
       return new Response(
         JSON.stringify({
           type: 'error',
-          error: { type: 'proxy_error', message: `lazy proxy failed to handle this request: ${message}` },
+          error: { type: 'proxy_error', message: `${LAZY_PROXY_FAILED_PREFIX} to handle this request: ${message}` },
         }),
         { status: 502, headers: { 'content-type': 'application/json' } },
       );

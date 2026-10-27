@@ -88,6 +88,26 @@ describe('usage-limits view', () => {
     expect(view.pause.held).toHaveLength(2);
   });
 
+  // INVARIANT: provider health reaches narrowed views as counts only — its
+  // failure TEXT can carry another member's credential label (their address)
+  // or quote an upstream error from somebody else's request.
+  test('narrowed views keep provider health counts but drop the failure text', () => {
+    const health = [{
+      provider: 'Anthropic', host: 'api.anthropic.com', requests: 3,
+      failures: { reset: 1, timeout: 0, connect: 0, server_error: 0, overloaded: 0, rate_limited: 0, other: 0 },
+      lastFailureAt: 1, lastFailure: 'Anthropic (api.anthropic.com, credential `bob@example.com (endpoint builtin:anthropic)`) reset',
+    }];
+    const project = projectUsageLimits([alice, bob], pause, Date.now(), [], health);
+    expect(project.providerHealth![0]!.lastFailure).toContain('bob@example.com');
+    for (const view of [
+      scopeUsageLimitsView(project, alice.credential, 't-alice'),
+      memberUsageLimitsView(project, alice.credential, 'user:__service__'),
+    ]) {
+      expect(view.providerHealth![0]).toMatchObject({ requests: 3, lastFailureAt: 1, lastFailure: null });
+      expect(JSON.stringify(view)).not.toContain('bob@example.com');
+    }
+  });
+
   // INVARIANT: a task agent's view names no credential but the one its own
   // turn spends — on a Teams host the others are other members' accounts.
   test('task scope keeps only the calling task\'s credential and hold', () => {

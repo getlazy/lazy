@@ -107,3 +107,53 @@ describe('the data volume across recreate, daemon restart and task end', () => {
     expect(await volumeCalls()).toEqual([`volume rm ${taskDataVolumeName(task.id)}`]);
   }, 60_000);
 });
+
+describe('an environment kept across an upgrade', () => {
+  async function setup(goal: string, name: string) {
+    const runner = new DockerRunner('docker');
+    const task = await storage.createTask(goal);
+    const session = await storage.createSession(task.id, 'claude-code', 'lazy/keep', 'base');
+    await storage.updateSessionContainerName(session.id, name, 'claude-code');
+    const runnerPath = resolve(import.meta.dir, '../../src/runner/index.ts');
+    const real = await import(runnerPath);
+    await mockModule(runnerPath, () => ({ ...real, createRunner: async () => runner }));
+    const { taskDataView } = await import('../../src/daemon/task-data-view');
+    const { OUTDATED_IMAGE_ENVIRONMENT_NOTICE } = await import('../../src/runner/task-data');
+    await docker.seedContainer(name, { state: 'running' });
+    await writeFile(join(docker.stateDir, `image-of-${name}`), 'sha256:old\n');
+    const view = async () => taskDataView(root, (await storage.getTask(task.id))!, await storage.getSessionByTaskId(task.id));
+    return { runner, task, view, OUTDATED_IMAGE_ENVIRONMENT_NOTICE };
+  }
+
+  // INVARIANT: a container still on an older image than the task's next
+  // launch would use offers the same restart as an old-layout one — a full
+  // `lazy upgrade` keeps running containers, so this notice is how a person
+  // learns a restart would bring the new image. The comparison is against the
+  // image the next launch RESOLVES (a new version tag, a changed Dockerfile's
+  // new name), never only the container's own tag.
+  test('offers a restart once the project image is a newer build, under a new tag', async () => {
+    const { resolveImageName } = await import('../../src/capture/claude');
+    const { view, OUTDATED_IMAGE_ENVIRONMENT_NOTICE } = await setup('Keep my tools', 'lazy-keep-image');
+    const expected = await resolveImageName(root);
+    await docker.seedImage(expected, { id: 'sha256:old' });
+    expect((await view()).restartAvailable).toBe(false);
+
+    await docker.seedImage(expected, { id: 'sha256:new' });
+    const behind = await view();
+    expect(behind.restartAvailable).toBe(true);
+    expect(behind.notice).toBe(OUTDATED_IMAGE_ENVIRONMENT_NOTICE);
+    const { checkOldTaskEnvironments } = await import('../../src/doctor/sweep');
+    expect((await checkOldTaskEnvironments(storage, root)).warning).toContain(OUTDATED_IMAGE_ENVIRONMENT_NOTICE);
+    expect((await docker.invocations()).some((c) => c.startsWith('rm '))).toBe(false);
+  }, 60_000);
+
+  test('compares a pinned task against its pin', async () => {
+    const { CUSTOM_IMAGE_META_KEY } = await import('../../src/docker/worktree-image');
+    const { task, view } = await setup('Keep my pinned tools', 'lazy-keep-pin');
+    await storage.updateTaskMetadata(task.id, CUSTOM_IMAGE_META_KEY, 'lazy-custom-abc:9.9');
+    await docker.seedImage('lazy-custom-abc:9.9', { id: 'sha256:new' });
+    expect((await view()).restartAvailable).toBe(true);
+    await docker.seedImage('lazy-custom-abc:9.9', { id: 'sha256:old' });
+    expect((await view()).restartAvailable).toBe(false);
+  }, 60_000);
+});

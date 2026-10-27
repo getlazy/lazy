@@ -8,7 +8,9 @@ describe('lazy close', () => {
   let ctx: TestContext;
 
   beforeEach(async () => {
-    ctx = await setupTestLazy();
+    // Close tears down the task environment; use a real supervised fake agent
+    // on the host runner so this suite never requires a Docker daemon.
+    ctx = await setupTestLazy({ fakeClaude: true });
   });
 
   afterEach(async () => {

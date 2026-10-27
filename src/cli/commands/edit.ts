@@ -50,6 +50,7 @@ export async function commandEdit(args: string[]): Promise<void> {
     { name: 'runner', takesValue: true },
     { name: 'effort', takesValue: true },
     { name: 'agent', takesValue: true },
+    { name: 'token-cap', takesValue: true },
     ...REVIEW_FLAGS,
   ], 'edit');
 
@@ -90,6 +91,21 @@ export async function commandEdit(args: string[]): Promise<void> {
       process.exit(1);
     }
     const reviewOverrides = reviewFlags.overrides;
+
+    // The token cap is the daemon's to apply (src/daemon/edit-task.ts) and is
+    // editable at any time, so it goes first and on its own.
+    const tokenCapValue = parsed.flags.get('token-cap') as string | undefined;
+    if (tokenCapValue !== undefined) {
+      try {
+        const result = await queryEditTask({ taskId: t.id, tokenCap: tokenCapValue });
+        for (const line of result.announcements ?? []) console.log(line);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+      const others = [runnerValue, agentValue, goalValue, promptValue, modelValue, typeValue, codeValue, parentValue, effortValue];
+      if (others.every((v) => v === undefined) && !hasReviewOverrides(reviewOverrides)) return;
+    }
 
     // Block editing once an agent has actually worked on the task (has turns).
     // Linked tasks have a session but no turns — those should remain editable.
@@ -476,7 +492,7 @@ export async function commandEdit(args: string[]): Promise<void> {
 }
 
 export function editUsage(): void {
-  console.log(`Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--runner <docker|container|podman>] [--effort <level>] [--agent <profile>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>]
+  console.log(`Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--runner <docker|container|podman>] [--effort <level>] [--agent <profile>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--token-cap <count>]
 
 Edit a task's goal, prompt, model, type, code, parent, runner, effort, agent, or review mode. Interactive if no flags provided.
 Once an agent has worked on the task, only --model, --effort, --runner, --agent and the
@@ -514,6 +530,11 @@ Options:
                      more than it is finding.
   --review-gate <g>  Change when a recorded review holds the merge: auto (the
                      mode decides), always, or never. Allowed any time.
+  --token-cap <count>
+                     The task's own token cap, e.g. 50M, 200k or 50000000; "none"
+                     clears it. Allowed any time. Once the task has spent that
+                     many tokens its running turn is stopped (work kept) and it
+                     does not continue until the cap is raised or cleared.
   --review-auto-fix <on|off>
                      Change whether a 'separate' review that found something
                      starts a fix turn by itself. Allowed any time.

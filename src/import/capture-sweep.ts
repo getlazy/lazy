@@ -117,6 +117,10 @@ export async function sweepConversations(
     const stat: SeenFile = { size: c.size, mtimeMs: c.mtimeMs };
     const seen = cursor.get(c.sessionId);
     try {
+      if (await storage.isConversationPurged(c.sessionId)) {
+        cursor.set(c.sessionId, stat);
+        continue;
+      }
       if (seen && seen.size === stat.size && seen.mtimeMs === stat.mtimeMs) {
         continue; // Unchanged since the last look — nothing to do.
       }
@@ -149,13 +153,14 @@ export async function sweepConversations(
       const outcome = await saveConversationWithoutRegression(
         storage,
         toStoredConversation(conversation, summary, stats),
+        { skipPurged: true },
       );
 
       // Record the stat either way: a refused prefix is not a failure to retry, and
       // re-parsing it on every tick would burn CPU to reach the same verdict.
       cursor.set(c.sessionId, stat);
       if (outcome === 'saved') result.captured.push(c.sessionId);
-      else result.skippedRegressions.push(c.sessionId);
+      else if (outcome === 'skipped-regression') result.skippedRegressions.push(c.sessionId);
     } catch (err) {
       // Leave the cursor unset for this session so a transient failure is
       // retried on the next tick rather than silently marked as handled.

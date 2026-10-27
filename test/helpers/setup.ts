@@ -10,6 +10,8 @@ import { basename, join, resolve } from 'path';
 import { mkdtemp, rm, writeFile, readFile, realpath } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { waitForDaemon, readPid, getDaemonDir, SIGNAL_SHUTDOWN_BUDGET_MS } from '../../src/daemon';
+import { DEFAULT_WEB_PORT, MAX_PORT_ATTEMPTS } from '../../src/config/constants';
+import { WEB_PORT_FILE } from '../../src/daemon/paths';
 import { TEST_PARENT_PID_ENV } from '../../src/daemon/test-parent-watch';
 import { TEST_AGENT_HOME_ENV } from '../../src/mcp/test-home-guard';
 import {
@@ -534,6 +536,7 @@ async function startTestDaemon(
   const { join: pathJoin } = await import('path');
   const daemonDir = getDaemonDir(projectRoot);
   await mkdir(daemonDir, { recursive: true });
+  await seedWorkerWebPort(daemonDir);
 
   // Capture daemon stdout/stderr so failures to start show up somewhere. The
   // default daemon.log isn't written until after the logger is configured,
@@ -541,13 +544,14 @@ async function startTestDaemon(
   const startupLogPath = pathJoin(daemonDir, 'test-startup.log');
   const logHandle = await open(startupLogPath, 'a');
 
+  let proc: ReturnType<typeof Bun.spawn>;
   try {
     const daemonArgv = ['bun', 'run'];
     if (!options.noPreload) daemonArgv.push('--preload', PRELOAD_PATH);
     if (options.transportPreload) daemonArgv.push('--preload', options.transportPreload);
     daemonArgv.push(ENTRY_PATH, 'daemon', 'start', '--foreground', '--project', projectRoot);
 
-    const proc = Bun.spawn(
+    proc = Bun.spawn(
       daemonArgv,
       {
         // cwd=projectRoot so preflight/findLazyRoot don't climb up to the
@@ -600,7 +604,12 @@ async function startTestDaemon(
     await logHandle.close();
   }
 
-  const ready = await waitForDaemon(projectRoot, 4_000);
+  // The budget is generous because it is a CEILING, not a delay: the poll
+  // returns the moment the daemon answers, and gives up at once if the process
+  // has already exited. A flat 4s used to be enough on an idle machine and
+  // failed hundreds of tests when the e2e files ran in parallel — a daemon that
+  // printed "Daemon started" was declared dead while the machine was busy.
+  const ready = await waitForTestDaemon(projectRoot, proc, DAEMON_READY_BUDGET_MS);
   if (!ready) {
     const { readFile } = await import('fs/promises');
     let diag = '';
@@ -610,6 +619,46 @@ async function startTestDaemon(
       `Startup log:\n${diag.slice(-2000)}`,
     );
   }
+}
+
+const DAEMON_READY_BUDGET_MS = 30_000;
+
+/**
+ * Under `bun test --parallel`, give each worker its own slice of the daemon
+ * port window.
+ *
+ * A daemon binds the port it last bound (the `web-port` marker in its daemon
+ * dir) or 26024, and walks up MAX_PORT_ATTEMPTS ports on EADDRINUSE. Serially
+ * that window holds one test daemon at a time with room to spare; with N
+ * workers all starting at 26024 they walk over each other and the late ones run
+ * out of window. Seeding the marker — the daemon's own, production preference,
+ * not a test-only seam — starts worker k at 26024 + k * MAX_PORT_ATTEMPTS, so
+ * each worker walks a window nobody else starts in. A marker that already
+ * exists (a restart within one test) is left alone, and a serial run (no
+ * worker id) is unchanged.
+ */
+async function seedWorkerWebPort(daemonDir: string): Promise<void> {
+  const worker = Number.parseInt(process.env.BUN_TEST_WORKER_ID ?? '', 10);
+  if (!Number.isInteger(worker) || worker < 1) return;
+  const markerPath = join(daemonDir, WEB_PORT_FILE);
+  try {
+    await writeFile(markerPath, String(DEFAULT_WEB_PORT + worker * MAX_PORT_ATTEMPTS), { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  }
+}
+
+async function waitForTestDaemon(
+  projectRoot: string,
+  proc: ReturnType<typeof Bun.spawn>,
+  budgetMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (await waitForDaemon(projectRoot, 500)) return true;
+    if (proc.exitCode !== null || proc.signalCode !== null) return false;
+  }
+  return false;
 }
 
 /**

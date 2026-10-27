@@ -275,8 +275,14 @@ an operator must set up — see
 Declaring services, and previewing a task's files, is covered in
 [Reaching a task's dev server](serve-ports.md#under-lazy-teams).
 
-Where a declared port is not being served at all, the card says exactly that and
-stops — it does not guess at a cause, because it was not told one.
+Where the task's environment does not publish a declared port (ports are fixed
+when the environment is created), the card says so, and the **Services** tab
+offers **Restart environment**: it recreates the environment so every declared
+port is published. Running services stop and the task's files are kept; run
+services again afterwards. If the restart cannot happen right now (for example
+during a turn), the tab says why. Where a declared port is not being served for
+any other reason, the card says exactly that and stops — it does not guess at a
+cause, because it was not told one.
 
 The card also shows the project's **Start services** command — the one command
 that brings the project's services up in a task's environment. It is one command for the

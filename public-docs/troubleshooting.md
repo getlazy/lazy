@@ -217,7 +217,9 @@ nothing.
 
 Lazy needs its daemon: it owns task state, storage and the agent runner, and
 every CLI command is a client of it. The CLI auto-starts one when it isn't
-already running, and reports the failure rather than proceeding when it can't:
+already running. Commands wait for its model proxy to be ready before proceeding,
+reporting progress when startup takes longer. If startup fails, the command reports
+the failure:
 
 ```
 Error: <what the daemon reported>

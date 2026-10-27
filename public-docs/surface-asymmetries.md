@@ -776,6 +776,18 @@ adding a fourth review argument to `lazy_edit` means adding it to that check.
 Humans are unaffected: `lazy edit --review*` on any task is a person deciding
 about their own project, which is the authority this whole page is about.
 
+### `lazy_edit`'s token cap: an agent may only set or tighten one
+
+A task's token cap (`lazy edit --token-cap`) bounds what it may spend. Over
+`lazy_edit`'s `token_cap`, an agent may put a cap on a **direct subtask** that
+has none, or lower an existing one. It may never raise or clear a cap, and never
+touch its own task's cap at all. Raising or clearing a cap lifts a spend limit
+on work the agent is driving. That is a person's or the builder's decision, for
+the same reason an agent may not let a task past the usage pause.
+
+People and the builder are unaffected: they can set, raise or clear any task's
+cap from the CLI, the dashboard, Lazy Teams or the builder's tools.
+
 ## 18. Turn reports and file justifications: agent writes, human reads
 
 `lazy_report`, `lazy_justify_protected`, and `lazy_justify_maintain` are

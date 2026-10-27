@@ -55,6 +55,8 @@ describe('Run services with the environment down and the task files missing', ()
     const storage = {
       resolveTask: async () => ({ task }),
       getSessionByTaskId: async () => null,
+      // A replacement launch retires the removed environment's exit fingerprints.
+      updateTaskMetadata: async () => {},
     } as unknown as Storage;
     let running = false;
     const launched: string[] = [];

@@ -34,6 +34,7 @@
 import type { Turn } from '../types';
 import { groupTurnsIntoChunks } from '../utils/turn-chunks';
 import { supervisedKindOfContent } from './supervised-headings';
+import { turnText } from '../utils/turn-content';
 import type { SupervisedKind } from '../protocol/types';
 
 /** What a mechanical turn was, in words a reader recognises. */
@@ -96,7 +97,7 @@ const SUPERVISED_MECHANICAL_KIND: Record<Exclude<SupervisedKind, 'pending_notes'
 };
 
 function isRecovered(turn: Turn): boolean {
-  return turn.content.startsWith(RECOVERED_PREFIX);
+  return turnText(turn).startsWith(RECOVERED_PREFIX);
 }
 
 function answersAPerson(turn: Turn): boolean {
@@ -108,7 +109,7 @@ function answersAPerson(turn: Turn): boolean {
 /** A supervisor-written follow-up prompt, and which kind; null for any other turn. */
 function supervisedPromptKind(turn: Turn): SupervisedKind | 'unknown' | null {
   if (turn.role !== 'human' || turn.turn_type !== 'nudge') return null;
-  return supervisedKindOfContent(turn.content) ?? 'unknown';
+  return supervisedKindOfContent(turnText(turn)) ?? 'unknown';
 }
 
 /** Why a turn that is not the prompt, the reply or a follow-up sits in the exchange. */

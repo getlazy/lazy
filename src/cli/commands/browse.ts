@@ -56,8 +56,8 @@ export async function commandBrowse(args: string[]): Promise<void> {
     }
 
     // Default full-screen browser — pre-flight: runner availability.
-    const { createRunner } = await import('../../runner');
-    const runner = await createRunner(root);
+    const { createInspectionRunner } = await import('../../runner');
+    const runner = await createInspectionRunner(root);
     try {
       await runner.checkAvailability();
     } catch (err) {

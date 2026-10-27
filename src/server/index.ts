@@ -5,6 +5,8 @@
  * Uses Bun's built-in HTTP server with no additional dependencies.
  */
 
+import { formatTokenCount as formatCapCount, runningStopLine, tokenCapOf } from '../usage-pause/running-stop';
+import { taskTokenSpend } from '../daemon/token-cap';
 import { remotePrUrl } from '../task/remote-pr';
 import { withPromotedTaskCodes, buildShowChat } from '../task/show-sections';
 import { reviewSettingsViewOf, type ReviewSettingsView } from '../review/mode';
@@ -224,6 +226,7 @@ import {
   actionRunJson,
   actionRunMatchesPath,
   wantsActionDialog,
+  type ActionConfirm,
 } from './action-run';
 import type { ProgressEmitter } from '../daemon/progress';
 import { parseServeNotice } from './serve-notice';
@@ -253,6 +256,8 @@ import { dashboardRunnerImageHtml } from './runner-image-banner';
 import { useCustomRunnerImage } from '../daemon/runner-image-choice';
 import { retryRunnerImageBuild } from '../daemon/runner-image';
 import { tokenBudgetBoxHtml } from './token-budget-box';
+import { providerHealthBoxHtml } from './provider-health-box';
+import { daemonProviderHealth } from '../proxy/provider-health';
 import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { UsagePauseState } from '../daemon/usage-pause';
 
@@ -395,8 +400,21 @@ function actionRunStarted(
   taskId: string,
   operation: string,
   work: (onProgress: ProgressEmitter) => Promise<{ redirect: string }>,
+  confirmOf?: (err: unknown) => ActionConfirm | undefined,
 ): Response {
-  return json(actionRunJson(beginActionRun({ taskId, operation, work })), 202);
+  return json(actionRunJson(beginActionRun({ taskId, operation, work, ...(confirmOf ? { confirmOf } : {}) })), 202);
+}
+
+/**
+ * Close/Reject refused because the worktree is stuck mid-merge and lazy cannot
+ * prove the merge is its own sync: offer the confirmed abort (the daemon's
+ * accept-dirty-worktree path) in the dialog, instead of a dead end. The
+ * daemon's own message says what the merge is; this only re-posts the form.
+ */
+function unprovenMergeConfirm(verb: 'close' | 'reject'): (err: unknown) => ActionConfirm | undefined {
+  return (err) => acceptRemedyOf(err)?.reason === 'unproven-merge'
+    ? { items: [], label: `Abort the merge and ${verb}`, fields: { accept_dirty_worktree: '1' } }
+    : undefined;
 }
 
 type SortField = TaskListSortField;
@@ -704,7 +722,7 @@ async function handleDashboard(
     unreadMessages,
     usagePauseHtml: await dashboardUsagePauseHtml(usagePauseState),
     runnerImageHtml: dashboardRunnerImageHtml(),
-    tokenBudgetHtml: await dashboardTokenBudgetHtml(tokenBudget),
+    tokenBudgetHtml: (await dashboardTokenBudgetHtml(tokenBudget)) + providerHealthBoxHtml(daemonProviderHealth.summary()),
   };
 
   return html(dashboardHtml(stats, duplicatedCodes));
@@ -1822,6 +1840,12 @@ async function handleTaskDetail(
     hashLinkBase: `/tasks/${seg}/changes`,
   };
 
+  const spend = {
+    tokens: await taskTokenSpend(storage, task.id),
+    cap: tokenCapOf(task),
+    stopLine: runningStopLine(task),
+  };
+
   // `render` stays open for the whole synchronous render, so the per-block
   // phases the template opens land under it as `render.turns`, `render.children`
   // and so on — no block has to know its own prefix.
@@ -1871,6 +1895,7 @@ async function handleTaskDetail(
       reparentTargets,
       submitPreflight,
       usagePause,
+      spend,
       markdown,
       openRaisedId: extras?.openRaisedId,
       openRaisedPanel: extras?.openRaisedPanel,
@@ -2254,6 +2279,8 @@ async function handleTaskAction(
   const pastUsagePause = String(form.get('past_usage_pause') ?? '') === '1';
   // "Run on lazy's default runner image" (the project's image is not ready).
   const useDefaultImage = String(form.get('use_default_image') ?? '') === '1';
+  // Close/Reject re-posted from the "Abort the merge and …" confirm.
+  const acceptDirtyWorktree = String(form.get('accept_dirty_worktree') ?? '') === '1';
   const runVerb = async (onProgress?: ProgressEmitter): Promise<string> => {
     switch (verb) {
       case 'start':
@@ -2262,12 +2289,16 @@ async function handleTaskAction(
       case 'stop':
         await taskActions.stopTask(task.id, reason, onProgress);
         break;
-      case 'close':
-        await taskActions.closeTask(task.id, reason, onProgress);
-        break;
-      case 'reject':
-        await taskActions.rejectTask(task.id, reason, onProgress);
-        break;
+      case 'close': {
+        const result = await taskActions.closeTask(task.id, reason, onProgress, { acceptDirtyWorktree });
+        const msg = ['Closed.', ...(result.warnings ?? [])].join(' ');
+        return `${url.origin}${backPath}?flash=${encodeURIComponent(msg)}`;
+      }
+      case 'reject': {
+        const result = await taskActions.rejectTask(task.id, reason, onProgress, { acceptDirtyWorktree });
+        const msg = ['Rejected.', ...(result.warnings ?? [])].join(' ');
+        return `${url.origin}${backPath}?flash=${encodeURIComponent(msg)}`;
+      }
       case 'resume':
         await taskActions.resumeTask(task.id, onProgress, { pastUsagePause, useDefaultImage });
         break;
@@ -2333,7 +2364,7 @@ async function handleTaskAction(
   if (dialog) {
     return actionRunStarted(task.id, verb, async (onProgress) => ({
       redirect: await runVerb(onProgress),
-    }));
+    }), verb === 'close' || verb === 'reject' ? unprovenMergeConfirm(verb) : undefined);
   }
 
   try {
@@ -2400,7 +2431,10 @@ async function selectableAgentsForTask(
         notice: 'No lazy project root found from the dashboard’s working directory — showing the built-in agents only.',
       };
     }
-    const config = await loadConfig(root);
+    // Strict: the daemon's last-known-good fallback would answer a broken
+    // lazy.toml with the previous copy, and the picker would look healthy to
+    // the person who is here to fix a profile block. The page says why instead.
+    const config = await loadConfig(root, { strict: true });
     const profiles = agentProfilesFor(config);
     const choices: AgentChoice[] = selectableAgentProfiles(profiles).map((profile) => ({
       name: profile.name,
@@ -2782,6 +2816,8 @@ async function handleTaskEdit(
   const lockedReason = lockedFieldsReason(task.status, turnCount);
   const savedPrompt = currentPromptOf(task) ?? '';
   const savedEffort = String(task.metadata?.effort ?? '');
+  const savedCap = tokenCapOf(task);
+  const savedTokenCap = savedCap === null ? '' : formatCapCount(savedCap);
 
   const agentChoices = await selectableAgentsForTask(task.agent_id);
   const duplicatedCodes = duplicateTaskCodes(await storage.listTaskCodes());
@@ -2807,6 +2843,7 @@ async function handleTaskEdit(
     model: task.model ?? '',
     effort: savedEffort,
     agent: task.agent_id,
+    tokenCap: savedTokenCap,
   };
 
   if (req.method === 'GET') {
@@ -2827,6 +2864,7 @@ async function handleTaskEdit(
     model: String(form.get('model') ?? '').trim(),
     effort: String(form.get('effort') ?? '').trim(),
     agent: String(form.get('agent') ?? task.agent_id).trim(),
+    tokenCap: String(form.get('token_cap') ?? savedTokenCap).trim(),
   };
 
   const input: TaskEditInput = {};
@@ -2837,6 +2875,7 @@ async function handleTaskEdit(
   if (draft.model && draft.model !== (task.model ?? '')) input.model = draft.model;
   if (draft.effort && draft.effort !== savedEffort) input.effort = draft.effort;
   if (draft.agent && draft.agent !== task.agent_id) input.agent = draft.agent;
+  if (draft.tokenCap !== savedTokenCap) input.tokenCap = draft.tokenCap === '' ? null : draft.tokenCap;
 
   if (editability.canEditLockedFields && !draft.goal.trim()) {
     return render(draft, { text: 'The goal cannot be empty.', error: true });

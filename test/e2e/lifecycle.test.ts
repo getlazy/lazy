@@ -3,7 +3,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectFailure, expectOutput, expectError } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { seedFinal } from '../helpers/final';
 
 describe('full task lifecycle', () => {
@@ -36,7 +36,7 @@ describe('full task lifecycle', () => {
     expect(existsSync(worktreePath)).toBe(true);
 
     // 4. Accept task (merges to main)
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
 
@@ -52,7 +52,7 @@ describe('full task lifecycle', () => {
 
     // `lazy abandon` was removed; `lazy close` is its successor — same
     // --reason/--yes contract, same resulting 'abandoned' status.
-    const closeResult = await ctx.lazy(['close', taskId, '--yes', '--reason', 'Incorrect approach, needs redesign']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--yes', '--reason', 'Incorrect approach, needs redesign'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
     // close reports "closed"; the resulting STATUS is 'abandoned' (asserted below)
     expectOutput(closeResult, 'closed');
@@ -69,7 +69,7 @@ describe('full task lifecycle', () => {
     await startAndReconcile(ctx, taskId);
 
     // close without --reason should fail in non-TTY context
-    const closeResult = await ctx.lazy(['close', taskId, '--yes']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectFailure(closeResult, 1);
     expectError(closeResult, '--reason is required when using --yes flag');
   });
@@ -77,7 +77,7 @@ describe('full task lifecycle', () => {
   test('create -> close (no session)', async () => {
     const taskId = await createTask(ctx, 'Abandon test', 'Something');
 
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'No longer needed']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--reason', 'No longer needed'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
     expectOutput(closeResult, 'closed');
 

@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { worktreePathFor } from '../helpers/storage';
 import { seedFinal } from '../helpers/final';
 
@@ -56,7 +56,7 @@ describe('Lazy co-author trailer', () => {
     const taskId = await createStartedTaskWithCommit(ctx, 'Test co-author on squash commit');
 
     // Accept the task (which creates a squash merge commit)
-    const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // Check that the squash merge commit on main has the Lazy co-author trailer
@@ -72,7 +72,7 @@ describe('Lazy co-author trailer', () => {
     // Create and accept multiple tasks
     for (let i = 1; i <= 3; i++) {
       const taskId = await createStartedTaskWithCommit(ctx, `Task ${i}`);
-      const acceptResult = await ctx.lazy(['accept', taskId, '--yes']);
+      const acceptResult = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
       expectSuccess(acceptResult);
     }
 
@@ -98,7 +98,7 @@ describe('Lazy co-author trailer', () => {
     writeFileSync(tomlPath, edited);
 
     const taskId = await createStartedTaskWithCommit(ctx, 'Test co-author opt-out');
-    expectSuccess(await ctx.lazy(['accept', taskId, '--yes']));
+    expectSuccess(await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS));
 
     const logResult = ctx.git('log', '--format=%B', '-n', '1', 'main');
     expect(logResult.exitCode).toBe(0);

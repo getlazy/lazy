@@ -180,6 +180,12 @@ describe('a ready runner image that disappears before an ask', () => {
       if (f.startsWith(prefix)) await rm(join(docker.stateDir, 'images', f), { recursive: true, force: true });
     }
 
+    // A stopped task keeps its container, and an ask into a kept container
+    // launches nothing — so remove it (as a prune would), or the image gate
+    // under test is never reached.
+    const removed = Bun.spawnSync([docker.binPath, 'rm', '-f', `lazy-${taskId}`]);
+    expect(removed.exitCode).toBe(0);
+
     const asked = await ctx.lazy(['ask', taskId, '-m', 'What is left?', '--no-wait']);
     expect(asked.exitCode, asked.stdout + asked.stderr).toBe(0);
     expect(await readTaskStatus(ctx.root, taskId)).not.toBe('interrupted');

@@ -271,7 +271,7 @@ function launchSettings(
 export function checkProtocolVersion(commandVersion: number | undefined, supervisorVersion: number): string | null {
   if (commandVersion === supervisorVersion) return null;
   const got = commandVersion === undefined ? 'unknown' : String(commandVersion);
-  return `Protocol version mismatch (got ${got}, expected ${supervisorVersion}). Run \`lazy upgrade\` to rebuild containers.`;
+  return `Protocol version mismatch (got ${got}, expected ${supervisorVersion}). Run \`lazy upgrade\`, which updates the agent in kept task containers, or restart the task's environment (\`lazy shell <task> --restart\`) to rebuild containers it cannot update.`;
 }
 
 /**
@@ -1710,6 +1710,7 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
     phase: 'reading_command',
     task_id: cmd.task_id,
     command_type: 'sync',
+    sync_command_id: cmd.command_id,
     started_at: syncNow,
     updated_at: syncNow,
     phase_started_at: syncNow,
@@ -1789,6 +1790,8 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   // contain, then merge approved upstream work on top. The host has already
   // fetched; `remote_branch` is only set when it found new commits.
   if (cmd.remote_branch) {
+    status.sync_merge_start_sha = await getHeadSha(worktreePath);
+    status.sync_merge_sha = await getBranchSha(worktreePath, cmd.remote_branch) ?? undefined;
     updatePhase(status, 'sync_with_remote', protocolDir);
     try {
       const remoteResult = await runSyncWithRemote(
@@ -1842,6 +1845,8 @@ async function handleSyncCommand(cmd: SyncCommand, config: SupervisorConfig, run
   } else if (branchResolvedSha) {
     status.upstream_merge_sha = branchResolvedSha;
   }
+  status.sync_merge_start_sha = await getHeadSha(worktreePath);
+  status.sync_merge_sha = status.upstream_merge_sha;
   writeStatus(protocolDir, status);
 
   if (commandUpstreamSha && branchResolvedSha && commandUpstreamSha !== branchResolvedSha) {

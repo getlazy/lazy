@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.94.1214] - 2026-10-26 - More fixes
+
+### Changed
+
+- **`bun run teams:deploy`** — update an existing KVM install using its server-side secrets, without depending on or copying a retired native install.
+- **`lazy upgrade` keeps task environments** — running task containers, their services and installed tools survive a full upgrade; restart an environment to move it to the new image.
+
+### Fixed
+
+- **Runner images** — wait for Docker to start, then build automatically; task launches retry expired image failures without requiring Retry.
+- **Daemon auto-start** — builder, pair, chat and other commands wait for the model proxy to be ready after a restart.
+- **`lazy accept`** — cleanup waits for a container removal already in progress instead of reporting a failed accept.
+- **"502 ECONNRESET" from the model proxy** — a dropped provider connection is retried at once; failures name the provider, and provider health shows in `lazy stats limits`, the dashboard and Teams.
+- **Daemon restarts and upgrades** — a task killed mid-turn after it had committed is now resumed, instead of being parked for review as if it had finished.
+- **Close and reject** — abort an unfinished sync merge when abandoning a task; a merge lazy cannot trace to its sync is shown and aborted only on your confirmation. Commits are kept.
+- **Teams Services tab** — a declared port the task's environment does not publish now says so and offers Restart environment, instead of "not being served".
+- **SSH service forwards** — an `ssh -L` forward lazy cannot complete now answers an HTTP client with a 502 saying why (e.g. service not published) instead of an empty reply.
+- **Conversation purge** — deleted housekeeping conversations stay out of live capture after a daemon restart.
+- **`lazy upgrade`** — no longer rejects a good agent binary when the container engine stops answering after the image build.
+- **`lazy start`** — honours `LAZY_ACTOR=builder`, recording the first turn as the builder's like every other command.
+- **`lazy show --full`** — no longer crashes on a task whose history holds a turn recorded without content.
+- **Accept history** — an accept records exactly one, attributed `complete` entry, even when another command reads the task list at the same moment.
+- **Dashboard task form** — a `lazy.toml` that does not load is shown as such in the agent picker again, instead of the last copy that loaded.
+- **Lazy Teams** — security updates for two Teams dependencies.
+
 ## [0.94.1212] - 2026-10-23 - Pair on other agents, Codex Builders, SSH into a task
 
 ### Added

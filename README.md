@@ -956,7 +956,7 @@ This rebuilds only the project's container image, with `--no-cache` so the newly
 - **Running builders** — on their next relaunch (a live builder keeps its image).
 - **Working agents** and **blocked tasks** — when their container is next recreated. A blocked task reuses its still-running supervisor on the next unblock, so it does *not* switch on the next turn; it adopts the new image only after its container is recreated (daemon restart, interruption, or crash).
 
-For an immediate, disruptive switch of everything (stop containers, rebuild image **and** agent binary, restart daemon), run a full `lazy upgrade`. Add `--dry-run` to preview without building.
+For a full switch (rebuild image **and** agent binary, restart daemon and agents; running task containers keep their image until restarted), run a full `lazy upgrade`. Add `--dry-run` to preview without building.
 
 ### Waiting on a Task
 

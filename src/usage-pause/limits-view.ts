@@ -10,6 +10,7 @@
  * applied by the daemon before anything leaves it.
  */
 import type { CredentialFailure } from '../proxy/credential-health';
+import type { ProviderHealth } from '../proxy/provider-health';
 import type { UsageLimitReading, UsageWindow } from '../proxy/usage-limits';
 import { isMemberEndpointUsageKey, memberEndpointUsageKey, usageLimitCredentialKey } from '../proxy/usage-limits';
 import {
@@ -67,6 +68,24 @@ export interface UsageLimitsPauseInput {
    * over it — see {@link projectUsageLimits}. Absent from an older daemon.
    */
   storeError?: { path: string | null; message: string } | null;
+  /** Tasks whose running turn lazy stopped for spend. Absent from an older daemon. */
+  stopped?: RunningStopView[];
+}
+
+/**
+ * A task whose running turn lazy stopped: `usage` (its credential crossed the
+ * threshold — resumes by itself after the reset) or `cap` (its own token cap —
+ * waits for a person). `line` is the wording every surface shows.
+ */
+export interface RunningStopView {
+  taskId: string;
+  task: string;
+  kind: 'usage' | 'cap';
+  line: string;
+  /** For `usage`: the credential it spent. */
+  credential?: string;
+  /** For `usage`: when it resumes (unix ms), or null when no reset time is known. */
+  resetsAt?: number | null;
 }
 
 /** The pause section of a view: the input minus `storeError`, which never reaches one. */
@@ -77,6 +96,8 @@ export interface UsageLimitsPauseView {
   held: UsageLimitHoldView[];
   /** Armed credentials and whether each has a usable reading (`none` = armed, NO READING). */
   coverage: UsagePauseCoverage[];
+  /** Tasks whose running turn lazy stopped for spend. */
+  stopped: RunningStopView[];
 }
 
 /** How every unreadable-readings refusal begins — {@link attachBudget} keeps it loud. */
@@ -122,6 +143,12 @@ export interface UsageLimitsView {
    * scoped like `readings`. Empty when everything works.
    */
   credentialHealth: CredentialFailure[];
+  /**
+   * Per provider/endpoint over the last hour: requests, failures by kind, last
+   * failure — "is it the provider or is it us?". Not credential-scoped: it
+   * names providers and hosts, never whose account. Absent from an older daemon.
+   */
+  providerHealth?: ProviderHealth[];
 }
 
 /**
@@ -150,6 +177,7 @@ export function projectUsageLimits(
   pause: UsageLimitsPauseInput,
   now: number = Date.now(),
   credentialHealth: readonly CredentialFailure[] = [],
+  providerHealth: readonly ProviderHealth[] = [],
 ): UsageLimitsView {
   if (pause.storeError) throw new UsageLimitsUnreadableError(pause.storeError);
   return {
@@ -167,9 +195,20 @@ export function projectUsageLimits(
       paused: pause.paused,
       held: pause.held,
       coverage: (pause.coverage ?? []).map((c) => ({ ...c })),
+      stopped: (pause.stopped ?? []).map((x) => ({ ...x })),
     },
     credentialHealth: credentialHealth.map((f) => ({ ...f })),
+    providerHealth: providerHealth.map((h) => ({ ...h, failures: { ...h.failures } })),
   };
+}
+
+/**
+ * Provider health for a narrowed view: counts and times, never the failure
+ * TEXT, which can name another member's credential (a member's label is their
+ * address) or quote an upstream error from somebody else's request.
+ */
+function withoutFailureText(health: readonly ProviderHealth[]): ProviderHealth[] {
+  return health.map((h) => ({ ...h, failures: { ...h.failures }, lastFailure: null }));
 }
 
 /**
@@ -199,8 +238,10 @@ export function scopeUsageLimitsView(
       paused: view.pause.paused.filter((p) => own(p.credential)),
       held: view.pause.held.filter((h) => h.taskId === taskId),
       coverage: view.pause.coverage.filter((c) => own(c.credential)),
+      stopped: view.pause.stopped.filter((x) => x.taskId === taskId),
     },
     credentialHealth: view.credentialHealth.filter((f) => own(f.credential)),
+    ...(view.providerHealth ? { providerHealth: withoutFailureText(view.providerHealth) } : {}),
   };
 }
 
@@ -246,7 +287,9 @@ export function memberUsageLimitsView(
       paused: view.pause.paused.filter((p) => visible(p.credential)),
       held: view.pause.held.filter((h) => visible(h.hold.credential)),
       coverage: view.pause.coverage.filter((c) => visible(c.credential)),
+      stopped: view.pause.stopped.filter((x) => x.kind === 'cap' || (x.credential !== undefined && visible(x.credential))),
     },
     credentialHealth: view.credentialHealth.filter((f) => visible(f.credential)),
+    ...(view.providerHealth ? { providerHealth: withoutFailureText(view.providerHealth) } : {}),
   };
 }

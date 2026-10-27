@@ -36,7 +36,7 @@ import { parseShellSessionMode, planPairOrChatExec } from './shell-pair';
 import { logger } from '../utils/logger';
 import { parseShellSessionName, shellSessionCommand } from '../terminal/shell-session';
 import { attachSessionArgv, isValidSessionName } from '../sessions/tmux';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { terminalEngineOf as engineOf } from '../runner/container-cli';
 import { taskRef } from '../task/identity';
 import { ExecStream, resolveDockerSocketPath } from '../runner/docker-exec-stream';
@@ -328,7 +328,7 @@ export function execContainerName(
 /**
  * The half of shell resolution that costs NOTHING at render time: does the task
  * have a session, and does its runner even have a container? Both are answered
- * from storage and config — `createRunner` loads config and resolves the agent
+ * from storage and config — `createInspectionRunner` loads config and resolves the agent
  * profile, it never spawns docker.
  *
  * This is what the PAGE calls. The remaining question — is that container
@@ -344,7 +344,7 @@ export async function resolveShellContainer(
   root: string,
   task: Task,
   session: Session | null,
-  runnerFor: (type: RunnerType | undefined) => Promise<Runner> = (type) => createRunner(root, type),
+  runnerFor: (type: RunnerType | undefined) => Promise<Pick<Runner, 'type' | 'usesSandbox' | 'runNameForTask'>> = (type) => createInspectionRunner(root, type),
 ): Promise<ShellTarget> {
   if (!session) {
     return { available: false, code: 'no-session', reason: `Task has no session — start it first.` };
@@ -382,7 +382,7 @@ export async function resolveShellTarget(
 ): Promise<ShellTarget> {
   const resolved = await resolveShellContainer(root, task, session);
   if (!resolved.available) return resolved;
-  const runner = await createRunner(root, session!.runner_type ?? task.runner_type ?? undefined);
+  const runner = await createInspectionRunner(root, session!.runner_type ?? task.runner_type ?? undefined);
   if (!(await runner.isRunning(resolved.container))) {
     return { available: false, code: 'not-running', reason: `Container for this task is not running.` };
   }
@@ -405,7 +405,7 @@ export async function resolveShellTarget(
 export async function resolveRunShellTarget(
   root: string,
   run: Pick<CommitRun, 'slug'>,
-  runnerFor: () => Promise<Pick<Runner, 'type' | 'usesSandbox' | 'isRunning'>> = () => createRunner(root),
+  runnerFor: () => Promise<Pick<Runner, 'type' | 'usesSandbox' | 'isRunning'>> = () => createInspectionRunner(root),
 ): Promise<ShellTarget> {
   const runner = await runnerFor();
   if (!runner.usesSandbox()) {

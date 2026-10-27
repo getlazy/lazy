@@ -63,7 +63,7 @@ import type { ActorIdentity } from './actor-tokens';
 import type { BuilderSession, BuilderSessionUpdate, BuilderRunnerImage, BuilderContinuedFrom } from '../storage/types';
 import { customImageReady, describeRunnerImage, runnerImageStatus, syncRunnerImageTarget } from './runner-image';
 import { loadConfig } from '../config/loader';
-import { createRunner } from '../runner';
+import { createRunner, createInspectionRunner, type InspectionRunner } from '../runner';
 import { resolveRoleTarget } from '../utils/role-target';
 import { builderTargetForProfile, resolveBuilderProfileName } from '../builder/builder-profile';
 import { findBuilderCodexHome } from '../builder/codex-home';
@@ -710,7 +710,7 @@ async function standDownLaunchedSession(
   if (!stopped.ok) {
     // The member's end already decided this container's fate, so an answer we
     // could not get is no reason to leave it: remove it anyway, best effort.
-    const runner = await createRunner(projectRoot);
+    const runner = await createInspectionRunner(projectRoot);
     await runner.removeRun(containerName).catch((err: unknown) => logger.warn(
       `Could not remove container ${containerName} of ended builder session ${claimed.id}: ` +
       `${err instanceof Error ? err.message : String(err)}`,
@@ -852,7 +852,7 @@ export type BuilderRunProbe =
   | { state: 'unknown'; reason: string };
 
 export async function probeBuilderRun(
-  runner: Awaited<ReturnType<typeof createRunner>>,
+  runner: InspectionRunner,
   containerName: string,
 ): Promise<BuilderRunProbe> {
   if (!runner.probeRunInfo) {
@@ -870,7 +870,7 @@ export async function probeBuilderRun(
  * is still readable until the recovery removes it.
  */
 async function describeDeadContainer(
-  runner: Awaited<ReturnType<typeof createRunner>>,
+  runner: InspectionRunner,
   containerName: string,
   exitCode: number | null,
   runId?: string,
@@ -928,13 +928,13 @@ async function describeDeadContainer(
  */
 export async function settleDeadBuilderSessions(projectRoot: string): Promise<void> {
   let rows: BuilderSession[];
-  let runner: Awaited<ReturnType<typeof createRunner>>;
+  let runner: InspectionRunner;
   try {
     const storage = await getOrCreateStorage();
     rows = (await storage.listBuilderSessions(projectRoot))
       .filter((r) => r.state === 'running' && r.containerName);
     if (rows.length === 0) return;
-    runner = await createRunner(projectRoot);
+    runner = await createInspectionRunner(projectRoot);
   } catch (err) {
     logger.warn(`Could not check builder sessions for dead containers: ${err instanceof Error ? err.message : String(err)}`);
     return;
@@ -1117,7 +1117,7 @@ function watchLaunchedBuilder(projectRoot: string, row: BuilderSession, trace: B
   const containerName = row.containerName!;
   void (async () => {
     try {
-      const runner = await createRunner(projectRoot);
+      const runner = await createInspectionRunner(projectRoot);
       let waited = 0;
       for (const at of LAUNCH_WATCH_CHECKS_MS) {
         await new Promise((r) => { setTimeout(r, at - waited).unref?.(); });
@@ -1211,7 +1211,7 @@ async function startBuilderSessionLocked(
     // — reached here only when the daemon died in that window (the start mutex
     // serializes live starts), so the same treatment is the recovery path for
     // both row states.
-    const runner = await createRunner(projectRoot);
+    const runner = await createInspectionRunner(projectRoot);
     // Three-way, like every other reader (probeBuilderRun): a runtime that did
     // not answer is refused, never read as "dead" — that reading stopped and
     // relaunched a LIVE builder because one probe was slow.
@@ -1893,7 +1893,7 @@ async function stopSessionContainer(
 ): Promise<StopSessionContainerResult> {
   assertSessionRowActionable(session);
   if (!session.containerName) return { ok: true, agentSessionId: null };
-  const runner = await createRunner(projectRoot);
+  const runner = await createInspectionRunner(projectRoot);
 
   // Three-way: a runtime that does not answer is NOT "already gone" —
   // reading it that way recorded a possibly live container as stopped, with

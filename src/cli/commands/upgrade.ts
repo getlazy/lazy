@@ -8,7 +8,8 @@
  * 1. Find all running lazy containers
  * 2. Start the image rebuild in the BACKGROUND, to a staging tag (the rebuild
  *    depends on the Dockerfile, not on the tasks, so it need not wait)
- * 3. Prompt if any containers are working; stop all running containers/processes
+ * 3. Prompt if any containers are working; task containers are KEPT (the
+ *    daemon restart stops only their agents)
  * 4. Collect the background build, promote its staging tag onto the canonical
  *    image tag, and rebuild the agent binary
  * 5. Restart daemon with new code
@@ -17,7 +18,7 @@
  * to the upgrade — so a cancelled upgrade leaves the current image untouched.
  *
  * The restarted daemon handles everything else automatically:
- * - Reconciles stopped containers → marks tasks as interrupted (~5s)
+ * - Reconciles cut-off turns → marks tasks as interrupted (~5s)
  * - Auto-resumes interrupted tasks with new supervisors
  */
 
@@ -71,6 +72,8 @@ import { backupStoreForUpgrade, SKIP_STORE_BACKUP_ENV } from '../../daemon/upgra
 import { backupOutcomeLine, backupProgressPrinter, describeUpcomingBackup } from '../../daemon/upgrade-store-backup';
 import { backupPurpose } from '../../daemon/store-backup-progress';
 import { missingCredentialNotice } from '../../daemon/credential-gate';
+import { supportsAgentSwap, swapAgentBinary } from '../../runner/agent-swap';
+import { containerCliOf } from '../../runner/container-cli';
 
 interface ContainerInfo {
   name: string;
@@ -387,15 +390,15 @@ export async function promptBuilderPreStop(
 function printImageRefreshBoundary(): void {
   console.log('When each session starts using the refreshed image:');
   console.log(`  ${theme.success('now')}   New and queued tasks — their container is created fresh at launch.`);
-  console.log(`  ${theme.success('now')}   Interrupted tasks — on auto-resume their container is recreated.`);
+  console.log(`  ${theme.warning('later')} Interrupted tasks — a kept container is reused on auto-resume; a recreated one gets it.`);
   console.log(`  ${theme.warning('later')} Running builders — on their next relaunch (a live builder keeps its image).`);
   console.log(`  ${theme.warning('later')} Working agents — when their container is next recreated.`);
   console.log(`  ${theme.warning('later')} Blocked tasks — NOT on the next unblock (the live supervisor is reused);`);
   console.log('        they adopt the new image only when their container is recreated');
-  console.log('        (daemon restart, interruption, or crash).');
+  console.log('        (restart the environment: Services tab, or `lazy shell <task> --restart`).');
   console.log('');
   console.log('  Running builders and agents were NOT touched by this refresh.');
-  console.log(`  For an immediate, disruptive switch of everything, run ${theme.command('lazy upgrade')}.`);
+  console.log(`  A full ${theme.command('lazy upgrade')} also restarts the daemon and agents; containers still keep their image.`);
 }
 
 /**
@@ -632,7 +635,10 @@ export async function commandUpgrade(args: string[]): Promise<void> {
           if (workingContainers.length > 0) {
             console.log('');
             console.log(theme.warning(`  ${workingContainers.length} container(s) are currently working.`));
-            console.log('  These will be stopped (mid-turn work will be lost, task resumes from last checkpoint).');
+            console.log('  Their turns will be cut off (mid-turn work is lost; the task resumes from its last checkpoint).');
+            console.log((await findLegacyDaemonMcpConfigs(root)).length > 0
+              ? '  Task containers are stopped and removed too: the shared daemon token is being rotated.'
+              : '  Task containers themselves stay running on their current image (older ones are replaced).');
           }
         }
 
@@ -734,6 +740,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       }
     }
 
+    let waitedForWorking = false;
     // Check for working containers
     if (workingContainers.length > 0 && !force && !wait) {
       console.log(theme.warning(`${workingContainers.length} container(s) are currently working:`));
@@ -742,7 +749,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
         console.log(`  ${theme.taskId(c.taskShortId)} ${goal}`);
       }
       console.log('');
-      console.log('Stopping them will interrupt mid-turn work. Tasks will resume from their last checkpoint.');
+      console.log("Upgrading cuts off their turns. Tasks resume from their last checkpoint, in the same container.");
 
       if (!isTTY()) {
         console.error('Cannot prompt for confirmation (no TTY). Use --force or --wait to skip.');
@@ -770,6 +777,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       if (choice === 1) {
         // User chose to wait — fall through to the wait logic below
         await waitForWorkingTasks(storage, workingContainers);
+        waitedForWorking = true;
       }
       // choice === 0: stop and upgrade now — continue with existing flow
     }
@@ -777,6 +785,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // --wait flag: wait for working tasks to finish before proceeding
     if (wait && workingContainers.length > 0) {
       await waitForWorkingTasks(storage, workingContainers);
+      waitedForWorking = true;
     }
 
     // A build still in flight must settle BEFORE anything is stopped: failing
@@ -814,24 +823,43 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // "never lose human feedback" (AGENTS.md). Skipped under --force / non-TTY.
     await promptBuilderPreStop(builderContainers.length, force, interactiveSessions, imageBuild);
 
-    // Step 1: Stop task containers/processes for this project. Builders ride
-    // through — the in-container supervisor reconnects when the daemon restarts.
-    const totalContainers = containers.length;
-    if (totalContainers > 0 || builderContainers.length > 0) {
-      if (totalContainers > 0) {
-        console.log(`\nStopping ${totalContainers} task container(s)...`);
-
-        for (const c of containers) {
-          const stopped = await runner.stopRun(c.name);
-          if (stopped) {
-            console.log(`  ${theme.success('stopped')} ${c.name}`);
-          } else {
-            console.log(`  ${theme.error('failed')} ${c.name}`);
-          }
-          await runner.removeRun(c.name);
-        }
+    // Step 1: Task containers ride through, like builders. The daemon restart
+    // below stops only each task's AGENT (src/runner/agent-stop.ts); before it,
+    // step 2b copies the rebuilt agent binary into each kept container, whose
+    // wrapper then starts every supervisor from that copy (src/runner/agent-swap.ts).
+    // The container — its services and installed tools — keeps running on its
+    // old image until a person restarts the environment (the task then shows
+    // the restart notice, src/daemon/task-data-view.ts).
+    //
+    // Stopped and removed as before:
+    //  - every container, when the project has leaked pre-v0.20 MCP configs:
+    //    step 3a rotates the shared daemon token, which a container cannot re-read;
+    //  - a run with no separate agent to stop (host-process: the run IS the agent);
+    //  - a container whose wrapper predates the agent swap: it would keep the
+    //    old supervisor, which refuses every command after a protocol change.
+    const legacyConfigsPresent = (await findLegacyDaemonMcpConfigs(root)).length > 0;
+    const keptContainers: ContainerInfo[] = [];
+    const replacedContainers: Array<{ c: ContainerInfo; why: string }> = [];
+    for (const c of containers) {
+      if (legacyConfigsPresent) replacedContainers.push({ c, why: 'the shared daemon token is about to be rotated' });
+      else if (!runner.stopAgentInRun) replacedContainers.push({ c, why: 'this runner has no container to keep' });
+      else if (!await supportsAgentSwap(containerCliOf(runner), c.name)) replacedContainers.push({ c, why: 'created by a lazy that cannot update its agent in place' });
+      else keptContainers.push(c);
+    }
+    const stopAndRemove = async (c: ContainerInfo, why: string) => {
+      const stopped = await runner.stopRun(c.name);
+      console.log(`  ${stopped ? theme.success('stopped') : theme.error('failed')} ${c.name} — ${why}`);
+      await runner.removeRun(c.name);
+    };
+    if (containers.length > 0 || builderContainers.length > 0) {
+      if (keptContainers.length > 0) {
+        console.log(`\n${keptContainers.length} task container(s) stay running — only their agents restart with the daemon.`);
+        console.log('  They keep their current image until you restart the environment.');
       }
-
+      if (replacedContainers.length > 0) {
+        console.log(`\nStopping ${replacedContainers.length} task container(s)...`);
+        for (const { c, why } of replacedContainers) await stopAndRemove(c, why);
+      }
       if (builderContainers.length > 0) {
         console.log(`\n${builderContainers.length} builder session(s) stay running — they reconnect when the daemon restarts.`);
       }
@@ -845,6 +873,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     console.log('\nRebuilding...');
     let promotedImageTags: string[] | null = null;
     let imageBuildSeconds: number | null = null;
+    let newAgentBinaryPath: string;
     if (imageBuild) {
       // The binary rebuild is independent of the image — run it alongside the
       // (possibly still-running) build rather than after it.
@@ -855,6 +884,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
         forceRebuildAgentBinary(),
         promoteBackgroundImage(imageBuild),
       ]);
+      newAgentBinaryPath = agentBinaryPath;
       promotedImageTags = imageResult;
       imageBuildSeconds = imageBuild.elapsedSeconds();
       if (imageResult.length > 0) {
@@ -867,12 +897,31 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       // No image build this run: either a host-process runner (which has no
       // container image at all) or the rebuild was skipped as a repeat of one
       // that just finished. Either way, only the agent binary is rebuilt.
-      await forceRebuildAgentBinary();
+      newAgentBinaryPath = await forceRebuildAgentBinary();
       console.log(`  ${theme.success(formatAgentBinaryRebuildLine())}`);
     }
 
+    // Step 2b: copy the rebuilt agent binary into each kept container, so the
+    // supervisor its wrapper starts after the daemon restart is the new one.
+    // A container the copy fails for is stopped and removed instead: left
+    // alone it would keep the old supervisor.
+    let keptCount = 0;
+    if (keptContainers.length > 0) {
+      console.log('\nUpdating the agent in kept task containers...');
+      for (const c of keptContainers) {
+        try {
+          await swapAgentBinary(containerCliOf(runner), c.name, newAgentBinaryPath);
+          keptCount++;
+          console.log(`  ${theme.success('updated')} ${c.name}`);
+        } catch (err) {
+          await stopAndRemove(c, err instanceof Error ? err.message : String(err));
+          replacedContainers.push({ c, why: 'agent update failed' });
+        }
+      }
+    }
+
     // Step 3: Restart daemon with new code.
-    // The new daemon will reconcile stopped containers (~5s) and auto-resume
+    // The new daemon will reconcile the cut-off turns (~5s) and auto-resume
     // interrupted tasks — no need for upgrade to do either of those.
     const daemonStatus = await checkDaemonHealth(root);
     const daemonWasRunning = daemonStatus.running;
@@ -909,7 +958,7 @@ export async function commandUpgrade(args: string[]): Promise<void> {
     // into the repo, and rotate that token.
     //
     // THIS IS THE ONLY SAFE POINT IN THE WHOLE FLOW, and the placement is the
-    // feature: every task container was stopped in step 1 and the old daemon has
+    // feature: any task container that could hold the shared token was stopped in step 1 and the old daemon has
     // just exited, so nobody is holding the shared token in a container (the one
     // class that could not re-read it from disk). The new
     // daemon has not started yet, so it adopts the fresh token on its first
@@ -958,7 +1007,8 @@ export async function commandUpgrade(args: string[]): Promise<void> {
       imageBuildSeconds,
       agentBinaryProvenance: getLastSourceBuildProvenance(),
       daemonRestarted: daemonWasRunning,
-      interruptedTaskCount: containers.length,
+      interruptedTaskCount: replacedContainers.length + (waitedForWorking ? 0 : keptContainers.filter(c => c.isWorking).length),
+      keptEnvironmentCount: keptCount,
       builderSessionCount: builderContainers.length,
       interactiveSessionCount: interactiveSessions.length,
     });
@@ -997,7 +1047,8 @@ Non-disruptive image refresh (--images):
     - Working agents and blocked tasks:  when their container is next recreated
       (a blocked task reuses its live supervisor on unblock, so it does NOT
       switch on the next turn)
-  For an immediate, disruptive switch of everything, run a full \`lazy upgrade\`.
+  A full \`lazy upgrade\` also restarts the daemon and every agent; running task
+  containers still keep their image until their environment is restarted.
   Only applies to docker/podman runners.
 
 What happens:
@@ -1008,7 +1059,8 @@ What happens:
      the only gain is re-resolving its unpinned contents, and the question says
      how old it is. Without a TTY it rebuilds; \`--images\` never asks.
   2. Live builder sessions are warned to submit any in-progress message
-  3. Task containers are stopped (builders stay running and reconnect in place)
+  3. Task containers and builders stay running (each task's agent restarts with
+     the daemon; a container keeps its image until you restart its environment)
   4. The background image is promoted onto the real image tag (usually already
      built by now) and the agent binary is force-rebuilt
   5. Daemon is restarted with new code

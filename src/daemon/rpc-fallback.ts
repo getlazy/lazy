@@ -14,6 +14,7 @@
  */
 
 import { logger } from '../utils/logger';
+import type { ProviderHealth } from '../proxy/provider-health';
 import type { TokenBudgetView } from '../usage-pause/budget-view';
 import type { ReviewSettingsOverrides } from '../review/mode';
 import { tryRpc, RpcApplicationError } from './client';
@@ -1455,6 +1456,8 @@ export async function queryEditTask(params: {
   agent?: string;
   model?: string;
   effort?: string;
+  /** The task's own token cap (`50M`, or null / `none` to clear). */
+  tokenCap?: string | null;
 }): Promise<EditTaskResult> {
   const rpc = await tryRpc<EditTaskResult>('editTask', params);
   if (rpc) return rpc;
@@ -2016,10 +2019,11 @@ export async function queryTokenBudget(): Promise<TokenBudgetView> {
 
 // --- Proxy usage-limit readings (src/proxy/usage-limits.ts) ---
 
-export async function queryUsageLimits(): Promise<{ readings: UsageLimitReading[]; credentialHealth: CredentialFailure[] }> {
-  const rpc = await tryRpc<{ readings: UsageLimitReading[]; credentialHealth?: CredentialFailure[] }>('usageLimits', {});
-  // An older daemon sends no health list; that is "none known", not an error.
-  if (rpc) return { readings: rpc.readings, credentialHealth: rpc.credentialHealth ?? [] };
+
+export async function queryUsageLimits(): Promise<{ readings: UsageLimitReading[]; credentialHealth: CredentialFailure[]; providerHealth: ProviderHealth[] }> {
+  const rpc = await tryRpc<{ readings: UsageLimitReading[]; credentialHealth?: CredentialFailure[]; providerHealth?: ProviderHealth[] }>('usageLimits', {});
+  // An older daemon sends no health lists; that is "none known", not an error.
+  if (rpc) return { readings: rpc.readings, credentialHealth: rpc.credentialHealth ?? [], providerHealth: rpc.providerHealth ?? [] };
 
   // Daemon down: the same fold over the bounded audit log, in-process.
   const root = resolveLazyRoot();

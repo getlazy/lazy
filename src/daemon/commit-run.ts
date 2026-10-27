@@ -38,7 +38,7 @@ import { actorEmail, actorName } from '../actor-ref';
 import { RpcError } from './rpc-error';
 import { getOrCreateStorage } from './rpc-handlers';
 import { requireString, optionalBoolean, optionalString, optionalActorInput } from './rpc-params';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { clearTaskEnv } from './task-env';
 import { forgetTaskFiles } from './task-files';
 import { readServicesRunState, runStartServices } from './serve-run';
@@ -184,7 +184,7 @@ export async function handleShowRun(projectRoot: string, params: Record<string, 
   const storage = await getOrCreateStorage();
   const run = await resolveCommitRun(storage, requireString(params, 'runId'));
   const view = await viewOf(projectRoot, run);
-  const runner = await createRunner(projectRoot);
+  const runner = await createInspectionRunner(projectRoot);
   const containerRunning = runner.usesSandbox() ? await runner.isRunning(view.containerName) : false;
   return { ...view, containerRunning, checkoutExists: await pathExists(view.worktreePath) };
 }
@@ -442,7 +442,7 @@ export async function pullCommitRun(
  * "not running", and is said so.
  */
 async function servicesRunning(projectRoot: string, run: CommitRun): Promise<'running' | 'not-running' | { unknown: string }> {
-  const runner = await createRunner(projectRoot);
+  const runner = await createInspectionRunner(projectRoot);
   if (!runner.usesSandbox()) return 'not-running';
   const name = runContainerName(projectRoot, run.slug);
   if (!(await runner.isRunning(name))) return 'not-running';
@@ -490,7 +490,7 @@ export async function removeCommitRun(
       const changes = await checkoutChanges(worktreePath, run.head_sha);
       if (hasChanges(changes)) throw dirtyCheckoutRefusal('Removing the run', changes);
     }
-    const runner = await createRunner(projectRoot);
+    const runner = await createInspectionRunner(projectRoot);
     if (runner.usesSandbox()) await removeRunContainer(containerCliOf(runner), runContainerName(projectRoot, run.slug));
     const { discarded, discardedCommits } = await removeRunCheckout(projectRoot, run.slug, { confirmDiscard: true, recordedSha: run.head_sha });
     await storage.deleteCommitRun(run.id);

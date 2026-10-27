@@ -41,8 +41,8 @@ import { open as openFile, stat } from 'fs/promises';
 import type { Server, ServerWebSocket } from 'bun';
 import type { Storage } from '../storage';
 import type { Task } from '../types';
-import type { FollowHandle, Runner } from '../runner/types';
-import { createRunner } from '../runner';
+import type { FollowHandle } from '../runner/types';
+import { createInspectionRunner, type InspectionRunner } from '../runner';
 import { taskRef, getWorktreePath, displayId, taskAuditForms } from '../task/identity';
 import { findLatestSessionFile, watchSessionReplayStart, watchEntryBelongsToTurn } from '../agent/session-discovery';
 import { WatchTurnTracker } from '../agent/watch-turns';
@@ -220,12 +220,12 @@ export function startTaskWatchStream(opts: {
     if (!running) return;
 
 
-    let runner: Runner;
+    let runner: InspectionRunner;
     try {
       // The task's OWN runner, as the shell resolves it: a task on smolvm in a
       // docker project is followed through its machine's engine, not this host's.
       const session = await storage.getSessionByTaskId(task.id);
-      runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
+      runner = await createInspectionRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
     } catch (err) {
       emit(renderWithColors(() => dim(`(supervisor and agent streams unavailable: ${err instanceof Error ? err.message : String(err)})`)));
       return;
@@ -296,7 +296,7 @@ async function tailAgentSession(
   projectDir: string,
   ctx: {
     protoDir: string;
-    runner: Runner;
+    runner: InspectionRunner;
     runName: string | null;
     storage: Storage;
     task: Task;

@@ -35,6 +35,7 @@ import { reviewExplanationLine } from '../../review/mode';
 import { describeExpiry } from '../../utils/local-day';
 import { protectionSummary, protectionAdvice } from '../../protection/status';
 import { attributionLabel } from '../../actor-ref';
+import { describeTokenCapSpend } from '../../usage-pause/running-stop';
 import { usagePauseHoldOf, usagePausePendingStartOf, type UsagePauseHold } from '../../usage-pause/hold';
 import { mayOfferUsagePauseOverride } from '../human-terminal';
 import { describeUsagePause } from '../../usage-pause/policy';
@@ -248,6 +249,9 @@ export function buildTaskShowLines(
         outputLines.push(`  ${theme.label('Cache Tokens:')}     ${formatTokenCount(sess.total_usage.cacheCreationTokens)} write, ${formatTokenCount(sess.total_usage.cacheReadTokens)} read`);
       }
     }
+    if (data.spend?.cap != null) {
+      outputLines.push(`  ${theme.label('Token Cap:')}        ${describeTokenCapSpend(data.spend.tokens, data.spend.cap)}`);
+    }
     outputLines.push(`  ${theme.label('Start SHA:')}        ${theme.commitSha(sess.git_start_sha.substring(0, 8))}`);
 
     // Declared [serve] ports. Only rendered when the project declares any —
@@ -265,6 +269,16 @@ export function buildTaskShowLines(
           outputLines.push(`    ${s.name} → ${displayUrlFor(s) ?? dim('(not published — restart to pick up [serve])')}`);
         }
       }
+    }
+
+    // Lazy stopped the last running turn for spend (usage window or token cap).
+    if (data.spend?.stopLine) {
+      outputLines.push(`\n  ${theme.warning(data.spend.stopLine)}`);
+      outputLines.push(`    ${dim(task.status === 'interrupted'
+        ? 'Its running turn was stopped; the work is kept. It resumes by itself after the reset' +
+          // The escape hatch is named only to a person at their own terminal.
+          (offerUsagePauseOverride ? ' — or now, with lazy resume ' + displayId(task) + ' --override-usage-pause.' : '.')
+        : 'Its running turn was stopped; the work is kept. Raise the cap (lazy edit ' + displayId(task) + ' --token-cap <count>), then unblock it.')}`);
     }
 
     // [usage_pause] holding a launch the daemon would otherwise have made.

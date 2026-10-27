@@ -284,14 +284,28 @@ export async function verifyAgentBinarySelfcheckInContainer(
   };
 }
 
-/** True when a probe failed because the container runtime is unavailable. */
-function containerRuntimeUnavailable(reason: string): boolean {
-  return reason.includes('not found') && (
+/**
+ * True when the container probe could not run at all, as opposed to running and
+ * rejecting the binary: the runtime's client is missing, or it is installed but
+ * its engine does not answer (no socket, engine stopped). Either way the probe
+ * says nothing about the binary, so the content check stands.
+ */
+export function containerRuntimeUnavailable(reason: string): boolean {
+  const clientMissing = reason.includes('not found') && (
     reason.includes("'docker'") ||
     reason.includes("'podman'") ||
     reason.includes('container selfcheck probe failed')
   );
+  return clientMissing || ENGINE_UNREACHABLE.some((re) => re.test(reason));
 }
+
+/** What the docker and podman clients print when their engine does not answer. */
+const ENGINE_UNREACHABLE: RegExp[] = [
+  /failed to connect to the docker API/i,
+  /Cannot connect to the Docker daemon/i,
+  /Is the docker daemon running\?/i,
+  /Cannot connect to Podman/i,
+];
 
 /**
  * Verify an on-disk agent binary is safe to bind-mount: content check first,

@@ -58,6 +58,19 @@ index_ref() {
 
 case "\${1:-}" in
   info)
+    # Answer once, then stay unavailable until the test removes the marker.
+    if [ -f "$STATE/info-answer-once" ]; then
+      if [ -f "$STATE/info-answered" ]; then exit 1; fi
+      touch "$STATE/info-answered"
+      exit 0
+    fi
+    if [ -f "$STATE/info-failures-left" ]; then
+      left="$(cat "$STATE/info-failures-left")"
+      if [ "$left" -gt 0 ]; then
+        echo "$((left - 1))" > "$STATE/info-failures-left"
+        exit 1
+      fi
+    fi
     # A test flips fail-info to get the state \`which\` cannot see: the binary is
     # installed, its daemon is not running. Every listing path fails OPEN there
     # (\`docker images\` and \`docker ps\` exit non-zero and lazy reads that as an
@@ -148,6 +161,17 @@ case "\${1:-}" in
         name="\${@: -1}"
         [ -f "\$STATE/old-layout-\$name" ] || echo 1
         ;;
+      *'{{.Image}}'*)
+        # \`inspect --format '{{.Image}}' <name>\`: the image ID a container was
+        # created from. A test writes image-of-<name>; without it, nothing is known.
+        name="\${@: -1}"
+        [ ! -f "\$STATE/image-of-\$name" ] || cat "\$STATE/image-of-\$name"
+        ;;
+      *lazy.agent-swap*)
+        # Created with the agent-swap wrapper: the same containers as the kept label.
+        name="\${@: -1}"
+        [ ! -f "\$STATE/kept-\$name" ] || echo 1
+        ;;
       *lazy.kept*)
         name="\${@: -1}"
         cstate="\$(awk -F'\\t' -v n="\$name" '\$1 == n { print \$2 }' "\$STATE/containers.tsv" 2>/dev/null)"
@@ -213,6 +237,11 @@ case "\${1:-}" in
     # \`cp <name>:<path> <dest>\`: one file a crashed builder left (see
     # \`crash\`'s supervisorLog). Copied with -P, as docker cp does: a symlink
     # arrives as a symlink. Nothing there → docker's own "Could not find".
+    # \`cp <host file> <name>:<path>\`: into a container, as the agent swap does.
+    case "\${2:-}" in
+      *:*) ;;
+      *) echo "\$2 -> \$3" >> "\$STATE/copied-in"; exit 0 ;;
+    esac
     src="\${2:-}"; dest="\${3:-}"; name="\${src%%:*}"; path="\${src#*:}"
     file="\$STATE/tmp-\$name/\$(basename "\$path")"
     if [ ! -e "\$file" ] && [ ! -L "\$file" ]; then
@@ -285,6 +314,15 @@ case "\${1:-}" in
           printf '%s\\n' "\$cstate"
           ;;
         *ID*) printf '%s\\n' "\$cid" ;;
+        *State*)
+          [ "\$clabel" = "-" ] && clabel=""
+          printf '%s\\t%s\\t%s\\n' "\$cname" "\$cstate" "\$clabel"
+          ;;
+        *Label*)
+          # \`discoverRunningRuns\`: \`{{.Names}}<tab>{{.Label "lazy.project"}}\`.
+          [ "\$clabel" = "-" ] && clabel=""
+          printf '%s\\t%s\\n' "\$cname" "\$clabel"
+          ;;
         *)
           [ "\$clabel" = "-" ] && clabel=""
           printf '%s\\t%s\\t%s\\n' "\$cname" "\$cstate" "\$clabel"

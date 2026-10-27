@@ -18,6 +18,7 @@ import {
   liveForwardCount,
   SERVICE_FORWARD_PATH,
 } from '../../src/ssh/service-forward';
+import { forwardSocketHandlers, looksLikeHttp } from '../../src/ssh/service-forwarder';
 
 const TASK_A = 'aaaaaaaa-0000-0000-0000-000000000001';
 const TASK_B = 'bbbbbbbb-0000-0000-0000-000000000002';
@@ -30,7 +31,7 @@ interface Harness {
   stop(): void;
 }
 
-async function start(opts: { aRunning?: boolean; highWater?: number; serviceReads?: boolean } = {}): Promise<Harness> {
+async function start(opts: { aRunning?: boolean; aUnpublished?: boolean; serviceGone?: boolean; highWater?: number; serviceReads?: boolean } = {}): Promise<Harness> {
   const serviceConns: { closed: boolean }[] = [];
   // The task's service: echoes, unless told not to read at all.
   const service = Bun.listen<{ rec: { closed: boolean } }>({
@@ -60,7 +61,7 @@ async function start(opts: { aRunning?: boolean; highWater?: number; serviceRead
     if (!running) return { ...base, services: [], unavailable: 'not-running', containerRunning: false };
     return {
       ...base,
-      services: [{ name: 'web', port: DECLARED, binding: { containerPort: DECLARED, hostAddress: '127.0.0.1', hostPort: service.port }, url: null }],
+      services: [{ name: 'web', port: DECLARED, binding: task.id === TASK_A && opts.aUnpublished ? null : { containerPort: DECLARED, hostAddress: '127.0.0.1', hostPort: opts.serviceGone ? 1 : service.port }, url: null }],
       unavailable: null,
       containerRunning: true,
     };
@@ -205,5 +206,85 @@ describe('the SSH service-forward route', () => {
     } finally {
       revokeForwardGrant(token);
     }
+  });
+});
+
+// The in-container half, run on an address of the test's own against the
+// real route: what a person's client gets when lazy cannot forward it.
+describe('the SSH service forwarder, when the forward fails', () => {
+  let h: Harness;
+  let listener: import('bun').TCPSocketListener<unknown> | null = null;
+  afterEach(() => { listener?.stop(true); listener = null; h?.stop(); });
+
+  function forwarder(token: string): number {
+    const base = h.url.replace(/^ws/, 'http').replace(SERVICE_FORWARD_PATH, '');
+    listener = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: forwardSocketHandlers(base, token, DECLARED) as never });
+    return listener.port;
+  }
+
+  async function exchange(port: number, send: string): Promise<{ text: string; closed: boolean }> {
+    let text = '';
+    let closed = false;
+    await Bun.connect({
+      hostname: '127.0.0.1',
+      port,
+      socket: {
+        open(s) { s.write(send); },
+        data(_s, b) { text += new TextDecoder().decode(b); },
+        close() { closed = true; },
+      },
+    });
+    await until(() => closed);
+    return { text, closed };
+  }
+
+  // INVARIANT: a refused forward reaches an HTTP client as a 502 naming the
+  // daemon's reason. Before, the refusal died in the forwarder and curl showed
+  // only "Empty reply from server".
+  test('an HTTP client is told the service is not published', async () => {
+    h = await start({ aUnpublished: true });
+    const token = mintForwardGrant({ taskId: TASK_A, memberEmail: 'a@example.com' });
+    const { text } = await exchange(forwarder(token), 'GET / HTTP/1.1\r\nHost: x\r\n\r\n');
+    expect(text).toStartWith('HTTP/1.1 502 Bad Gateway');
+    expect(text).toContain('service web (port 3000) is not published');
+    expect(text).toContain('restart the task');
+    revokeForwardGrant(token);
+  });
+
+  test('an HTTP client is told when the service is unreachable', async () => {
+    h = await start({ serviceGone: true });
+    const token = mintForwardGrant({ taskId: TASK_A, memberEmail: 'a@example.com' });
+    const { text } = await exchange(forwarder(token), 'GET / HTTP/1.1\r\nHost: x\r\n\r\n');
+    expect(text).toStartWith('HTTP/1.1 502');
+    expect(text).toContain('service unreachable');
+    revokeForwardGrant(token);
+  });
+
+  // INVARIANT: raw TCP stays raw — a non-HTTP client is never sent HTTP text.
+  test('a raw TCP client is closed without bytes', async () => {
+    h = await start({ aUnpublished: true });
+    const token = mintForwardGrant({ taskId: TASK_A, memberEmail: 'a@example.com' });
+    const { text } = await exchange(forwarder(token), '\x00\x00\x00\x08\x04\xd2\x16\x2f');
+    expect(text).toBe('');
+    revokeForwardGrant(token);
+  });
+
+  test('a working forward is relayed untouched', async () => {
+    h = await start();
+    const token = mintForwardGrant({ taskId: TASK_A, memberEmail: 'a@example.com' });
+    const port = forwarder(token);
+    let text = '';
+    const s = await Bun.connect({ hostname: '127.0.0.1', port, socket: { data(_s, b) { text += new TextDecoder().decode(b); } } });
+    s.write('GET / HTTP/1.1\r\n\r\n');
+    await until(() => text.length > 0);
+    expect(text).toBe('GET / HTTP/1.1\r\n\r\n');
+    s.end();
+    revokeForwardGrant(token);
+  });
+
+  test('HTTP is recognised by its request line only', () => {
+    expect(looksLikeHttp(new TextEncoder().encode('POST /x HTTP/1.1'))).toBe(true);
+    expect(looksLikeHttp(new TextEncoder().encode('SSH-2.0-OpenSSH'))).toBe(false);
+    expect(looksLikeHttp(null)).toBe(false);
   });
 });

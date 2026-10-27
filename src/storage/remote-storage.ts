@@ -844,8 +844,8 @@ export class RemoteStorage implements Storage {
 
   // --- Conversations ---
 
-  async saveConversation(conversation: StoredConversation): Promise<void> {
-    await this.call('saveConversation', { conversation });
+  async saveConversation(conversation: StoredConversation, options?: { skipPurged?: boolean }): Promise<void | 'skipped-purged'> {
+    return this.call<void | 'skipped-purged'>('saveConversation', { conversation, options });
   }
 
   async loadConversation(sessionId: string): Promise<StoredConversation | null> {
@@ -872,8 +872,12 @@ export class RemoteStorage implements Storage {
     return this.call<boolean>('isConversationImported', { sessionId });
   }
 
-  async deleteConversation(sessionId: string): Promise<boolean> {
-    return this.call<boolean>('deleteConversation', { sessionId });
+  async isConversationPurged(sessionId: string): Promise<boolean> {
+    return this.call<boolean>('isConversationPurged', { sessionId });
+  }
+
+  async deleteConversation(sessionId: string, options?: { preventCapture?: boolean }): Promise<boolean> {
+    return this.call<boolean>('deleteConversation', { sessionId, options });
   }
 
   // --- Agent Session Logs ---

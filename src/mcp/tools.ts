@@ -69,6 +69,7 @@
  * boundary, not airtight containment.
  */
 
+import { formatTokenCount, parseTokenCap, tokenCapOf } from '../usage-pause/running-stop';
 import { withPromotedTaskCodes } from '../task/show-sections';
 import { MEMBER_PAIR_CREATION_KEY } from '../task/created-by-own-agent';
 import { isParkedStatus, isStoppedParked } from '../task/user-stop';
@@ -86,7 +87,8 @@ import {
 } from '../review/mode';
 import { join, isAbsolute, basename, normalize, dirname } from 'path';
 import { createHash } from 'crypto';
-import { shortId, MAX_TASK_CODE_LENGTH, getWorktreePathForRef, taskRef, validateCode as validateTaskCode } from '../task/identity';
+import { shortId, displayId, MAX_TASK_CODE_LENGTH, getWorktreePathForRef, taskRef, validateCode as validateTaskCode } from '../task/identity';
+import { inspectWorktreeMerge } from '../task/unfinished-sync';
 import { readFile, stat, mkdir, writeFile } from 'fs/promises';
 import { detectArchiveKind, listArchiveMembers, readArchiveMember, type ArchiveMember } from './archive-members';
 import { SCRATCH_ENV_VAR } from '../builder/scratch';
@@ -169,8 +171,8 @@ import { type RunnerType, resolveRunnerType, RUNNER_ALIAS_HINT, VALID_EFFORT_LEV
 import { assertRunnerAllowedInManagedMode, hostRunnerRemovedMessage, isRemovedHostRunnerInput } from '../runner/host-runner-gate';
 import { agentProfileOrThrow, agentProfilesFor, selectableAgentProfiles } from '../config/agent-profiles';
 import { resolveAgentForNewTaskFromConfig } from '../agent/task-agent';
-import { createRunner } from '../runner';
-import type { Runner } from '../runner';
+import { createInspectionRunner } from '../runner';
+import type { InspectionRunner } from '../runner';
 import { inheritCustomImageMetadata, droppedCustomImagePinWarning } from '../docker/worktree-image';
 import { statusCanShowFailure, taskTurnFailure, turnFailureLabel, type TaskTurnFailure } from '../task/turn-failure';
 import { formatWorkingSubstate, readSupervisorStatusAsync, type WorkingSubstate } from '../utils/working-substate';
@@ -2448,7 +2450,7 @@ export const usageLimitsTool: McpTool = {
   name: 'lazy_usage_limits',
   description:
     'Usage readings, as `lazy stats limits --json`: per-credential windows ' +
-    '(usedPercent, resetsAt; reset: resetSince, raw: storedWindows), overage, [usage_pause], budget (tokens left). ' +
+    '(usedPercent, resetsAt; reset: resetSince, raw: storedWindows), overage, [usage_pause], budget (tokens left), providerHealth. ' +
     'Own credentials only.',
   inputSchema: { type: 'object', properties: {} },
 };
@@ -2492,9 +2494,9 @@ export function createUsageLimitsHandler(ctx: McpToolContext): McpToolHandler {
     }
     const { queryUsageLimits, queryUsagePause, queryTokenBudget } = await import('../daemon/rpc-fallback');
     const { projectUsageLimits } = await import('../usage-pause/limits-view');
-    const { readings, credentialHealth } = await queryUsageLimits();
+    const { readings, credentialHealth, providerHealth } = await queryUsageLimits();
     const { attachBudget } = await import('../usage-pause/budget-view');
-    return attachBudget(projectUsageLimits(readings, await queryUsagePause(), Date.now(), credentialHealth), queryTokenBudget);
+    return attachBudget(projectUsageLimits(readings, await queryUsagePause(), Date.now(), credentialHealth, providerHealth), queryTokenBudget);
   };
 }
 
@@ -6050,12 +6052,24 @@ export const rejectTool: McpTool = {
       },
       accept_dirty_worktree: {
         type: 'boolean',
-        description: 'Allow rejecting even if worktree has uncommitted changes. Use when you are certain you want to discard uncommitted work.',
+        description: 'Reject despite uncommitted changes; a merge in progress is aborted (commits kept). Use only when certain.',
       },
     },
     required: ['task_id'],
   },
 };
+
+/**
+ * Name the merge a confirmed lazy_close/lazy_reject with accept_dirty_worktree
+ * will abort, so the confirmation step shows exactly what is discarded.
+ * Read-only; empty when the flag is off or the worktree holds no merge.
+ */
+async function mergeAbortNotice(task: Task, acceptDirtyWorktree: boolean | undefined, command: 'close' | 'reject'): Promise<string> {
+  if (!acceptDirtyWorktree) return '';
+  const merge = await inspectWorktreeMerge(getWorktreePathForRef(resolveLazyRoot(), taskRef(task)));
+  if (!merge) return '';
+  return `\n\nWith accept_dirty_worktree, confirming also ABORTS the merge in progress in this task's worktree (HEAD ${merge.head}, incoming ${merge.mergeHead}, ${merge.conflicts} conflicted file${merge.conflicts === 1 ? '' : 's'}). Every commit is kept; the merge and anything else uncommitted in the worktree are discarded. Call lazy_${command} again with the code and accept_dirty_worktree: true to proceed.`;
+}
 
 export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
   return async (args) => {
@@ -6091,7 +6105,8 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
         const result = await queryRejectTask(params);
 
         return {
-          output: `Rejected task ${result.displayId} (${result.branchName})`,
+          output: [`Rejected task ${result.displayId} (${result.branchName})`, ...result.warnings].join('\n'),
+          warnings: result.warnings,
           taskId: result.taskId,
           displayId: result.displayId,
           branchName: result.branchName,
@@ -6118,7 +6133,7 @@ export function createRejectHandler(ctx: McpToolContext): McpToolHandler {
       const context = gatherRejectContext(task, commitCount, linesChanged, code);
       const guidance = renderGuidance('reject', context);
 
-      throw new Error(guidance);
+      throw new Error(guidance + await mergeAbortNotice(task, acceptDirtyWorktree, 'reject'));
     } finally {
       await storage.close();
     }
@@ -6156,7 +6171,7 @@ export const closeTool: McpTool = {
       },
       accept_dirty_worktree: {
         type: 'boolean',
-        description: 'Allow closing even if worktree has uncommitted changes. Use when you are certain you want to discard uncommitted work.',
+        description: 'Close despite uncommitted changes; a merge in progress is aborted (commits kept). Use only when certain.',
       },
     },
     required: ['task_id', 'reason'],
@@ -6196,7 +6211,8 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
         const result = await queryCloseTask(params);
 
         return {
-          output: `Closed task ${result.displayId} (${result.branchName})`,
+          output: [`Closed task ${result.displayId} (${result.branchName})`, ...result.warnings].join('\n'),
+          warnings: result.warnings,
           taskId: result.taskId,
           displayId: result.displayId,
           branchName: result.branchName,
@@ -6222,7 +6238,7 @@ export function createCloseHandler(ctx: McpToolContext): McpToolHandler {
       const templateName = `close-${level}` as const;
       const guidance = renderGuidance(templateName, context);
 
-      throw new Error(guidance);
+      throw new Error(guidance + await mergeAbortNotice(task, acceptDirtyWorktree, 'close'));
     } finally {
       await storage.close();
     }
@@ -6480,7 +6496,7 @@ export function createResumeHandler(ctx: McpToolContext): McpToolHandler {
 async function deriveTaskSubstateLabel(
   storage: Storage,
   lazyRoot: string,
-  runner: Runner,
+  runner: InspectionRunner,
   task: Task,
 ): Promise<string | null> {
   if (task.status !== 'working') return null;
@@ -6534,7 +6550,7 @@ async function withSubstate<T extends { id: string; status: string }>(
 ): Promise<T[]> {
   const anyWorking = !ctx.boundToTeams && tasks.some(t => t.status === 'working');
   const lazyRoot = anyWorking ? resolveLazyRoot() : null;
-  const runner = lazyRoot ? await createRunner(lazyRoot) : null;
+  const runner = lazyRoot ? await createInspectionRunner(lazyRoot) : null;
 
   return Promise.all(
     tasks.map(async t => {
@@ -7278,8 +7294,7 @@ export const editTool: McpTool = {
     'Goal/prompt/type/parent only before an agent has started (no turns). ' +
     'Model, effort, review, agent, and a code-only rename (branch, worktree and PR ' +
     'keep their old names) also work on started tasks. Switching agents mid-task ' +
-    'resets the session (no resume across agents), re-resolves model/effort unless ' +
-    'this call supplies them, and keeps the conversation history.',
+    'resets the session, re-resolves model/effort unless supplied, keeps history.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -7324,6 +7339,10 @@ export const editTool: McpTool = {
         type: 'string',
         description: 'New agent PROFILE name — an [agents.<name>] block in lazy.toml; harness names (claude-code, codex, cursor, pi) are the built-in profiles. Editable on started tasks.',
       },
+      token_cap: {
+        type: 'string',
+        description: '"50M"/"none"; subtasks only, alone.',
+      },
       ...REVIEW_TOOL_ARGS,
     },
     required: ['task_id'],
@@ -7341,6 +7360,7 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
     const parent = args.parent as string | undefined;
     const effort = args.effort as string | undefined;
     const agent = args.agent as string | undefined;
+    const tokenCap = args.token_cap as string | undefined;
     const reviewOverrides = parseReviewArgs(args);
 
     // Applied after the other fields, which would land while this is refused.
@@ -7387,6 +7407,42 @@ export function createEditHandler(ctx: McpToolContext): McpToolHandler {
       const terminalStatuses = new Set(['complete', 'abandoned']);
       if (terminalStatuses.has(task.status)) {
         throw new Error(`Cannot edit task in ${task.status} status`);
+      }
+
+      // The token cap bounds what a task may spend. Raising it on yourself is
+      // lifting your own limit, so an agent may set it only on a subtask.
+      if (tokenCap !== undefined) {
+        if (ctx.taskId && task.id === ctx.taskId) {
+          throw new Error('Agents cannot change their OWN task\'s token cap: it bounds what this task may spend, and lifting it is a person\'s decision. You may set it on a DIRECT SUBTASK.');
+        }
+        if (goal !== undefined || prompt !== undefined || model !== undefined || type !== undefined || code !== undefined
+          || parent !== undefined || effort !== undefined || agent !== undefined || hasReviewOverrides(reviewOverrides)) {
+          throw new Error('Pass token_cap on its own, in a separate lazy_edit call.');
+        }
+        // A task agent may put a cap on its subtask or tighten one, never raise
+        // or clear one: that would lift a spend limit on work it drives (the
+        // same reason it may not let a task past the usage pause).
+        if (ctx.taskId) {
+          const current = tokenCapOf(task);
+          let next: number | null;
+          try {
+            next = parseTokenCap(tokenCap);
+          } catch (err) {
+            throw new Error(err instanceof Error ? err.message : String(err));
+          }
+          if (current !== null && (next === null || next > current)) {
+            throw new Error(
+              `Agents may set a token cap on a subtask or lower it, never raise or clear one: ${displayId(task)}'s cap is ` +
+              `${formatTokenCount(current)}. Raising it is a person's or the builder's decision.`,
+            );
+          }
+        }
+        const result = await editTask(storage, resolveLazyRoot(), { taskId: task.id, tokenCap, actor: mcpActor(ctx) });
+        return {
+          task_id: shortId(task.id),
+          changes: result.changes,
+          ...(result.announcements?.length ? { announcements: result.announcements } : {}),
+        };
       }
 
       // Validate agent if provided

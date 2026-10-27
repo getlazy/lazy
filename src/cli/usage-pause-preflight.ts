@@ -60,6 +60,9 @@ export async function usagePauseRefusalLines(
       ...(opts.beside ? { beside: true, actor: getActor() } : {}),
       usagePauseOverrideEligible: eligible,
     });
+    // The task's own token cap refuses a work turn whatever the pause says, and
+    // no override lifts it: say so before the editor opens.
+    if (!opts.beside && verb !== 'ask' && !opts.pastUsagePause && state.task?.tokenCapRefusal) return [state.task.tokenCapRefusal];
     verdict = (opts.beside ? state.beside?.verdict : state.task?.verdict) ?? null;
   } catch (err) {
     logger.debug(`Usage-pause preflight could not run: ${err instanceof Error ? err.message : String(err)}`);

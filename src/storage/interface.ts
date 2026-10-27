@@ -1390,9 +1390,11 @@ export interface Storage {
   // --- Conversations ---
 
   /**
-   * Save (create or overwrite) a conversation
+   * Save (create or overwrite) a conversation. With skipPurged, atomically
+   * leave explicitly purged sessions untouched (live capture only) and return
+   * 'skipped-purged'; a successful save returns void.
    */
-  saveConversation(conversation: StoredConversation): Promise<void>;
+  saveConversation(conversation: StoredConversation, options?: { skipPurged?: boolean }): Promise<void | 'skipped-purged'>;
 
   /**
    * Load a conversation by session ID
@@ -1439,7 +1441,12 @@ export interface Storage {
    */
   isConversationImported(sessionId: string): Promise<boolean>;
 
+  /** Whether live capture must leave this explicitly purged session alone. */
+  isConversationPurged(sessionId: string): Promise<boolean>;
+
   /**
+   * With preventCapture, durably exclude the session from live capture before
+   * deleting it. Explicit imports may still restore the raw session.
    * Delete a stored conversation. Returns true if a conversation was deleted,
    * false if none existed under that session ID — so the operation is
    * idempotent and callers can report "already gone" without a pre-check race.
@@ -1453,7 +1460,7 @@ export interface Storage {
    * from lazy alone (Claude Code prunes the raw JSONL on disk over time), so
    * any new caller must be explicitly human-confirmed.
    */
-  deleteConversation(sessionId: string): Promise<boolean>;
+  deleteConversation(sessionId: string, options?: { preventCapture?: boolean }): Promise<boolean>;
 
   // --- Agent Session Logs (raw Claude Code JSONL) ---
 

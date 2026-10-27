@@ -38,6 +38,13 @@ describe('task metadata', () => {
   test('show does not display metadata section when null', async () => {
     const taskId = await createTask(ctx, 'No metadata task');
 
+    // A created task carries metadata of its own (its task_ref), so null is
+    // staged, as the empty-object case below stages {}.
+    const taskJsonPath = taskFilePath(ctx.root, taskId, 'task.json');
+    const taskJson = JSON.parse(await readFile(taskJsonPath, 'utf-8'));
+    taskJson.metadata = null;
+    await writeFile(taskJsonPath, JSON.stringify(taskJson, null, 2), 'utf-8');
+
     const result = await ctx.lazy(['show', taskId]);
     expectSuccess(result);
     expectOutputExcludes(result, 'Metadata:');

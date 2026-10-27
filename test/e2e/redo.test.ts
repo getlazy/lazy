@@ -20,7 +20,7 @@ describe('lazy redo', () => {
   test('redo a backlog task with --no-start', async () => {
     const taskId = await createTask(ctx, 'Original task goal', 'Original prompt text');
 
-    const result = await ctx.lazy(['redo', taskId, '--no-start']);
+    const result = await ctx.lazyMocked(['redo', taskId, '--no-start'], MOCK_CLAUDE_SUCCESS);
 
     expectSuccess(result);
     expectOutput(result, 'Closing task');
@@ -67,7 +67,7 @@ describe('lazy redo', () => {
     await startAndReconcile(ctx, taskId);
 
     // Redo the task
-    const result = await ctx.lazy(['redo', taskId, '--no-start']);
+    const result = await ctx.lazyMocked(['redo', taskId, '--no-start'], MOCK_CLAUDE_SUCCESS);
 
     expectSuccess(result);
     expectOutput(result, 'Closing task');
@@ -102,7 +102,7 @@ describe('lazy redo', () => {
 
   test('fails for already-closed task', async () => {
     const taskId = await createTask(ctx, 'Already closed task');
-    await ctx.lazy(['close', taskId, '--reason', 'Done']);
+    await ctx.lazyMocked(['close', taskId, '--reason', 'Done'], MOCK_CLAUDE_SUCCESS);
 
     const result = await ctx.lazy(['redo', taskId]);
 
@@ -142,7 +142,7 @@ describe('lazy redo', () => {
   test('close reason includes new task ID', async () => {
     const taskId = await createTask(ctx, 'Task with close reason check', 'Prompt');
 
-    const result = await ctx.lazy(['redo', taskId, '--no-start']);
+    const result = await ctx.lazyMocked(['redo', taskId, '--no-start'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
 
     // Old task's close reason should mention the new task ID
@@ -159,7 +159,7 @@ describe('lazy redo', () => {
     expectSuccess(createResult);
     const taskId = extractNewTaskId(createResult.stdout);
 
-    const result = await ctx.lazy(['redo', taskId, '--no-start']);
+    const result = await ctx.lazyMocked(['redo', taskId, '--no-start'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
 
     // New task should have -redo-1 code
@@ -185,7 +185,7 @@ describe('lazy redo', () => {
     };
     writeTaskJson(ctx.root, taskId, data);
 
-    const result = await ctx.lazy(['redo', taskId, '--no-start']);
+    const result = await ctx.lazyMocked(['redo', taskId, '--no-start'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
     expectOutput(result, `custom container image pin (${imageRef})`);
     expectOutputExcludes(result, 'inherited from previous attempt');

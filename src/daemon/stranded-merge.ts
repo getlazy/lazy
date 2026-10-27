@@ -113,7 +113,8 @@ export function gitAuthorOfActor(actor: ActorInput | undefined): GitAuthor | nul
  * forge ever heard of. This marker distinguishes them, and doubles as the record
  * of what to restore to.
  */
-export const ACCEPT_IN_FLIGHT_KEY = 'accept_in_flight_from';
+import { ACCEPT_IN_FLIGHT_KEY } from '../task/accept-in-flight';
+export { ACCEPT_IN_FLIGHT_KEY };
 
 /** The status a stranded merge was returned to, and how it was classified. */
 export interface StrandedMergeRecovery {

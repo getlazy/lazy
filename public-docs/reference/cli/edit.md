@@ -3,7 +3,7 @@
 This page is generated from `lazy edit --help`.
 
 ```text
-Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--runner <docker|container|podman>] [--effort <level>] [--agent <profile>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>]
+Usage: lazy edit <task_id> [--goal <goal>] [--prompt <text>] [--model <model>] [--type <type>] [--code <code>] [--parent <task_id>] [--runner <docker|container|podman>] [--effort <level>] [--agent <profile>] [--review <mode>] [--review-gate <g>] [--review-auto-fix <on|off>] [--token-cap <count>]
 
 Edit a task's goal, prompt, model, type, code, parent, runner, effort, agent, or review mode. Interactive if no flags provided.
 Once an agent has worked on the task, only --model, --effort, --runner, --agent and the
@@ -41,6 +41,11 @@ Options:
                      more than it is finding.
   --review-gate <g>  Change when a recorded review holds the merge: auto (the
                      mode decides), always, or never. Allowed any time.
+  --token-cap <count>
+                     The task's own token cap, e.g. 50M, 200k or 50000000; "none"
+                     clears it. Allowed any time. Once the task has spent that
+                     many tokens its running turn is stopped (work kept) and it
+                     does not continue until the cap is raised or cleared.
   --review-auto-fix <on|off>
                      Change whether a 'separate' review that found something
                      starts a fix turn by itself. Allowed any time.

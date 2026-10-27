@@ -112,9 +112,12 @@ async function seedAudit(root: string, records: SeedRecord[]): Promise<void> {
   await writeFile(path, records.map((r, i) => seedLine(i + 1, r)).join('\n') + '\n', 'utf-8');
 }
 
-const NOW = Date.now();
-
+// Ages are measured from when a test SEEDS, never from when the file loaded: a
+// file-level `Date.now()` made "10s ago" drift by however long the earlier
+// tests in the file took, so `--since 15s` lost its newest record on a busy
+// machine (every e2e file running in parallel) while passing on an idle one.
 function sampleRecords(): SeedRecord[] {
+  const NOW = Date.now();
   return [
     {
       id: 'aaaa1111-1111-1111-1111-111111111111',
@@ -261,6 +264,9 @@ describe('lazy stats audit', () => {
     expectOutput(since, '1 of 1 matching record(s)');
     expectOutput(since, 'eeee5555');
 
+    // Reseed so --last gets the same 5s margin --since had, not 5s minus
+    // however long the --since command took on a busy machine.
+    await seedAudit(ctx.root, sampleRecords());
     const last = await ctx.lazy(['stats', 'audit', '--last', '15s']);
     expectSuccess(last);
     expectOutput(last, '1 of 1 matching record(s)');
@@ -319,7 +325,7 @@ describe('lazy stats audit', () => {
     await seedAudit(ctx.root, [
       {
         id: 'ffff6666-6666-6666-6666-666666666666',
-        ts: NOW,
+        ts: Date.now(),
         taskId: 'task-alpha',
         toolUses: [{ name: 'Read', path: '/repo/old.ts' }],
         toolResults: [{ len: 512, preview: 'older record…' }],
@@ -342,8 +348,8 @@ describe('lazy stats audit', () => {
 
   test('a missing or ambiguous record id fails loudly', async () => {
     await seedAudit(ctx.root, [
-      { id: 'abc11111-0000-0000-0000-000000000000', ts: NOW },
-      { id: 'abc22222-0000-0000-0000-000000000000', ts: NOW },
+      { id: 'abc11111-0000-0000-0000-000000000000', ts: Date.now() },
+      { id: 'abc22222-0000-0000-0000-000000000000', ts: Date.now() },
     ]);
 
     const missing = await ctx.lazy(['stats', 'audit', 'zzzz']);

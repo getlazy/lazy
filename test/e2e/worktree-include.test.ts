@@ -5,6 +5,18 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 
+/**
+ * Set `include` inside the [worktree] section `lazy init` already writes.
+ * Appending a second [worktree] table is a TOML redefinition error (AGENTS.md:
+ * edit the key, never append the section), so edit it in place and fail loudly
+ * if the section is not where init puts it.
+ */
+function withWorktreeInclude(config: string, include: string): string {
+  const updated = config.replace(/^\[worktree\]\n/m, `[worktree]\ninclude = ${include}\n`);
+  if (updated === config) throw new Error('lazy.toml has no [worktree] section to edit');
+  return updated;
+}
+
 describe('lazy worktree.include', () => {
   let ctx: TestContext;
 
@@ -24,7 +36,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include in lazy.toml
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = [".env"]\n';
+    const updatedConfig = withWorktreeInclude(config, '[".env"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task
@@ -52,7 +64,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include with glob pattern
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = [".env*"]\n';
+    const updatedConfig = withWorktreeInclude(config, '[".env*"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task
@@ -84,7 +96,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include with pattern that matches both
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = [".env*"]\n';
+    const updatedConfig = withWorktreeInclude(config, '[".env*"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task
@@ -104,7 +116,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include with a pattern that won't match anything
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = [".env", ".env.local"]\n';
+    const updatedConfig = withWorktreeInclude(config, '[".env", ".env.local"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task (no .env files exist)
@@ -125,7 +137,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = ["config/local.yml"]\n';
+    const updatedConfig = withWorktreeInclude(config, '["config/local.yml"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task
@@ -144,7 +156,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = [".env"]\n';
+    const updatedConfig = withWorktreeInclude(config, '[".env"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create task, start it, close it (no .env file yet, so worktree is clean)
@@ -154,7 +166,7 @@ describe('lazy worktree.include', () => {
     });
 
     // Close the task to remove worktree
-    const closeResult = await ctx.lazy(['close', taskId, '--reason', 'test']);
+    const closeResult = await ctx.lazyMocked(['close', taskId, '--reason', 'test'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
 
     // Now create the .env file
@@ -181,7 +193,7 @@ describe('lazy worktree.include', () => {
     // Configure worktree.include
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = ["script.sh"]\n';
+    const updatedConfig = withWorktreeInclude(config, '["script.sh"]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task
@@ -205,7 +217,7 @@ describe('lazy worktree.include', () => {
     // Configure empty worktree.include
     const tomlPath = join(ctx.root, 'lazy.toml');
     const config = readFileSync(tomlPath, 'utf-8');
-    const updatedConfig = config + '\n[worktree]\ninclude = []\n';
+    const updatedConfig = withWorktreeInclude(config, '[]');
     writeFileSync(tomlPath, updatedConfig);
 
     // Create and start a task

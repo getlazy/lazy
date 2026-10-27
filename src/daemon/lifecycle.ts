@@ -45,6 +45,7 @@ export interface AutoReactBudgetEntry {
 
 export interface DaemonStatus {
   running: boolean;
+  startup?: import('./startup-phase').StartupPhaseView;
   /**
    * True when the daemon's socket accepted the connection but no response came
    * back within {@link DAEMON_HEALTH_TIMEOUT_MS}, and the recorded pid is still
@@ -622,7 +623,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
       return { running: false, pid: pid ?? undefined };
     }
 
-    const data = await response.json() as { runtimeFacts?: RuntimeFacts; projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; managed?: boolean; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
+    const data = await response.json() as { startup?: DaemonStatus['startup']; runtimeFacts?: RuntimeFacts; projectRoot?: string; uptime?: number; version?: string; instanceId?: string; buildTime?: string; buildSha?: string; buildDirty?: boolean; buildBranch?: string; buildSourcePath?: string; codeSha?: string; sourceId?: string; sourceIdKind?: string; webPort?: number; bindHost?: string; dashboardUrl?: string | null; managed?: boolean; autoReactBudget?: AutoReactBudgetEntry[]; proxy?: DaemonProxyStatus; wedged?: DaemonStatus['wedged'] };
     if (data.projectRoot !== projectRoot) {
       // A daemon answered, but for a different project — our port marker is
       // stale and another project's daemon now holds the port.
@@ -630,6 +631,7 @@ export async function checkDaemonHealth(projectRoot: string): Promise<DaemonStat
     }
     return {
       running: true,
+      startup: data.startup,
       pid: pid ?? undefined,
       uptime: data.uptime,
       version: data.version,
@@ -696,15 +698,19 @@ export async function requestShutdown(projectRoot: string): Promise<boolean> {
 }
 
 /**
- * Wait for the daemon to become reachable on its TCP port.
+ * Wait for RPC and proxy startup to settle before dispatching a command.
  * Polls every 100ms up to the given timeout.
- * Returns true if the daemon responded to a health check within the timeout.
+ * Returns true when the proxy is live or startup has completed. A failed proxy
+ * must leave reads and doctor available; resolveLiveProxyUrl owns launch refusal.
  */
 export async function waitForDaemon(projectRoot: string, timeoutMs: number = 5000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const status = await checkDaemonHealth(projectRoot);
-    if (status.running) return true;
+    if (status.running && status.proxy?.running) return true;
+    // Still-starting proxies are waited for by every command. Once startup
+    // settles, only callers needing a proxy address should refuse the failure.
+    if (status.running && status.startup?.complete !== false) return true;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   return false;

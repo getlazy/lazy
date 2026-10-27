@@ -703,7 +703,7 @@ type = "docker"
 # max_child_fix_rounds = 3
 
 # [usage_pause]
-# Stop STARTING turns on a credential once a subscription usage window (Claude's
+# Stop turns on a credential once a subscription usage window (Claude's
 # 5-hour or 7-day window) is this full. Useful when your account has overage /
 # usage credits turned on and you would rather wait than pay for them; without
 # overage the provider already stops you at 100%. Off unless set.
@@ -712,9 +712,12 @@ type = "docker"
 # are refused with the reading and when the window resets. The daemon's own
 # launches (auto-resume, auto-delivery, cluster restarts, automatic reviews,
 # a cluster's subtask starts) wait and go ahead by themselves after the reset.
-# Crossing this threshold does not kill a running process. Further launches
-# still face admission checks; a tiered profile can refuse model requests
-# when all its tiers are full. `lazy stats limits` shows the
+# A turn already RUNNING is stopped too: its next model request is refused and
+# the agent stopped, its work and environment kept; the task shows "Paused for
+# usage" and resumes by itself after the reset (or now, with
+# `lazy resume <task> --override-usage-pause`). A per-task token cap
+# (`lazy edit <task> --token-cap 50M`) stops a task the same way, but it waits
+# for a person to raise the cap. `lazy stats limits` shows the
 # readings and whether paid overage is on; `lazy doctor` explains an active
 # pause and warns "armed, NO READING" when it has nothing to act on.
 #

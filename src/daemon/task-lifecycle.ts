@@ -1,3 +1,4 @@
+import { unfinishedSyncMerge, inspectWorktreeMerge, unprovenMergeRefusalMessage, correlateSyncMerge, recordUnfinishedSyncMerge, type UnfinishedSyncMerge } from '../task/unfinished-sync';
 import { refreshEnvironmentReplacedCommand } from './environment-replaced-command';
 /**
  * Daemon-side lifecycle orchestration for unblock, accept, reject, close.
@@ -479,6 +480,61 @@ async function refuseRedirectedHead(worktreePath: string, branch: string): Promi
     if (err instanceof TaskHeadBranchError) throw new RpcError(409, err.message);
     throw err;
   }
+}
+
+async function stopRunBeforeAbandon(runner: Runner, runName: string, command: string): Promise<void> {
+  if (await runner.stopRun(runName)) return;
+  // A failed stop also means "already gone" on some runners. Only a positive
+  // runtime answer can establish that; an unanswered probe cannot authorize
+  // aborting a merge underneath an agent that might still be writing it.
+  if (runner.probeRunInfo) {
+    const probe = await runner.probeRunInfo(runName);
+    if (probe.kind === 'answered' && !probe.info?.running) return;
+  } else if (!await runner.runExists(runName)) {
+    // Local runners can positively establish absence from their run record.
+    return;
+  }
+  throw new RpcError(502, `Could not confirm that task run ${runName} stopped. No merge was aborted and the task was not ${command === 'close' ? 'closed' : 'rejected'}. Restore access to the runner and retry ${command}.`);
+}
+
+/**
+ * Abort a merge left in progress before close/reject abandons the task.
+ * A merge PROVEN to be lazy's own sync is aborted with no question. Any other
+ * merge is aborted only when the person confirmed it (`confirmedAbort`, the
+ * accept-dirty-worktree path) — and never on a task that was running when they
+ * asked, whose agent may be the one merging.
+ */
+async function abandonUnfinishedSync(projectRoot: string, storage: Storage, task: Task, worktreePath: string, command: string, confirmedAbort = false): Promise<string | null> {
+  if (task.status === 'working' || !await pathExists(worktreePath)) return null;
+  await checkWorktreeGitSafeOrThrow(worktreePath, displayId(task), command);
+  const session = await storage.getSessionByTaskId(task.id);
+  if (!session?.git_branch) return null;
+  await refuseRedirectedHead(worktreePath, session.git_branch);
+  const proven = await unfinishedSyncMerge(storage, task, worktreePath, projectRoot);
+  const merge = proven ?? (confirmedAbort ? await inspectWorktreeMerge(worktreePath) : null);
+  if (!merge) return null;
+  const aborted = await runGit(['merge', '--abort'], { cwd: worktreePath });
+  if (aborted.exitCode !== 0) throw new RpcError(409, `Could not abort the unfinished sync merge: ${aborted.stderr.trim()}. The task was not ${command === "close" ? "closed" : "rejected"}.`);
+  const head = await runGit(['rev-parse', 'HEAD'], { cwd: worktreePath });
+  if (head.exitCode !== 0 || head.stdout.trim() !== merge.head || isMidMerge(await readWorktreeMergeState(worktreePath))) {
+    throw new RpcError(409, 'The unfinished sync merge could not be safely aborted; the task was not abandoned.');
+  }
+  if (!proven) {
+    return `Aborted the merge in progress (incoming ${merge.mergeHead.substring(0, 7)}, ${merge.conflicts} conflict${merge.conflicts === 1 ? '' : 's'}) as confirmed; every commit is kept and the branch stays at ${merge.head.substring(0, 7)}.`;
+  }
+  return `Aborted the unfinished sync merge (${merge.conflicts} conflict${merge.conflicts === 1 ? '' : 's'}); the branch stays at ${merge.head.substring(0, 7)}.`;
+}
+
+async function refuseUnprovenMergeOrThrow(storage: Storage, task: Task, worktreePath: string, projectRoot: string, command: 'close' | 'reject'): Promise<void> {
+  if (task.status === 'pairing') return;
+  const merge = await inspectWorktreeMerge(worktreePath);
+  if (!merge || await unfinishedSyncMerge(storage, task, worktreePath, projectRoot)) return;
+  const id = displayId(task);
+  throw acceptRefusal(409, unprovenMergeRefusalMessage(id, command, merge, { working: task.status === 'working' }), {
+    reason: 'unproven-merge',
+    next: `Confirm aborting the merge (every commit is kept), then ${command}.`,
+    command: `lazy ${command} ${shellQuote(id)} --accept-dirty-worktree`,
+  });
 }
 
 async function checkUncommittedChangesOrThrow(worktreePath: string, displayTaskId: string, commandName: string): Promise<void> {
@@ -1018,7 +1074,7 @@ async function launchUnblockTaskRun(
   // as this unblock will run it, and without spending the one-shot override, so
   // a refused unblock leaves the task exactly as it was — stored agent
   // included. The gate after the turn budget takes the override.
-  await assertTurnStartAllowed(projectRoot, {
+  await assertTurnStartAllowed(projectRoot, { storage,
     task: params.agentOverride ? { ...task, agent_id: params.agentOverride } : task,
     config: await loadConfig(projectRoot),
     actor,
@@ -1165,7 +1221,7 @@ async function launchUnblockTaskRun(
   // pairing preflights, so it is not spent on an unblock that fails there.
   // Still before the feedback turn and every counter reset; the caller holds
   // the feedback either way (the CLI's recovery file, the web page's draft).
-  await assertTurnStartAllowed(projectRoot, {
+  await assertTurnStartAllowed(projectRoot, { storage,
     task, config: unblockTurnBudgetConfig, actor, verb: 'unblock', daemonLaunch: params.daemonLaunch,
     overrideEligible: params.usagePauseOverrideEligible === true,
   });
@@ -2649,7 +2705,7 @@ async function launchAskTaskRun(
   // --- Usage pause ([usage_pause]) ---
   // The live route resumes the task's own agent: its credential is judged,
   // before the worktree lock (the first write).
-  await assertTurnStartAllowed(projectRoot, {
+  await assertTurnStartAllowed(projectRoot, { storage,
     task, config: await loadConfig(projectRoot), actor, verb: 'ask',
     overrideEligible: params.usagePauseOverrideEligible === true,
   });
@@ -3972,7 +4028,7 @@ async function launchReviewTaskRun(
   // before dispatching (src/daemon/auto-review.ts), and it must never take a
   // person's one-shot override.
   if (!params.autoReview) {
-    await assertTurnStartAllowed(projectRoot, {
+    await assertTurnStartAllowed(projectRoot, { storage,
       task, config: await loadConfig(projectRoot), actor, verb: 'review',
       overrideEligible: params.usagePauseOverrideEligible === true,
     });
@@ -4876,9 +4932,6 @@ async function rejectTaskRun(
 
   // --- Worktree uncommitted changes check ---
   const worktreePath = getWorktreePath(projectRoot, task);
-  if (!params.acceptDirtyWorktree) {
-    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'reject');
-  }
 
   // --- Session check ---
   const sess = await storage.getSessionByTaskId(task.id);
@@ -4917,6 +4970,13 @@ async function rejectTaskRun(
   // there, and the reason lands.
   task = await escapeMergingForOperation(storage, task, actor, 'reject', projectRoot);
 
+  // Preserve the ordinary dirty-worktree refusal before stopping a live task.
+  // A proven sync merge is inspected here and aborted only AFTER its agent stops.
+  if (!params.acceptDirtyWorktree && !await unfinishedSyncMerge(storage, task, worktreePath, projectRoot)) {
+    await refuseUnprovenMergeOrThrow(storage, task, worktreePath, projectRoot, 'reject');
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'reject');
+  }
+
   const wasWorking = task.status === 'working';
   phases.end(displayId(task));
   phases.announce(rejectPhasePlan(wasWorking), displayId(task));
@@ -4930,9 +4990,19 @@ async function rejectTaskRun(
     phases.begin(TERMINATE_PHASES.stop);
     const runner = await createRunner(projectRoot, sess.runner_type ?? undefined);
     const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-    await runner.stopRun(runName);
+    await stopRunBeforeAbandon(runner, runName, 'reject');
     await storage.updateTaskStatus(task.id, 'interrupted', actor);
+    task = { ...task, status: 'interrupted' };
     phases.end();
+  }
+
+  const abortedSync = await abandonUnfinishedSync(projectRoot, storage, task, worktreePath, 'reject', params.acceptDirtyWorktree === true && !wasWorking);
+  if (abortedSync) {
+    warnings.push(abortedSync);
+    await storage.createComment(task.id, abortedSync, actor);
+  }
+  if (!params.acceptDirtyWorktree) {
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'reject');
   }
 
   phases.begin(TERMINATE_PHASES.finalize);
@@ -5079,9 +5149,6 @@ async function closeTaskRun(
 
   // --- Worktree uncommitted changes check ---
   const worktreePath = getWorktreePath(projectRoot, task);
-  if (!params.acceptDirtyWorktree) {
-    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'close');
-  }
 
   // --- Session check ---
   const sess = await storage.getSessionByTaskId(task.id);
@@ -5089,6 +5156,13 @@ async function closeTaskRun(
   // See rejectTask: a merge whose owner is gone must not swallow the close
   // reason the human typed. Recover to a resting state, then close normally.
   task = await escapeMergingForOperation(storage, task, actor, 'close', projectRoot);
+
+  // Preserve the ordinary dirty-worktree refusal before stopping a live task.
+  // A proven sync merge is inspected here and aborted only AFTER its agent stops.
+  if (!params.acceptDirtyWorktree && !await unfinishedSyncMerge(storage, task, worktreePath, projectRoot)) {
+    await refuseUnprovenMergeOrThrow(storage, task, worktreePath, projectRoot, 'close');
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'close');
+  }
 
   const wasWorking = task.status === 'working';
   phases.end(displayId(task));
@@ -5103,10 +5177,20 @@ async function closeTaskRun(
     if (sess) {
       const runner = await createRunner(projectRoot, sess.runner_type ?? undefined);
       const runName = sess.container_name ?? runner.runNameForTask(taskRef(task));
-      await runner.stopRun(runName);
+      await stopRunBeforeAbandon(runner, runName, 'close');
     }
     await storage.updateTaskStatus(task.id, 'interrupted', actor);
+    task = { ...task, status: 'interrupted' };
     phases.end();
+  }
+
+  const abortedSync = await abandonUnfinishedSync(projectRoot, storage, task, worktreePath, 'close', params.acceptDirtyWorktree === true && !wasWorking);
+  if (abortedSync) {
+    warnings.push(abortedSync);
+    await storage.createComment(task.id, abortedSync, actor);
+  }
+  if (!params.acceptDirtyWorktree) {
+    await checkUncommittedChangesOrThrow(worktreePath, displayId(task), 'close');
   }
 
   phases.begin(TERMINATE_PHASES.finalize);
@@ -9090,7 +9174,7 @@ async function syncTaskRun(
       // INVARIANT: a sync somebody ASKED for is refused, like any other turn
       // they ask for, before the agent is launched or the task claimed.
       try {
-        await assertTurnStartAllowed(projectRoot, {
+        await assertTurnStartAllowed(projectRoot, { storage,
           task,
           config,
           actor,
@@ -9314,6 +9398,7 @@ async function syncTaskRun(
       // anything that throws on the way here (a credential bind, the status
       // transition, launch-identity resolution) then leaves no marker behind at
       // all, rather than one whose turn never ran.
+      await correlateSyncMerge(storage, task.id, syncCommandId);
       await markSyncRestoreStatus(storage, task.id, priorStatus, syncCommandId);
       writeCommand(protoDir, syncCommand);
 
@@ -10188,7 +10273,7 @@ async function resumeTaskRun(
   // --- Usage pause ([usage_pause], src/daemon/usage-pause.ts) ---
   // After every preflight that can refuse on its own, so a one-shot override is
   // not spent on a resume that was going to fail anyway; before any write.
-  await assertTurnStartAllowed(projectRoot, {
+  await assertTurnStartAllowed(projectRoot, { storage,
     task, config: resumeTurnBudgetConfig, actor, verb: 'resume',
     overrideEligible: params.usagePauseOverrideEligible === true,
   });
@@ -10683,6 +10768,10 @@ async function stopTaskRun(
   // agent stamp stay, because it still exists: the stamp is what makes an
   // agent switch recreate it, and the name is what the terminal-task sweep
   // removes it by.
+  // Host-process supervisors merge locally, so their checkpoint owns each
+  // step until Stop clears it. Preserve the exact stopped merge first.
+  const stoppedMerge = await unfinishedSyncMerge(storage, task, getWorktreePath(projectRoot, task), projectRoot);
+  if (stoppedMerge) await recordUnfinishedSyncMerge(storage, task.id, stoppedMerge.head, stoppedMerge.mergeHead);
   try {
     clearStatus(protoDir);
   } catch {

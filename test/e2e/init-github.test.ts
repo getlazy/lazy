@@ -8,7 +8,12 @@ import { resolve } from 'path';
 const ENTRY_PATH = resolve(__dirname, '../../src/index.ts');
 
 async function runLazy(cwd: string, args: string[], envOverrides?: Record<string, string | undefined>) {
-  const proc = Bun.spawn(['bun', 'run', ENTRY_PATH, ...args], {
+  // Every repo here has a remote named `.../repo.git`, so the default store
+  // would be `~/.lazy/repo` for all of them: the first test's store then
+  // belongs to a deleted checkout and every later init is refused. Give each
+  // checkout its own store beside it (removed with it in afterEach).
+  const storeArgs = args[0] === 'init' && !args.includes('--help') ? ['--external-path', `${cwd}-store`] : [];
+  const proc = Bun.spawn(['bun', 'run', ENTRY_PATH, ...args, ...storeArgs], {
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
@@ -35,6 +40,7 @@ describe('lazy init GitHub detection', () => {
   afterEach(async () => {
     if (tmpDir) {
       await rm(tmpDir, { recursive: true, force: true });
+      await rm(`${tmpDir}-store`, { recursive: true, force: true });
     }
   });
 
@@ -141,6 +147,7 @@ describe('lazy init smart remote detection', () => {
   afterEach(async () => {
     if (tmpDir) {
       await rm(tmpDir, { recursive: true, force: true });
+      await rm(`${tmpDir}-store`, { recursive: true, force: true });
     }
   });
 

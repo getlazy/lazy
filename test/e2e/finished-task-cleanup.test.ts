@@ -6,6 +6,9 @@ import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { storageDirFor } from '../helpers/storage';
 import { pinConfig } from '../helpers/pin-config';
 import { FileStorage } from '../../src/storage/file-storage';
+import { runAcceptFollowThrough } from '../../src/daemon/task-lifecycle';
+import { ACCEPT_FOLLOWTHROUGH_KEY, FOLLOWTHROUGH_STEPS } from '../../src/daemon/accept-intent';
+import { loadConfig } from '../../src/config/loader';
 import { TerminalCleanupManager } from '../../src/daemon/terminal-cleanup';
 import { getWorktreePath, taskRef } from '../../src/task/identity';
 import { acquireLock, removeLock } from '../../src/utils/lock';
@@ -36,7 +39,13 @@ describe('finished-task resources on disk', () => {
 import { existsSync, appendFileSync, unlinkSync } from 'fs';
 const dir = ${JSON.stringify(dir)}, name = ${JSON.stringify(runName)}, id = ${JSON.stringify(taskId)};
 const argv = process.argv.slice(2); appendFileSync(dir+'/calls', argv.join(' ')+'\\n');
-const exists = existsSync(dir+'/environment');
+let exists = existsSync(dir+'/environment');
+if (argv[0] === 'inspect' && existsSync(dir+'/removing')) {
+  if (existsSync(dir+'/fail-probe')) { console.error('daemon unavailable'); process.exit(1); }
+  if (existsSync(dir+'/stuck-removal')) { console.log('true'); process.exit(0); }
+  if (existsSync(dir+'/probed-removing')) { unlinkSync(dir+'/environment'); unlinkSync(dir+'/removing'); exists = false; }
+  else appendFileSync(dir+'/probed-removing', '1');
+}
 if (argv[0] === 'ps') {
   if (exists && !argv.join(' ').includes('label=lazy.member-terminal')) console.log(name);
 } else if (argv[0] === 'inspect') {
@@ -44,6 +53,10 @@ if (argv[0] === 'ps') {
   console.log('true 0 0001-01-01T00:00:00Z false');
 } else if (argv[0] === 'rm') {
   if (existsSync(dir+'/fail-removal')) { console.error('permission denied removing container'); process.exit(1); }
+  if (existsSync(dir+'/removal-in-progress')) {
+    appendFileSync(dir+'/removing', '1');
+    console.error('Error response from daemon: removal of container '+name+' is already in progress'); process.exit(1);
+  }
   if (exists) unlinkSync(dir+'/environment');
 }
 `);
@@ -82,6 +95,47 @@ if (argv[0] === 'ps') {
     expect((await manager.view()).failures).toEqual([]);
     expect((await readFile(join(dir, 'calls'), 'utf8'))).toContain(`rm -f ${runName}`);
   });
+
+  // INVARIANT: a concurrent Docker removal is successful accept cleanup only
+  // after the environment is gone; no retry remains owed to the person.
+  test('accept cleanup waits for an in-progress removal and leaves nothing pending', async () => {
+    await storage.updateTaskStatus(taskId, 'blocked', 'human');
+    await storage.updateTaskStatus(taskId, 'merging', 'human');
+    await storage.updateTaskStatus(taskId, 'complete', 'system');
+    const record = {
+      targetBranch: 'main', viaForge: false, pushParent: false,
+      done: FOLLOWTHROUGH_STEPS.filter(s => s !== 'cleanup'), attempts: 0,
+    };
+    await storage.updateTaskMetadata(taskId, ACCEPT_FOLLOWTHROUGH_KEY, JSON.stringify(record));
+    await writeFile(join(dir, 'environment'), '1');
+    await writeFile(join(dir, 'removal-in-progress'), '1');
+    const result = await runAcceptFollowThrough(ctx.root, taskId, {
+      storage, config: await loadConfig(ctx.root), driver: {} as any,
+    });
+    expect(result.pending).toEqual([]);
+    expect(result.error).toBeUndefined();
+    expect(await exists(join(dir, 'probed-removing'))).toBe(true);
+    expect(await exists(join(dir, 'environment'))).toBe(false);
+    expect(await exists(path)).toBe(false);
+    expect((await storage.getSessionByTaskId(taskId))!.container_name).toBeNull();
+    expect((await storage.getTask(taskId))!.metadata![ACCEPT_FOLLOWTHROUGH_KEY]).toBe('');
+  });
+
+  // INVARIANT: an in-progress removal never permits deleting mounted files
+  // when Docker cannot confirm absence, or when the removal never completes.
+  for (const failure of ['fail-probe', 'stuck-removal']) {
+    test(`concurrent removal preserves files when ${failure}`, async () => {
+      await writeFile(join(dir, 'environment'), '1');
+      await writeFile(join(dir, 'removal-in-progress'), '1');
+      await writeFile(join(dir, failure), '1');
+      await manager.run();
+      expect(await exists(path)).toBe(true);
+      expect((await storage.getSessionByTaskId(taskId))!.container_name).toBe(runName);
+      expect((await manager.view()).failures[0].error).toContain(
+        failure === 'fail-probe' ? 'daemon unavailable' : 'did not finish within 10s',
+      );
+    }, 20_000);
+  }
 
   test('a live worktree lock and an open member session never enter the removal plan', async () => {
     await acquireLock(path, 'test live lock');

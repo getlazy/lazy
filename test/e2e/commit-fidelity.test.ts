@@ -12,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess } from '../helpers/assertions';
-import { createTask, disablePreAccept, startAndReconcile } from '../helpers/fixtures';
+import { createTask, disablePreAccept, startAndReconcile, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
 import { seedFinal } from '../helpers/final';
 
 /** Latest commit body on the given branch. */
@@ -52,7 +52,7 @@ describe('commit/PR fidelity (local driver squash message)', () => {
     const id = await startCommittedTask(ctx, 'Fidelity goal');
     const logPath = join(ctx.root, 'summarizer-calls.log');
 
-    const accept = await ctx.lazy(['accept', id, '--reason', 'LGTM'], {
+    const accept = await ctx.lazyMocked(['accept', id, '--reason', 'LGTM'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_TEST: '1', LAZY_SUMMARIZER_STUB: '1', LAZY_SUMMARIZER_STUB_LOG: logPath },
     });
     expectSuccess(accept);
@@ -75,7 +75,7 @@ describe('commit/PR fidelity (local driver squash message)', () => {
   test('accept falls back to the deterministic message when synthesis fails', async () => {
     const id = await startCommittedTask(ctx, 'Fallback goal');
 
-    const accept = await ctx.lazy(['accept', id, '--reason', 'LGTM'], {
+    const accept = await ctx.lazyMocked(['accept', id, '--reason', 'LGTM'], MOCK_CLAUDE_SUCCESS, {
       env: { LAZY_TEST: '1', LAZY_SUMMARIZER_STUB: '1', LAZY_SUMMARIZER_FAIL: '1' },
     });
     expectSuccess(accept);

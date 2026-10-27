@@ -8,13 +8,13 @@
  * `lazy url` that does not answer.
  */
 
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { loadConfig } from '../config/loader';
 import { mainServiceOf, resolveServices, type ResolvedService, type ServicePort } from './ports';
 import { withPublicUrls } from './subdomain';
 import type { Session, Task } from '../types';
 import { taskRef } from '../task/identity';
-import type { Runner } from '../runner';
+import type { InspectionRunner } from '../runner';
 import type { RunnerType } from '../config/types';
 import type { CommitRun } from '../storage/types';
 import { runContainerName } from '../run/identity';
@@ -96,7 +96,7 @@ async function serveStateFor(
     /** Named in hostnames by {@link withPublicUrls}' label rule (code, else short id). */
     host: { id: string; code?: string | null };
     runnerType: RunnerType | undefined;
-    containerName: (runner: Runner) => string;
+    containerName: (runner: InspectionRunner) => string;
   },
   opts: { alwaysProbe?: boolean },
 ): Promise<TaskServeState> {
@@ -113,7 +113,7 @@ async function serveStateFor(
     return { declared, services: [], unavailable: null, containerName: '', runnerType: '', containerRunning: false, mainService };
   }
 
-  const runner = await createRunner(root, subject.runnerType);
+  const runner = await createInspectionRunner(root, subject.runnerType);
   const containerName = subject.containerName(runner);
 
   const base = { declared, containerName, runnerType: runner.type, mainService };

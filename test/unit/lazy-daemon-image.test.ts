@@ -28,6 +28,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { spawnSyncUnsupervised } from '../../src/utils/spawn';
 import { SECOND_LOOPBACK_HOST, secondLoopbackSuiteSkipped } from '../helpers/second-loopback';
+import { pickPortFreeEverywhere } from '../helpers/port-free-everywhere';
 import { GUEST_INIT_SCRIPT, guestInitId, materializeGuestInit } from '../../src/guest/guest-init';
 
 const IMAGE_DIR = join(import.meta.dir, '..', '..', 'lazy-teams', 'deploy', 'daemon-image');
@@ -642,7 +643,8 @@ describe('settings that change with an in-place swap', () => {
     await fake('dockerd', 'exit 0');
     await fake('id', 'echo 0');
     await fake('dmesg', 'exit 0');
-    const daemon = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('daemon-ok') });
+    // Free on 0.0.0.0 and the second loopback too: socat binds the same port there.
+    const daemon = Bun.serve({ hostname: '127.0.0.1', port: pickPortFreeEverywhere(), fetch: () => new Response('daemon-ok') });
     const mountsFile = join(dir, 'mounts');
     await writeFile(mountsFile, WITH_STORAGE);
     const env = {

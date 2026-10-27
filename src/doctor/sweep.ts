@@ -48,8 +48,8 @@ import {
 } from '../config/loader';
 import { lastKnownGoodState } from '../config/last-good';
 import { DaemonClient } from '../daemon/client';
-import { createRunner } from '../runner';
-import { OLD_TASK_ENVIRONMENT_NOTICE } from '../runner/task-data';
+import { createRunner, createInspectionRunner } from '../runner';
+import { OLD_TASK_ENVIRONMENT_NOTICE, OUTDATED_IMAGE_ENVIRONMENT_NOTICE } from '../runner/task-data';
 import type { Runner } from '../runner';
 import {
   findUnknownConfigKeys,
@@ -867,7 +867,7 @@ async function usagePauseStateForDoctor(root: string, now: number): Promise<Usag
  */
 export function usagePauseAdvice(offerOverride: boolean): string[] {
   return [
-    'New turns on a paused credential are not started; turns already running continue. ' +
+    'New turns on a paused credential are not started; a turn already running stops at its next model request, its work kept. ' +
       'Work lazy started by itself goes ahead when the window resets.',
     offerOverride
       ? `To let one task's next turn start anyway: ${theme.command('lazy resume <task> --override-usage-pause')} ` +
@@ -881,6 +881,22 @@ export function usagePauseAdvice(offerOverride: boolean): string[] {
 async function checkUsagePause(root: string, config: ResolvedConfig, offerOverride: boolean): Promise<CheckResult> {
   const { threshold_percent: global, credentials } = config.usage_pause;
   if (global <= 0 && !Object.values(credentials).some((v) => v > 0)) {
+    // A task's own token cap works without [usage_pause]: still say which
+    // tasks it stopped.
+    try {
+      const capped = ((await usagePauseStateForDoctor(root, Date.now())).stopped ?? []).filter((x) => x.kind === 'cap');
+      if (capped.length > 0) {
+        return {
+          ok: true,
+          label: 'Usage pause (off)',
+          warning: capped.map((x) =>
+            `${x.task}: ${x.line}. Raise it: ${theme.command(`lazy edit ${x.task} --token-cap <count>`)}, then unblock it.`,
+          ).join('\n  '),
+        };
+      }
+    } catch (err) {
+      logger.debug(`doctor: could not list token-cap stops: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return { ok: true, label: 'Usage pause (off)' };
   }
   const label = global > 0 ? `Usage pause (threshold ${global}%)` : 'Usage pause (per-credential thresholds)';
@@ -892,6 +908,7 @@ async function checkUsagePause(root: string, config: ResolvedConfig, offerOverri
     const coverage = state.coverage ?? [];
     const paused = state.paused ?? [];
     const held = state.held ?? [];
+    const stopped = state.stopped ?? [];
     const override = state.override ?? null;
     const overrideSetAt = state.overrideSetAt ?? null;
     const noReading = coverage.filter((c) => c.coverage === 'none');
@@ -908,6 +925,11 @@ async function checkUsagePause(root: string, config: ResolvedConfig, offerOverri
     for (const c of overageOn) lines.push(describeOverage(c.credential, c.overage!));
     for (const v of paused) lines.push(describeUsagePause(v, now));
     for (const h of held) lines.push(`${h.task}: its ${h.hold.held} is waiting on ${h.hold.credential}.`);
+    for (const x of stopped) {
+      lines.push(x.kind === 'cap'
+        ? `${x.task}: ${x.line}. Raise it: ${theme.command(`lazy edit ${x.task} --token-cap <count>`)}, then unblock it.`
+        : `${x.task}: ${x.line}. Its running turn was stopped; the work is kept.`);
+    }
     if (override !== null) {
       lines.push(
         `A one-shot override is pending: ${override > 0 ? `threshold ${override}%` : 'off'}` +
@@ -919,7 +941,7 @@ async function checkUsagePause(root: string, config: ResolvedConfig, offerOverri
       ? `${label} — overage off on ${overageOff.map((c) => `${c.credential} (${c.overage!.reason ?? c.overage!.status})`).join(', ')}`
       : label;
     if (lines.length === 0) return { ok: true, label: overageLabel };
-    if (paused.length > 0 || held.length > 0) lines.push(...usagePauseAdvice(offerOverride));
+    if (paused.length > 0 || held.length > 0 || stopped.some((x) => x.kind === 'usage')) lines.push(...usagePauseAdvice(offerOverride));
     const armedLabel = storeError
       ? `${overageLabel} — saved readings UNREADABLE, launches refused`
       : noReading.length > 0
@@ -2043,14 +2065,23 @@ export function formatTimeSince(isoDate: string): string {
 export async function checkOldTaskEnvironments(storage: Storage, root: string): Promise<CheckResult> {
   const label = 'Task environments have the data directory';
   const old: string[] = [];
+  const outdated: string[] = [];
+  const { nextLaunchImage } = await import('../daemon/task-data-view');
   for (const task of await storage.listTasksWithOptions({ nonTerminalOnly: true })) {
     const session = await storage.getSessionByTaskId(task.id);
-    const runner = await createRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
+    const runner = await createInspectionRunner(root, session?.runner_type ?? task.runner_type ?? undefined);
     const name = session?.container_name ?? runner.runNameForTask(taskRef(task));
-    if (await runner.lacksCurrentLayout?.(name)) old.push(displayId(task));
+    if (await runner.lacksCurrentLayout?.(name)) { old.push(displayId(task)); continue; }
+    if (!runner.runsOutdatedImage || !await runner.isRunning(name)) continue;
+    const expected = await nextLaunchImage(root, task);
+    if (expected && await runner.runsOutdatedImage(name, expected)) outdated.push(displayId(task));
   }
-  return old.length
-    ? { ok: true, label, warning: old.join(', ') + ': ' + OLD_TASK_ENVIRONMENT_NOTICE + ' Use Restart environment on each task’s Services tab.' }
+  const warnings = [
+    ...(old.length ? [old.join(', ') + ': ' + OLD_TASK_ENVIRONMENT_NOTICE] : []),
+    ...(outdated.length ? [outdated.join(', ') + ': ' + OUTDATED_IMAGE_ENVIRONMENT_NOTICE] : []),
+  ];
+  return warnings.length
+    ? { ok: true, label, warning: warnings.join(' ') + ' Use Restart environment on each task’s Services tab.' }
     : { ok: true, label };
 }
 

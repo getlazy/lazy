@@ -86,6 +86,9 @@ describe('web task page navigation and markdown', () => {
     expect(html).toContain('<table class="md-table">');
     expect(html).toContain('<th>Check</th>');
     expect(html).toContain('<td>typecheck</td>');
-    expect(html).not.toContain('| Check | Result |');
+    // The Copy button carries the markdown SOURCE in its data-copy-md
+    // attribute, deliberately; the rendered body must not.
+    const rendered = html.replace(/ data-copy-md="[^"]*"/g, '');
+    expect(rendered).not.toContain('| Check | Result |');
   });
 });

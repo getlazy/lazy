@@ -49,7 +49,7 @@ const activeMonitors = new Map<string, ActivityMonitor>();
  */
 function syncActivityMonitors(
   workingTaskIds: Map<string, { worktreePath: string; turnStartedAt?: string }>,
-  runner: import('../../runner').Runner | null,
+  runner: import('../../runner').InspectionRunner | null,
 ): void {
   // Start monitors for new working tasks
   for (const [taskShortId, info] of workingTaskIds) {
@@ -727,12 +727,12 @@ export async function commandLoop(args: string[]): Promise<void> {
   // start refuses an unavailable runner), and a clone bound to Lazy Teams has no
   // local runner to ask. The runner is only needed for the live activity view of
   // tasks whose worktree is on THIS machine, and is created on first use.
-  let localRunner: import('../../runner').Runner | null = null;
-  const getLocalRunner = async (): Promise<import('../../runner').Runner> => {
+  let localRunner: import('../../runner').InspectionRunner | null = null;
+  const getLocalRunner = async (): Promise<import('../../runner').InspectionRunner> => {
     if (!localRunner) {
-      const { createRunner } = await import('../../runner');
+      const { createInspectionRunner } = await import('../../runner');
       try {
-        localRunner = await createRunner(root);
+        localRunner = await createInspectionRunner(root);
       } catch (err) {
         console.error(`Error: cannot show live activity: ${err instanceof Error ? err.message : err}`);
         process.exit(1);

@@ -13,8 +13,8 @@ import { currentDiskSpaceManager } from '../docker/disk-space';
  * - Inside the daemon `ensureImage` asks this module (through the
  *   custom-image gate) instead of inspecting-and-building: a launch never
  *   starts its own build of the custom image, not while this one runs and not
- *   after it failed. A failed build stays `failed`, with its reason and the
- *   Dockerfile, until the Dockerfile changes or someone retries.
+ *   after it failed. A failed build backs off before another attempt; waiting for the
+ *   engine to start does not count as a failed build.
  * - While the image is not ready, builders start on lazy's DEFAULT runner image
  *   with a banner, and agent launches need an explicit confirmation to do the
  *   same (src/daemon/runner-image-choice.ts). Nothing switches back on its own.
@@ -27,12 +27,13 @@ import { currentDiskSpaceManager } from '../docker/disk-space';
  */
 import { readFile, writeFile, mkdir, mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { logger } from '../utils/logger';
 import { spawn } from '../utils/spawn';
 import { autoBuildsRootDockerfile } from '../config/managed-mode';
 import { loadConfig } from '../config/loader';
 import { registerCustomImageGate, type CustomImageVerdict } from '../capture/custom-image-gate';
-import { ensureImage, forgetBuildFailure, resetBuildFailuresForTests, resolveImageRepository, IMAGE_TAG, resolveCustomDockerfile, describeDockerfileSource, runWithBuildContext, rootIntegrationBranch, gitInRoot } from '../capture/claude';
+import { ContainerEngineUnavailableError, ensureImage, forgetBuildFailure, resetBuildFailuresForTests, resolveImageRepository, IMAGE_TAG, resolveCustomDockerfile, describeDockerfileSource, runWithBuildContext, rootIntegrationBranch, gitInRoot } from '../capture/claude';
 import { runWithoutBuildObserver } from '../capture/build-observer';
 import { startImageBuildJob, whileNotCancelled, type ImageBuildJob } from './image-build-job';
 import { forgetFailedDamagedImageRepair } from '../docker/damaged-image';
@@ -58,7 +59,7 @@ export interface BranchCommit {
 export type RunnerImageState =
   /** No custom image is configured, or the runner has no image: nothing to wait for. */
   | { state: 'none' }
-  | { state: 'checking'; imageName: string; dockerfile: string; defaultImage: string; startedAt: string; buildId?: string | null; attemptedFrom?: BranchCommit }
+  | { state: 'checking'; imageName: string; dockerfile: string; defaultImage: string; startedAt: string; buildId?: string | null; attemptedFrom?: BranchCommit; waitingForEngine?: boolean }
   | ({
       state: 'building'; imageName: string; dockerfile: string; defaultImage: string; startedAt: string;
       /** Why the build runs (missing, inputs changed, too old, requested). */
@@ -158,7 +159,9 @@ export function describeBranchCommit(c: BranchCommit): string {
 export function describeRunnerImage(s: RunnerImageState = runnerImageStatus()): string {
   switch (s.state) {
     case 'none': return 'This project runs on lazy\'s default runner image.';
-    case 'checking': return `Checking the project's runner image ${s.imageName} (from ${s.dockerfile}).`;
+    case 'checking':
+      if (s.waitingForEngine) return `Docker is not answering. Lazy is waiting for Docker and will build the project's runner image as soon as it answers.`;
+      return `Checking the project's runner image ${s.imageName} (from ${s.dockerfile}).`;
     case 'building':
       if (s.replacing) return `The project's runner image ${s.imageName} is being rebuilt from ${s.dockerfile}; the current one stays in use until it succeeds.`;
       return `The project's runner image ${s.imageName} (from ${s.dockerfile}) is still building` +
@@ -282,11 +285,13 @@ function startBuild(
     // Attempt memory across restarts (see BootAttemptRecord). A deferred build
     // is shown as failed with its next-attempt time; Retry / Rebuild ignore it.
     let failuresSoFar = 0;
+    let previousAttempt: BootAttemptRecord | null = null;
     // A rebuild for an advance is not the boot build: its failures must not
     // defer the next daemon boot's build of an image that is fine.
     if (t.projectRoot && !opts.advance) {
       try {
         const rec = await readBootAttempt(t.projectRoot, imageName);
+        previousAttempt = rec;
         failuresSoFar = rec ? (rec.inProgress ? rec.failures + 1 : rec.failures) : 0;
         if (failuresSoFar && job.metadata.trigger === 'boot') job.metadata.trigger = 'retry';
         const deferral = opts.explicit || opts.rebuild ? null : bootDeferral(rec);
@@ -298,12 +303,38 @@ function startBuild(
           logger.warn(`Runner image: not building ${imageName}: ${error}`);
           return;
         }
-        await writeBootAttempt(t.projectRoot, { imageName, failures: failuresSoFar, lastAttemptAt: new Date().toISOString(), inProgress: true, error: null });
       } catch (err) {
         logger.warn(`Runner image: build-attempt memory unavailable, building anyway: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    const waitForEngine = async () => {
+      // An engine still starting is not a build failure. Only cheap, bounded
+      // readiness probes repeat; no build runs or consumes the OOM budget.
+      let probeDelay = 1_000;
+      while (!job.cancelled && current()) {
+        let answers = false;
+        try {
+          answers = await whileNotCancelled(job, (async () =>
+            (await spawn([t.binary, 'info'], { stdout: 'ignore', stderr: 'ignore', timeout: 10_000 }).exited) === 0)());
+        } catch (err) {
+          if (job.cancelled) throw new Error('Runner image readiness check was cancelled', { cause: err });
+          job.note('Docker readiness probe: ' + (err instanceof Error ? err.message : String(err)));
+        }
+        if (answers) break;
+        if (t.status.state === 'checking') t.status = { ...t.status, waitingForEngine: true };
+        if (probeDelay === 1_000) job.narrate('Waiting for Docker; the runner image will build as soon as it answers.');
+        await delay(probeDelay, undefined, { signal: job.controller.signal });
+        probeDelay = Math.min(30_000, probeDelay * 2);
+      }
+      if (job.cancelled || !current()) throw new Error('the build was cancelled');
+      if (t.status.state === 'checking') t.status = { ...t.status, waitingForEngine: false };
+    };
     try {
+      await t.prepare?.();
+      await waitForEngine();
+      if (t.projectRoot && !opts.advance) {
+        await writeBootAttempt(t.projectRoot, { imageName, failures: failuresSoFar, lastAttemptAt: new Date().toISOString(), inProgress: true, error: null });
+      }
       if (!job.metadata.commit && t.projectRoot) {
         const { loadValidAdoptedImage } = await import('./adopted-image');
         const adopted = await loadValidAdoptedImage(t.projectRoot);
@@ -322,28 +353,51 @@ function startBuild(
       // Outside the job: it is not this build, and Cancel must not stop it.
       // (The custom build's own base-first step IS inside the job; if Cancel
       // stops that, this call — waiting on the same lock — builds it after.)
-      await t.prepare?.();
       void runWithoutBuildObserver(() => ensureImage(t.binary, { useDefaultImage: true })).catch((err) => {
         logger.warn(`Runner image: lazy's default image ${defaultImage} could not be prepared: ${err instanceof Error ? err.message : String(err)}`);
       });
-      const build = () => ensureImage(t.binary, {
-        bypassGate: true,
-        rebuild: opts.rebuild,
-        noCache: opts.noCache,
-        notify: (detail) => {
-          job.narrate(detail);
-          if (!current()) return;
-          const s = t.status;
-          const building = /^(re)?building /.test(detail);
-          if (building) rebuilt = true;
-          if (s.state === 'checking' && building) {
-            t.status = { state: 'building', imageName, dockerfile, defaultImage, startedAt, reason: detail, progress: null, buildId: job.id, ...from };
-            logger.info(`Runner image: ${detail}`);
-          } else if (s.state === 'building') {
-            t.status = { ...s, progress: detail };
+      const build = async () => {
+        for (;;) {
+          try {
+            return await ensureImage(t.binary, {
+              bypassGate: true,
+              rebuild: opts.rebuild,
+              noCache: opts.noCache,
+              notify: (detail) => {
+                job.narrate(detail);
+                if (!current()) return;
+                const s = t.status;
+                const building = /^(re)?building /.test(detail);
+                if (building) rebuilt = true;
+                if (s.state === 'checking' && building) {
+                  t.status = { state: 'building', imageName, dockerfile, defaultImage, startedAt, reason: detail, progress: null, buildId: job.id, ...from };
+                  logger.info(`Runner image: ${detail}`);
+                } else if (s.state === 'building') {
+                  t.status = { ...s, progress: detail };
+                }
+              },
+            });
+          } catch (err) {
+            // checkDocker runs again inside ensureImage. Docker can disappear
+            // after our probe; undo only this unstarted attempt, preserving any
+            // previous real failures and their cross-restart OOM backoff.
+            if (!(err instanceof ContainerEngineUnavailableError) || rebuilt || job.cancelled || !current()) {
+              throw new Error(`Runner image preparation failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+            }
+            if (t.projectRoot && !opts.advance) {
+              if (previousAttempt) await writeBootAttempt(t.projectRoot, previousAttempt);
+              else await clearBootAttempt(t.projectRoot);
+            }
+            if (t.status.state === 'checking') t.status = { ...t.status, waitingForEngine: true };
+            job.narrate('Docker stopped answering before the build started; waiting for it to return.');
+            await delay(1_000, undefined, { signal: job.controller.signal });
+            await waitForEngine();
+            if (t.projectRoot && !opts.advance) {
+              await writeBootAttempt(t.projectRoot, { imageName, failures: failuresSoFar, lastAttemptAt: new Date().toISOString(), inProgress: true, error: null });
+            }
           }
-        },
-      });
+        }
+      };
       if (opts.committed) committedDir = await prepareBootContext(t, opts.committed.commit, imageName, job.controller.signal);
       if (job.cancelled) throw new Error('the build was cancelled');
       const committedFrom = committedDir && opts.committed ? opts.committed.commit : undefined;
@@ -382,7 +436,7 @@ function startBuild(
       if (!current()) return; // superseded: the newer build owns the attempt record
       if (t.projectRoot && !opts.advance) await writeBootAttempt(t.projectRoot, { imageName, failures: failuresSoFar + 1, lastAttemptAt: new Date().toISOString(), inProgress: false, error }).catch((e) => logger.warn(`Runner image: could not record the failed attempt: ${e instanceof Error ? e.message : String(e)}`));
       if (!current()) return;
-      t.status = { state: 'failed', imageName, dockerfile, defaultImage, failedAt: new Date().toISOString(), error, buildId: job.id, ...(replacing ? { replacing } : {}), ...from, ...serving };
+      t.status = { state: 'failed', imageName, dockerfile, defaultImage, failedAt: new Date().toISOString(), error, buildId: job.id, retryAt: new Date(Date.now() + refreshBackoffMs(failuresSoFar + 1)).toISOString(), ...(replacing ? { replacing } : {}), ...from, ...serving };
       logger.warn(`Runner image: building ${imageName} from ${dockerfile} FAILED: ${error}`);
     }
   })();
@@ -824,6 +878,9 @@ export async function startRunnerImageBoot(
             message: `The project's runner image ${imageName} is not built yet; the daemon is building it. ` +
               `Run on lazy's default runner image instead, or wait for it.`,
           };
+        }
+        if (s.state === 'failed' && !s.cancelled && !s.adoptionUnavailable && s.retryAt && Date.parse(s.retryAt) <= Date.now() && !s.replacing) {
+          startBuild(t, s.imageName, s.dockerfile, s.defaultImage);
         }
         maybeRefresh(t);
         return verdict();

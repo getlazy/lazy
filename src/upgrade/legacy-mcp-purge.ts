@@ -20,7 +20,7 @@
  * WHY THIS RIDES `lazy upgrade` rather than running on daemon start or as a
  * one-off command: deleting files and rotating a credential are exactly the kind
  * of side effect that must not surprise anyone mid-session. Upgrade is already
- * the moment when everything stops and restarts, and it is the human's explicit
+ * the moment when the daemon and every agent restart, and it is the human's explicit
  * action.
  *
  * WHY THE ROTATION IS SAFE HERE (blast radius). Deleting the files does not
@@ -36,8 +36,9 @@
  *     outright. Rotation cannot touch them.
  *   - That leaves in-container holders of the shared token — the only class
  *     that cannot re-read a host-side file. `purgeAndRotate` is called from the
- *     one point in the upgrade where that class is empty by construction: after
- *     every task and builder container has been stopped, and after the old
+ *     one point in the upgrade where that class is empty by construction: when
+ *     legacy configs exist upgrade stops and removes every task container first
+ *     (builders are not stopped, as before this rule changed), and the old
  *     daemon has fully exited, but before the new one starts and adopts a token.
  *
  * IDEMPOTENT: a project with no legacy files removes nothing and rotates

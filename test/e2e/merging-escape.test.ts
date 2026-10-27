@@ -99,7 +99,7 @@ describe('merging escape hatch', () => {
     await startAndReconcile(ctx, taskId);
     strandInMerging(ctx.root, taskId);
 
-    const result = await ctx.lazy(['reject', taskId, '--reason', 'changed my mind', '--yes']);
+    const result = await ctx.lazyMocked(['reject', taskId, '--reason', 'changed my mind', '--yes'], MOCK_CLAUDE_SUCCESS);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr + result.stdout).toContain('being resumed by the daemon');
     expect(readTaskStatus(ctx.root, taskId)).toBe('merging');
@@ -115,7 +115,7 @@ describe('merging escape hatch', () => {
     strandInMerging(ctx.root, taskId);
     exhaustResumes(ctx.root, taskId);
 
-    const result = await ctx.lazy(['reject', taskId, '--reason', 'not what I wanted', '--yes']);
+    const result = await ctx.lazyMocked(['reject', taskId, '--reason', 'not what I wanted', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
     expect(readTaskStatus(ctx.root, taskId)).toBe('abandoned');
     // INVARIANT: the escape clears EVERY resume key with the marker. A leftover
@@ -133,7 +133,7 @@ describe('merging escape hatch', () => {
     strandInMerging(ctx.root, taskId);
     exhaustResumes(ctx.root, taskId);
 
-    const result = await ctx.lazy(['close', taskId, '--reason', 'abandoning this line of work', '--yes']);
+    const result = await ctx.lazyMocked(['close', taskId, '--reason', 'abandoning this line of work', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(result);
     expect(readTaskStatus(ctx.root, taskId)).toBe('abandoned');
     // Never lose human feedback: the reason the human typed must survive the
@@ -354,13 +354,13 @@ describe('merging escape hatch', () => {
     persistIntent(ctx.root, taskId, 'it merged');
     exhaustResumes(ctx.root, taskId);
 
-    const rejected = await ctx.lazy(['reject', taskId, '--reason', 'undo it', '--yes']);
+    const rejected = await ctx.lazyMocked(['reject', taskId, '--reason', 'undo it', '--yes'], MOCK_CLAUDE_SUCCESS);
     expect(rejected.exitCode).not.toBe(0);
     expect(rejected.stdout + rejected.stderr).toContain('already on');
     expect(rejected.stdout + rejected.stderr).toContain('lazy accept');
     expect(readTaskStatus(ctx.root, taskId)).toBe('merging');
 
-    const accepted = await ctx.lazy(['accept', taskId, '--yes']);
+    const accepted = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(accepted);
     expect(readTaskStatus(ctx.root, taskId)).toBe('complete');
   });
@@ -382,7 +382,7 @@ describe('merging escape hatch', () => {
 
     // Accept on a merging task — local driver returns null for getPRState
     // which means it falls through to the pending state message
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
     expectOutput(await ctx.lazy(['show', taskId]), 'complete');
@@ -422,7 +422,7 @@ describe('merging escape hatch', () => {
     expect(statusMatch![1]).not.toBe('merging');
 
     // Re-accept should work (task is no longer in merging state)
-    const acceptResult = await ctx.lazy(['accept', taskId]);
+    const acceptResult = await ctx.lazyMocked(['accept', taskId], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
   });

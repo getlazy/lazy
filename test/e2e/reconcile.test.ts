@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
 import { expectSuccess, expectOutput, extractTaskId } from '../helpers/assertions';
 import { createTask, MOCK_CLAUDE_SUCCESS } from '../helpers/fixtures';
+import { runReconcile as runMockedReconcile } from '../helpers/reconcile';
 import {
   writeResponse,
   consumeResponse,
@@ -601,7 +602,10 @@ describe('reconciliation sweep: merged branch zombie detection', () => {
     createAcceptTag(ctx, fullTaskId, 'main');
 
     // Trigger reconciliation — the sweep recovers the zombie AND runs cleanup.
-    await runReconcile(ctx.root);
+    // Through the mocked subprocess pass: the cleanup tears down the task's
+    // run, and the in-process pass would ask the host's real container runtime.
+    const pass = await runMockedReconcile(ctx.root, ctx.protocolBase);
+    expect(pass.exitCode).toBe(0);
 
     // Task recovered to complete.
     const showAfter = await ctx.lazy(['show', taskId]);

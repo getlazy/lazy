@@ -206,7 +206,7 @@ export async function startAndAccept(
   // before any accept of a committed task (see test/helpers/final.ts). Suites
   // whose subject IS the finality flow assert it themselves instead.
   seedFinal(ctx, taskId);
-  const result = await ctx.lazy(['accept', taskId, '--yes']);
+  const result = await ctx.lazyMocked(['accept', taskId, '--yes'], MOCK_CLAUDE_SUCCESS);
   if (result.exitCode !== 0) {
     throw new Error(`accept failed for ${taskId}: ${result.stderr}\n${result.stdout}`);
   }

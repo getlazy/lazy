@@ -83,7 +83,7 @@ async function acceptParent(
   // seed (see test/helpers/final.ts).
   seedFinal(ctx, parentId);
 
-  return ctx.lazy(['accept', parentId, '--reason', 'LGTM']);
+  return ctx.lazyMocked(['accept', parentId, '--reason', 'LGTM'], MOCK_CLAUDE_SUCCESS);
 }
 
 /**

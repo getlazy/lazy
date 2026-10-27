@@ -125,7 +125,7 @@ export interface SettingEntry {
 }
 
 const USAGE_PAUSE_EFFECT =
-  'Checked each time a turn is about to start, whether a person or lazy starts it; a turn already running is never stopped. Starts lazy was holding because of a pause are let through within about a minute once the new value allows them.';
+  'Checked each time a turn is about to start, whether a person or lazy starts it, and on every model request of a running turn, which is stopped (work kept) and resumes after the reset. Starts lazy was holding because of a pause are let through within about a minute once the new value allows them.';
 
 const EFFORTS = VALID_EFFORT_LEVELS;
 const CHATTINESS = VALID_CHATTINESS_LEVELS;

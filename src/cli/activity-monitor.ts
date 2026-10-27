@@ -154,7 +154,7 @@ export class ActivityMonitor {
   /** Guards against overlapping async polls when one runs longer than the interval. */
   private polling = false;
 
-  constructor(runner: Runner, worktreePath: string, taskId: string, turnStartedAt?: string) {
+  constructor(runner: Pick<Runner, 'agentSessionProjectDir'>, worktreePath: string, taskId: string, turnStartedAt?: string) {
     // The runner is authoritative about where its agent writes session logs.
     this.projectDir = runner.agentSessionProjectDir(worktreePath);
     this.taskId = taskId;

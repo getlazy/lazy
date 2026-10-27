@@ -53,8 +53,8 @@ export const USAGE_PAUSE_PENDING_FIX_KEY = 'usage_pause_pending_review_fix';
  * (src/daemon/usage-pause.ts, `processUsagePauseHolds`).
  *
  * Held rather than refused because the driver cannot do anything useful with a
- * refusal: its own turn is still running (the pause never stops a running
- * turn), nothing would ever restart it after the reset, and retrying is exactly
+ * refusal: its own turn is still running (the pause stops a running turn only at
+ * its next model request), nothing would ever restart it after the reset, and retrying is exactly
  * the spending the pause exists to stop. A held child is WAITABLE — `lazy_wait`
  * treats it as still running — so the driver waits on it like any other child.
  */

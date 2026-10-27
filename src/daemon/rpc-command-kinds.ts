@@ -678,6 +678,7 @@ export const READ_ONLY_STORAGE_METHODS: ReadonlySet<string> = new Set([
   'listBuilders',
   'getBuilder',
   'isConversationImported',
+  'isConversationPurged',
   'getAgentSessionLog',
   'getProjectSettings',
   'listBuilderResumeIntents',

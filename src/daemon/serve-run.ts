@@ -45,7 +45,7 @@ import { containerCliForType, containerCliOf } from '../runner/container-cli';
 import { getOrCreateStorage } from './rpc-handlers';
 import { RpcError } from './rpc-error';
 import { resolveProjectStartServicesCmd, resolveProjectStopServicesCmd } from '../serve/start-cmd';
-import { createRunner } from '../runner';
+import { createInspectionRunner } from '../runner';
 import { displayId, getWorktreePathForRef, taskRef } from '../task/identity';
 import { spawn } from '../utils/spawn';
 import type { Storage } from '../storage';
@@ -617,7 +617,7 @@ export async function stopStartServices(
 
 /** A run's container when it is running; null otherwise. */
 export async function runContainerTarget(projectRoot: string, run: CommitRun): Promise<{ binary: string; name: string } | null> {
-  const runner = await createRunner(projectRoot);
+  const runner = await createInspectionRunner(projectRoot);
   if (!runner.usesSandbox()) return null;
   const name = runContainerName(projectRoot, run.slug);
   if (!(await runner.isRunning(name))) return null;
@@ -626,7 +626,7 @@ export async function runContainerTarget(projectRoot: string, run: CommitRun): P
 
 /** The task's container when it is running on a container runner; null otherwise. */
 export async function taskContainerTarget(projectRoot: string, task: Task, session: Session | null): Promise<{ binary: string; name: string } | null> {
-  const runner = await createRunner(projectRoot, session?.runner_type ?? task.runner_type ?? undefined);
+  const runner = await createInspectionRunner(projectRoot, session?.runner_type ?? task.runner_type ?? undefined);
   if (!runner.usesSandbox()) return null;
   const name = session?.container_name ?? runner.runNameForTask(taskRef(task));
   if (!(await runner.isRunning(name))) return null;

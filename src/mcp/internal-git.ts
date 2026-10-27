@@ -25,6 +25,9 @@
  */
 
 import { dirname } from 'path';
+import { protocolDir } from '../protocol';
+import { readSupervisorStatusAsync } from '../utils/working-substate';
+import { recordUnfinishedSyncMerge, syncCommandId, UNFINISHED_SYNC_MERGE_KEY } from '../task/unfinished-sync';
 import type { McpTool, McpToolHandler } from './types';
 import { INTERNAL_GIT_TOOL_NAME } from './types';
 import { type McpToolContext, mcpActor } from './tools';
@@ -282,7 +285,14 @@ export function createInternalGitHandler(ctx: McpToolContext): McpToolHandler {
         const targetSha = await assertMergeTargetAllowed(ctx, cwd, target);
         // Merge the resolved SHA, not the ref the caller named: the ref could
         // move between validation and merge.
+        const status = await readSupervisorStatusAsync(protocolDir(ctx.taskId));
+        const commandId = await syncCommandId(ctx.taskId);
+        const isSync = commandId && status?.task_id === ctx.taskId &&
+          status.command_type === 'sync' && status.sync_command_id === commandId;
+        const storage = isSync ? await getStorage(ctx) : null;
+        if (storage) await recordUnfinishedSyncMerge(storage, ctx.taskId, await headOf(cwd), targetSha);
         result = await runGit(['merge', targetSha, '--no-ff', '-m', message], { cwd });
+        if (storage && result.exitCode === 0) await storage.updateTaskMetadata(ctx.taskId, UNFINISHED_SYNC_MERGE_KEY, '');
         break;
       }
       case 'merge_abort':

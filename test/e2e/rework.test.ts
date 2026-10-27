@@ -152,7 +152,7 @@ describe('lazy rework', () => {
   // INVARIANT: rework refuses closed tasks and suggests reopen.
   test('fails for closed task', async () => {
     const taskId = await createTask(ctx, 'Closed task');
-    await ctx.lazy(['close', taskId, '--reason', 'Done']);
+    await ctx.lazyMocked(['close', taskId, '--reason', 'Done'], MOCK_CLAUDE_SUCCESS);
 
     const result = await ctx.lazy(['rework', taskId, '--prompt', 'Fix it']);
     expectFailure(result);
@@ -266,7 +266,7 @@ describe('lazy rework', () => {
     const parentResult = await ctx.lazy(['create', '--goal', 'Closed parent', '--code', 'closed-par']);
     expectSuccess(parentResult);
     const parentId = extractTaskId(parentResult.stdout);
-    const closeResult = await ctx.lazy(['close', parentId, '--reason', 'Done']);
+    const closeResult = await ctx.lazyMocked(['close', parentId, '--reason', 'Done'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(closeResult);
 
     // Create and accept a task to rework

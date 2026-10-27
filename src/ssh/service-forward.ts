@@ -146,7 +146,7 @@ export function createServiceForwardUpgrader(deps: {
     if (state.unavailable) return { status: 409, error: `the task's services are not available (${state.unavailable})` };
     const service = state.services.find((s) => s.port === port);
     if (!service) return { status: 403, error: `port ${port} is not a declared service of this task` };
-    if (!service.binding) return { status: 409, error: `service ${service.name} is not published` };
+    if (!service.binding) return { status: 409, error: `service ${service.name} (port ${port}) is not published by the task's container — restart the task's environment so it publishes the port` };
     return { hostAddress: service.binding.hostAddress, hostPort: service.binding.hostPort };
   };
 
@@ -243,7 +243,14 @@ export function createServiceForwardUpgrader(deps: {
       const port = Number(url.searchParams.get('port'));
       if (!Number.isInteger(port) || port < 1 || port > 65535) return refuse(400, 'port must be 1-65535');
       const binding = await resolveBinding(grant, port);
-      if ('error' in binding) return refuse(binding.status, binding.error);
+      if ('error' in binding) {
+        // The forwarder tells the person (./service-forwarder.ts); this is for
+        // whoever runs the daemon. Logged on the upgrade only: the plain GET
+        // that follows is the forwarder re-asking for the reason in words.
+        const upgrading = (req.headers.get('upgrade') ?? '').toLowerCase().includes('websocket');
+        if (upgrading) logger.info(`ssh service forward ${grant.memberEmail} → task ${grant.taskId.slice(0, 8)}:${port} refused (${binding.status}): ${binding.error}`);
+        return refuse(binding.status, binding.error);
+      }
       const data: ForwardSocketData = {
         target: binding,
         label: `${grant.memberEmail} → task ${grant.taskId.slice(0, 8)}:${port}`,

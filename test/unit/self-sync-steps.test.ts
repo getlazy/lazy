@@ -29,7 +29,10 @@ const TASK_BRANCH = 'lazy/task';
 
 function stubStorage(): { storage: Storage; turns: Array<Record<string, unknown>> } {
   const turns: Array<Record<string, unknown>> = [];
+  const metadata = new Map<string, string>();
   const storage = {
+    updateTaskMetadata: async (_taskId: string, key: string, value: string) => { metadata.set(key, value); },
+    getTaskMetadata: async (_taskId: string, key: string) => metadata.get(key) ?? null,
     getNextTurnSequence: async () => turns.length + 1,
     createTurn: async (input: Record<string, unknown>) => {
       turns.push(input);

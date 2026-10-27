@@ -1,3 +1,4 @@
+import { UNFINISHED_SYNC_MERGE_KEY, recordUnfinishedSyncMerge } from '../task/unfinished-sync';
 /**
  * Self-sync: a task's OWN agent reconciling its branch while its turn is running.
  *
@@ -198,9 +199,14 @@ export async function runSelfSync(args: {
       throw err;
     }
 
+    const incomingSha = await runGit(['rev-parse', '--verify', planned.target], { cwd: worktreePath });
+    if (incomingSha.exitCode !== 0) throw new RpcError(500, `Could not resolve sync target ${planned.ref}: ${incomingSha.stderr.trim()}`);
+    await recordUnfinishedSyncMerge(storage, taskId, headBefore, incomingSha.stdout.trim());
+
     const merge = await runGit(['merge', planned.target, '--no-ff', '-m', message], { cwd: worktreePath });
 
     if (merge.exitCode === 0) {
+      await storage.updateTaskMetadata(taskId, UNFINISHED_SYNC_MERGE_KEY, '');
       const headAfter = await headOf(worktreePath);
       const step: SelfSyncStep = {
         step: planned.step,

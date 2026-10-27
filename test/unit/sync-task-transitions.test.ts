@@ -220,9 +220,10 @@ function createMockStorage() {
     // did nothing would stamp this turn's rows with the last human who
     // unblocked the task (src/daemon/turn-owner.ts). The mock has to model both
     // halves or the launch refuses itself.
-    setSessionTurnOwner: async (sessionId: string, owner: unknown) => {
+    setSessionTurnOwner: async (sessionId: string, owner: unknown, systemInitiated?: boolean) => {
       updateCalls.push({ method: 'setSessionTurnOwner', args: [sessionId, owner] });
       if (mockSession) {
+        (mockSession as Record<string, unknown>).turn_system_initiated = systemInitiated === true;
         mockSession.turn_owner_email = (owner as { email?: string } | null)?.email ?? null;
         mockSession.turn_owner_name = (owner as { name?: string } | null)?.name ?? null;
       }
@@ -256,6 +257,10 @@ function createMockStorage() {
     updateTaskMetadata: async (taskId: string, key: string, value: unknown) => {
       updateCalls.push({ method: 'updateTaskMetadata', args: [taskId, key, value] });
       if (mockTask) (mockTask.metadata as Record<string, unknown>)[key] = value;
+    },
+    getTaskMetadata: async (_taskId: string, key: string) => {
+      const value = (mockTask?.metadata as Record<string, unknown> | undefined)?.[key];
+      return value == null ? null : String(value);
     },
     resetTaskPendingSync: async () => {
       updateCalls.push({ method: 'resetTaskPendingSync', args: [] });

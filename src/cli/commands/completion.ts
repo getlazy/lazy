@@ -110,7 +110,7 @@ const COMMAND_FLAGS: Record<string, string[]> = expandAliasKeys({
   'fix':                 ['--goal', '--prompt', '--model', '--code', '--parent'],
   'document':            ['--goal', '--prompt', '--model', '--code', '--parent'],
   'refactor':            ['--goal', '--prompt', '--model', '--code', '--parent'],
-  'edit':                ['--goal', '--prompt', '--model', '--effort', '--type', '--code', '--parent', '--runner', '--agent', '--review', '--review-gate', '--review-auto-fix'],
+  'edit':                ['--goal', '--prompt', '--model', '--effort', '--type', '--code', '--parent', '--runner', '--agent', '--review', '--review-gate', '--review-auto-fix', '--token-cap'],
   'clone':               ['--parent', '--default-parent', '--code', '--model', '--agent', '--same-base', '--base', '--device', '--device-name'],
   'list':                ['--all', '--flat', '--tree', '--ids-only', '--tag', '--levels'],
   'active':              ['--flat', '--tree', '--follow', '--ids-only', '--levels'],

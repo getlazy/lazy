@@ -458,6 +458,14 @@ export interface Runner {
    */
   lacksCurrentLayout?(runName: string): Promise<boolean>;
 
+  /**
+   * True when a run's container was created from a different image than
+   * `expectedImage` (what the task's next launch would use) — what a `lazy upgrade`
+   * leaves behind, since it
+   * keeps running containers. Informational only, like {@link lacksCurrentLayout}.
+   */
+  runsOutdatedImage?(runName: string, expectedImage: string): Promise<boolean>;
+
   /** List all running lazy runs (container names or run names). */
   discoverRunningRuns(): Promise<string[]>;
 

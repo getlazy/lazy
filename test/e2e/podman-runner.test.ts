@@ -1,4 +1,4 @@
-import { describe, test, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { join } from 'path';
 import { writeFileSync, readFileSync } from 'fs';
 import { setupTestLazy, type TestContext } from '../helpers/setup';
@@ -29,8 +29,10 @@ describe('podman runner configuration', () => {
     writeFileSync(configPath, setRunnerType(existingConfig, 'podman'));
 
     const result = await ctx.lazy(['doctor']);
-    // Should show Podman-specific checks instead of Docker checks
-    expectOutput(result, 'Podman installed');
+    // Should show Podman-specific checks instead of Docker checks. The check
+    // reads "Podman installed" where Podman is, and names the problem where it
+    // is not — either way it is the Podman check that ran.
+    expect(result.stdout).toMatch(/Podman installed|Podman isn't installed on this machine/);
     expectOutputExcludes(result, 'Docker installed');
     expectOutputExcludes(result, 'Docker daemon');
   });

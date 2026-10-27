@@ -36,11 +36,15 @@
  *   after it by the auto-review catchup, a queued sync by the sync retry loop.
  *   The first offer after the reset goes ahead.
  *
- * A turn already running is never touched — nor a nudge the supervisor sends
- * inside it: the gate only runs at launch.
+ * A turn already RUNNING is stopped too once its credential crosses the
+ * threshold — by the proxy, on the turn's next model request, parked
+ * `interrupted` and resumed by the hold above after the reset
+ * (src/daemon/running-turn-stop.ts). This module's gate itself only runs at
+ * launch.
  */
 
 import { randomUUID } from 'crypto';
+import { daemonProviderHealthWith } from '../proxy/provider-health';
 import { builderTargetForProfile, resolveBuilderProfileName } from '../builder/builder-profile';
 import { join } from 'path';
 import { readAuditRecords } from '../proxy/audit-log';
@@ -97,6 +101,9 @@ import {
 } from '../usage-pause/hold';
 import { seedUsageReadings, usageReadingsStoreError, type UsageReadingsStoreError } from './usage-readings';
 import { RpcError } from './rpc-error';
+import { runningStopLine, tokenCapOf, usagePauseStopOf } from '../usage-pause/running-stop';
+import type { RunningStopView } from '../usage-pause/limits-view';
+import { tokenCapReached, tokenCapRefusalText } from './token-cap';
 import { getTaskSessionBinding } from './session-credentials';
 import {
   memberPairUsageLimitsView,
@@ -186,6 +193,7 @@ export function resetUsagePauseStateForTest(): void {
   override = null;
   overrideSetAt = null;
   taskAllowances.clear();
+  allowedRunningTurns.clear();
   postedEpisodes.clear();
   oneshotAllowances.clear();
 }
@@ -272,11 +280,33 @@ export function taskUsagePauseAllowance(taskId: string): TaskUsagePauseAllowance
   return taskAllowances.get(taskId) ?? null;
 }
 
+/**
+ * Turns an allowance let past the pause, so the running-turn stop
+ * (src/daemon/running-turn-stop.ts) lets them run to their end. Bound to the
+ * supervisor command of the first request seen after the allowance was taken:
+ * a later turn runs under another command and is judged again.
+ */
+const allowedRunningTurns = new Map<string, { commandId: string | null }>();
+
+/** Did an allowance let the turn running under `commandId` past the pause? */
+export function runningTurnAllowedPastPause(taskId: string, commandId: string | null): boolean {
+  const entry = allowedRunningTurns.get(taskId);
+  if (!entry) return false;
+  if (entry.commandId === null) {
+    entry.commandId = commandId;
+    return true;
+  }
+  if (entry.commandId === commandId) return true;
+  allowedRunningTurns.delete(taskId);
+  return false;
+}
+
 /** Take the allowance (see the invariant): true when there was one to take. */
 function takeTaskAllowance(taskId: string, what: string): boolean {
   const current = taskAllowances.get(taskId);
   if (!current) return false;
   taskAllowances.delete(taskId);
+  allowedRunningTurns.set(taskId, { commandId: null });
   logger.info(`usage pause: the allowance set by ${current.setBy ?? 'somebody'} let ${what} past the pause`);
   return true;
 }
@@ -291,6 +321,14 @@ function takeTaskAllowance(taskId: string, what: string): boolean {
  */
 export async function takeTaskAllowanceAtLaunch(projectRoot: string, task: Task, what: string): Promise<void> {
   if (!taskAllowances.has(task.id)) return;
+  // The allowance also lets a task at its own token cap run one turn.
+  if (tokenCapOf(task) !== null) {
+    const { getOrCreateStorage } = await import('./rpc-handlers');
+    if (await tokenCapReached(await getOrCreateStorage(), task)) {
+      takeTaskAllowance(task.id, `the ${what} of ${displayId(task)} (past its token cap)`);
+      return;
+    }
+  }
   const config = await loadConfig(projectRoot);
   const pause = await usagePauseForTask(projectRoot, config, task);
   if (!pause || pause.verdict.storeError) return;
@@ -520,11 +558,19 @@ export async function usagePauseForTask(
   task: Task,
   threshold?: number,
   now: number = Date.now(),
+  /**
+   * Whose credential the turn spends, when the caller knows it better than the
+   * request scope does — the running-turn stop passes the live session
+   * binding's owner, because the proxy path runs outside any request.
+   * Undefined: the request's turn owner, as a launch is judged.
+   */
+  owner?: string | null,
 ): Promise<TaskUsagePause | null> {
+  const payer = owner === undefined ? getTurnOwner(task.id) : owner;
   const profile = profileForAgentNameOrNull(config, task.agent_id);
-  if (profile?.tiers) return tieredUsagePause(projectRoot, config, profile.name, profile.harness, threshold, now, getTurnOwner(task.id));
+  if (profile?.tiers) return tieredUsagePause(projectRoot, config, profile.name, profile.harness, threshold, now, payer);
   if (threshold === undefined && !usagePauseConfigured(config)) return null;
-  const spend = await turnSpendCredential(projectRoot, config, task);
+  const spend = await spendCredentialFor(projectRoot, config, task.agent_id, payer, displayId(task));
   return usagePauseForSpend(projectRoot, config, spend, threshold, now);
 }
 
@@ -719,6 +765,9 @@ const NOT_DONE: Record<UsagePauseVerb, string> = {
   chat: 'opened for a chat',
 };
 
+/** Launches the task's own token cap refuses: every one that runs the task's agent on its work. */
+const TOKEN_CAPPED_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'sync']);
+
 /** Launch verbs whose CLI command and builder MCP tool carry the per-task allowance themselves. */
 const ALLOWANCE_FLAG_VERBS: ReadonlySet<UsagePauseVerb> = new Set(['start', 'unblock', 'resume', 'review', 'ask', 'pair']);
 /** Launch verbs whose builder MCP tool takes `override_usage_pause` (src/mcp/tools.ts). */
@@ -769,9 +818,32 @@ export async function assertTurnStartAllowed(
     overrideEligible?: boolean;
     /** One more line for the refusal (what already happened, what did not). */
     note?: string;
+    /**
+     * Where the task's token spend is read for its token cap. Every task launch
+     * passes it; absent, the daemon's own storage is used.
+     */
+    storage?: Storage;
   },
 ): Promise<void> {
   const { task, config } = input;
+  // The task's own token cap: a work turn of a task at its cap is refused
+  // whoever asks — raising the cap is the way on, not an override.
+  // A conflict sync runs the agent too, so it is capped like a work turn.
+  if (TOKEN_CAPPED_VERBS.has(input.verb) && tokenCapOf(task) !== null) {
+    const store = input.storage ?? await (await import('./rpc-handlers')).getOrCreateStorage();
+    const reached = await tokenCapReached(store, task);
+    if (reached) {
+      // "Let its next turn through" lets ONE turn past every spend limit on
+      // the task, its cap included — taken here, so the usage pause below is
+      // not asked to spend it a second time.
+      if (!taskAllowances.has(task.id)) {
+        throw new RpcError(429, tokenCapRefusalText(task, reached), 'token_cap_reached');
+      }
+      if (input.peek) return;
+      takeTaskAllowance(task.id, `the ${input.verb} of ${displayId(task)} (past its token cap)`);
+      return;
+    }
+  }
   await assertSpendAllowed({
     actor: input.actor,
     peek: input.peek,
@@ -783,6 +855,9 @@ export async function assertTurnStartAllowed(
     note: input.note,
     task: { id: task.id, retry: usagePauseRetryCommand(input.verb, displayId(task), input.actor) },
   });
+  // An allowance spent on an ask or a review let no WORK turn through, so the
+  // running-turn stop must not hand the next work turn a free pass on it.
+  if (!input.peek && !TOKEN_CAPPED_VERBS.has(input.verb)) allowedRunningTurns.delete(task.id);
 }
 
 /**
@@ -845,7 +920,8 @@ const oneshotAllowances = new Map<string, number>();
  * So the command is judged here, before its first call (the override is taken
  * here if it is what lets it through), and every call that presents the
  * allowance skips the gate. That also means a pause that trips MID-command
- * does not cut it off: like a running turn, a started command finishes.
+ * does not cut it off: a started command finishes (a running WORK turn, by
+ * contrast, is stopped at its next request — src/daemon/running-turn-stop.ts).
  */
 export async function admitOneshotCommand(
   projectRoot: string,
@@ -895,7 +971,8 @@ export async function assertBesideUsagePauseOverrideAllowed(
  * a paused credential (the 429 names the window and the reset), and the
  * person's one-shot override may let it through. Judged ONCE, before the
  * session opens; a relaunch of the same session after a daemon restart is not
- * judged again, just as a running turn never is.
+ * judged again (unlike a running WORK turn, which the proxy judges on every
+ * request — src/daemon/running-turn-stop.ts; a pairing task is not `working`).
  *
  * Which credential: a task pair runs the TASK's agent profile in its container
  * (src/cli/commands/pair-container.ts), so it is the task's turn credential; a
@@ -1152,6 +1229,11 @@ export async function usagePauseHold(
   task: Task,
   held: string,
 ): Promise<string | null> {
+  // A task at its own token cap waits for a person to raise it — never for a
+  // reset, so it records no usage hold.
+  const reached = await tokenCapReached(storage, task);
+  if (reached && !taskAllowances.has(task.id)) return tokenCapRefusalText(task, reached);
+  if (reached) return null; // the allowance lets this one launch past the cap; the launch takes it
   const config = await loadConfig(projectRoot);
   const existing = parseUsagePauseHold(await storage.getTaskMetadata(task.id, USAGE_PAUSE_HELD_KEY));
   const pause = await usagePauseForTask(projectRoot, config, task);
@@ -1202,7 +1284,7 @@ async function announceEpisode(storage: Storage, v: UsagePauseVerdict, task: Tas
         title: `The usage pause cannot read its saved readings: launches on ${v.credential} are refused`,
         body:
           `${describeUsagePause(v)}\n\n` +
-          `Turns already running continue. Turns lazy starts by itself (first held: the ${held} of ` +
+          `Turns already running stop on their next model request. Turns lazy starts by itself (first held: the ${held} of ` +
           `**${displayId(task)}**) wait, and go ahead once the file is readable again.`,
       });
       return;
@@ -1213,7 +1295,7 @@ async function announceEpisode(storage: Storage, v: UsagePauseVerdict, task: Tas
       title: `New turns on ${v.credential} are paused: ${windowLabel(v.window)} at ${v.usedPercent ?? '?'}%`,
       body:
         `${describeUsagePause(v)}\n\n` +
-        `Turns already running continue. Turns lazy starts by itself (first held: the ${held} of ` +
+        `Turns already running stop on their next model request, their work kept, and resume after the reset. Turns lazy starts by itself (first held: the ${held} of ` +
         `**${displayId(task)}**) wait and go ahead on their own when the window resets. ` +
         `Starts, unblocks, resumes, reviews, asks and the other model runs you ask for are refused ` +
         `until then.\n\n` +
@@ -1516,6 +1598,8 @@ export interface UsagePauseState {
   paused: UsagePauseVerdict[];
   /** Tasks whose daemon-started launch the pause is holding. */
   held: Array<{ taskId: string; task: string; hold: UsagePauseHold }>;
+  /** Tasks whose RUNNING turn lazy stopped for spend (src/daemon/running-turn-stop.ts). */
+  stopped: RunningStopView[];
   /**
    * Tasks whose next turn a person or the builder let through the pause, not
    * yet used (see "The per-task allowance"). Absent from an older daemon.
@@ -1536,6 +1620,12 @@ export interface UsagePauseState {
   task?: {
     credential: string | null; harness: string | null; supported: boolean; verdict: UsagePauseVerdict | null;
     allowed?: boolean;
+    /**
+     * Set when the task has reached its own token cap: the refusal a work turn
+     * (start, unblock, resume, a conflict sync) gets, whatever the pause says.
+     * The CLI pre-flight shows it before an editor opens. Absent from an older daemon.
+     */
+    tokenCapRefusal?: string | null;
   };
   /**
    * With `beside`: a model run BESIDE a task (the builder role's credential —
@@ -1612,6 +1702,7 @@ export async function describeUsagePauseState(
     if (v) paused.push(v);
   }
   const held: UsagePauseState['held'] = [];
+  const stopped: RunningStopView[] = [];
   let taskState: UsagePauseState['task'];
   let pausedTasks: UsagePauseState['pausedTasks'];
   if (storage) {
@@ -1619,11 +1710,20 @@ export async function describeUsagePauseState(
     for (const t of tasks) {
       const hold = usagePauseHoldOf(t);
       if (hold) held.push({ taskId: t.id, task: displayId(t), hold });
+      const line = runningStopLine(t);
+      if (line) {
+        const u = t.status === 'interrupted' ? usagePauseStopOf(t) : null;
+        stopped.push(u
+          ? { taskId: t.id, task: displayId(t), kind: 'usage', line, credential: u.credential, resetsAt: u.resetsAt }
+          : { taskId: t.id, task: displayId(t), kind: 'cap', line });
+      }
     }
     if (taskId) {
       const resolved = await storage.resolveTask(taskId);
       if (!resolved.task) throw new RpcError(404, `Task not found: ${taskId}`);
       taskState = await judgeTaskUsagePause(projectRoot, config, resolved.task, agentId, now, opts.ownerEmail);
+      const reached = await tokenCapReached(storage, resolved.task);
+      if (reached && !taskAllowances.has(resolved.task.id)) taskState = { ...taskState, tokenCapRefusal: tokenCapRefusalText(resolved.task, reached) };
     }
     if (opts.pausedTasks && paused.length > 0) {
       pausedTasks = [];
@@ -1641,6 +1741,7 @@ export async function describeUsagePauseState(
     coverage: await usagePauseCoverage(projectRoot, config, now),
     paused,
     held,
+    stopped,
     allowed: await listAllowances(storage),
     storeError: usagePauseConfigured(config) ? usageReadingsStoreError() : null,
     ...(taskState ? { task: taskState } : {}),
@@ -1933,7 +2034,10 @@ export async function describeUsageLimitsView(
   const config = await loadConfig(projectRoot);
   // Failing credentials, scoped below exactly like the readings.
   const records = await readAuditRecords(join(projectRoot, config.data.path), { limit: 200 });
-  const view = projectUsageLimits(daemonUsageLimits.readings(), state, Date.now(), await currentCredentialFailures(projectRoot, records));
+  const view = projectUsageLimits(
+    daemonUsageLimits.readings(), state, Date.now(), await currentCredentialFailures(projectRoot, records),
+    daemonProviderHealthWith(records),
+  );
   if (caller.kind === 'member-pair') {
     const task = caller.taskId ? await storage.getTask(caller.taskId) : null;
     const profile = task ? profileForAgentNameOrNull(config, task.agent_id) : null;

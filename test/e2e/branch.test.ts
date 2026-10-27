@@ -302,7 +302,7 @@ describe('lazy branch', () => {
 
     seedFinal(ctx, childId);
 
-    const acceptResult = await ctx.lazy(['accept', childId, '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', childId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
     expectOutput(acceptResult, 'accepted and merged');
 
@@ -338,7 +338,7 @@ describe('lazy branch', () => {
 
     seedFinal(ctx, childId);
 
-    const acceptResult = await ctx.lazy(['accept', childId, '--yes']);
+    const acceptResult = await ctx.lazyMocked(['accept', childId, '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(acceptResult);
 
     // The child's file is on the parent's branch...
@@ -365,7 +365,7 @@ describe('lazy branch', () => {
     const childId = extractVariantTaskId(branchResult.stdout);
 
     // Reject child
-    const rejectResult = await ctx.lazy(['reject', childId, '--reason', 'Wrong approach', '--yes']);
+    const rejectResult = await ctx.lazyMocked(['reject', childId, '--reason', 'Wrong approach', '--yes'], MOCK_CLAUDE_SUCCESS);
     expectSuccess(rejectResult);
     expectOutput(rejectResult, 'rejected');
 
@@ -399,7 +399,7 @@ describe('lazy branch', () => {
     ctx.git('-C', childWorktreePath, 'commit', '-m', 'Bad work');
 
     // Reject child
-    await ctx.lazy(['reject', childId, '--reason', 'Not needed', '--yes']);
+    await ctx.lazyMocked(['reject', childId, '--reason', 'Not needed', '--yes'], MOCK_CLAUDE_SUCCESS);
 
     // Parent worktree should still be intact with its file
     expect(existsSync(join(parentWorktreePath, 'parent-file.txt'))).toBe(true);

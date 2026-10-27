@@ -319,11 +319,18 @@ describe('Current review tab', () => {
     expect(data.parent_task_id).toBeNull();
   }, 90_000);
 
-  test('restructure verbs are disabled on a working task', async () => {
-    const id = await blockedTask('Working disables restructure');
+  // Never a disabled control (AGENTS.md): on a working task each restructure
+  // verb stays clickable and clicking says why it cannot run now — and no form
+  // that would perform it is offered.
+  test('restructure verbs on a working task say why they cannot run', async () => {
+    const id = await blockedTask('Working refuses restructure');
     setTaskStatus(ctx.root, id, 'working');
     const landing = await (await fetch(`${base}/tasks/${id}`)).text();
-    expect(landing).toContain('title="Task is working. Wait for it to finish or interrupt it first."');
+    for (const verb of ['reparent', 'redo', 'clone']) {
+      const button = new RegExp(`<button[^>]*data-lz-action-open="${verb}"[^>]*>`).exec(landing)?.[0] ?? '';
+      expect(button).toContain('data-control-refusal="Task is working. Wait for it to finish or interrupt it first."');
+      expect(button).not.toMatch(/\sdisabled\b/);
+    }
     expect(landing).not.toContain(`action="/tasks/${id}/actions/reparent"`);
     expect(landing).not.toContain(`action="/tasks/${id}/actions/redo"`);
     expect(landing).not.toContain(`action="/tasks/${id}/actions/clone"`);

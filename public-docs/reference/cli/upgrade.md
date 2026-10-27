@@ -19,7 +19,8 @@ Non-disruptive image refresh (--images):
     - Working agents and blocked tasks:  when their container is next recreated
       (a blocked task reuses its live supervisor on unblock, so it does NOT
       switch on the next turn)
-  For an immediate, disruptive switch of everything, run a full `lazy upgrade`.
+  A full `lazy upgrade` also restarts the daemon and every agent; running task
+  containers still keep their image until their environment is restarted.
   Only applies to docker/podman runners.
 
 What happens:
@@ -30,7 +31,8 @@ What happens:
      the only gain is re-resolving its unpinned contents, and the question says
      how old it is. Without a TTY it rebuilds; `--images` never asks.
   2. Live builder sessions are warned to submit any in-progress message
-  3. Task containers are stopped (builders stay running and reconnect in place)
+  3. Task containers and builders stay running (each task's agent restarts with
+     the daemon; a container keeps its image until you restart its environment)
   4. The background image is promoted onto the real image tag (usually already
      built by now) and the agent binary is force-rebuilt
   5. Daemon is restarted with new code

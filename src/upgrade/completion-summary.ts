@@ -36,6 +36,8 @@ export interface FullUpgradeCompletionContext {
   > | null;
   daemonRestarted: boolean;
   interruptedTaskCount: number;
+  /** Task containers kept running on their old image. */
+  keptEnvironmentCount?: number;
   builderSessionCount: number;
   interactiveSessionCount: number;
 }
@@ -122,14 +124,21 @@ export async function printFullUpgradeCompletionSummary(
     );
   }
 
+  if (ctx.keptEnvironmentCount && ctx.keptEnvironmentCount > 0) {
+    const noun = ctx.keptEnvironmentCount === 1 ? 'environment keeps' : 'environments keep';
+    nextActions.push(
+      `${ctx.keptEnvironmentCount} task ${noun} its services and the previous image — restart one ` +
+      '(Services tab: Restart environment, or `lazy shell <task> --restart`) to move it to the new image',
+    );
+  }
   if (nextActions.length > 0) {
     console.log(`  ${theme.label('Next:')}`);
     for (const line of nextActions) {
       console.log(`    • ${line}`);
     }
     console.log('');
-    console.log('  Working agents and blocked tasks keep their current container until it is');
-    console.log('  recreated — see when each session picks up the new image above.');
+    console.log('  Running task containers keep their current image until their environment is');
+    console.log('  restarted; new tasks start on the rebuilt image.');
   } else {
     console.log(`  ${theme.label('Next:')} nothing else to do — new and resumed tasks use the rebuilt image.`);
   }

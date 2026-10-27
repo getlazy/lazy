@@ -1,4 +1,5 @@
 import { DiskSpaceManager, diskSpaceSupported, setDiskSpaceManager } from '../docker/disk-space';
+import { runningTurnStopFor, stopRunningTurnForSpend } from './running-turn-stop';
 /**
  * Daemon HTTP server — a single TCP listener is the daemon's ONLY transport.
  *
@@ -226,6 +227,8 @@ export interface DaemonServerOptions {
    * Not part of the daemon's public contract.
    */
   _forceBindWebInTest?: boolean;
+  /** Test-only boundary hook: hold proxy startup after the RPC listener binds. */
+  _beforeProxyStart?: () => Promise<void>;
 }
 
 export interface RunningDaemon {
@@ -2296,6 +2299,7 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
     // Search from projectRoot explicitly — loadConfig otherwise defaults its
     // search to process.cwd(), which is the project root for a real daemon but
     // NOT for an in-process test daemon.
+    await options._beforeProxyStart?.();
     const cfg = await loadConfig(projectRoot);
     // Managed mode deliberately pins `[data] path` to `.lazy` (managed.ts), so
     // no fleet override here: the audit log is PROJECT-LOCAL telemetry by
@@ -2382,6 +2386,15 @@ export async function startDaemonServer(options: DaemonServerOptions): Promise<R
         })(),
         historyCrossed: async (taskId) => tieredHistoryCrossed(await getOrCreateStorage(), taskId),
         prepareTierChoice: () => prepareTierUsageReadings(projectRoot, cfg),
+        // Stops a running work turn whose credential crossed [usage_pause] or
+        // whose task reached its token cap (src/daemon/running-turn-stop.ts).
+        runningTurnStop: async (taskId) => {
+          const storage = await getOrCreateStorage();
+          const stop = await runningTurnStopFor(projectRoot, storage, taskId);
+          if (!stop) return null;
+          stopRunningTurnForSpend(projectRoot, storage, taskId, stop);
+          return { message: stop.message };
+        },
       },
     );
     // Publish the ACTUAL bound port (OS-assigned when `[proxy] port` was
@@ -3477,6 +3490,8 @@ function startConversationCaptureLoop(projectRoot: string): () => void {
     try {
       const config = await loadConfig(projectRoot);
       const storage = await getOrCreateStorage();
+      // Purge records are read from Storage on every tick, never cached in the
+      // process cursor: a purge while this daemon runs takes effect immediately.
       const result = await sweepConversations({
         lazyRoot: projectRoot,
         dataDirAbs: join(projectRoot, config.data.path),
